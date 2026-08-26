@@ -191,10 +191,12 @@
         <div class="num">03 · GATE</div>
         <h3>A human merges</h3>
         <p>Approved work waits at the gate. The PR-watch reconciler syncs the board with what the
-        human actually does on the forge; notifications ping when judgment is needed.</p>
+        human actually does on the forge; notifications ping when judgment is needed. Bounce a PR
+        and the rework worker must enumerate, fix, and acknowledge every comment — it cannot
+        resubmit past unaddressed feedback.</p>
       </div>
     </div>
-    <div class="statemachine">backlog → <b>ready</b> → in_progress → review → <b>approved</b> → <span class="gate">⟨ human ⟩</span> → <b>done</b> &nbsp;&nbsp;·&nbsp;&nbsp; blocked / failed / abandoned are off-ramps</div>
+    <div class="statemachine">backlog → <b>ready</b> → in_progress → review → <b>approved</b> → <span class="gate">⟨ human ⟩</span> → <b>done</b> &nbsp;&nbsp;·&nbsp;&nbsp; off-ramps: blocked · failed · superseded · abandoned</div>
   </section>
 
   <section id="quickstart">

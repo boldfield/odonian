@@ -74,9 +74,6 @@ Odonian exists to power this workflow:
 4. A pool of **execution agents** (e.g., Haiku) claim tasks, execute them, and submit for review.
 5. **Reviewer agents** (e.g., Opus) review the work; a **human** merges and gates the final ship.
 
-The system is built on Go + SQLite, deployed as a single-replica service. It is the queue and
-state-machine primitive underneath an agent-driven development workflow.
-
 ## The Core Model
 
 **Projects → Documents → Tasks**
@@ -95,7 +92,7 @@ backlog ──promote──► ready ──claim──► in_progress ──subm
                                                                       merged → done
                                                                       closed → abandoned
 
-                      blocked / failed / abandoned are off-ramps
+                      blocked / failed / superseded / abandoned are off-ramps
 ```
 
 - **backlog**: Initial state. Task is not yet claimable.
@@ -105,6 +102,7 @@ backlog ──promote──► ready ──claim──► in_progress ──subm
 - **approved**: All reviewers voted approve. Awaits human merge (or PR-watch driven transitions).
 - **done**: Work is merged.
 - **blocked / failed / abandoned**: Off-ramps. Abandoned is terminal (PR closed without merging or task explicitly abandoned).
+- **superseded**: Terminal. The task was replaced by a recreated one — dependents are re-pointed at the replacement and the stale attempt's PR is closed. This is the recovery path for tasks whose spec or approach was wrong (`failed` has no revive).
 
 **Dependencies & Claiming**
 
@@ -112,10 +110,12 @@ A task is **claimable** iff:
 - It is in `ready` state (human promoted it).
 - All its dependencies are `done`.
 - It has no active lease (crashed agent recovery).
+- It is not `held` (a human hold flag that pauses claiming without changing state).
 
 Claiming is a single atomic database transaction — no locks, no broker, no race conditions.
 Leases are checked lazily: if an agent dies, its lease expires, and the task becomes claimable
-again. No background sweeper needed for MVP concurrency (2–5 agents).
+again. No background sweeper has been needed, including under a production fleet of ~10
+concurrent agents.
 
 **Task Kind & Review**
 
@@ -133,6 +133,8 @@ All endpoints (except `/healthz`) require `Authorization: Bearer <token>` header
 - `ODONIAN_ADDR` (optional, default `:8080`): Server address.
 - `ODONIAN_MODELS` (optional, default `haiku,sonnet,opus`): Comma-separated list of valid model names. This is the allowlist for all models that can claim tasks or be specified as reviewers.
 - `ODONIAN_ESCALATION_LADDER` (optional): Comma-separated list of models in escalation order for reviewer routing. Defaults to `ODONIAN_MODELS` if unset. Every model in this ladder must be in `ODONIAN_MODELS`. Models can be valid review models without being in the escalation ladder — for example, `gpt-5.5` can be specified as a reviewer model via the Codex CLI (see below) without being in the escalation ladder.
+- `ODONIAN_ESCALATION_THRESHOLDS` (optional): Per-tier reject-round thresholds before a task escalates to the next ladder model, as comma-separated `model=N` pairs (e.g., `haiku=3,sonnet=2,opus=2`). Exceeding the top tier blocks the task.
+- `ODONIAN_LEASE_TTL` (optional): Claim lease duration (e.g., `30m`). Kept generous in practice — renewal is agent-driven, and a session that outlives its lease loses the task to reclamation.
 - `FORGE_TOKENS` (optional): Path to the forge tokens file for GitHub API authentication (defaults to `~/.odonian/forge-tokens`). Only needed if PR-watch reconciler is enabled.
 
 See [`docs/api.md`](./docs/api.md) for the full API reference with all request/response examples.
@@ -323,9 +325,7 @@ make check     # Run gofmt, go vet, and go mod tidy checks
 
 ### Deployment
 
-The odonian server's Kubernetes manifests have been consolidated into a separate manifests repository for centralized configuration management. The manifests live in [`github.com/boldfield/manifests`](https://github.com/boldfield/manifests) under `cp/odonian/` (deployment.yaml, service.yaml, pvc.yaml, kustomization.yaml, etc.) and are applied from there.
-
-This repository's responsibility is now limited to **building and pushing the server image** — the actual Kubernetes deployment is owned by the manifests repo. Apply server updates with `make apply-odonian` from that repository.
+The odonian server ships as a single container image; this repository's responsibility is **building and pushing that image** (`make release`). Kubernetes deployment of the server is owned by your own infrastructure repo — a kustomization with a namespace, PVC, deployment, and service is all it takes (the deployment needs `replicas: 1` and `strategy: Recreate`: SQLite is single-writer).
 
 Note: `deploy/fleet/` remains in this repository because it contains build inputs (Dockerfile.fleet, Dockerfile.merger, fleet-entrypoint.sh) that must live alongside fleet deployment manifests — they are tightly coupled to the build pipeline and the fleet's lifecycle.
 
@@ -351,6 +351,17 @@ Each agent:
 
 Agents stand up their own git worktrees (one per repo), so multiple agents can work in parallel
 without stepping on each other.
+
+**Rework & the feedback gate.** When a human bounces a PR (changes requested), the task returns
+to `ready` and the next worker session is a **rework**: it must enumerate every unaddressed PR
+feedback item — inline review threads and global comments — with `odonian pr-feedback list`,
+fix each, and acknowledge each with `odonian pr-feedback ack` (a marker-stamped reply, plus
+thread resolution or a 👍 reaction). The gate is mechanical, not just prompted: `odonian submit`
+refuses to submit while unaddressed items remain. Because the fleet shares one GitHub identity
+with its human, agents self-identify in PR comments with `<model>-<role>:` markers
+(`haiku-worker:`, `opus-reviewer:`) — that convention is how the tooling tells agent comments
+from human ones. See
+[`docs/specs/2026-08-18-pr-feedback-single-identity.md`](./docs/specs/2026-08-18-pr-feedback-single-identity.md).
 
 **Review-Only Models via Codex**
 

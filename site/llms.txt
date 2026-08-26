@@ -7,7 +7,8 @@
 
 Key facts:
 - Agents CLAIM tasks (pull model); nothing is assigned. Claiming is one atomic SQLite transaction.
-- Task states: backlog → ready → in_progress → review → approved → done; blocked/failed/abandoned off-ramps.
+- Task states: backlog → ready → in_progress → review → approved → done; blocked/failed/superseded/abandoned off-ramps.
+- Rework loop: on a bounced PR the worker must enumerate, fix, and acknowledge every feedback item; `odonian submit` mechanically refuses while items remain. Agents self-identify in PR comments with `<model>-<role>:` markers because the fleet shares its human's GitHub identity.
 - Every merge is human-gated; a PR-watch reconciler syncs board state with what the human does on GitHub.
 - Rejected work escalates up a model ladder (e.g. haiku → sonnet → opus → fable) with per-tier thresholds.
 - Model hierarchy: Project → Document (design/feature_spec) → Task. Docs live in the project's repo; the board stores refs.
