@@ -39,7 +39,7 @@ spec:
       containers:
         - name: merger
           # Version tag is bumped by hand on release; make merger-image must have pushed this tag first.
-          image: docker.summercamp.eastharbor.casa:32050/odonian/merger:v0.16.0-12-g5f7549c
+          image: docker.summercamp.eastharbor.casa:32050/odonian/merger:v0.16.0-17-gbd57579
           args: ["--kind", "merge"]
           env:
             # All fleet pods reach the server via its PUBLIC ingress, so placement is decoupled from

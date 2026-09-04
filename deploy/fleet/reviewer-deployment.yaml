@@ -32,7 +32,7 @@ spec:
         # codex-home emptyDir from the read-only codex-auth secret (mounted side-path here).
         - name: codex-auth-setup
           # Version tag is bumped by hand on release; make fleet-image must have pushed this tag first.
-          image: docker.summercamp.eastharbor.casa:32050/odonian/fleet:v0.16.0-12-g5f7549c
+          image: docker.summercamp.eastharbor.casa:32050/odonian/fleet:v0.16.0-17-gbd57579
           command: ["sh", "-c", "cp /etc/codex-auth/auth.json /home/agent/.codex/auth.json && chmod 600 /home/agent/.codex/auth.json"]
           volumeMounts:
             - { name: codex-home, mountPath: /home/agent/.codex }
@@ -43,7 +43,7 @@ spec:
       containers:
         - name: reviewer
           # Version tag is bumped by hand on release; make fleet-image must have pushed this tag first.
-          image: docker.summercamp.eastharbor.casa:32050/odonian/fleet:v0.16.0-12-g5f7549c
+          image: docker.summercamp.eastharbor.casa:32050/odonian/fleet:v0.16.0-17-gbd57579
           args: ["--kind", "review"]
           env:
             - name: ODONIAN_URL
