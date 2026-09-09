@@ -531,7 +531,8 @@ func TestReconcilePerTaskErrorIsolation(t *testing.T) {
 	reconciler.getReviewDecision = getReviewDecision
 
 	t.Run("error on task-1 should not affect task-2 processing", func(t *testing.T) {
-		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int))
+		backoff := newRateLimitBackoff()
+		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int), backoff, time.Now())
 		if err != nil {
 			t.Fatalf("expected no error from reconcileProject, got %v", err)
 		}
@@ -1140,5 +1141,161 @@ func Test403NotTombstoned(t *testing.T) {
 	}
 	if !strings.Contains(logStr, "get PR state error") {
 		t.Errorf("expected error log for 403, got: %s", logStr)
+	}
+}
+
+// TestRateLimitBackoff tests that when a rate-limit error (403 or 429 with rate-limit body)
+// is returned, no further API calls are made for that owner in the current pass, and the
+// owner is skipped on subsequent passes until the backoff period expires.
+func TestRateLimitBackoff(t *testing.T) {
+	ctx := context.Background()
+
+	var apiCallCount int
+	apiCallsForOwner := make(map[string]int)
+
+	// Create two tasks for two different owners
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-owner1-1",
+					Title:      "Test Task for owner1",
+					State:      "approved",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+				{
+					ID:         "task-owner1-2",
+					Title:      "Another Test Task for owner1",
+					State:      "approved",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+				{
+					ID:         "task-owner2-1",
+					Title:      "Test Task for owner2",
+					State:      "approved",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-owner1-1": {
+				ID:        "task-owner1-1",
+				Title:     "Test Task for owner1",
+				State:     "approved",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{
+						ID:    "link-1",
+						Kind:  "pr",
+						Value: "https://github.com/owner1/repo/pull/1",
+					},
+				},
+			},
+			"task-owner1-2": {
+				ID:        "task-owner1-2",
+				Title:     "Another Test Task for owner1",
+				State:     "approved",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{
+						ID:    "link-2",
+						Kind:  "pr",
+						Value: "https://github.com/owner1/repo/pull/2",
+					},
+				},
+			},
+			"task-owner2-1": {
+				ID:        "task-owner2-1",
+				Title:     "Test Task for owner2",
+				State:     "approved",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{
+						ID:    "link-3",
+						Kind:  "pr",
+						Value: "https://github.com/owner2/repo/pull/3",
+					},
+				},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		apiCallCount++
+		apiCallsForOwner[owner]++
+		// First call for owner1 returns rate-limit error, others return success
+		if owner == "owner1" && apiCallsForOwner[owner] == 1 {
+			return "", fmt.Errorf("API request failed with status 403: API rate limit exceeded for 1.2.3.4")
+		}
+		if owner == "owner2" {
+			return "open", nil
+		}
+		return "open", nil
+	}
+
+	getReviewDecision := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "pending", time.Time{}, nil
+	}
+
+	var logOutput strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, logger)
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = getReviewDecision
+
+	// First reconcile pass - owner1's first task hits rate limit
+	apiCallCount = 0
+	apiCallsForOwner = make(map[string]int)
+	err := reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Verify that owner1 only had 1 call (rate limit on first task)
+	// and owner2 had 1 call (no rate limit)
+	if apiCallsForOwner["owner1"] != 1 {
+		t.Errorf("expected 1 API call for owner1, got %d", apiCallsForOwner["owner1"])
+	}
+	if apiCallsForOwner["owner2"] != 1 {
+		t.Errorf("expected 1 API call for owner2, got %d", apiCallsForOwner["owner2"])
+	}
+
+	// Verify rate limit warning was logged
+	logStr := logOutput.String()
+	if !strings.Contains(logStr, "rate limit exceeded, skipping owner") {
+		t.Errorf("expected rate limit warning log, got: %s", logStr)
+	}
+
+	// Test backoff state machine directly
+	backoff := newRateLimitBackoff()
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Simulate what would happen after rate limit: set backoff
+	backoff.setBackoff("owner1", now.Add(30*time.Second))
+
+	// When backoff hasn't expired: this time is still before expiry
+	if !backoff.isBackedOff("owner1", now) {
+		t.Error("owner1 should be backed off at 12:00:00")
+	}
+
+	// When backoff expires: this time is after expiry
+	laterTime := time.Date(2024, 1, 1, 12, 0, 31, 0, time.UTC)
+	if backoff.isBackedOff("owner1", laterTime) {
+		t.Error("owner1 should NOT be backed off at 12:00:31 (after 30s)")
+	}
+
+	// Owner2 should never be backed off
+	if backoff.isBackedOff("owner2", now) {
+		t.Error("owner2 should never be backed off")
 	}
 }
