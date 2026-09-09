@@ -61,6 +61,7 @@ type Store interface {
 // sqliteStore wraps a SQLite database connection and provides migration functionality.
 type sqliteStore struct {
 	conn             *sql.DB
+	readConn         *sql.DB
 	allowedModels    []string
 	allowedModelsM   map[string]bool
 	escalationLadder []string
@@ -132,6 +133,15 @@ func Open(dbPath string, allowedModels []string, opts ...StoreOption) (Store, er
 		return nil, fmt.Errorf("failed to apply migrations: %w", err)
 	}
 
+	// Open a second connection for reads with SetMaxOpenConns(4)
+	readConn, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to open read connection: %w", err)
+	}
+	readConn.SetMaxOpenConns(4)
+	store.readConn = readConn
+
 	return store, nil
 }
 
@@ -139,7 +149,12 @@ func Open(dbPath string, allowedModels []string, opts ...StoreOption) (Store, er
 func buildDSN(dbPath string) string {
 	// If the path is already a DSN (contains scheme), use it directly but append pragmas.
 	if strings.Contains(dbPath, "://") || strings.Contains(dbPath, ":memory:") {
-		return dsn_addPragmas(dbPath)
+		dsn := dbPath
+		// For in-memory databases, ensure cache=shared so multiple connections share the same database
+		if strings.Contains(dsn, ":memory:") && !strings.Contains(dsn, "cache=shared") {
+			dsn = "file:" + dsn + "?cache=shared"
+		}
+		return dsn_addPragmas(dsn)
 	}
 
 	// Otherwise, treat it as a file path.
@@ -293,7 +308,19 @@ func listMigrations(fsys fs.FS) ([]migration, error) {
 
 // Close closes the database connection.
 func (s *sqliteStore) Close() error {
-	return s.conn.Close()
+	var errs []error
+	if s.readConn != nil {
+		if err := s.readConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := s.conn.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
 }
 
 // Conn returns the underlying database connection for direct access.
@@ -362,7 +389,7 @@ func (s *sqliteStore) setTaskDepends(ctx context.Context, tx *sql.Tx, taskID str
 
 // ListEvents retrieves all events for a given task, ordered by created_at and id.
 func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, error) {
-	rows, err := s.conn.QueryContext(ctx, `
+	rows, err := s.readConn.QueryContext(ctx, `
 		SELECT id, task_id, actor, kind, verdict, note, created_at
 		FROM event
 		WHERE task_id = ?
@@ -696,7 +723,7 @@ func (s *sqliteStore) CreateProject(ctx context.Context, name, repo string) (Pro
 // Returns ErrNotFound if the project does not exist.
 func (s *sqliteStore) GetProject(ctx context.Context, id string) (Project, error) {
 	var p Project
-	err := s.conn.QueryRowContext(ctx, `
+	err := s.readConn.QueryRowContext(ctx, `
 		SELECT id, name, repo, created_at FROM project WHERE id = ?
 	`, id).Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt)
 
@@ -760,7 +787,7 @@ func (s *sqliteStore) ListProjects(ctx context.Context, filter ProjectListFilter
 
 	query += ` ORDER BY created_at`
 
-	rows, err := s.conn.QueryContext(ctx, query, args...)
+	rows, err := s.readConn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query projects: %w", err)
 	}
@@ -861,7 +888,7 @@ func (s *sqliteStore) ListDocuments(ctx context.Context, projectID string, kind 
 
 	query += ` ORDER BY created_at, id`
 
-	rows, err := s.conn.QueryContext(ctx, query, args...)
+	rows, err := s.readConn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query documents: %w", err)
 	}
@@ -1070,7 +1097,7 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error) {
 	var t Task
 	var reviewModelsJSON *string
-	err := s.conn.QueryRowContext(ctx, `
+	err := s.readConn.QueryRowContext(ctx, `
 		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
 	`, id).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
@@ -1091,7 +1118,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	}
 
 	// Fetch dependencies
-	depRows, err := s.conn.QueryContext(ctx, `
+	depRows, err := s.readConn.QueryContext(ctx, `
 		SELECT depends_on_id FROM task_dep WHERE task_id = ? ORDER BY depends_on_id
 	`, id)
 	if err != nil {
@@ -1112,7 +1139,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	}
 
 	// Fetch links
-	linkRows, err := s.conn.QueryContext(ctx, `
+	linkRows, err := s.readConn.QueryContext(ctx, `
 		SELECT id, task_id, kind, value, tombstoned_at FROM task_link WHERE task_id = ? ORDER BY id
 	`, id)
 	if err != nil {
@@ -1223,7 +1250,7 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 
 	query += ` ORDER BY created_at, id`
 
-	rows, err := s.conn.QueryContext(ctx, query, args...)
+	rows, err := s.readConn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tasks: %w", err)
 	}
@@ -1256,7 +1283,7 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 // ListDependents returns all task IDs that depend on the given taskID (reverse dependencies).
 // Returns an empty slice if the task has no dependents.
 func (s *sqliteStore) ListDependents(ctx context.Context, taskID string) ([]string, error) {
-	rows, err := s.conn.QueryContext(ctx, `
+	rows, err := s.readConn.QueryContext(ctx, `
 		SELECT task_id FROM task_dep WHERE depends_on_id = ? ORDER BY task_id
 	`, taskID)
 	if err != nil {
