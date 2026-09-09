@@ -109,7 +109,7 @@ func TestReconcilerName(t *testing.T) {
 	notifier := &fakeNotifierForReconciler{}
 	tokenLookup := func(owner string) (string, error) { return "token", nil }
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, nil)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, nil)
 
 	if reconciler.Name() != "pr-watch" {
 		t.Errorf("expected name 'pr-watch', got %q", reconciler.Name())
@@ -158,7 +158,7 @@ func TestReconcileActionDone(t *testing.T) {
 		return "approved", time.Time{}, nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -229,7 +229,7 @@ func TestReconcileActionAbandon(t *testing.T) {
 		return "pending", time.Time{}, nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -307,7 +307,7 @@ func TestReconcileActionBounce(t *testing.T) {
 		forge.GitHubBaseURL = oldBaseURL
 	}()
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -371,7 +371,7 @@ func TestReconcileActionNoop(t *testing.T) {
 		return "pending", time.Time{}, nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -412,7 +412,7 @@ func TestReconcileSkipAgentMerge(t *testing.T) {
 	notifier := &fakeNotifierForReconciler{}
 	tokenLookup := func(owner string) (string, error) { return "token", nil }
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
 	err := reconciler.Reconcile(ctx)
 
 	if err != nil {
@@ -456,7 +456,7 @@ func TestReconcileSkipNoPRLink(t *testing.T) {
 	notifier := &fakeNotifierForReconciler{}
 	tokenLookup := func(owner string) (string, error) { return "token", nil }
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
 	err := reconciler.Reconcile(ctx)
 
 	if err != nil {
@@ -526,12 +526,12 @@ func TestReconcilePerTaskErrorIsolation(t *testing.T) {
 	notifier := &fakeNotifierForReconciler{}
 	tokenLookup := func(owner string) (string, error) { return "token", nil }
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
 	t.Run("error on task-1 should not affect task-2 processing", func(t *testing.T) {
-		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int))
+		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int), time.Now())
 		if err != nil {
 			t.Fatalf("expected no error from reconcileProject, got %v", err)
 		}
@@ -726,7 +726,7 @@ func TestRetrofitClosesOpenPRForSupersededTaskThroughRealStore(t *testing.T) {
 	task := createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/123", "superseded", &replacementID)
 
 	tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
 
 	if err := reconciler.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
@@ -762,7 +762,7 @@ func TestRetrofitClosesOpenPRForAbandonedTask(t *testing.T) {
 	createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/456", "abandoned", nil)
 
 	tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
 
 	if err := reconciler.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
@@ -794,7 +794,7 @@ func TestRetrofitLeavesDoneTaskMergedPRUntouched(t *testing.T) {
 	createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/789", "done", nil)
 
 	tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, newTestLogger())
+	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
 
 	if err := reconciler.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
@@ -829,7 +829,7 @@ func TestRetrofitSkipsAlreadyClosedOrMergedSupersededPR(t *testing.T) {
 			createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/321", "superseded", &replacementID)
 
 			tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-			reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, newTestLogger())
+			reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
 
 			if err := reconciler.Reconcile(ctx); err != nil {
 				t.Fatalf("Reconcile failed: %v", err)
@@ -914,7 +914,7 @@ func TestSkipsOwnersWithoutForgeToken(t *testing.T) {
 		return "", nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, logger)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, logger)
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -999,7 +999,7 @@ func Test404TombstonedPRSkippedOnNextPass(t *testing.T) {
 	var logOutput strings.Builder
 	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, logger)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, logger)
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -1119,7 +1119,7 @@ func Test403NotTombstoned(t *testing.T) {
 	var logOutput strings.Builder
 	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, logger)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, logger)
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -1140,5 +1140,209 @@ func Test403NotTombstoned(t *testing.T) {
 	}
 	if !strings.Contains(logStr, "get PR state error") {
 		t.Errorf("expected error log for 403, got: %s", logStr)
+	}
+}
+
+// TestRateLimitBackoffPersistsAcrossReconcilePasses drives the reconciler through
+// three passes to prove the per-owner backoff is real reconciler state (not scoped
+// to a single Reconcile call): pass 1 hits the rate limit and aborts the rest of
+// that owner's checks for the pass; pass 2, before the reset, still skips the
+// owner entirely; pass 3, after the reset, resumes. A second owner is checked on
+// every pass throughout, unaffected by the first owner's backoff.
+func TestRateLimitBackoffPersistsAcrossReconcilePasses(t *testing.T) {
+	ctx := context.Background()
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+				{ID: "task-2", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+				{ID: "task-3", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-1", Kind: "pr", Value: "https://github.com/owner1/repo/pull/1"}},
+			},
+			"task-2": {
+				ID: "task-2", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-2", Kind: "pr", Value: "https://github.com/owner1/repo/pull/2"}},
+			},
+			"task-3": {
+				ID: "task-3", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-3", Kind: "pr", Value: "https://github.com/owner2/repo/pull/3"}},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	var owner1Calls, owner2Calls int
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		if owner == "owner1" {
+			owner1Calls++
+			if owner1Calls == 1 {
+				return "", &forge.RateLimitError{StatusCode: 403, Body: "API rate limit exceeded"}
+			}
+			return "open", nil
+		}
+		owner2Calls++
+		return "open", nil
+	}
+	getReviewDecision := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+
+	var logOutput strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+
+	backoffInterval := time.Minute
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, backoffInterval, logger)
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = getReviewDecision
+
+	t0 := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+	nowVal := t0
+	reconciler.now = func() time.Time { return nowVal }
+
+	// Pass 1: owner1's first check hits the rate limit and aborts the rest of the
+	// pass for owner1 (task-2 is skipped); owner2 is unaffected.
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 1: expected no error, got %v", err)
+	}
+	if owner1Calls != 1 {
+		t.Errorf("pass 1: expected 1 getPRState call for owner1, got %d", owner1Calls)
+	}
+	if owner2Calls != 1 {
+		t.Errorf("pass 1: expected 1 getPRState call for owner2, got %d", owner2Calls)
+	}
+	logStr := logOutput.String()
+	if !strings.Contains(logStr, "entering rate limit backoff") || !strings.Contains(logStr, "owner1") {
+		t.Errorf("pass 1: expected backoff WARN for owner1, got: %s", logStr)
+	}
+	if strings.Contains(logStr, "resumed") {
+		t.Errorf("pass 1: did not expect a resume log, got: %s", logStr)
+	}
+
+	// Pass 2: before the backoff interval elapses, owner1 is still skipped
+	// entirely (this is the cross-pass persistence the fix is for); owner2
+	// keeps working.
+	logOutput.Reset()
+	nowVal = t0.Add(30 * time.Second)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 2: expected no error, got %v", err)
+	}
+	if owner1Calls != 1 {
+		t.Errorf("pass 2: expected still 1 getPRState call for owner1 (before reset), got %d", owner1Calls)
+	}
+	if owner2Calls != 2 {
+		t.Errorf("pass 2: expected 2 getPRState calls for owner2, got %d", owner2Calls)
+	}
+	logStr = logOutput.String()
+	if strings.Contains(logStr, "entering rate limit backoff") {
+		t.Errorf("pass 2: did not expect a new backoff WARN, got: %s", logStr)
+	}
+	if strings.Contains(logStr, "resumed") {
+		t.Errorf("pass 2: did not expect a resume log before reset, got: %s", logStr)
+	}
+
+	// Pass 3: after the backoff interval elapses, owner1 resumes: task-1's retry
+	// succeeds, and task-2 (no longer backed off) is checked too, for 2 more
+	// calls. The resume transition logs exactly one INFO.
+	logOutput.Reset()
+	nowVal = t0.Add(90 * time.Second)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 3: expected no error, got %v", err)
+	}
+	if owner1Calls != 3 {
+		t.Errorf("pass 3: expected 3 getPRState calls for owner1 (resumed, both tasks checked), got %d", owner1Calls)
+	}
+	if owner2Calls != 3 {
+		t.Errorf("pass 3: expected 3 getPRState calls for owner2, got %d", owner2Calls)
+	}
+	logStr = logOutput.String()
+	if !strings.Contains(logStr, "rate limit backoff resumed") || !strings.Contains(logStr, "owner1") {
+		t.Errorf("pass 3: expected resume INFO for owner1, got: %s", logStr)
+	}
+}
+
+// TestRateLimitBackoffUsesXRateLimitResetHeader proves the not-before time comes
+// from the rate-limit response's X-RateLimit-Reset when present, not the fixed
+// fallback interval: with a short fallback interval and a reset header minutes
+// out, the owner must still be backed off once the fallback interval alone would
+// have expired, and must resume once the header's reset time passes.
+func TestRateLimitBackoffUsesXRateLimitResetHeader(t *testing.T) {
+	ctx := context.Background()
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-1", Kind: "pr", Value: "https://github.com/owner1/repo/pull/1"}},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	t0 := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+	resetAt := t0.Add(5 * time.Minute)
+
+	var calls int
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "", &forge.RateLimitError{StatusCode: 403, Body: "API rate limit exceeded", Reset: resetAt}
+		}
+		return "open", nil
+	}
+	getReviewDecision := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+
+	// A fallback interval much shorter than the reset window: if it were used
+	// instead of the header, the owner would incorrectly resume long before
+	// resetAt.
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, 10*time.Second, newTestLogger())
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = getReviewDecision
+
+	nowVal := t0
+	reconciler.now = func() time.Time { return nowVal }
+
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 1: expected no error, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("pass 1: expected 1 getPRState call, got %d", calls)
+	}
+
+	// Past the fallback interval (10s) but well before the header's reset time
+	// (5 minutes out): must still be backed off.
+	nowVal = t0.Add(30 * time.Second)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 2: expected no error, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("pass 2: expected still 1 getPRState call (backed off until reset header), got %d", calls)
+	}
+
+	// Past the header's reset time: resumes.
+	nowVal = resetAt.Add(time.Second)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 3: expected no error, got %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("pass 3: expected 2 getPRState calls (resumed after reset header), got %d", calls)
 	}
 }

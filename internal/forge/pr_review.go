@@ -59,6 +59,9 @@ func GetReviewDecision(ctx context.Context, owner, repo string, prNumber int, to
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		if rle := rateLimitError(resp, respBody); rle != nil {
+			return "", time.Time{}, rle
+		}
 		return "", time.Time{}, fmt.Errorf("graphql request failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
 

@@ -32,6 +32,9 @@ func GetPRState(ctx context.Context, owner, repo string, prNumber int, token str
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
+		if rle := rateLimitError(resp, respBody); rle != nil {
+			return "", rle
+		}
 		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
 

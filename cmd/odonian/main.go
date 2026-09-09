@@ -253,7 +253,7 @@ func runServer() {
 		reconcilers = append(reconcilers, notify.NewNotifyReconciler(s, notifyClient, notifyFailedWindow, time.Now, logger))
 	}
 
-	reconcilers = append(reconcilers, prwatch.NewPRWatchReconciler(s, notifier, forge.OwnerToken, logger))
+	reconcilers = append(reconcilers, prwatch.NewPRWatchReconciler(s, notifier, forge.OwnerToken, notifyInterval, logger))
 	runner := reconcile.NewRunner(notifyInterval, logger, reconcilers...)
 
 	go func() {
