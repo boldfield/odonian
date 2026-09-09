@@ -734,6 +734,20 @@ func TestAcknowledgeFeedbackItem_InlineItem(t *testing.T) {
 		} else if strings.Contains(bodyStr, "addPullRequestReviewThreadReply") {
 			// Handle addPullRequestReviewThreadReply mutation
 			mutationCalls["addPullRequestReviewThreadReply"] = bodyStr
+			// Fail if the request does not use the correct field name (AddPullRequestReviewThreadReplyInput)
+			if !strings.Contains(bodyStr, "pullRequestReviewThreadId:") {
+				graphqlResp := `{
+  "errors": [
+    {
+      "message": "Field 'threadId' doesn't exist on type 'AddPullRequestReviewThreadReplyInput'"
+    }
+  ]
+}`
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(graphqlResp))
+				return
+			}
 			graphqlResp := `{
   "data": {
     "addPullRequestReviewThreadReply": {
