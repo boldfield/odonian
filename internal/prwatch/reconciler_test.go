@@ -27,6 +27,13 @@ type fakeTaskSource struct {
 	getTaskErrs          map[string]error
 	transitionCalls      []transitionCall
 	transitionErr        error
+	tombstoneLinkCalls   []tombstoneLinkCall
+	tombstoneLinkErr     error
+}
+
+type tombstoneLinkCall struct {
+	taskID string
+	linkID string
 }
 
 type transitionCall struct {
@@ -73,6 +80,14 @@ func (f *fakeTaskSource) TransitionTask(ctx context.Context, taskID, to string, 
 		note:    note,
 	})
 	return store.Task{}, f.transitionErr
+}
+
+func (f *fakeTaskSource) TombstoneLink(ctx context.Context, taskID, linkID string) error {
+	f.tombstoneLinkCalls = append(f.tombstoneLinkCalls, tombstoneLinkCall{
+		taskID: taskID,
+		linkID: linkID,
+	})
+	return f.tombstoneLinkErr
 }
 
 type fakeNotifierForReconciler struct {
