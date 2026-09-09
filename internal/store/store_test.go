@@ -8625,3 +8625,110 @@ func TestSupersedeTaskForgeFailureStillSucceeds(t *testing.T) {
 		t.Errorf("expected old task to still be superseded by the new task despite the forge failure, got %+v", oldTaskAfter)
 	}
 }
+
+// TestReadsNotBlockedByWrites verifies that read queries do not block behind write transactions.
+// Opens a store, starts a writer holding a transaction, then concurrently issues reads
+// and verifies they complete promptly without waiting for the write to finish.
+func TestReadsNotBlockedByWrites(t *testing.T) {
+	ctx := context.Background()
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+
+	st, err := Open(dbPath, defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer st.Close()
+
+	// Create a project and some tasks
+	proj, err := st.CreateProject(ctx, "Test Project", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := st.CreateDocument(ctx, proj.ID, "feature_spec", "Test Doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := st.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Task 1", Spec: "Spec 1", DocumentID: doc.ID},
+		{Title: "Task 2", Spec: "Spec 2", DocumentID: doc.ID},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	// Start a writer goroutine that holds a transaction for a bit
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		conn := st.Conn()
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			t.Errorf("failed to begin transaction: %v", err)
+			return
+		}
+
+		// Hold the transaction open for 500ms
+		time.Sleep(500 * time.Millisecond)
+
+		if err := tx.Commit(); err != nil {
+			t.Errorf("failed to commit transaction: %v", err)
+		}
+	}()
+
+	// Measure time for ListTasks to complete
+	start := time.Now()
+	tasks2, err := st.ListTasks(ctx, proj.ID, TaskListFilter{})
+	duration := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	// Verify reads returned promptly (well under the 500ms writer hold)
+	if duration >= 400*time.Millisecond {
+		t.Errorf("ListTasks took too long (%v), suggests it was blocked by the writer", duration)
+	}
+
+	// Verify the read returned correct data
+	if len(tasks2) != 2 {
+		t.Errorf("expected 2 tasks, got %d", len(tasks2))
+	}
+
+	// Build a map of tasks by ID for easy lookup
+	tasksById := make(map[string]Task)
+	for _, t := range tasks2 {
+		tasksById[t.ID] = t
+	}
+
+	// Verify task details match what we created
+	task1, ok := tasksById[tasks[0].ID]
+	if !ok {
+		t.Errorf("task 1 not found in results")
+	} else if task1.Title != "Task 1" {
+		t.Errorf("expected task 1 title 'Task 1', got '%s'", task1.Title)
+	}
+
+	task2, ok := tasksById[tasks[1].ID]
+	if !ok {
+		t.Errorf("task 2 not found in results")
+	} else if task2.Title != "Task 2" {
+		t.Errorf("expected task 2 title 'Task 2', got '%s'", task2.Title)
+	}
+
+	// Wait for writer to finish
+	<-writerDone
+
+	// Verify GetTask also returns correct data
+	fullTask, err := st.GetTask(ctx, tasks[0].ID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+
+	if fullTask.ID != tasks[0].ID || fullTask.Title != "Task 1" {
+		t.Errorf("unexpected task from GetTask: %+v", fullTask)
+	}
+}
