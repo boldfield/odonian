@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/boldfield/odonian/internal/forge"
@@ -16,6 +17,7 @@ type taskSource interface {
 	ListTasks(ctx context.Context, projectID string, filter store.TaskListFilter) ([]store.Task, error)
 	GetTask(ctx context.Context, id string) (store.TaskWithDepsAndLinks, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (store.Task, error)
+	TombstoneLink(ctx context.Context, taskID, linkID string) error
 }
 
 type PRWatchReconciler struct {
@@ -121,6 +123,10 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 		return nil
 	}
 
+	if prLink.TombstonedAt != nil {
+		return nil
+	}
+
 	owner, repo, prNumber, err := parsePRURL(prLink.Value)
 	if err != nil {
 		r.logger.Error("parse PR URL error", "task_id", task.ID, "pr_url", prLink.Value, "error", err)
@@ -140,12 +146,26 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 
 	state, err := r.getPRState(ctx, owner, repo, prNumber, token)
 	if err != nil {
+		if is404Error(err) {
+			r.logger.Warn("PR owner/repo#N gone (404); will not retry", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber)
+			if err := r.taskSource.TombstoneLink(ctx, task.ID, prLink.ID); err != nil {
+				r.logger.Error("tombstone link error", "task_id", task.ID, "link_id", prLink.ID, "error", err)
+			}
+			return nil
+		}
 		r.logger.Error("get PR state error", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
 		return nil
 	}
 
 	decision, latestReviewAt, err := r.getReviewDecision(ctx, owner, repo, prNumber, token)
 	if err != nil {
+		if is404Error(err) {
+			r.logger.Warn("PR owner/repo#N gone (404); will not retry", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber)
+			if err := r.taskSource.TombstoneLink(ctx, task.ID, prLink.ID); err != nil {
+				r.logger.Error("tombstone link error", "task_id", task.ID, "link_id", prLink.ID, "error", err)
+			}
+			return nil
+		}
 		r.logger.Error("get review decision error", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
 		return nil
 	}
@@ -231,6 +251,10 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 		return
 	}
 
+	if prLink.TombstonedAt != nil {
+		return
+	}
+
 	owner, repo, prNumber, err := forge.ParsePRURL(prLink.Value)
 	if err != nil {
 		r.logger.Error("retrofit parse PR URL error", "task_id", task.ID, "pr_url", prLink.Value, "error", err)
@@ -250,6 +274,13 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 
 	state, err := r.getPRState(ctx, owner, repo, prNumber, token)
 	if err != nil {
+		if is404Error(err) {
+			r.logger.Warn("PR owner/repo#N gone (404); will not retry", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber)
+			if err := r.taskSource.TombstoneLink(ctx, task.ID, prLink.ID); err != nil {
+				r.logger.Error("tombstone link error", "task_id", task.ID, "link_id", prLink.ID, "error", err)
+			}
+			return
+		}
 		r.logger.Error("retrofit get PR state error", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
 		return
 	}
@@ -336,4 +367,8 @@ func taskWithDepsLinksToTask(t store.TaskWithDepsAndLinks) store.Task {
 		ArchivedAt:     t.ArchivedAt,
 		SupersededBy:   t.SupersededBy,
 	}
+}
+
+func is404Error(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "status 404")
 }

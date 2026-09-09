@@ -55,6 +55,7 @@ type Store interface {
 	UnarchiveTask(ctx context.Context, taskID string) (Task, error)
 	ArchiveProject(ctx context.Context, projectID string) (Project, error)
 	UnarchiveProject(ctx context.Context, projectID string) (Project, error)
+	TombstoneLink(ctx context.Context, taskID, linkID string) error
 }
 
 // sqliteStore wraps a SQLite database connection and provides migration functionality.
@@ -505,10 +506,11 @@ type Task struct {
 
 // TaskLink represents a link from a task to external resources (PR, branch, commit, CI).
 type TaskLink struct {
-	ID     string `db:"id" json:"id"`
-	TaskID string `db:"task_id" json:"task_id"`
-	Kind   string `db:"kind" json:"kind"` // 'pr', 'branch', 'commit', or 'ci'
-	Value  string `db:"value" json:"value"`
+	ID           string  `db:"id" json:"id"`
+	TaskID       string  `db:"task_id" json:"task_id"`
+	Kind         string  `db:"kind" json:"kind"` // 'pr', 'branch', 'commit', or 'ci'
+	Value        string  `db:"value" json:"value"`
+	TombstonedAt *string `db:"tombstoned_at" json:"tombstoned_at"` // nullable, set when PR returns 404
 }
 
 // TaskInput is the input format for bulk task creation.
@@ -1111,7 +1113,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 
 	// Fetch links
 	linkRows, err := s.conn.QueryContext(ctx, `
-		SELECT id, task_id, kind, value FROM task_link WHERE task_id = ? ORDER BY id
+		SELECT id, task_id, kind, value, tombstoned_at FROM task_link WHERE task_id = ? ORDER BY id
 	`, id)
 	if err != nil {
 		return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query links: %w", err)
@@ -1121,7 +1123,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	links := make([]TaskLink, 0)
 	for linkRows.Next() {
 		var link TaskLink
-		if err := linkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value); err != nil {
+		if err := linkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt); err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to scan link: %w", err)
 		}
 		links = append(links, link)
@@ -1970,7 +1972,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 
 		// Fetch links (including those we just inserted)
 		linkRows, err := tx.QueryContext(ctx, `
-			SELECT id, task_id, kind, value FROM task_link WHERE task_id = ? ORDER BY id
+			SELECT id, task_id, kind, value, tombstoned_at FROM task_link WHERE task_id = ? ORDER BY id
 		`, taskID)
 		if err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query links: %w", err)
@@ -1980,7 +1982,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 		fetchedLinks := make([]TaskLink, 0)
 		for linkRows.Next() {
 			var link TaskLink
-			if err := linkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value); err != nil {
+			if err := linkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt); err != nil {
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to scan link: %w", err)
 			}
 			fetchedLinks = append(fetchedLinks, link)
@@ -2707,6 +2709,31 @@ func (s *sqliteStore) UnarchiveProject(ctx context.Context, projectID string) (P
 	}
 
 	return p, nil
+}
+
+// TombstoneLink marks a task link as tombstoned (permanently gone, e.g. PR returns 404).
+// This prevents future reconciler passes from retrying a PR that no longer exists.
+func (s *sqliteStore) TombstoneLink(ctx context.Context, taskID, linkID string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.conn.ExecContext(ctx, `
+		UPDATE task_link
+		SET tombstoned_at = ?
+		WHERE id = ? AND task_id = ?
+	`, now, linkID, taskID)
+	if err != nil {
+		return fmt.Errorf("failed to tombstone link: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected != 1 {
+		return ErrNotFound
+	}
+
+	return nil
 }
 
 // HoldTask sets the held flag on a task, preventing it from being claimed or auto-transitioned.
