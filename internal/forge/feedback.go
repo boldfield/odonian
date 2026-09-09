@@ -519,12 +519,13 @@ func AcknowledgeFeedbackItem(ctx context.Context, owner, repo string, prNumber i
 // postReviewThreadReply posts a reply comment to a review thread via GraphQL.
 func postReviewThreadReply(ctx context.Context, threadID, fixingSha, markerPrefix, token string) error {
 	const mutationTemplate = `mutation {
-  addPullRequestReviewThreadReply(input: {threadId: "%s", body: "%s"}) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: "%s", body: "%s"}) {
     comment {
       id
     }
   }
 }`
+	// AddPullRequestReviewThreadReplyInput
 
 	replyBody := markerPrefix + "addressed in " + fixingSha
 	mutation := fmt.Sprintf(mutationTemplate, threadID, escapeGraphQLString(replyBody))
