@@ -24,11 +24,19 @@ func newRateLimitBackoff() *rateLimitBackoff {
 	}
 }
 
-func (b *rateLimitBackoff) isBackedOff(owner string, now time.Time) bool {
+func (b *rateLimitBackoff) isBackedOff(owner string, now time.Time) (backed bool, resumed bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	notBefore, exists := b.backoffAt[owner]
-	return exists && now.Before(notBefore)
+	if !exists {
+		return false, false
+	}
+	if now.Before(notBefore) {
+		return true, false
+	}
+	// Backoff has expired; clear it and return resumed=true
+	delete(b.backoffAt, owner)
+	return false, true
 }
 
 func (b *rateLimitBackoff) setBackoff(owner string, notBefore time.Time) {
@@ -174,8 +182,12 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 		return nil
 	}
 
-	if r.backoff.isBackedOff(owner, now) {
+	backedOff, resumed := r.backoff.isBackedOff(owner, now)
+	if backedOff {
 		return nil
+	}
+	if resumed {
+		r.logger.Info("rate limit backoff expired, resuming checks", "owner", owner)
 	}
 
 	state, err := r.getPRState(ctx, owner, repo, prNumber, token)
@@ -316,8 +328,12 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 		return
 	}
 
-	if r.backoff.isBackedOff(owner, now) {
+	backedOff, resumed := r.backoff.isBackedOff(owner, now)
+	if backedOff {
 		return
+	}
+	if resumed {
+		r.logger.Info("rate limit backoff expired, resuming checks", "owner", owner)
 	}
 
 	state, err := r.getPRState(ctx, owner, repo, prNumber, token)
