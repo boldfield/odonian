@@ -516,7 +516,7 @@ func TestReconcilePerTaskErrorIsolation(t *testing.T) {
 	reconciler.getReviewDecision = getReviewDecision
 
 	t.Run("error on task-1 should not affect task-2 processing", func(t *testing.T) {
-		err := reconciler.reconcileProject(ctx, "proj-1")
+		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int))
 		if err != nil {
 			t.Fatalf("expected no error from reconcileProject, got %v", err)
 		}
@@ -826,5 +826,102 @@ func TestRetrofitSkipsAlreadyClosedOrMergedSupersededPR(t *testing.T) {
 				t.Errorf("expected retrofit not to close an already-%s PR, got %d close calls", prState, calls.closeCount)
 			}
 		})
+	}
+}
+
+func TestSkipsOwnersWithoutForgeToken(t *testing.T) {
+	ctx := context.Background()
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-1",
+					Title:      "Task with token",
+					State:      "approved",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+				{
+					ID:         "task-2",
+					Title:      "Task without token",
+					State:      "approved",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:        "task-1",
+				Title:     "Task with token",
+				State:     "approved",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner-with-token/repo/pull/1"},
+				},
+			},
+			"task-2": {
+				ID:        "task-2",
+				Title:     "Task without token",
+				State:     "approved",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner-without-token/repo/pull/2"},
+				},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	var getStateCallCount int
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		getStateCallCount++
+		if owner != "owner-with-token" {
+			t.Errorf("getPRState called for owner %q without token", owner)
+		}
+		return "merged", nil
+	}
+
+	getReviewDecision := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+
+	var logOutput strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+
+	tokenLookup := func(owner string) (string, error) {
+		if owner == "owner-with-token" {
+			return "test-token", nil
+		}
+		return "", nil
+	}
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, logger)
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = getReviewDecision
+
+	err := reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Verify getPRState was called exactly once (only for owner-with-token)
+	if getStateCallCount != 1 {
+		t.Errorf("expected getPRState to be called 1 time, got %d", getStateCallCount)
+	}
+
+	// Verify log contains warning about skipped owner
+	logStr := logOutput.String()
+	if !strings.Contains(logStr, "no forge token for owner") {
+		t.Errorf("expected log to contain 'no forge token for owner', got: %s", logStr)
+	}
+	if !strings.Contains(logStr, "owner-without-token") {
+		t.Errorf("expected log to contain 'owner-without-token', got: %s", logStr)
+	}
+	if !strings.Contains(logStr, "skipped_pr_checks=1") {
+		t.Errorf("expected log to contain 'skipped_pr_checks=1', got: %s", logStr)
 	}
 }
