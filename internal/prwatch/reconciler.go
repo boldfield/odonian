@@ -2,6 +2,7 @@ package prwatch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -28,12 +29,16 @@ type PRWatchReconciler struct {
 	getPRState        func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error)
 	getReviewDecision func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error)
 	postPRComment     func(ctx context.Context, owner, repo string, prNumber int, token, comment string) error
+	backoffInterval   time.Duration
+	now               func() time.Time
+	backoff           *rateLimitBackoff
 }
 
 func NewPRWatchReconciler(
 	taskSource taskSource,
 	notifier notify.Notifier,
 	tokenLookup func(owner string) (string, error),
+	backoffInterval time.Duration,
 	logger *slog.Logger,
 ) *PRWatchReconciler {
 	return &PRWatchReconciler{
@@ -44,6 +49,9 @@ func NewPRWatchReconciler(
 		getPRState:        forge.GetPRState,
 		getReviewDecision: forge.GetReviewDecision,
 		postPRComment:     forge.PostPRComment,
+		backoffInterval:   backoffInterval,
+		now:               time.Now,
+		backoff:           newRateLimitBackoff(),
 	}
 }
 
@@ -52,6 +60,11 @@ func (r *PRWatchReconciler) Name() string {
 }
 
 func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
+	// Captured once and threaded through the whole pass so a single sweep is
+	// internally consistent: an owner's backoff, set from a call earlier in this
+	// same pass, reliably skips every later check for that owner this pass too.
+	now := r.now()
+
 	projects, err := r.taskSource.ListProjects(ctx, store.ProjectListFilter{})
 	if err != nil {
 		return err
@@ -60,7 +73,7 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	skippedPRsByOwner := make(map[string]int)
 
 	for _, project := range projects {
-		if err := r.reconcileProject(ctx, project.ID, skippedPRsByOwner); err != nil {
+		if err := r.reconcileProject(ctx, project.ID, skippedPRsByOwner, now); err != nil {
 			r.logger.Error("reconcile project error", "project_id", project.ID, "error", err)
 		}
 	}
@@ -70,7 +83,7 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	// pull requests that accrued before supersession started closing them
 	// inline, and it's the same safety net for any inline close that failed.
 	for _, project := range projects {
-		if err := r.retrofitClosePRsForTerminalTasks(ctx, project.ID, skippedPRsByOwner); err != nil {
+		if err := r.retrofitClosePRsForTerminalTasks(ctx, project.ID, skippedPRsByOwner, now); err != nil {
 			r.logger.Error("retrofit close PR error", "project_id", project.ID, "error", err)
 		}
 	}
@@ -83,7 +96,7 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID string, skippedPRsByOwner map[string]int) error {
+func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, now time.Time) error {
 	approvedState := "approved"
 	tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
 		State: &approvedState,
@@ -93,7 +106,7 @@ func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID stri
 	}
 
 	for _, task := range tasks {
-		if err := r.reconcileTask(ctx, task, skippedPRsByOwner); err != nil {
+		if err := r.reconcileTask(ctx, task, skippedPRsByOwner, now); err != nil {
 			r.logger.Error("reconcile task error", "task_id", task.ID, "error", err)
 		}
 	}
@@ -101,7 +114,7 @@ func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID stri
 	return nil
 }
 
-func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int) error {
+func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, now time.Time) error {
 	if task.AgentMerge {
 		return nil
 	}
@@ -133,6 +146,10 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 		return nil
 	}
 
+	if r.checkBackoff(owner, now) {
+		return nil
+	}
+
 	token, err := r.tokenLookup(owner)
 	if err != nil {
 		r.logger.Error("token lookup error", "task_id", task.ID, "owner", owner, "error", err)
@@ -153,6 +170,10 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 			}
 			return nil
 		}
+		if rle, ok := asRateLimitError(err); ok {
+			r.enterBackoff(owner, rle, now)
+			return nil
+		}
 		r.logger.Error("get PR state error", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
 		return nil
 	}
@@ -164,6 +185,10 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 			if err := r.taskSource.TombstoneLink(ctx, task.ID, prLink.ID); err != nil {
 				r.logger.Error("tombstone link error", "task_id", task.ID, "link_id", prLink.ID, "error", err)
 			}
+			return nil
+		}
+		if rle, ok := asRateLimitError(err); ok {
+			r.enterBackoff(owner, rle, now)
 			return nil
 		}
 		r.logger.Error("get review decision error", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
@@ -209,7 +234,7 @@ var terminalPRCleanupStates = []string{"superseded", "abandoned"}
 // retrofitClosePRsForTerminalTasks closes still-open pull requests belonging to tasks
 // already in a terminal state. It's the one-shot backlog drain plus the ongoing safety
 // net for any inline close (on supersession) that failed.
-func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context, projectID string, skippedPRsByOwner map[string]int) error {
+func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, now time.Time) error {
 	for _, state := range terminalPRCleanupStates {
 		tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
 			State:             &state,
@@ -222,7 +247,7 @@ func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context
 		}
 
 		for _, task := range tasks {
-			r.retrofitCloseTaskPR(ctx, task, skippedPRsByOwner)
+			r.retrofitCloseTaskPR(ctx, task, skippedPRsByOwner, now)
 		}
 	}
 
@@ -232,7 +257,7 @@ func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context
 // retrofitCloseTaskPR closes the still-open pull request belonging to a task that has
 // already reached a terminal state. Every failure is logged and swallowed: a stale
 // pull request that can't be closed this pass is picked up again on the next one.
-func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int) {
+func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, now time.Time) {
 	fullTask, err := r.taskSource.GetTask(ctx, task.ID)
 	if err != nil {
 		r.logger.Error("retrofit get task error", "task_id", task.ID, "error", err)
@@ -261,6 +286,10 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 		return
 	}
 
+	if r.checkBackoff(owner, now) {
+		return
+	}
+
 	token, err := r.tokenLookup(owner)
 	if err != nil {
 		r.logger.Error("retrofit token lookup error", "task_id", task.ID, "owner", owner, "error", err)
@@ -279,6 +308,10 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 			if err := r.taskSource.TombstoneLink(ctx, task.ID, prLink.ID); err != nil {
 				r.logger.Error("tombstone link error", "task_id", task.ID, "link_id", prLink.ID, "error", err)
 			}
+			return
+		}
+		if rle, ok := asRateLimitError(err); ok {
+			r.enterBackoff(owner, rle, now)
 			return
 		}
 		r.logger.Error("retrofit get PR state error", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
@@ -371,4 +404,75 @@ func taskWithDepsLinksToTask(t store.TaskWithDepsAndLinks) store.Task {
 
 func is404Error(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "status 404")
+}
+
+func asRateLimitError(err error) (*forge.RateLimitError, bool) {
+	var rle *forge.RateLimitError
+	if errors.As(err, &rle) {
+		return rle, true
+	}
+	return nil, false
+}
+
+// checkBackoff reports whether owner is currently rate-limit backed off, and logs
+// exactly one INFO when a previously-set backoff for owner has just expired. It's
+// called once per task, so only the first task for a resuming owner observes the
+// transition (the backoff entry is cleared on that first check); later tasks for
+// the same owner this pass just see "no entry" and stay silent.
+func (r *PRWatchReconciler) checkBackoff(owner string, now time.Time) bool {
+	backedOff, resumed := r.backoff.check(owner, now)
+	if resumed {
+		r.logger.Info("rate limit backoff resumed", "owner", owner)
+	}
+	return backedOff
+}
+
+// enterBackoff records that owner hit a GitHub rate limit and logs the single WARN
+// for it, aborting the remainder of the current pass's checks for that owner (via
+// checkBackoff on every later task). The not-before time comes from the response's
+// X-RateLimit-Reset when the forge call captured one and it's still in the future,
+// else a fixed cool-off of one reconcile interval. The future check guards the
+// current-pass abort guarantee: a reset timestamp at or before the captured pass
+// time (clock skew, or GitHub reporting a reset that's already elapsed) must not
+// let a later task for the same owner slip through and call GitHub again this pass.
+func (r *PRWatchReconciler) enterBackoff(owner string, rle *forge.RateLimitError, now time.Time) {
+	notBefore := now.Add(r.backoffInterval)
+	if !rle.Reset.IsZero() && rle.Reset.After(now) {
+		notBefore = rle.Reset
+	}
+	r.backoff.enter(owner, notBefore)
+	r.logger.Warn("entering rate limit backoff", "owner", owner, "not_before", notBefore, "status", rle.StatusCode)
+}
+
+// rateLimitBackoff tracks, per owner, the time before which no further GitHub calls
+// should be made — the "abort the remainder of the current reconcile pass" state.
+// It lives on PRWatchReconciler (not local to a single Reconcile call) so the
+// not-before time also skips the owner's checks on subsequent passes, up until it
+// passes.
+type rateLimitBackoff struct {
+	notBefore map[string]time.Time
+}
+
+func newRateLimitBackoff() *rateLimitBackoff {
+	return &rateLimitBackoff{notBefore: make(map[string]time.Time)}
+}
+
+// check reports whether owner is currently backed off as of now. If a previously
+// set backoff has just expired (now is at or after the recorded not-before time),
+// the entry is cleared and resumed is true — a one-shot signal for the caller to
+// log the resume transition exactly once.
+func (b *rateLimitBackoff) check(owner string, now time.Time) (backedOff, resumed bool) {
+	nb, ok := b.notBefore[owner]
+	if !ok {
+		return false, false
+	}
+	if now.Before(nb) {
+		return true, false
+	}
+	delete(b.notBefore, owner)
+	return false, true
+}
+
+func (b *rateLimitBackoff) enter(owner string, notBefore time.Time) {
+	b.notBefore[owner] = notBefore
 }
