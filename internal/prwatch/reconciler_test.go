@@ -1346,3 +1346,63 @@ func TestRateLimitBackoffUsesXRateLimitResetHeader(t *testing.T) {
 		t.Errorf("pass 3: expected 2 getPRState calls (resumed after reset header), got %d", calls)
 	}
 }
+
+// TestRateLimitBackoffAbortsCurrentPassEvenWhenResetIsNotInFuture proves the
+// within-pass abort guarantee holds even when the rate-limit response's
+// X-RateLimit-Reset is at or before the captured pass time (GitHub clock skew, or
+// a reset that's already elapsed by the time the error is handled): task-1's rate
+// limit must still skip task-2 for the same owner in this same pass, rather than
+// treating the owner as immediately resumed and letting task-2 call GitHub again.
+func TestRateLimitBackoffAbortsCurrentPassEvenWhenResetIsNotInFuture(t *testing.T) {
+	ctx := context.Background()
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+				{ID: "task-2", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-1", Kind: "pr", Value: "https://github.com/owner1/repo/pull/1"}},
+			},
+			"task-2": {
+				ID: "task-2", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-2", Kind: "pr", Value: "https://github.com/owner1/repo/pull/2"}},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	t0 := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+
+	var calls int
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		calls++
+		if calls == 1 {
+			// Reset equals the pass time captured by Reconcile: not in the future.
+			return "", &forge.RateLimitError{StatusCode: 403, Body: "API rate limit exceeded", Reset: t0}
+		}
+		return "open", nil
+	}
+	getReviewDecision := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = getReviewDecision
+	reconciler.now = func() time.Time { return t0 }
+
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 getPRState call (task-2 skipped this pass despite reset==now), got %d", calls)
+	}
+}

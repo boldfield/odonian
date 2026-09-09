@@ -430,11 +430,14 @@ func (r *PRWatchReconciler) checkBackoff(owner string, now time.Time) bool {
 // enterBackoff records that owner hit a GitHub rate limit and logs the single WARN
 // for it, aborting the remainder of the current pass's checks for that owner (via
 // checkBackoff on every later task). The not-before time comes from the response's
-// X-RateLimit-Reset when the forge call captured one, else a fixed cool-off of one
-// reconcile interval.
+// X-RateLimit-Reset when the forge call captured one and it's still in the future,
+// else a fixed cool-off of one reconcile interval. The future check guards the
+// current-pass abort guarantee: a reset timestamp at or before the captured pass
+// time (clock skew, or GitHub reporting a reset that's already elapsed) must not
+// let a later task for the same owner slip through and call GitHub again this pass.
 func (r *PRWatchReconciler) enterBackoff(owner string, rle *forge.RateLimitError, now time.Time) {
 	notBefore := now.Add(r.backoffInterval)
-	if !rle.Reset.IsZero() {
+	if !rle.Reset.IsZero() && rle.Reset.After(now) {
 		notBefore = rle.Reset
 	}
 	r.backoff.enter(owner, notBefore)
