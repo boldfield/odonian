@@ -940,3 +940,205 @@ func TestSkipsOwnersWithoutForgeToken(t *testing.T) {
 		t.Errorf("expected log to contain 'skipped_pr_checks=1', got: %s", logStr)
 	}
 }
+
+// Test404TombstonedPRSkippedOnNextPass tests that when a PR returns 404 on the first
+// reconcile pass, it is marked as tombstoned and skipped entirely on the second pass,
+// making zero GitHub API calls.
+func Test404TombstonedPRSkippedOnNextPass(t *testing.T) {
+	ctx := context.Background()
+
+	// Track API calls
+	var apiCallCount int
+
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		apiCallCount++
+		// Return 404 error to trigger tombstoning
+		return "", fmt.Errorf("status 404")
+	}
+
+	getReviewDecision := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+
+	// Set up task source with tombstoning capability
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-1",
+					Title:      "Test Task",
+					State:      "approved",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:        "task-1",
+				Title:     "Test Task",
+				State:     "approved",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{
+						ID:    "link-1",
+						Kind:  "pr",
+						Value: "https://github.com/owner/repo/pull/1",
+					},
+				},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	var logOutput strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, logger)
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = getReviewDecision
+
+	// First pass: should see 404 and tombstone
+	err := reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error on first reconcile, got %v", err)
+	}
+
+	// Verify tombstoning was called
+	if len(ts.tombstoneLinkCalls) != 1 {
+		t.Errorf("expected 1 tombstone call on first pass, got %d", len(ts.tombstoneLinkCalls))
+	} else if ts.tombstoneLinkCalls[0].taskID != "task-1" || ts.tombstoneLinkCalls[0].linkID != "link-1" {
+		t.Errorf("expected tombstone call for task-1/link-1, got %v", ts.tombstoneLinkCalls[0])
+	}
+
+	// Verify WARN was logged
+	logStr := logOutput.String()
+	if !strings.Contains(logStr, "PR owner/repo#N gone (404); will not retry") {
+		t.Errorf("expected log to contain tombstone warning, got: %s", logStr)
+	}
+
+	// Second pass: update the task to have a tombstoned link and reset tracking
+	secondPassAPICallCount := 0
+	getPRState = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		secondPassAPICallCount++
+		return "open", nil
+	}
+	reconciler.getPRState = getPRState
+
+	// Update task link to have tombstoned_at set
+	ts.taskWithDepsAndLinks["task-1"] = store.TaskWithDepsAndLinks{
+		ID:        "task-1",
+		Title:     "Test Task",
+		State:     "approved",
+		UpdatedAt: "2024-01-01T00:00:00Z",
+		Links: []store.TaskLink{
+			{
+				ID:           "link-1",
+				Kind:         "pr",
+				Value:        "https://github.com/owner/repo/pull/1",
+				TombstonedAt: &[]string{"2024-01-01T00:00:00Z"}[0],
+			},
+		},
+	}
+	logOutput.Reset()
+
+	// Second pass: should skip the tombstoned PR
+	err = reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error on second reconcile, got %v", err)
+	}
+
+	// Verify no API calls were made for the tombstoned PR
+	if secondPassAPICallCount > 0 {
+		t.Errorf("expected 0 getPRState calls for tombstoned PR on second pass, got %d", secondPassAPICallCount)
+	}
+
+	// Verify no additional tombstone calls were made
+	if len(ts.tombstoneLinkCalls) != 1 {
+		t.Errorf("expected still only 1 tombstone call total, got %d", len(ts.tombstoneLinkCalls))
+	}
+}
+
+// Test403NotTombstoned tests that a 403 error does NOT trigger tombstoning,
+// so the PR is retried on the next pass.
+func Test403NotTombstoned(t *testing.T) {
+	ctx := context.Background()
+
+	var apiCallCount int
+
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		apiCallCount++
+		// Return 403 error (should NOT be tombstoned)
+		return "", fmt.Errorf("status 403")
+	}
+
+	getReviewDecision := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-1",
+					Title:      "Test Task",
+					State:      "approved",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:        "task-1",
+				Title:     "Test Task",
+				State:     "approved",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{
+						ID:    "link-1",
+						Kind:  "pr",
+						Value: "https://github.com/owner/repo/pull/1",
+					},
+				},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	var logOutput strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, logger)
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = getReviewDecision
+
+	err := reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Verify NO tombstoning occurred (403 should NOT trigger tombstoning)
+	if len(ts.tombstoneLinkCalls) != 0 {
+		t.Errorf("expected 0 tombstone calls for 403 error, got %d", len(ts.tombstoneLinkCalls))
+	}
+
+	// Verify error was logged but NOT as a tombstone warning
+	logStr := logOutput.String()
+	if strings.Contains(logStr, "PR owner/repo#N gone (404); will not retry") {
+		t.Errorf("expected NO tombstone warning for 403, got: %s", logStr)
+	}
+	if !strings.Contains(logStr, "get PR state error") {
+		t.Errorf("expected error log for 403, got: %s", logStr)
+	}
+}
