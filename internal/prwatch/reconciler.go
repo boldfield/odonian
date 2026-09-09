@@ -54,6 +54,7 @@ type PRWatchReconciler struct {
 	getReviewDecision func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error)
 	postPRComment     func(ctx context.Context, owner, repo string, prNumber int, token, comment string) error
 	backoff           *rateLimitBackoff
+	now               func() time.Time
 }
 
 func NewPRWatchReconciler(
@@ -71,6 +72,7 @@ func NewPRWatchReconciler(
 		getReviewDecision: forge.GetReviewDecision,
 		postPRComment:     forge.PostPRComment,
 		backoff:           newRateLimitBackoff(),
+		now:               time.Now,
 	}
 }
 
@@ -85,7 +87,7 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	}
 
 	skippedPRsByOwner := make(map[string]int)
-	now := time.Now()
+	now := r.now()
 
 	for _, project := range projects {
 		if err := r.reconcileProject(ctx, project.ID, skippedPRsByOwner, now); err != nil {

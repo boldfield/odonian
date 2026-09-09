@@ -1252,6 +1252,10 @@ func TestRateLimitBackoff(t *testing.T) {
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
+	// Use a controllable clock for testing
+	mockTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	reconciler.now = func() time.Time { return mockTime }
+
 	// First reconcile pass - owner1's first task hits rate limit
 	apiCallCount = 0
 	apiCallsForOwner = make(map[string]int)
@@ -1275,26 +1279,37 @@ func TestRateLimitBackoff(t *testing.T) {
 		t.Errorf("expected rate limit warning log, got: %s", logStr)
 	}
 
-	// Test backoff state machine directly
-	backoff := newRateLimitBackoff()
-	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	// Simulate what would happen after rate limit: set backoff
-	backoff.setBackoff("owner1", now.Add(30*time.Second))
-
-	// When backoff hasn't expired: this time is still before expiry
-	if !backoff.isBackedOff("owner1", now) {
-		t.Error("owner1 should be backed off at 12:00:00")
+	// Second reconcile pass - at same time, before backoff expires
+	// owner1 should still be skipped (backoff not expired yet)
+	apiCallCount = 0
+	apiCallsForOwner = make(map[string]int)
+	err = reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	// When backoff expires: this time is after expiry
-	laterTime := time.Date(2024, 1, 1, 12, 0, 31, 0, time.UTC)
-	if backoff.isBackedOff("owner1", laterTime) {
-		t.Error("owner1 should NOT be backed off at 12:00:31 (after 30s)")
+	// owner1 should have 0 calls (backed off), owner2 should have 1 call
+	if apiCallsForOwner["owner1"] != 0 {
+		t.Errorf("expected 0 API calls for owner1 during backoff period, got %d", apiCallsForOwner["owner1"])
+	}
+	if apiCallsForOwner["owner2"] != 1 {
+		t.Errorf("expected 1 API call for owner2, got %d", apiCallsForOwner["owner2"])
 	}
 
-	// Owner2 should never be backed off
-	if backoff.isBackedOff("owner2", now) {
-		t.Error("owner2 should never be backed off")
+	// Third reconcile pass - advance time past backoff period (31 seconds later)
+	mockTime = time.Date(2024, 1, 1, 12, 0, 31, 0, time.UTC)
+	apiCallCount = 0
+	apiCallsForOwner = make(map[string]int)
+	err = reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// owner1 should now have 1 call (backoff expired), owner2 should have 1 call
+	if apiCallsForOwner["owner1"] != 1 {
+		t.Errorf("expected 1 API call for owner1 after backoff expires, got %d", apiCallsForOwner["owner1"])
+	}
+	if apiCallsForOwner["owner2"] != 1 {
+		t.Errorf("expected 1 API call for owner2, got %d", apiCallsForOwner["owner2"])
 	}
 }
