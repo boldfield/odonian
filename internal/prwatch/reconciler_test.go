@@ -531,8 +531,7 @@ func TestReconcilePerTaskErrorIsolation(t *testing.T) {
 	reconciler.getReviewDecision = getReviewDecision
 
 	t.Run("error on task-1 should not affect task-2 processing", func(t *testing.T) {
-		backoff := newRateLimitBackoff()
-		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int), backoff, time.Now())
+		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int), time.Now())
 		if err != nil {
 			t.Fatalf("expected no error from reconcileProject, got %v", err)
 		}
