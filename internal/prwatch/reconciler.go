@@ -29,6 +29,8 @@ type PRWatchReconciler struct {
 	getPRState        func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error)
 	getReviewDecision func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error)
 	postPRComment     func(ctx context.Context, owner, repo string, prNumber int, token, comment string) error
+	getRemainingQuota func(ctx context.Context, token string) (*forge.QuotaInfo, error)
+	rateLimitFloor    int
 	backoffInterval   time.Duration
 	now               func() time.Time
 	backoff           *rateLimitBackoff
@@ -39,6 +41,7 @@ func NewPRWatchReconciler(
 	notifier notify.Notifier,
 	tokenLookup func(owner string) (string, error),
 	backoffInterval time.Duration,
+	rateLimitFloor int,
 	logger *slog.Logger,
 ) *PRWatchReconciler {
 	return &PRWatchReconciler{
@@ -49,6 +52,8 @@ func NewPRWatchReconciler(
 		getPRState:        forge.GetPRState,
 		getReviewDecision: forge.GetReviewDecision,
 		postPRComment:     forge.PostPRComment,
+		getRemainingQuota: forge.GetRemainingQuota,
+		rateLimitFloor:    rateLimitFloor,
 		backoffInterval:   backoffInterval,
 		now:               time.Now,
 		backoff:           newRateLimitBackoff(),
@@ -71,9 +76,10 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	}
 
 	skippedPRsByOwner := make(map[string]int)
+	checkedQuotaByOwner := make(map[string]bool)
 
 	for _, project := range projects {
-		if err := r.reconcileProject(ctx, project.ID, skippedPRsByOwner, now); err != nil {
+		if err := r.reconcileProject(ctx, project.ID, skippedPRsByOwner, checkedQuotaByOwner, now); err != nil {
 			r.logger.Error("reconcile project error", "project_id", project.ID, "error", err)
 		}
 	}
@@ -83,7 +89,7 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	// pull requests that accrued before supersession started closing them
 	// inline, and it's the same safety net for any inline close that failed.
 	for _, project := range projects {
-		if err := r.retrofitClosePRsForTerminalTasks(ctx, project.ID, skippedPRsByOwner, now); err != nil {
+		if err := r.retrofitClosePRsForTerminalTasks(ctx, project.ID, skippedPRsByOwner, checkedQuotaByOwner, now); err != nil {
 			r.logger.Error("retrofit close PR error", "project_id", project.ID, "error", err)
 		}
 	}
@@ -96,7 +102,7 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, now time.Time) error {
+func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, checkedQuotaByOwner map[string]bool, now time.Time) error {
 	approvedState := "approved"
 	tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
 		State: &approvedState,
@@ -106,7 +112,7 @@ func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID stri
 	}
 
 	for _, task := range tasks {
-		if err := r.reconcileTask(ctx, task, skippedPRsByOwner, now); err != nil {
+		if err := r.reconcileTask(ctx, task, skippedPRsByOwner, checkedQuotaByOwner, now); err != nil {
 			r.logger.Error("reconcile task error", "task_id", task.ID, "error", err)
 		}
 	}
@@ -114,7 +120,7 @@ func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID stri
 	return nil
 }
 
-func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, now time.Time) error {
+func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, checkedQuotaByOwner map[string]bool, now time.Time) error {
 	if task.AgentMerge {
 		return nil
 	}
@@ -159,6 +165,24 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 	if token == "" {
 		skippedPRsByOwner[owner]++
 		return nil
+	}
+
+	if !checkedQuotaByOwner[owner] {
+		checkedQuotaByOwner[owner] = true
+		if r.rateLimitFloor > 0 {
+			quota, err := r.getRemainingQuota(ctx, token)
+			if err != nil {
+				if rle, ok := asRateLimitError(err); ok {
+					r.enterBackoff(owner, rle, now)
+					return nil
+				}
+				r.logger.Warn("get remaining quota error", "owner", owner, "error", err)
+			} else if quota.Remaining < r.rateLimitFloor {
+				r.logger.Warn("remaining quota below floor", "owner", owner, "remaining", quota.Remaining, "floor", r.rateLimitFloor, "not_before", quota.Reset)
+				r.enterBackoff(owner, &forge.RateLimitError{Reset: quota.Reset}, now)
+				return nil
+			}
+		}
 	}
 
 	state, err := r.getPRState(ctx, owner, repo, prNumber, token)
@@ -234,7 +258,7 @@ var terminalPRCleanupStates = []string{"superseded", "abandoned"}
 // retrofitClosePRsForTerminalTasks closes still-open pull requests belonging to tasks
 // already in a terminal state. It's the one-shot backlog drain plus the ongoing safety
 // net for any inline close (on supersession) that failed.
-func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, now time.Time) error {
+func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, checkedQuotaByOwner map[string]bool, now time.Time) error {
 	for _, state := range terminalPRCleanupStates {
 		tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
 			State:             &state,
@@ -247,7 +271,7 @@ func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context
 		}
 
 		for _, task := range tasks {
-			r.retrofitCloseTaskPR(ctx, task, skippedPRsByOwner, now)
+			r.retrofitCloseTaskPR(ctx, task, skippedPRsByOwner, checkedQuotaByOwner, now)
 		}
 	}
 
@@ -257,7 +281,7 @@ func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context
 // retrofitCloseTaskPR closes the still-open pull request belonging to a task that has
 // already reached a terminal state. Every failure is logged and swallowed: a stale
 // pull request that can't be closed this pass is picked up again on the next one.
-func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, now time.Time) {
+func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, checkedQuotaByOwner map[string]bool, now time.Time) {
 	fullTask, err := r.taskSource.GetTask(ctx, task.ID)
 	if err != nil {
 		r.logger.Error("retrofit get task error", "task_id", task.ID, "error", err)
@@ -299,6 +323,24 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 	if token == "" {
 		skippedPRsByOwner[owner]++
 		return
+	}
+
+	if !checkedQuotaByOwner[owner] {
+		checkedQuotaByOwner[owner] = true
+		if r.rateLimitFloor > 0 {
+			quota, err := r.getRemainingQuota(ctx, token)
+			if err != nil {
+				if rle, ok := asRateLimitError(err); ok {
+					r.enterBackoff(owner, rle, now)
+					return
+				}
+				r.logger.Warn("get remaining quota error", "owner", owner, "error", err)
+			} else if quota.Remaining < r.rateLimitFloor {
+				r.logger.Warn("remaining quota below floor", "owner", owner, "remaining", quota.Remaining, "floor", r.rateLimitFloor, "not_before", quota.Reset)
+				r.enterBackoff(owner, &forge.RateLimitError{Reset: quota.Reset}, now)
+				return
+			}
+		}
 	}
 
 	state, err := r.getPRState(ctx, owner, repo, prNumber, token)

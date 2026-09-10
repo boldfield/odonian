@@ -210,6 +210,16 @@ func runServer() {
 		log.Fatalf("failed to parse NOTIFY_FAILED_WINDOW: %v", err)
 	}
 
+	// Parse PR-watch rate limit floor configuration
+	rateLimitFloorStr := os.Getenv("PRWATCH_RATE_LIMIT_FLOOR")
+	if rateLimitFloorStr == "" {
+		rateLimitFloorStr = "1500"
+	}
+	rateLimitFloor, err := strconv.Atoi(rateLimitFloorStr)
+	if err != nil {
+		log.Fatalf("failed to parse PRWATCH_RATE_LIMIT_FLOOR: %v", err)
+	}
+
 	// Open the store
 	s, err := store.Open(dbPath, allowedModels, store.WithEscalationLadder(escalationLadder))
 	if err != nil {
@@ -253,7 +263,7 @@ func runServer() {
 		reconcilers = append(reconcilers, notify.NewNotifyReconciler(s, notifyClient, notifyFailedWindow, time.Now, logger))
 	}
 
-	reconcilers = append(reconcilers, prwatch.NewPRWatchReconciler(s, notifier, forge.OwnerToken, notifyInterval, logger))
+	reconcilers = append(reconcilers, prwatch.NewPRWatchReconciler(s, notifier, forge.OwnerToken, notifyInterval, rateLimitFloor, logger))
 	runner := reconcile.NewRunner(notifyInterval, logger, reconcilers...)
 
 	go func() {

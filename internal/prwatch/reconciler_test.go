@@ -109,7 +109,7 @@ func TestReconcilerName(t *testing.T) {
 	notifier := &fakeNotifierForReconciler{}
 	tokenLookup := func(owner string) (string, error) { return "token", nil }
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, nil)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, nil)
 
 	if reconciler.Name() != "pr-watch" {
 		t.Errorf("expected name 'pr-watch', got %q", reconciler.Name())
@@ -158,7 +158,7 @@ func TestReconcileActionDone(t *testing.T) {
 		return "approved", time.Time{}, nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -229,7 +229,7 @@ func TestReconcileActionAbandon(t *testing.T) {
 		return "pending", time.Time{}, nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -307,7 +307,7 @@ func TestReconcileActionBounce(t *testing.T) {
 		forge.GitHubBaseURL = oldBaseURL
 	}()
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -371,7 +371,7 @@ func TestReconcileActionNoop(t *testing.T) {
 		return "pending", time.Time{}, nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -412,7 +412,7 @@ func TestReconcileSkipAgentMerge(t *testing.T) {
 	notifier := &fakeNotifierForReconciler{}
 	tokenLookup := func(owner string) (string, error) { return "token", nil }
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
 	err := reconciler.Reconcile(ctx)
 
 	if err != nil {
@@ -456,7 +456,7 @@ func TestReconcileSkipNoPRLink(t *testing.T) {
 	notifier := &fakeNotifierForReconciler{}
 	tokenLookup := func(owner string) (string, error) { return "token", nil }
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
 	err := reconciler.Reconcile(ctx)
 
 	if err != nil {
@@ -526,12 +526,12 @@ func TestReconcilePerTaskErrorIsolation(t *testing.T) {
 	notifier := &fakeNotifierForReconciler{}
 	tokenLookup := func(owner string) (string, error) { return "token", nil }
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
 	t.Run("error on task-1 should not affect task-2 processing", func(t *testing.T) {
-		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int), time.Now())
+		err := reconciler.reconcileProject(ctx, "proj-1", make(map[string]int), make(map[string]bool), time.Now())
 		if err != nil {
 			t.Fatalf("expected no error from reconcileProject, got %v", err)
 		}
@@ -728,7 +728,7 @@ func TestRetrofitClosesOpenPRForSupersededTaskThroughRealStore(t *testing.T) {
 	task := createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/123", "superseded", &replacementID)
 
 	tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, 0, newTestLogger())
 
 	if err := reconciler.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
@@ -798,7 +798,7 @@ func TestRetrofitClosesOpenPRForAbandonedTask(t *testing.T) {
 	createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/456", "abandoned", nil)
 
 	tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, 0, newTestLogger())
 
 	if err := reconciler.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
@@ -830,7 +830,7 @@ func TestRetrofitLeavesDoneTaskMergedPRUntouched(t *testing.T) {
 	createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/789", "done", nil)
 
 	tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, 0, newTestLogger())
 
 	if err := reconciler.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
@@ -891,7 +891,7 @@ func TestRetrofitDoesNotTombstoneLinkIfClosePRFails(t *testing.T) {
 	task := createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/567", "superseded", &replacementID)
 
 	tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, 0, newTestLogger())
 
 	// First pass: close fails, so link should NOT be tombstoned
 	if err := reconciler.Reconcile(ctx); err != nil {
@@ -956,7 +956,7 @@ func TestRetrofitSkipsAlreadyClosedOrMergedSupersededPR(t *testing.T) {
 			task := createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/321", "superseded", &replacementID)
 
 			tokenLookup := func(owner string) (string, error) { return "test-token", nil }
-			reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
+			reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, 0, newTestLogger())
 
 			if err := reconciler.Reconcile(ctx); err != nil {
 				t.Fatalf("Reconcile failed: %v", err)
@@ -1072,7 +1072,7 @@ func TestSkipsOwnersWithoutForgeToken(t *testing.T) {
 		return "", nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, logger)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, logger)
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -1157,7 +1157,7 @@ func Test404TombstonedPRSkippedOnNextPass(t *testing.T) {
 	var logOutput strings.Builder
 	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, logger)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, logger)
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -1277,7 +1277,7 @@ func Test403NotTombstoned(t *testing.T) {
 	var logOutput strings.Builder
 	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, logger)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, logger)
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -1358,7 +1358,7 @@ func TestRateLimitBackoffPersistsAcrossReconcilePasses(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
 
 	backoffInterval := time.Minute
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, backoffInterval, logger)
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, backoffInterval, 0, logger)
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -1471,7 +1471,7 @@ func TestRateLimitBackoffUsesXRateLimitResetHeader(t *testing.T) {
 	// A fallback interval much shorter than the reset window: if it were used
 	// instead of the header, the owner would incorrectly resume long before
 	// resetAt.
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, 10*time.Second, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, 10*time.Second, 0, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 
@@ -1552,7 +1552,7 @@ func TestRateLimitBackoffAbortsCurrentPassEvenWhenResetIsNotInFuture(t *testing.
 		return "approved", time.Time{}, nil
 	}
 
-	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, newTestLogger())
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
 	reconciler.getPRState = getPRState
 	reconciler.getReviewDecision = getReviewDecision
 	reconciler.now = func() time.Time { return t0 }
@@ -1562,5 +1562,291 @@ func TestRateLimitBackoffAbortsCurrentPassEvenWhenResetIsNotInFuture(t *testing.
 	}
 	if calls != 1 {
 		t.Errorf("expected 1 getPRState call (task-2 skipped this pass despite reset==now), got %d", calls)
+	}
+}
+
+// TestRateLimitFloorBelowThreshold proves that when the remaining-quota check
+// reports a value below the floor, the reconciler makes zero PR-state calls for
+// that owner in that pass, enters backoff until the reported reset, and the
+// backoff persists across passes until then.
+func TestRateLimitFloorBelowThreshold(t *testing.T) {
+	ctx := context.Background()
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+				{ID: "task-2", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-1", Kind: "pr", Value: "https://github.com/owner/repo/pull/1"}},
+			},
+			"task-2": {
+				ID: "task-2", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-2", Kind: "pr", Value: "https://github.com/owner/repo/pull/2"}},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	t0 := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+	resetAt := t0.Add(5 * time.Minute)
+
+	var quotaCalls, prStateCalls int
+	nowVal := t0 // Needs to be accessible for closure
+	getRemainingQuota := func(ctx context.Context, token string) (*forge.QuotaInfo, error) {
+		quotaCalls++
+		// After reset time, return a refilled quota; before, return low quota
+		if nowVal.After(resetAt) {
+			return &forge.QuotaInfo{Remaining: 4500, Reset: nowVal.Add(time.Hour)}, nil
+		}
+		return &forge.QuotaInfo{Remaining: 1000, Reset: resetAt}, nil
+	}
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		prStateCalls++
+		return "open", nil
+	}
+
+	var logOutput strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+	floor := 1500
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, floor, logger)
+	reconciler.getRemainingQuota = getRemainingQuota
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+
+	reconciler.now = func() time.Time { return nowVal }
+
+	// Pass 1: quota check reports remaining below floor; zero PR-state calls
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 1: expected no error, got %v", err)
+	}
+	if quotaCalls != 1 {
+		t.Errorf("pass 1: expected 1 quota call, got %d", quotaCalls)
+	}
+	if prStateCalls != 0 {
+		t.Errorf("pass 1: expected 0 PR-state calls (quota below floor), got %d", prStateCalls)
+	}
+	logStr := logOutput.String()
+	if !strings.Contains(logStr, "remaining quota below floor") {
+		t.Errorf("pass 1: expected 'remaining quota below floor' log, got: %s", logStr)
+	}
+
+	// Pass 2: before the reset time, still backed off; zero more calls
+	logOutput.Reset()
+	nowVal = t0.Add(2 * time.Minute)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 2: expected no error, got %v", err)
+	}
+	if quotaCalls != 1 {
+		t.Errorf("pass 2: expected still 1 quota call (backoff), got %d", quotaCalls)
+	}
+	if prStateCalls != 0 {
+		t.Errorf("pass 2: expected 0 PR-state calls (still backed off), got %d", prStateCalls)
+	}
+	logStr = logOutput.String()
+	if strings.Contains(logStr, "remaining quota below floor") {
+		t.Errorf("pass 2: did not expect a new 'remaining quota below floor' log, got: %s", logStr)
+	}
+
+	// Pass 3: after the reset time, resumes
+	logOutput.Reset()
+	nowVal = resetAt.Add(time.Second)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 3: expected no error, got %v", err)
+	}
+	if quotaCalls != 2 {
+		t.Errorf("pass 3: expected 2 quota calls (resumed), got %d", quotaCalls)
+	}
+	if prStateCalls != 2 {
+		t.Errorf("pass 3: expected 2 PR-state calls (both tasks now checked), got %d", prStateCalls)
+	}
+	logStr = logOutput.String()
+	if !strings.Contains(logStr, "rate limit backoff resumed") {
+		t.Errorf("pass 3: expected 'rate limit backoff resumed' log, got: %s", logStr)
+	}
+}
+
+// TestRateLimitFloorAboveThreshold proves that when the remaining-quota check
+// reports a value above the floor, the PR calls proceed and the lookup is called
+// exactly once per owner per pass even with several tasks for that owner.
+func TestRateLimitFloorAboveThreshold(t *testing.T) {
+	ctx := context.Background()
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+				{ID: "task-2", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+				{ID: "task-3", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-1", Kind: "pr", Value: "https://github.com/owner/repo/pull/1"}},
+			},
+			"task-2": {
+				ID: "task-2", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-2", Kind: "pr", Value: "https://github.com/owner/repo/pull/2"}},
+			},
+			"task-3": {
+				ID: "task-3", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-3", Kind: "pr", Value: "https://github.com/owner/repo/pull/3"}},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	var quotaCalls, prStateCalls int
+	getRemainingQuota := func(ctx context.Context, token string) (*forge.QuotaInfo, error) {
+		quotaCalls++
+		return &forge.QuotaInfo{Remaining: 3000, Reset: time.Time{}}, nil
+	}
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		prStateCalls++
+		return "open", nil
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	floor := 1500
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, floor, logger)
+	reconciler.getRemainingQuota = getRemainingQuota
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+	reconciler.now = func() time.Time { return time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC) }
+
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if quotaCalls != 1 {
+		t.Errorf("expected 1 quota call (once per owner per pass), got %d", quotaCalls)
+	}
+	if prStateCalls != 3 {
+		t.Errorf("expected 3 PR-state calls (all tasks proceed), got %d", prStateCalls)
+	}
+}
+
+// TestRateLimitFloorDisabled proves that when the floor is set to 0, the quota
+// lookup is never called.
+func TestRateLimitFloorDisabled(t *testing.T) {
+	ctx := context.Background()
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-1", Kind: "pr", Value: "https://github.com/owner/repo/pull/1"}},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	var quotaCalls int
+	getRemainingQuota := func(ctx context.Context, token string) (*forge.QuotaInfo, error) {
+		quotaCalls++
+		return nil, errors.New("should not be called")
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, logger)
+	reconciler.getRemainingQuota = getRemainingQuota
+	reconciler.getPRState = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		return "open", nil
+	}
+	reconciler.getReviewDecision = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+	reconciler.now = func() time.Time { return time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC) }
+
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if quotaCalls != 0 {
+		t.Errorf("expected 0 quota calls (floor disabled), got %d", quotaCalls)
+	}
+}
+
+// TestRateLimitFloorLookupError proves that when the quota lookup returns an error,
+// the PR calls proceed (a broken lookup must not stall reconciliation).
+func TestRateLimitFloorLookupError(t *testing.T) {
+	ctx := context.Background()
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{{ID: "link-1", Kind: "pr", Value: "https://github.com/owner/repo/pull/1"}},
+			},
+		},
+	}
+
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	var quotaCalls, prStateCalls int
+	getRemainingQuota := func(ctx context.Context, token string) (*forge.QuotaInfo, error) {
+		quotaCalls++
+		return nil, errors.New("quota lookup failed")
+	}
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		prStateCalls++
+		return "open", nil
+	}
+
+	var logOutput strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+	floor := 1500
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, floor, logger)
+	reconciler.getRemainingQuota = getRemainingQuota
+	reconciler.getPRState = getPRState
+	reconciler.getReviewDecision = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+	reconciler.now = func() time.Time { return time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC) }
+
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if quotaCalls != 1 {
+		t.Errorf("expected 1 quota call, got %d", quotaCalls)
+	}
+	if prStateCalls != 1 {
+		t.Errorf("expected 1 PR-state call (proceed despite quota error), got %d", prStateCalls)
+	}
+	logStr := logOutput.String()
+	if !strings.Contains(logStr, "get remaining quota error") {
+		t.Errorf("expected 'get remaining quota error' log, got: %s", logStr)
 	}
 }

@@ -38,6 +38,7 @@ no-op when `NOTIFY_URL` is unset: nothing is sent and nothing is logged.
 | `NOTIFY_TOKEN` | required if `NOTIFY_URL` is set | Sent as `Authorization: Bearer <token>` to the webhook. |
 | `NOTIFY_INTERVAL` | `30s` | Tick interval for the reconcile runner. This is the cadence for every reconciler, PR-watch included, not only the notifier. |
 | `NOTIFY_FAILED_WINDOW` | `1h` | A `failed` task is notified only if it failed within this window. |
+| `PRWATCH_RATE_LIMIT_FLOOR` | `1500` | Minimum remaining GitHub quota the reconciler preserves for workers and reviewers. When the remaining quota falls below this floor, the reconciler stops calling GitHub for that owner until the quota resets. A value of 0 disables the check. |
 
 Events the server publishes:
 
