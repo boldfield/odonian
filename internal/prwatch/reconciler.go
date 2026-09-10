@@ -22,18 +22,19 @@ type taskSource interface {
 }
 
 type PRWatchReconciler struct {
-	taskSource           taskSource
-	notifier             notify.Notifier
-	tokenLookup          func(owner string) (string, error)
-	logger               *slog.Logger
-	getPRState           func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error)
-	getReviewDecision    func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error)
-	postPRComment        func(ctx context.Context, owner, repo string, prNumber int, token, comment string) error
-	remainingQuotaLookup func(ctx context.Context, token string) (*forge.QuotaInfo, error)
-	backoffInterval      time.Duration
-	rateLimitFloor       int
-	now                  func() time.Time
-	backoff              *rateLimitBackoff
+	taskSource              taskSource
+	notifier                notify.Notifier
+	tokenLookup             func(owner string) (string, error)
+	logger                  *slog.Logger
+	getPRState              func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error)
+	getReviewDecision       func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error)
+	postPRComment           func(ctx context.Context, owner, repo string, prNumber int, token, comment string) error
+	remainingQuotaLookup    func(ctx context.Context, token string) (*forge.QuotaInfo, error)
+	backoffInterval         time.Duration
+	rateLimitFloor          int
+	now                     func() time.Time
+	backoff                 *rateLimitBackoff
+	lastLoggedSkippedCounts map[string]int
 }
 
 func NewPRWatchReconciler(
@@ -45,18 +46,19 @@ func NewPRWatchReconciler(
 	logger *slog.Logger,
 ) *PRWatchReconciler {
 	return &PRWatchReconciler{
-		taskSource:           taskSource,
-		notifier:             notifier,
-		tokenLookup:          tokenLookup,
-		logger:               logger,
-		getPRState:           forge.GetPRState,
-		getReviewDecision:    forge.GetReviewDecision,
-		postPRComment:        forge.PostPRComment,
-		remainingQuotaLookup: forge.GetRemainingQuota,
-		backoffInterval:      backoffInterval,
-		rateLimitFloor:       rateLimitFloor,
-		now:                  time.Now,
-		backoff:              newRateLimitBackoff(),
+		taskSource:              taskSource,
+		notifier:                notifier,
+		tokenLookup:             tokenLookup,
+		logger:                  logger,
+		getPRState:              forge.GetPRState,
+		getReviewDecision:       forge.GetReviewDecision,
+		postPRComment:           forge.PostPRComment,
+		remainingQuotaLookup:    forge.GetRemainingQuota,
+		backoffInterval:         backoffInterval,
+		rateLimitFloor:          rateLimitFloor,
+		now:                     time.Now,
+		backoff:                 newRateLimitBackoff(),
+		lastLoggedSkippedCounts: make(map[string]int),
 	}
 }
 
@@ -94,9 +96,21 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 		}
 	}
 
-	// Log skipped PR checks once per owner
+	// Log skipped PR checks only when the situation appears or changes
 	for owner, count := range skippedPRsByOwner {
-		r.logger.Warn("no forge token for owner", "owner", owner, "skipped_pr_checks", count)
+		lastCount, seen := r.lastLoggedSkippedCounts[owner]
+		if !seen || lastCount != count {
+			r.logger.Warn("no forge token for owner", "owner", owner, "skipped_pr_checks", count)
+			r.lastLoggedSkippedCounts[owner] = count
+		}
+	}
+
+	// Log INFO when an owner no longer appears (gained a token or has no terminal/approved tasks left)
+	for owner := range r.lastLoggedSkippedCounts {
+		if _, stillSkipped := skippedPRsByOwner[owner]; !stillSkipped {
+			r.logger.Info("no longer skipping owner (token restored or no pending tasks)", "owner", owner)
+			delete(r.lastLoggedSkippedCounts, owner)
+		}
 	}
 
 	return nil

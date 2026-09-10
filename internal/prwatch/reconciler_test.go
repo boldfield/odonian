@@ -1870,3 +1870,168 @@ func TestQuotaFloorLookupErrorProceedsWithNormalCall(t *testing.T) {
 		t.Errorf("expected a WARN logging the lookup error for owner1, got: %s", logStr)
 	}
 }
+
+// captureLogRecords captures slog records using a custom Handler
+type captureLogRecordsHandler struct {
+	records []*slog.Record
+}
+
+func (h *captureLogRecordsHandler) Handle(ctx context.Context, r slog.Record) error {
+	// Make a copy so we don't share state
+	cp := r
+	h.records = append(h.records, &cp)
+	return nil
+}
+
+func (h *captureLogRecordsHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return h
+}
+
+func (h *captureLogRecordsHandler) WithGroup(name string) slog.Handler {
+	return h
+}
+
+func (h *captureLogRecordsHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return true
+}
+
+// TestNoForgeTokenWarningOnChange verifies that WARN is emitted when an owner's
+// skipped count appears for the first time, changes, or reappears after disappearing.
+func TestNoForgeTokenWarningOnChange(t *testing.T) {
+	ctx := context.Background()
+
+	// Setup initial state with one owner missing a token
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-1",
+					State:      "approved",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:        "task-1",
+				State:     "approved",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner-no-token/repo/pull/1"},
+				},
+			},
+		},
+	}
+
+	logHandler := &captureLogRecordsHandler{}
+	logger := slog.New(logHandler)
+
+	tokenLookup := func(owner string) (string, error) {
+		if owner == "owner-no-token" {
+			return "", nil
+		}
+		return "token", nil
+	}
+
+	reconciler := NewPRWatchReconciler(ts, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, 0, logger)
+
+	// Pass 1: first time we see owner-no-token, should log WARN
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 1: expected no error, got %v", err)
+	}
+
+	warnCount1 := countRecordsByLevelAndMessage(logHandler.records, slog.LevelWarn, "no forge token for owner")
+	if warnCount1 != 1 {
+		t.Errorf("pass 1: expected 1 WARN for 'no forge token for owner', got %d", warnCount1)
+	}
+
+	// Pass 2: same owner with same count, should NOT log WARN
+	logHandler.records = nil
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 2: expected no error, got %v", err)
+	}
+
+	warnCount2 := countRecordsByLevelAndMessage(logHandler.records, slog.LevelWarn, "no forge token for owner")
+	if warnCount2 != 0 {
+		t.Errorf("pass 2: expected 0 WARN for 'no forge token for owner' (same count), got %d", warnCount2)
+	}
+
+	// Pass 3: now add another task for the same owner, count changes, should log WARN again
+	ts.tasks["proj-1"] = append(ts.tasks["proj-1"], store.Task{
+		ID:         "task-2",
+		State:      "approved",
+		UpdatedAt:  "2024-01-01T00:00:00Z",
+		AgentMerge: false,
+	})
+	ts.taskWithDepsAndLinks["task-2"] = store.TaskWithDepsAndLinks{
+		ID:        "task-2",
+		State:     "approved",
+		UpdatedAt: "2024-01-01T00:00:00Z",
+		Links: []store.TaskLink{
+			{Kind: "pr", Value: "https://github.com/owner-no-token/repo/pull/2"},
+		},
+	}
+
+	logHandler.records = nil
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 3: expected no error, got %v", err)
+	}
+
+	warnCount3 := countRecordsByLevelAndMessage(logHandler.records, slog.LevelWarn, "no forge token for owner")
+	if warnCount3 != 1 {
+		t.Errorf("pass 3: expected 1 WARN for 'no forge token for owner' (count changed), got %d", warnCount3)
+	}
+
+	// Pass 4: remove the missing-token owner, should log INFO
+	ts.tasks["proj-1"] = []store.Task{} // Remove all tasks
+
+	logHandler.records = nil
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 4: expected no error, got %v", err)
+	}
+
+	infoCount := countRecordsByLevelAndMessage(logHandler.records, slog.LevelInfo, "no longer skipping owner")
+	if infoCount != 1 {
+		t.Errorf("pass 4: expected 1 INFO for 'no longer skipping owner', got %d", infoCount)
+	}
+
+	// Pass 5: owner reappears (e.g., new task added), should log WARN again
+	ts.tasks["proj-1"] = []store.Task{
+		{
+			ID:         "task-3",
+			State:      "approved",
+			UpdatedAt:  "2024-01-01T00:00:00Z",
+			AgentMerge: false,
+		},
+	}
+	ts.taskWithDepsAndLinks["task-3"] = store.TaskWithDepsAndLinks{
+		ID:        "task-3",
+		State:     "approved",
+		UpdatedAt: "2024-01-01T00:00:00Z",
+		Links: []store.TaskLink{
+			{Kind: "pr", Value: "https://github.com/owner-no-token/repo/pull/3"},
+		},
+	}
+
+	logHandler.records = nil
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("pass 5: expected no error, got %v", err)
+	}
+
+	warnCount5 := countRecordsByLevelAndMessage(logHandler.records, slog.LevelWarn, "no forge token for owner")
+	if warnCount5 != 1 {
+		t.Errorf("pass 5: expected 1 WARN for 'no forge token for owner' (owner reappears), got %d", warnCount5)
+	}
+}
+
+func countRecordsByLevelAndMessage(records []*slog.Record, level slog.Level, msgContains string) int {
+	count := 0
+	for _, r := range records {
+		if r.Level == level && strings.Contains(r.Message, msgContains) {
+			count++
+		}
+	}
+	return count
+}
