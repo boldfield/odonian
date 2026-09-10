@@ -38,6 +38,7 @@ no-op when `NOTIFY_URL` is unset: nothing is sent and nothing is logged.
 | `NOTIFY_TOKEN` | required if `NOTIFY_URL` is set | Sent as `Authorization: Bearer <token>` to the webhook. |
 | `NOTIFY_INTERVAL` | `30s` | Tick interval for the reconcile runner. This is the cadence for every reconciler, PR-watch included, not only the notifier. |
 | `NOTIFY_FAILED_WINDOW` | `1h` | A `failed` task is notified only if it failed within this window. |
+| `PRWATCH_RATE_LIMIT_FLOOR` | `1500` | Minimum remaining GitHub primary-quota budget PR-watch will leave for an owner's token. Once per owner per pass, before its first GitHub call, PR-watch checks the token's remaining quota (a free call); if it's at or below this floor, PR-watch enters the same per-owner backoff it uses after a 403 and skips the rest of that owner's checks until the quota window resets. `0` disables the check. The default of 1500 leaves headroom in the shared `odonian-forge-tokens` identity for the fleet's workers and reviewers, which need the quota more urgently than the reconciler does. |
 
 Events the server publishes:
 
