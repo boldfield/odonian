@@ -603,6 +603,7 @@ func TestParsePRURL(t *testing.T) {
 type retrofitCalls struct {
 	mu            sync.Mutex
 	closeCount    int
+	getStateCount int
 	comments      []string
 	deletedBranch string
 }
@@ -620,6 +621,7 @@ func newRetrofitTestServer(t *testing.T, prState string) (*httptest.Server, *ret
 
 		switch {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/pulls/"):
+			calls.getStateCount++
 			w.Header().Set("Content-Type", "application/json")
 			switch prState {
 			case "merged":
@@ -733,16 +735,50 @@ func TestRetrofitClosesOpenPRForSupersededTaskThroughRealStore(t *testing.T) {
 	}
 
 	calls.mu.Lock()
-	defer calls.mu.Unlock()
 	if calls.closeCount != 1 {
+		calls.mu.Unlock()
 		t.Errorf("expected retrofit to close the stale PR exactly once, got %d", calls.closeCount)
 	}
 	if len(calls.comments) != 1 || !strings.Contains(calls.comments[0], replacementID) {
+		calls.mu.Unlock()
 		t.Errorf("expected retrofit comment to name the replacement task %s, got %v", replacementID, calls.comments)
 	}
 	wantBranch := "mr/" + task.ID[:8]
 	if calls.deletedBranch != wantBranch {
+		calls.mu.Unlock()
 		t.Errorf("expected branch %q to be deleted, got %q", wantBranch, calls.deletedBranch)
+	}
+	callCountAfterFirstPass := calls.getStateCount
+	calls.mu.Unlock()
+
+	// Verify link is tombstoned after close
+	fullTask, err := st.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	var prLink *store.TaskLink
+	for i := range fullTask.Links {
+		if fullTask.Links[i].Kind == "pr" {
+			prLink = &fullTask.Links[i]
+			break
+		}
+	}
+	if prLink == nil {
+		t.Fatalf("expected task to have a PR link")
+	}
+	if prLink.TombstonedAt == nil {
+		t.Errorf("expected link to be tombstoned after close")
+	}
+
+	// Run second pass and verify zero GitHub calls
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	calls.mu.Lock()
+	defer calls.mu.Unlock()
+	if calls.getStateCount != callCountAfterFirstPass {
+		t.Errorf("expected no GitHub calls on second pass after tombstoning, but got %d calls (was %d)", calls.getStateCount, callCountAfterFirstPass)
 	}
 }
 
@@ -810,6 +846,97 @@ func TestRetrofitLeavesDoneTaskMergedPRUntouched(t *testing.T) {
 	}
 }
 
+// TestRetrofitDoesNotTombstoneLinkIfClosePRFails verifies that when the close PR call fails,
+// the link is NOT tombstoned and subsequent passes will retry the GitHub call.
+func TestRetrofitDoesNotTombstoneLinkIfClosePRFails(t *testing.T) {
+	ctx := context.Background()
+
+	// Create a test server that fails on close (PATCH) calls
+	calls := &retrofitCalls{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.mu.Lock()
+		defer calls.mu.Unlock()
+
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/pulls/"):
+			calls.getStateCount++
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"merged_at": null, "state": "open"}`)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/comments"):
+			body, _ := io.ReadAll(r.Body)
+			calls.comments = append(calls.comments, string(body))
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/pulls/"):
+			calls.closeCount++
+			// Fail the close call with a non-2xx status
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/git/refs/heads/"):
+			idx := strings.Index(r.URL.Path, "/git/refs/heads/")
+			calls.deletedBranch = r.URL.Path[idx+len("/git/refs/heads/"):]
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	oldBaseURL := forge.GitHubBaseURL
+	forge.GitHubBaseURL = server.URL
+	defer func() { forge.GitHubBaseURL = oldBaseURL }()
+
+	st, proj, doc := newRealTestStoreWithProject(t, ctx)
+
+	replacementID := "33333333-4444-5555-6666-777777777777"
+	task := createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/567", "superseded", &replacementID)
+
+	tokenLookup := func(owner string) (string, error) { return "test-token", nil }
+	reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
+
+	// First pass: close fails, so link should NOT be tombstoned
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	calls.mu.Lock()
+	if calls.closeCount != 1 {
+		calls.mu.Unlock()
+		t.Errorf("expected one close attempt, got %d", calls.closeCount)
+	}
+	callCountAfterFirstPass := calls.getStateCount
+	calls.mu.Unlock()
+
+	// Verify link is NOT tombstoned after failed close
+	fullTask, err := st.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	var prLink *store.TaskLink
+	for i := range fullTask.Links {
+		if fullTask.Links[i].Kind == "pr" {
+			prLink = &fullTask.Links[i]
+			break
+		}
+	}
+	if prLink == nil {
+		t.Fatalf("expected task to have a PR link")
+	}
+	if prLink.TombstonedAt != nil {
+		t.Errorf("expected link to NOT be tombstoned after close failure")
+	}
+
+	// Run second pass and verify GitHub is called again
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	calls.mu.Lock()
+	defer calls.mu.Unlock()
+	if calls.getStateCount == callCountAfterFirstPass {
+		t.Errorf("expected GitHub calls on second pass since link wasn't tombstoned, but call count stayed at %d", callCountAfterFirstPass)
+	}
+}
+
 // TestRetrofitSkipsAlreadyClosedOrMergedSupersededPR proves the retrofit pass, like the
 // supersede-time close, never touches a PR that isn't open.
 func TestRetrofitSkipsAlreadyClosedOrMergedSupersededPR(t *testing.T) {
@@ -826,7 +953,7 @@ func TestRetrofitSkipsAlreadyClosedOrMergedSupersededPR(t *testing.T) {
 			st, proj, doc := newRealTestStoreWithProject(t, ctx)
 
 			replacementID := "22222222-3333-4444-5555-666666666666"
-			createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/321", "superseded", &replacementID)
+			task := createTerminalTaskWithPRLink(t, ctx, st, proj.ID, doc.ID, "https://github.com/testowner/testrepo/pull/321", "superseded", &replacementID)
 
 			tokenLookup := func(owner string) (string, error) { return "test-token", nil }
 			reconciler := NewPRWatchReconciler(st, &fakeNotifierForReconciler{}, tokenLookup, time.Minute, newTestLogger())
@@ -835,10 +962,41 @@ func TestRetrofitSkipsAlreadyClosedOrMergedSupersededPR(t *testing.T) {
 				t.Fatalf("Reconcile failed: %v", err)
 			}
 
+			// Verify link is tombstoned after first pass
+			fullTask, err := st.GetTask(ctx, task.ID)
+			if err != nil {
+				t.Fatalf("failed to get task: %v", err)
+			}
+			var prLink *store.TaskLink
+			for i := range fullTask.Links {
+				if fullTask.Links[i].Kind == "pr" {
+					prLink = &fullTask.Links[i]
+					break
+				}
+			}
+			if prLink == nil {
+				t.Fatalf("expected task to have a PR link")
+			}
+			if prLink.TombstonedAt == nil {
+				t.Errorf("expected link to be tombstoned after first pass")
+			}
+
+			calls.mu.Lock()
+			callCountAfterFirstPass := calls.getStateCount
+			calls.mu.Unlock()
+
+			// Run second pass and verify zero calls to GitHub
+			if err := reconciler.Reconcile(ctx); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+
 			calls.mu.Lock()
 			defer calls.mu.Unlock()
 			if calls.closeCount != 0 {
 				t.Errorf("expected retrofit not to close an already-%s PR, got %d close calls", prState, calls.closeCount)
+			}
+			if calls.getStateCount != callCountAfterFirstPass {
+				t.Errorf("expected no GitHub calls on second pass after tombstoning, but got %d calls (was %d)", calls.getStateCount, callCountAfterFirstPass)
 			}
 		})
 	}

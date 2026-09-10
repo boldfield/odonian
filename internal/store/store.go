@@ -537,7 +537,7 @@ type TaskLink struct {
 	TaskID       string  `db:"task_id" json:"task_id"`
 	Kind         string  `db:"kind" json:"kind"` // 'pr', 'branch', 'commit', or 'ci'
 	Value        string  `db:"value" json:"value"`
-	TombstonedAt *string `db:"tombstoned_at" json:"tombstoned_at"` // nullable, set when PR returns 404
+	TombstonedAt *string `db:"tombstoned_at" json:"tombstoned_at"` // nullable, set when the reconciler has established there is nothing left to do for the link (PR is gone, merged, closed, or closed by the reconciler) and the link must not be polled again
 }
 
 // TaskInput is the input format for bulk task creation.
@@ -2738,8 +2738,9 @@ func (s *sqliteStore) UnarchiveProject(ctx context.Context, projectID string) (P
 	return p, nil
 }
 
-// TombstoneLink marks a task link as tombstoned (permanently gone, e.g. PR returns 404).
-// This prevents future reconciler passes from retrying a PR that no longer exists.
+// TombstoneLink marks a task link as tombstoned when the reconciler has established there is nothing left to do for it
+// (PR is gone, merged, closed, or closed by the reconciler). This prevents future reconciler passes from unnecessarily
+// retrying the link.
 func (s *sqliteStore) TombstoneLink(ctx context.Context, taskID, linkID string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := s.conn.ExecContext(ctx, `

@@ -320,6 +320,9 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 
 	// Only close open PRs; never touch a merged or already-closed one.
 	if state != "open" {
+		if err := r.taskSource.TombstoneLink(ctx, task.ID, prLink.ID); err != nil {
+			r.logger.Error("tombstone link error", "task_id", task.ID, "link_id", prLink.ID, "error", err)
+		}
 		return
 	}
 
@@ -332,6 +335,11 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 	if err := forge.ClosePR(ctx, owner, repo, prNumber, token); err != nil {
 		r.logger.Error("retrofit close PR error", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
 		return
+	}
+
+	// Tombstone the link after PR is successfully closed, regardless of branch deletion outcome.
+	if err := r.taskSource.TombstoneLink(ctx, task.ID, prLink.ID); err != nil {
+		r.logger.Error("tombstone link error", "task_id", task.ID, "link_id", prLink.ID, "error", err)
 	}
 
 	branch := "mr/" + task.ID[:8]
