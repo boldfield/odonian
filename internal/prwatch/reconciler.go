@@ -22,16 +22,18 @@ type taskSource interface {
 }
 
 type PRWatchReconciler struct {
-	taskSource        taskSource
-	notifier          notify.Notifier
-	tokenLookup       func(owner string) (string, error)
-	logger            *slog.Logger
-	getPRState        func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error)
-	getReviewDecision func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error)
-	postPRComment     func(ctx context.Context, owner, repo string, prNumber int, token, comment string) error
-	backoffInterval   time.Duration
-	now               func() time.Time
-	backoff           *rateLimitBackoff
+	taskSource           taskSource
+	notifier             notify.Notifier
+	tokenLookup          func(owner string) (string, error)
+	logger               *slog.Logger
+	getPRState           func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error)
+	getReviewDecision    func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error)
+	postPRComment        func(ctx context.Context, owner, repo string, prNumber int, token, comment string) error
+	remainingQuotaLookup func(ctx context.Context, token string) (*forge.QuotaInfo, error)
+	backoffInterval      time.Duration
+	rateLimitFloor       int
+	now                  func() time.Time
+	backoff              *rateLimitBackoff
 }
 
 func NewPRWatchReconciler(
@@ -39,19 +41,22 @@ func NewPRWatchReconciler(
 	notifier notify.Notifier,
 	tokenLookup func(owner string) (string, error),
 	backoffInterval time.Duration,
+	rateLimitFloor int,
 	logger *slog.Logger,
 ) *PRWatchReconciler {
 	return &PRWatchReconciler{
-		taskSource:        taskSource,
-		notifier:          notifier,
-		tokenLookup:       tokenLookup,
-		logger:            logger,
-		getPRState:        forge.GetPRState,
-		getReviewDecision: forge.GetReviewDecision,
-		postPRComment:     forge.PostPRComment,
-		backoffInterval:   backoffInterval,
-		now:               time.Now,
-		backoff:           newRateLimitBackoff(),
+		taskSource:           taskSource,
+		notifier:             notifier,
+		tokenLookup:          tokenLookup,
+		logger:               logger,
+		getPRState:           forge.GetPRState,
+		getReviewDecision:    forge.GetReviewDecision,
+		postPRComment:        forge.PostPRComment,
+		remainingQuotaLookup: forge.GetRemainingQuota,
+		backoffInterval:      backoffInterval,
+		rateLimitFloor:       rateLimitFloor,
+		now:                  time.Now,
+		backoff:              newRateLimitBackoff(),
 	}
 }
 
@@ -71,9 +76,10 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	}
 
 	skippedPRsByOwner := make(map[string]int)
+	quotaCheckedByOwner := make(map[string]bool)
 
 	for _, project := range projects {
-		if err := r.reconcileProject(ctx, project.ID, skippedPRsByOwner, now); err != nil {
+		if err := r.reconcileProject(ctx, project.ID, skippedPRsByOwner, quotaCheckedByOwner, now); err != nil {
 			r.logger.Error("reconcile project error", "project_id", project.ID, "error", err)
 		}
 	}
@@ -83,7 +89,7 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	// pull requests that accrued before supersession started closing them
 	// inline, and it's the same safety net for any inline close that failed.
 	for _, project := range projects {
-		if err := r.retrofitClosePRsForTerminalTasks(ctx, project.ID, skippedPRsByOwner, now); err != nil {
+		if err := r.retrofitClosePRsForTerminalTasks(ctx, project.ID, skippedPRsByOwner, quotaCheckedByOwner, now); err != nil {
 			r.logger.Error("retrofit close PR error", "project_id", project.ID, "error", err)
 		}
 	}
@@ -96,7 +102,7 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, now time.Time) error {
+func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) error {
 	approvedState := "approved"
 	tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
 		State: &approvedState,
@@ -106,7 +112,7 @@ func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID stri
 	}
 
 	for _, task := range tasks {
-		if err := r.reconcileTask(ctx, task, skippedPRsByOwner, now); err != nil {
+		if err := r.reconcileTask(ctx, task, skippedPRsByOwner, quotaCheckedByOwner, now); err != nil {
 			r.logger.Error("reconcile task error", "task_id", task.ID, "error", err)
 		}
 	}
@@ -114,7 +120,7 @@ func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID stri
 	return nil
 }
 
-func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, now time.Time) error {
+func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) error {
 	if task.AgentMerge {
 		return nil
 	}
@@ -158,6 +164,10 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 
 	if token == "" {
 		skippedPRsByOwner[owner]++
+		return nil
+	}
+
+	if r.checkQuotaFloor(ctx, owner, token, quotaCheckedByOwner, now) {
 		return nil
 	}
 
@@ -234,7 +244,7 @@ var terminalPRCleanupStates = []string{"superseded", "abandoned"}
 // retrofitClosePRsForTerminalTasks closes still-open pull requests belonging to tasks
 // already in a terminal state. It's the one-shot backlog drain plus the ongoing safety
 // net for any inline close (on supersession) that failed.
-func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, now time.Time) error {
+func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) error {
 	for _, state := range terminalPRCleanupStates {
 		tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
 			State:             &state,
@@ -247,7 +257,7 @@ func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context
 		}
 
 		for _, task := range tasks {
-			r.retrofitCloseTaskPR(ctx, task, skippedPRsByOwner, now)
+			r.retrofitCloseTaskPR(ctx, task, skippedPRsByOwner, quotaCheckedByOwner, now)
 		}
 	}
 
@@ -257,7 +267,7 @@ func (r *PRWatchReconciler) retrofitClosePRsForTerminalTasks(ctx context.Context
 // retrofitCloseTaskPR closes the still-open pull request belonging to a task that has
 // already reached a terminal state. Every failure is logged and swallowed: a stale
 // pull request that can't be closed this pass is picked up again on the next one.
-func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, now time.Time) {
+func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) {
 	fullTask, err := r.taskSource.GetTask(ctx, task.ID)
 	if err != nil {
 		r.logger.Error("retrofit get task error", "task_id", task.ID, "error", err)
@@ -298,6 +308,10 @@ func (r *PRWatchReconciler) retrofitCloseTaskPR(ctx context.Context, task store.
 
 	if token == "" {
 		skippedPRsByOwner[owner]++
+		return
+	}
+
+	if r.checkQuotaFloor(ctx, owner, token, quotaCheckedByOwner, now) {
 		return
 	}
 
@@ -450,6 +464,48 @@ func (r *PRWatchReconciler) enterBackoff(owner string, rle *forge.RateLimitError
 	}
 	r.backoff.enter(owner, notBefore)
 	r.logger.Warn("entering rate limit backoff", "owner", owner, "not_before", notBefore, "status", rle.StatusCode)
+}
+
+// checkQuotaFloor consults the remaining-quota lookup for owner once per pass, the
+// first time the reconciler is about to spend a GitHub call for that owner. A
+// floor of 0 disables the check. If the owner's quota has already been checked
+// this pass (successfully or not), it does nothing further and lets the call
+// proceed. If the lookup reports remaining quota at or below the floor, it enters
+// the shared per-owner backoff (reusing the same mechanism as a 403 from GitHub)
+// with not_before set to the reported reset time, falling back to the existing
+// backoffInterval cool-off when the reset is zero or not in the future — matching
+// enterBackoff's own guard — logs one WARN, and returns true so the caller skips
+// the call that triggered the check. A *forge.RateLimitError from the lookup
+// itself goes through enterBackoff like any other rate-limit response. Any other
+// lookup error is logged once for the owner this pass and treated as "proceed":
+// a broken lookup must not stall reconciliation.
+func (r *PRWatchReconciler) checkQuotaFloor(ctx context.Context, owner, token string, quotaCheckedByOwner map[string]bool, now time.Time) bool {
+	if r.rateLimitFloor <= 0 || quotaCheckedByOwner[owner] {
+		return false
+	}
+	quotaCheckedByOwner[owner] = true
+
+	quota, err := r.remainingQuotaLookup(ctx, token)
+	if err != nil {
+		if rle, ok := asRateLimitError(err); ok {
+			r.enterBackoff(owner, rle, now)
+			return true
+		}
+		r.logger.Warn("remaining quota lookup error", "owner", owner, "error", err)
+		return false
+	}
+
+	if quota.Remaining > r.rateLimitFloor {
+		return false
+	}
+
+	notBefore := now.Add(r.backoffInterval)
+	if !quota.Reset.IsZero() && quota.Reset.After(now) {
+		notBefore = quota.Reset
+	}
+	r.backoff.enter(owner, notBefore)
+	r.logger.Warn("remaining quota below floor; entering backoff", "owner", owner, "remaining", quota.Remaining, "floor", r.rateLimitFloor, "not_before", notBefore)
+	return true
 }
 
 // rateLimitBackoff tracks, per owner, the time before which no further GitHub calls
