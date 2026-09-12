@@ -83,7 +83,8 @@ unless you ask for pull-request mode.
 # Drain a project backed by a LOCAL git repo (local_commit mode: the CLI commits; no PR, no forge)
 bash harness/sbx.sh --project <uuid> --repo <path-to-local-git-repo>
 
-# A fully self-contained throwaway demo: creates its own repo, project, and board
+# A fully self-contained throwaway demo: creates its own repo, project, and board, and posts one
+# example task (harness/seed-demo.sh). Walkthrough: docs/demo.md
 bash harness/sbx.sh --seed-demo
 
 # Drain every board over GitHub (needs forge tokens)
