@@ -14,7 +14,8 @@
 #
 #   --project <uuid|all>   what the fleet drains (required unless --seed-demo). 'all' = pull_request multi.
 #   --repo <path>          local git repo the CLI commits into (required for local_commit / pull_request single).
-#   --seed-demo            create+use a throwaway local repo + project + board (no GitHub) — for a smoke test.
+#   --seed-demo            create+use a throwaway local repo + project + board (no GitHub), with ONE example
+#                          task already posted (harness/seed-demo.sh) — the guided first run in docs/demo.md.
 #   --worktree-home <path> CLI per-task worktree root (local_commit; default /tmp/odonian/worktrees).
 #   --reviewer-model TIER  PIN reviewers to a model tier (default: empty = dynamic, i.e. review with the
 #                          task's own model — like the workers). Workers are always dynamic.
@@ -262,8 +263,15 @@ else
   die "claude auth probe failed for a NON-auth reason — not a login problem, so re-authenticating will not help (claude -p said: $CLAUDE_AUTH_OUT). Check network/proxy egress to api.anthropic.com from inside the sandbox, then re-run."
 fi
 
-command -v codex >/dev/null 2>&1 || die "codex CLI not on PATH — gpt-5.5 is allowlisted and routed via AGENT_CODEX_MODELS, so its review dispatches would fail"
-say "codex: $(command -v codex)"
+if command -v codex >/dev/null 2>&1; then
+  say "codex: $(command -v codex)"
+elif [ "$SEED_DEMO" -eq 1 ]; then
+  # The seeded demo task is reviewed by opus only, so the demo runs without codex. Any task you add
+  # with a gpt-5.5 reviewer would still fail to dispatch, so say so once, loudly, and carry on.
+  say "WARNING: codex CLI not on PATH — fine for the seeded demo (its reviewer is opus), but a gpt-5.5 review task would fail to dispatch"
+else
+  die "codex CLI not on PATH — gpt-5.5 is allowlisted and routed via AGENT_CODEX_MODELS, so its review dispatches would fail"
+fi
 
 # ============================== 2. handle a stale / bound port ==============================
 # If our server is already up on this port and healthy, reuse it; if something else holds the port, error.
@@ -406,6 +414,13 @@ MK
   [ -n "$PROJECT_ID" ] && [ "$PROJECT_ID" != "null" ] || die "failed to resolve demo project id"
   FLEET_REPO="$SEED_REPO"
   say "demo project: $PROJECT_ID  (repo: $SEED_REPO)"
+
+  # 5b. Put one example task on the board (idempotent; see harness/seed-demo.sh). Without this the
+  #     fleet boots green and then idles forever, which reads as "nothing happened" to a first-time
+  #     visitor. The task is haiku-implemented, opus-reviewed, and human-gated (agent_merge=false).
+  DEMO_TASK_ID="$(ODONIAN_URL="$ODONIAN_URL" ODONIAN_TOKEN="$LOCAL_TOKEN" \
+    bash "$HARNESS_DIR/seed-demo.sh" --project "$PROJECT_ID")" || die "seeding the demo task failed"
+  say "demo task: $DEMO_TASK_ID  (ready; a worker will claim it once the fleet is up)"
 else
   # Drain the caller's project. Soft-check it exists (the board may legitimately be empty for now).
   PROJECT_ID="$PROJECT_ARG"
@@ -512,14 +527,17 @@ EOF
 if [ "$SEED_DEMO" -eq 1 ]; then
 cat <<EOF
 [sbx]
-[sbx] Demo board — put a task on it (a worker then claims + dispatches claude).
-[sbx] NOTE: tasks need a document_id, so create a document first:
-[sbx]   A=(-H "Authorization: Bearer $LOCAL_TOKEN" -H "Content-Type: application/json")
-[sbx]   DID=\$(curl -s "\${A[@]}" -X POST $ODONIAN_URL/projects/$PROJECT_ID/documents \\
-[sbx]     -d '{"kind":"feature_spec","title":"demo","ref":"README.md"}' | jq -r '.id')
-[sbx]   TID=\$(curl -s "\${A[@]}" -X POST $ODONIAN_URL/projects/$PROJECT_ID/tasks \\
-[sbx]     -d "\$(jq -n --arg d "\$DID" '[{title:"demo",spec:"Append a line to GREETINGS.md",model:"haiku",document_id:\$d}]')" | jq -r '.[0].id')
-[sbx]   curl -s "\${A[@]}" -X POST $ODONIAN_URL/tasks/\$TID/promote
+[sbx] Demo board: one task is READY ($DEMO_TASK_ID). A worker claims it, runs claude, and commits;
+[sbx] a reviewer then votes. When it reaches APPROVED it waits for YOU. In another shell:
+[sbx]   export ODONIAN_URL=$ODONIAN_URL ODONIAN_TOKEN=$LOCAL_TOKEN ODONIAN_HOME=$ODONIAN_HOME
+[sbx]   export ODONIAN_DELIVERY_MODE=local_commit ODONIAN_REPO=$SEED_REPO ODONIAN_WORKTREE_HOME=$WORKTREE_HOME
+[sbx]   export PATH=$BIN_DIR:\$PATH
+[sbx]   odonian pending --project $PROJECT_ID          # STATE column: review -> approved
+[sbx]   odonian show $DEMO_TASK_ID                     # spec, links, result
+[sbx]   odonian diff $DEMO_TASK_ID                     # the commit the worker made
+[sbx]   odonian approve $DEMO_TASK_ID                  # or: odonian reject $DEMO_TASK_ID --note '...'
+[sbx] Another task: bash harness/seed-demo.sh --project $PROJECT_ID --again
+[sbx] Full walkthrough: docs/demo.md
 EOF
 fi
 cat <<EOF

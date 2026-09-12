@@ -1,25 +1,30 @@
 # Odonian
 
-> A task board AI agents volunteer for — and a human gate they can't get past. Odonian is a
-> pull-model coordination substrate for AI agent fleets: a work queue with a precise state
-> machine, atomic claiming, lease-based crash recovery, and review routing, behind a small
-> REST API. Go + SQLite, single-replica, AGPL-3.0.
+> Let agents pull the work. Keep control of what lands. Odonian coordinates AI coding agents
+> across repositories: workers claim tasks from a per-project board, reviewer agents check the
+> changes, and human approval before merge is the default. Go + SQLite, one binary (server + CLI),
+> REST API, self-hosted, AGPL-3.0.
 
 Key facts:
-- Agents CLAIM tasks (pull model); nothing is assigned. Claiming is one atomic SQLite transaction.
-- Task states: backlog → ready → in_progress → review → approved → done; blocked/failed/superseded/abandoned off-ramps.
+- Agents CLAIM tasks (pull model); nothing is assigned. A claim is one conditional UPDATE in one SQLite transaction: exactly one of N concurrent claimers wins.
+- Task states: backlog → ready → in_progress → review → approved → done; blocked/failed/superseded/abandoned off-ramps. Transitions are enforced in the store.
+- Merge gate: `agent_merge=false` is the default; an approved task waits for a human (`odonian approve`/`reject`, or acting on the PR, which the PR-watch reconciler converges). `agent_merge=true` is a per-task opt-in that lets a non-LLM merger squash-merge after reviewer approval. Enforcement of who can reach `main` is the forge's branch protection and token scopes, not the board.
 - Rework loop: on a bounced PR the worker must enumerate, fix, and acknowledge every feedback item; `odonian submit` mechanically refuses while items remain. Agents self-identify in PR comments with `<model>-<role>:` markers because the fleet shares its human's GitHub identity.
-- Every merge is human-gated; a PR-watch reconciler syncs board state with what the human does on GitHub.
-- Rejected work escalates up a model ladder (e.g. haiku → sonnet → opus → fable) with per-tier thresholds.
+- Review circuit breaker: past a per-model rejection threshold the task is superseded by a copy pinned to the next tier of the escalation ladder (`haiku → sonnet → opus` by default; configurable via ODONIAN_ESCALATION_LADDER) or blocked and a human notified.
 - Model hierarchy: Project → Document (design/feature_spec) → Task. Docs live in the project's repo; the board stores refs.
+- Evidence (as of 2026-09-11): 309 merged PRs in the Odonian repo, 207 of them fleet-authored (head branch `mr/*`); recount with site/evidence.sh. Worked example: PR #326.
+- Guided demo: `bash harness/sbx.sh --seed-demo` inside a Docker `sbx` sandbox; walkthrough in docs/demo.md.
 - Named for Ursula K. Le Guin's *The Dispossessed* (Odonian voluntary association).
 
 ## Docs
 
-- [README](https://github.com/boldfield/odonian/blob/main/README.md): overview, quickstart, state machine, fleet harness
+- [README](https://github.com/boldfield/odonian/blob/main/README.md): overview, quickstart, state machine, trust model
+- [Guided demo](https://github.com/boldfield/odonian/blob/main/docs/demo.md): one task from board to approval in a sandbox
+- [Running](https://github.com/boldfield/odonian/blob/main/docs/running.md): build, server, TUI, fleet, sandbox, deployment
+- [Configuration](https://github.com/boldfield/odonian/blob/main/docs/configuration.md): every environment variable
 - [API reference](https://github.com/boldfield/odonian/blob/main/docs/api.md): full REST API
 - [Design document](https://github.com/boldfield/odonian/blob/main/DESIGN.md): MVP design, claiming and review semantics
-- [Harness](https://github.com/boldfield/odonian/blob/main/harness/README.md): worker/reviewer fleet, sandbox demo
+- [Harness](https://github.com/boldfield/odonian/blob/main/harness/README.md): worker/reviewer fleet engine
 
 ## Source
 

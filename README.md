@@ -10,12 +10,13 @@
 [![CI](https://github.com/boldfield/odonian/actions/workflows/ci.yml/badge.svg)](https://github.com/boldfield/odonian/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](./LICENSE)
 
-**A task board that AI agents volunteer for — and a human gate they can't get past.**
+**Let agents pull the work. Keep control of what lands.**
 
-Odonian is the coordination substrate under a fleet of AI coding agents. A human decomposes a
-design into bite-size tasks on a per-project board. Worker agents claim tasks **pull-model**
-(nothing is ever assigned), do the work, and submit. Reviewer agents vote. By default, nothing
-merges until a person says so.
+Odonian coordinates AI coding agents across your repositories. A human decomposes a design into
+bite-size tasks on a per-project board. Worker agents claim tasks **pull-model** (nothing is ever
+assigned), do the work, and submit. Reviewer agents vote. Human approval before merge is the
+default; automatic merging is a per-task opt-in (`agent_merge=true`), and what actually keeps an
+agent off `main` is your forge's branch protection and token scopes, not the board.
 
 It is the control plane only: a work queue with a precise state machine, atomic claiming,
 lease-based crash recovery, review routing with a circuit breaker, and a set of level-triggered
@@ -54,16 +55,17 @@ flowchart LR
 ## Status
 
 Odonian has run in production since June 2026. A Kubernetes fleet of workers, reviewers, and a
-non-LLM merger drains boards for a dozen-plus projects. One of those projects is this repository:
-198 of the 297 pull requests merged here were opened by the fleet from its own board, reviewed by a
-second model, and merged by a human.
+non-LLM merger drains boards for fifteen projects on the author's board. One of those projects is
+this repository: as of 2026-09-11, 207 of the 309 pull requests merged here were opened by the
+fleet from its own board (head branch `mr/*`), reviewed by a second model, and merged by a human.
+Recount with [`site/evidence.sh`](./site/evidence.sh).
 
 | | |
 |---|---|
 | Go source | 11.8k lines, 11 packages |
 | Tests | 31.5k lines, 531 test functions; every push runs them plus a Docker smoke test |
-| Merged pull requests | 297, of which 198 fleet-authored |
-| Latest release | v0.16.0 |
+| Merged pull requests | 309, of which 207 fleet-authored (as of 2026-09-11) |
+| Latest release | v0.16.3 |
 
 It is a personal-scale substrate and wears that honestly. Known limits, in the order they would
 hurt at larger scale:
@@ -274,11 +276,15 @@ export ODONIAN_URL=http://localhost:8080 ODONIAN_TOKEN=... ODONIAN_PROJECT=<id> 
 ```
 
 For a self-contained throwaway demo inside an `sbx` sandbox, `bash harness/sbx.sh --seed-demo`
-boots the server and a small fleet with all state under `/tmp/odonian`. The full build, server,
-TUI, fleet, sandbox, and deployment reference is in [`docs/running.md`](./docs/running.md).
+boots the server and a small fleet with all state under `/tmp/odonian`, posts one example task,
+and leaves it waiting for your approval once a worker and a reviewer have handled it. The
+walkthrough, with prerequisites, expected output, the approval step, and cleanup, is
+[`docs/demo.md`](./docs/demo.md). The full build, server, TUI, fleet, sandbox, and deployment
+reference is in [`docs/running.md`](./docs/running.md).
 
 ## Documentation
 
+- [`docs/demo.md`](./docs/demo.md): the guided first run: one task from board to approval in a sandbox.
 - [`docs/running.md`](./docs/running.md): build, run, test, deploy, and run the fleet locally or in a sandbox.
 - [`docs/configuration.md`](./docs/configuration.md): every environment variable for the server, notifier, PR-watch, CLI, and harness.
 - [`docs/api.md`](./docs/api.md): REST API reference.
