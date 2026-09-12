@@ -89,8 +89,10 @@ PR-watch skips an owner when its token is missing, even for public repositories.
 `no forge token for owner` when the skipped count first appears or changes, and logs when the
 owner is no longer skipped. Add the matching token to the server's file to enable checks;
 the file is read again on later passes. For a deployment with no GitHub integration, an empty
-file leaves those checks disabled. The worker harness has a separate fallback to its local
-`gh` authentication; that does not authenticate the server.
+file leaves those checks disabled. The worker/reviewer harness has a separate fallback to its
+local `gh` authentication; that does not authenticate the server or merger. The merger reads
+only its per-owner token file. It does not fall back to `gh` authentication or `GH_TOKEN`; a
+missing owner entry results in an unauthenticated merge request, which cannot merge the PR.
 
 ## CLI (`odonian <command>`)
 
@@ -114,7 +116,7 @@ overridden per invocation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ODONIAN_URL`, `ODONIAN_TOKEN` | required | As above. |
-| `ODONIAN_PROJECT` | all projects when unset/empty | Set a full project UUID to pin the slot to one board, or `all` to discover and drain every project with claimable work, cloning repos on demand. Set this explicitly when you intend to work on one repository. |
+| `ODONIAN_PROJECT` | depends on the env file; see below | Set a full project UUID for one board, or literal `all` to discover and drain every project with claimable work, cloning repos on demand. |
 | `ODONIAN_PROJECTS` | unset | In `all` mode, a comma-separated allowlist of project ids. |
 | `ODONIAN_REPO` | | Local checkout for single-project mode. Ignored in `all` mode. |
 | `ODONIAN_MAIN_REPO` | `$ODONIAN_REPO` | The canonical clone that worktrees are detached from. |
@@ -123,6 +125,13 @@ overridden per invocation.
 | `AGENT_CLAUDE_FLAGS` | empty | Extra flags appended to every `claude -p` dispatch. `sbx.sh` uses it to pass the flag a nested `claude` needs inside a sandbox. |
 | `AGENT_CODEX_MODELS` | unset | Comma-separated models to dispatch through `codex exec` instead of `claude -p`, e.g. `gpt-5.5`. Review-only in practice. |
 | `AGENT_CODEX_FLAGS` | unset | Extra flags for `codex exec`, on top of the hardcoded `-c model_reasoning_effort=high`. |
+
+Project selection is evaluated after sourcing `$ODONIAN_HOME/env`. The example file supplies
+the placeholder `<project-uuid-or-all>` when the variable was unset or empty; replace it before
+starting the fleet. That placeholder is treated as a project ID and can leave the slot polling
+an empty queue indefinitely. If the value is still unset or empty after configuration is
+loaded, the current harness selects **all projects visible to the shared board token**. Choose
+an explicit UUID or literal `all` instead of relying on that implicit scope.
 
 Codex-routed reviewers authenticate with a `codex-auth` secret seeded from `~/.codex/auth.json`.
 That credential rotates on every refresh and revokes its predecessor, so a snapshot copied into

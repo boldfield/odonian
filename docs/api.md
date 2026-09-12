@@ -288,7 +288,17 @@ Bulk-create tasks for a project.
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
 - `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
 - `escalate` (optional, default `true`): Allow replacement by a higher model tier after the review threshold is exceeded.
-- `track` (optional, default `build`): `build` or `design`; selects the corresponding harness prompt.
+- `track` (optional, default `build`): Selects the harness prompt directory. The API stores any nonempty string without validating it. The bundled harness supports `build` in both delivery modes and `design` only in `pull_request` mode; see the supported combinations below.
+
+| Delivery mode | Supported tracks |
+|---|---|
+| `pull_request` | `build`, `design` |
+| `local_commit` | `build` |
+
+These combinations have worker and reviewer prompts in the bundled harness. With an unsupported
+combination (including `local_commit` + `design`), the API still accepts the task, but the
+harness logs `prompt not found` and skips it. The task can remain `ready` without a board error.
+Choose a supported combination, or supply the corresponding prompts before promoting the task.
 
 **Response (201 Created):**
 ```json
@@ -851,7 +861,8 @@ The state machine enforces these rules:
 - `ready` → `in_progress` (via claim)
 - `in_progress` → `review` (via submit for implement tasks)
 - `review` → `approved` (when all reviewers approve; automatic, via verdict)
-- `review` → `ready` (when any reviewer rejects; automatic, via verdict)
+- `review` → `done` (automatic after unanimous approval when `agent_merge=true`, a `no_op` link exists, and no `pr` link exists)
+- `review` → `ready` (once every review finishes and at least one rejects, unless the circuit breaker escalates or blocks the task)
 - `approved` → `done` (human merges PR)
 - `approved` → `ready` (human disagrees with reviewers, requests rework)
 - `blocked` → `ready` (human unblocks / retries; clears stale assignee and lease)
@@ -862,11 +873,14 @@ The state machine enforces these rules:
 - `approved` → `abandoned` (retire without merging)
 - `in_progress` → `done` for `merge` tasks only
 
-Note: `review` → `done` is no longer a direct transition. Implement tasks normally pass through
-`approved`; merge subtasks can transition directly from `in_progress` to `done`, and opted-in
-no-op implement tasks can finalize automatically when their reviews approve. The `approved` state is the human merge gate. `blocked` is recoverable via the
-`blocked` → `ready` transition, unlike terminal states `done` and `failed`. Once a `blocked`
-task is decided to be unrecoverable, use `blocked` → `failed` to retire it cleanly.
+The operator `/transition` endpoint does not permit `review` → `done`. Review aggregation does
+perform that direct transition for the opted-in no-op case above, in a single update; the parent
+never enters `approved` and will not appear in a script that drains that lane. A no-op task with
+`agent_merge=false` still waits in `approved` for a human decision. Merge subtasks instead go
+from `in_progress` to `done` after merging.
+
+`blocked` is recoverable via `blocked` → `ready`; use `blocked` → `failed` to retire it.
+`done`, `failed`, `superseded`, and `abandoned` have no outgoing operator transitions.
 
 ---
 
@@ -1155,14 +1169,15 @@ curl -fsS "$BASE/tasks/$TASK_ID" -H "$AUTH" | jq -e 'select(.state == "done")'
 **Key Points:**
 1. Tasks are created with a `model` field; workers claim by declaring their model (e.g., `haiku`, `opus`)
 2. Claiming is atomic and model-matched — if the model doesn't match, you get `409 MODEL_MISMATCH`
-3. Implement tasks (the default `kind`) transition `in_progress` → `review` → `approved` → `done`
+3. In this human-gated example, implement tasks transition `in_progress` → `review` → `approved` → `done`. An `agent_merge=true` task with a `no_op` link and no `pr` link goes directly from `review` to `done` after unanimous approval.
 4. Submitting an implement task auto-spawns review tasks for each required reviewer (default: Opus)
 5. Review tasks are claimed and completed by reviewers submitting verdicts (approve or reject)
-6. When all reviewers of a round approve, the parent moves to `approved`; if any reject, it returns to `ready` unless the circuit breaker escalates or blocks it
+6. When all reviewers of a round approve, the parent moves to `approved` (or directly to `done` for the opted-in no-op case); if any reject, it returns to `ready` unless the circuit breaker escalates or blocks it
 7. The human gates the final merge: tasks in `approved` are merged and transitioned to `done` by humans
 8. Workers extend their lease via heartbeat to prevent task expiry
 9. Dependencies are enforced at claim time — tasks with undone deps cannot be claimed
 10. The second task `task2` cannot be claimed until `task1` is `done` (due to `depends_on`)
+11. Operator transitions cannot reopen `done`, `failed`, `superseded`, or `abandoned` tasks. Unblocking applies to `blocked` tasks.
 
 ---
 
@@ -1206,36 +1221,43 @@ All error responses follow a consistent format:
 
 ## State Machine
 
-Implement tasks follow this state machine:
+The default human-gated implement flow is:
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    backlog --> ready: promote
+    ready --> in_progress: claim
+    in_progress --> review: submit
+    review --> approved: all approve
+    review --> ready: rejection, unless escalated or blocked
+    approved --> done: human completes
+    approved --> ready: human requests rework
 ```
-backlog ──promote──► ready ──claim──► in_progress ──submit──► review ──┐
-                       ▲                    │                        │
-                       │                    │      all approve       ▼
-                       │              lease expiry       ┌──────► approved ──human──► done
-                       │                    │           │            │
-                       └────────────────────┴──────────┴ any reject  │
-                                                                     │
-                                           human disagrees ◄────────┘
 
-blocked / failed are off-ramps from any active state.
-```
+`blocked`, `failed`, and `superseded` are off-ramps from active states.
+`approved` → `abandoned` retires work without merging.
+
+With `agent_merge=true`, unanimous review of a task carrying a `no_op` link and no `pr` link
+performs **`review` → `done` directly**, skipping `approved`. With a PR link, approval instead
+spawns a merge subtask. Lease expiry makes `in_progress` work reclaimable without first changing
+its state to `ready`.
 
 **For implement tasks:**
 - `backlog`: Initial state; tasks are not yet ready for work
 - `ready`: Promoted; claimability still depends on dependencies, hold, and model
 - `in_progress`: Claimed by an agent; work is in progress; lease-based crash recovery
 - `review`: Work submitted; reviewers are working; auto-spawned review tasks are claimable
-- `approved`: All reviewers approved; awaiting human merge
-- `done`: Approved and merged; task is complete
+- `approved`: All reviewers approved; awaiting the human decision or an opted-in merger
+- `done`: Completed by a human or merger, or automatically finalized as an opted-in reviewed no-op
 - `blocked`: Off-ramp; task cannot proceed (blocked on external dependency)
-- `failed`: Off-ramp; task attempt failed; consider rework or cancellation
+- `failed`: Terminal; task attempt retired as failed
+- `superseded`: Terminal for operator transitions; the supersede endpoint creates a replacement and repoints dependencies
+- `abandoned`: Terminal for operator transitions; approved work retired without merging, including a PR closed unmerged
 
 **For review tasks** (auto-spawned when parent enters `review`):
 ```
 ready ──claim──► in_progress ──submit verdict──► done
-           │                        │
-           └────── lease expiry ────┘
 
 blocked / failed are off-ramps.
 ```

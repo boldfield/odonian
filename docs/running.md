@@ -68,15 +68,16 @@ applies to the next task without a restart. For workers and reviewers, Ctrl-C se
 to the active agent session and exits; it does not wait for the task to finish. Cleanup removes
 the slot worktree in pull-request mode, so unpushed work may be lost. To let a task finish, wait
 until it has submitted before stopping its slot. A second Ctrl-C force-quits. The non-LLM merger
-finishes its current merge operation before stopping.
+also has no guaranteed drain: Ctrl-C can interrupt its foreground `odonian merge` command
+between merging on GitHub and recording completion on the board. Check both the PR and task
+state after interrupting it.
 
-Start the server as above. In the environment that will run the fleet, build Odonian and add
-its binary to `PATH`. Create the configuration directory and edit the example values before
+Start the server as above. In the environment that will run the fleet, build Odonian.
+Create the configuration directory and edit the example values before
 launching a worker. Preserve any configuration you already have:
 
 ```bash
-export ODONIAN_SOURCE="$PWD"            # run from the Odonian checkout
-export PATH="$ODONIAN_SOURCE/bin:$PATH"
+# From the Odonian checkout:
 mkdir -p ~/.odonian
 test -e ~/.odonian/env || cp harness/env.example ~/.odonian/env
 chmod 600 ~/.odonian/env
@@ -90,11 +91,13 @@ Use the [API](./api.md#full-lifecycle-walkthrough) to create a project, register
 create tasks, and promote the ones you want worked. The API walkthrough uses example work;
 replace its repository and specs with your own when preparing a real board.
 
-For pull requests, authenticate `gh` in the fleet environment or configure the
+For worker and reviewer pull-request operations, authenticate `gh` in the fleet environment or configure the
 [per-owner forge tokens](../harness/README.md#per-owner-github-auth-forge-tokens).
 The server also needs its own `FORGE_TOKENS` file for PR-watch to observe merges and reviews.
+The merger requires its own matching owner token in `FORGE_TOKENS` (default
+`~/.odonian/forge-tokens`); it does not use `gh auth login` or `GH_TOKEN` as a fallback.
 
-In each fleet terminal, from the Odonian checkout:
+In each fleet terminal, from the Odonian checkout, add the built CLI to `PATH` and run one wrapper:
 
 ```bash
 export PATH="$PWD/bin:$PATH"

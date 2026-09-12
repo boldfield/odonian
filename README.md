@@ -254,7 +254,9 @@ the peek-without-claim amplifier. Postmortem and spec:
   `agent_merge` controls the board's workflow; it does not revoke an agent's forge permissions.
 - The server, fleet, and merger each read forge credentials where they run. Tokens are kept in
   per-owner files and the fleet exports the selected token to its agent; they are never stored
-  in the board database or returned by the API.
+  in the board database or returned by the API. Worker/reviewer operations can fall back to
+  local `gh` authentication. The merger requires a matching token in its own `FORGE_TOKENS`
+  file (default `~/.odonian/forge-tokens`) and does not fall back to `gh` or `GH_TOKEN`.
 - The fleet shares one GitHub identity with its human. Agents self-identify in PR comments with
   `<model>-<role>:` markers (`haiku-worker:`, `opus-reviewer:`, `odonian-reconciler:`); that
   convention is how the tooling tells agent comments from human ones. See
@@ -264,7 +266,6 @@ the peek-without-claim amplifier. Postmortem and spec:
 
 ```bash
 make build
-export PATH="$PWD/bin:$PATH"
 export ODONIAN_TOKEN="your-secret-token"
 ./bin/odonian server            # REST API on :8080, SQLite at ./odonian.db, created on first run
 ```

@@ -282,7 +282,7 @@ change any other file."
     </figure>
 
     <figure class="term">
-      <pre tabindex="0" aria-label="Command line: odonian pending lists the approved task, odonian diff shows the worker's commit, odonian approve records the human decision."><span class="t-muted"># PROJECT_ID and TASK_ID contain full UUIDs from JSON output.</span>
+      <pre tabindex="0" aria-label="Command line: odonian pending lists the approved task, odonian diff shows the worker's commit, odonian approve records the human decision."><span class="t-muted"># PROJECT_ID and TASK_ID contain the full UUIDs printed by the boot banner.</span>
 <span class="t-prompt">$ </span><span class="t-cmd">odonian pending --project "$PROJECT_ID"</span>
 ID        STATE     KIND       TITLE
 bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line #3 to GREETINGS.md
@@ -478,10 +478,10 @@ export PATH=/tmp/odonian/bin:$PATH
 
 tail -f /tmp/odonian/logs/workers.log /tmp/odonian/logs/reviewers.log
 <span class="c"># Ctrl-C stops this log viewer; leave the boot shell running.</span>
-odonian projects --json | jq -r '.[] | [.id, .name] | @tsv'
-odonian pending --project &lt;full-project-uuid&gt; --json | jq -r '.[] | [.id, .state, .title] | @tsv'
-odonian diff &lt;full-task-uuid&gt;
-odonian approve &lt;full-task-uuid&gt;   <span class="c"># freezes a branch; or reject --note "…"</span></pre>
+<span class="c"># copy these commands with their full IDs from the boot banner</span>
+odonian pending --project &lt;project-id&gt;   <span class="c"># empty until review or approved</span>
+odonian diff &lt;task-id&gt;
+odonian approve &lt;task-id&gt;   <span class="c"># freezes a branch; or reject --note "…"</span></pre>
       </div>
     </div>
     <div class="qs">

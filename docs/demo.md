@@ -19,7 +19,7 @@ script creates for the purpose.
 | Go 1.25.6 or newer inside the sandbox | The script builds the `odonian` binary for the container's own architecture. |
 | `claude` (Claude Code CLI), **logged in** | Workers and reviewers are `claude -p` dispatches. Either the sandbox's own `claude` login or a `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. |
 | `git`, `jq`, `curl`, `bash` 3.2+ | Used by the harness. `gh` is only needed for pull-request mode, which the demo does not use. |
-| `codex` (OpenAI Codex CLI) | **Optional for the demo.** The demo task is reviewed by `opus`. Without `codex` the boot prints a warning and continues; a task you add with a `gpt-5.5` reviewer would fail to dispatch. |
+| `codex` (OpenAI Codex CLI) | **Installed by the setup step below.** Installation must succeed even though the demo is reviewed by `opus`. Codex authentication is not needed for this demo; tasks with a `gpt-5.5` reviewer need it separately. |
 
 **Usage and cost.** The run makes real model calls on your Claude account: one boot-time
 authentication probe (capped at $0.02 with `--max-budget-usd`), then `haiku` implementation
@@ -143,14 +143,8 @@ export PATH=/tmp/odonian/bin:$PATH
 odonian pending --project <project-id>
 ```
 
-The table abbreviates task IDs to eight characters. The CLI requires full UUIDs; retrieve them
-with JSON output before inspecting or approving a task:
-
-```bash
-odonian pending --project <project-id> --json | jq -r '.[] | [.id, .state, .title] | @tsv'
-```
-
-The table view looks like:
+Use the full project ID from the boot banner. `pending` stays empty until the task reaches
+`review` or `approved`; its table looks like:
 
 ```
 ID        STATE     KIND       TITLE
@@ -184,6 +178,15 @@ ladder is `haiku → sonnet → opus → fable`; the server default is `haiku �
 
 In `local_commit` mode the worker's output is a commit on a per-task `wip/<task-id>` branch in a
 worktree under `/tmp/odonian/worktrees`, recorded on the task as a `commit` link.
+
+Copy the `show`, `diff`, and `approve` commands printed by the boot banner: they already contain
+the task's full UUID. The table's eight-character ID is only for display. If you no longer have
+the banner, this optional lookup lists full IDs of tasks awaiting review or approval and prints
+nothing while that list is empty:
+
+```bash
+odonian pending --project <project-id> --json | jq -r '.[]? | [.id, .state, .title] | @tsv'
+```
 
 ```bash
 odonian show <task-id>          # spec, state, model, links, result
