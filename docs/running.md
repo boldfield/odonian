@@ -5,6 +5,8 @@ Kubernetes. Configuration variables are in [`configuration.md`](./configuration.
 
 ## Build
 
+Requires Go 1.25.6 or newer, `git`, and `make`. From the repository root:
+
 ```bash
 make build      # ./bin/odonian        (server + CLI, one binary)
 make tui        # ./bin/odonian-tui    (optional terminal UI)
@@ -42,7 +44,12 @@ confirm-gated archive and unarchive actions. It talks to the server over the sam
 ./bin/odonian-tui
 ```
 
-## The fleet on a laptop
+## The fleet in your development environment
+
+Run workers and reviewers in a disposable sandbox or container with an authenticated Claude
+Code CLI, `git`, `gh`, `jq`, and Bash 3.2+. They run with agent permission prompts disabled.
+The [guided sandbox demo](./demo.md) is the first-run path. The setup below connects the harness
+to your own repository and board; that repository must have an `origin/main` branch.
 
 The harness is one engine, [`harness/agent.sh`](../harness/agent.sh), parameterized by `--kind`.
 The wrappers are one-liners:
@@ -57,16 +64,50 @@ The wrappers are one-liners:
 Each slot has a persistent agent id and its own detached git worktree, so parallel agents never
 collide. One `claude -p` (or `codex exec`) dispatch per task; the prompt under
 `harness/prompts/<delivery_mode>/<track>/<kind>.md` is read fresh each dispatch, so editing it
-applies to the next task without a restart. Ctrl-C finishes the in-flight task and stops; a
-second Ctrl-C force-quits.
+applies to the next task without a restart. For workers and reviewers, Ctrl-C sends `SIGTERM`
+to the active agent session and exits; it does not wait for the task to finish. Cleanup removes
+the slot worktree in pull-request mode, so unpushed work may be lost. To let a task finish, wait
+until it has submitted before stopping its slot. A second Ctrl-C force-quits. The non-LLM merger
+also has no guaranteed drain: Ctrl-C can interrupt its foreground `odonian merge` command
+between merging on GitHub and recording completion on the board. Check both the PR and task
+state after interrupting it.
+
+Start the server as above. In the environment that will run the fleet, build Odonian.
+Create the configuration directory and edit the example values before
+launching a worker. Preserve any configuration you already have:
 
 ```bash
-cp harness/env.example ~/.odonian/env    # URL, token, project, repo
+# From the Odonian checkout:
+mkdir -p ~/.odonian
+test -e ~/.odonian/env || cp harness/env.example ~/.odonian/env
+chmod 600 ~/.odonian/env
+${EDITOR:-vi} ~/.odonian/env
+```
+
+Set `ODONIAN_URL` to a server reachable from this environment, `ODONIAN_TOKEN` to that server's
+token, `ODONIAN_PROJECT` to the full project UUID, and `ODONIAN_REPO` to the absolute path of
+that project's local checkout. A server on your host is not the sandbox's `localhost`.
+Use the [API](./api.md#full-lifecycle-walkthrough) to create a project, register a document,
+create tasks, and promote the ones you want worked. The API walkthrough uses example work;
+replace its repository and specs with your own when preparing a real board.
+
+For worker and reviewer pull-request operations, authenticate `gh` in the fleet environment or configure the
+[per-owner forge tokens](../harness/README.md#per-owner-github-auth-forge-tokens).
+The server also needs its own `FORGE_TOKENS` file for PR-watch to observe merges and reviews.
+The merger requires its own matching owner token in `FORGE_TOKENS` (default
+`~/.odonian/forge-tokens`); it does not use `gh auth login` or `GH_TOKEN` as a fallback.
+
+In each fleet terminal, from the Odonian checkout, add the built CLI to `PATH` and run one wrapper:
+
+```bash
+export PATH="$PWD/bin:$PATH"
 cd harness
 ./worker.sh worker-1      # each in its own terminal
 ./reviewer.sh reviewer-1
 ./merger.sh merger-1      # only if any task has agent_merge=true
 ```
+
+Run one wrapper per terminal; each is a foreground loop. The wrappers source `~/.odonian/env`.
 
 `ODONIAN_PROJECT=all` switches to multi-project mode: the agent discovers every board with
 claimable work and clones repos on demand under `$ODONIAN_HOME/repos`, evicting by disk watermark.
@@ -76,8 +117,10 @@ GitHub auth, and project scope in depth.
 ## Everything inside an `sbx` sandbox
 
 [`harness/sbx.sh`](../harness/sbx.sh) boots the whole stack, server plus fleet, inside an `sbx`
-sandbox with all state under `/tmp/odonian`. Nothing touches `~/.odonian`, your repos, or GitHub
-unless you ask for pull-request mode.
+sandbox with all harness state under `/tmp/odonian`. The demo uses a throwaway repository;
+`--repo` instead lets the CLI create branches and worktrees in the repository you provide.
+Only pull-request mode pushes to GitHub. See the [sandbox shell setup](./demo.md#1-enter-a-sandbox-with-the-repository-mounted)
+before running these commands.
 
 ```bash
 # Drain a project backed by a LOCAL git repo (local_commit mode: the CLI commits; no PR, no forge)

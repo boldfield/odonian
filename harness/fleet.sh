@@ -11,7 +11,7 @@
 #   fleet.sh --kind implement --count 2 --delivery-mode local_commit  # local_commit mode
 #
 # Agents are spawned in slots: worker-N, reviewer-N, merger-N (N = 1..count).
-# Ctrl-C gracefully stops the fleet (all agents finish their in-flight tasks; Ctrl-C again to force-quit).
+# Ctrl-C stops the fleet and can interrupt in-flight work; it does not guarantee a drain.
 set -uo pipefail
 
 # --- resolve our REAL directory, even when invoked via a symlink ---
@@ -58,12 +58,12 @@ esac
 # Export delivery mode for child agents
 export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
 
-# --- graceful stop ---
+# --- stop ---
 STOP=0
 request_stop() {
   [ "$STOP" -eq 1 ] && return
   STOP=1
-  echo "[fleet] stop requested — all agents finishing their in-flight tasks. Ctrl-C again to force-quit."
+  echo "[fleet] stop requested — stopping agents; in-flight work may be interrupted. Ctrl-C again to force-quit."
   trap - INT TERM
   # Signal all child processes
   kill -TERM 0 2>/dev/null || true
@@ -90,4 +90,4 @@ for pid in "${PIDS[@]}"; do
   wait "$pid" 2>/dev/null || true
 done
 
-echo "[fleet] all agents finished"
+echo "[fleet] all agents exited"

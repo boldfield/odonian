@@ -6,9 +6,14 @@ work, run it via `claude -p`, and submit — Haiku implements, Opus reviews, the
 ## Requirements
 
 - `odonian` CLI must be on `PATH` for board polling and work discovery
+- An authenticated `claude` CLI for worker/reviewer dispatches; run them in a disposable sandbox
+  or container because permission prompts are disabled
 - `gh` (GitHub CLI) for repo cloning and git authentication  
 - `jq` for JSON processing
 - Bash 3.2+ (macOS ships 3.2; Linux and others typically have 4+)
+
+For the complete build, configuration, authentication, and launch sequence, see
+[`docs/running.md`](../docs/running.md#the-fleet-in-your-development-environment).
 
 ## One engine
 
@@ -25,7 +30,11 @@ Run a few in separate terminals, each with a **distinct slot**:
 
 Each agent takes a persistent id (per slot), stands up its own detached git worktree, polls for
 claimable work of its `kind`, and the task specifies the model. One `claude -p` dispatch per task,
-then repeats. Ctrl-C is a graceful stop (finishes the in-flight task; Ctrl-C again to force-quit).
+then repeats. Ctrl-C interrupts the active worker/reviewer session and exits. Pull-request slot
+worktrees are removed during cleanup, including unpushed changes; wait for submission first if
+you want the task to finish. Ctrl-C again force-quits. The non-LLM merger has no guaranteed
+drain either: Ctrl-C can interrupt its foreground merge command after GitHub merges the PR but
+before the board records completion. Check both states after an interruption.
 
 ## Code vs. state
 
@@ -37,7 +46,8 @@ The engine keeps **code** and **state** in separate trees, so they never mix:
 - **State + config** — lives under `$ODONIAN_HOME` (default `~/.odonian`), un-versioned: `env`
   (URL / token / project), `agents/<slot>.id` (persistent ids), `wt-*` (worktrees), `repos/`
   (on-demand repo clones in multi-project mode), and optionally `forge-tokens` (per-owner PATs).
-  Copy `env.example` → `~/.odonian/env` and fill it in.
+  Create the directory with `mkdir -p ~/.odonian`, copy `env.example` → `~/.odonian/env` if no
+  configuration exists, and fill in the URL, token, full project UUID, and repository path.
 
 ## Per-owner GitHub auth (`forge-tokens`)
 
@@ -49,7 +59,12 @@ right token **from the repo owner** (which Odonian already exposes via each proj
 Optional `~/.odonian/forge-tokens` pairs an owner with a PAT (`owner=token` per line; `#` comments
 ok). The worker derives the owner from the project's repo URL, exports that owner's token as
 `GH_TOKEN` for the clone + the dispatched worker's `git push`/`gh`, and **falls back to your default
-`gh` auth** when an owner has no entry. Odonian never holds git creds — they live with the worker.
+`gh` auth** when an owner has no entry. The server separately reads its own `FORGE_TOKENS` file
+for PR-watch and stale-PR cleanup; without a matching owner token it skips those checks, even
+for public repositories. The merger reads its token only from `FORGE_TOKENS`, defaulting to
+`~/.odonian/forge-tokens`; it has **no fallback to `gh` authentication or `GH_TOKEN`**. A missing
+owner entry makes its merge request unauthenticated and unable to merge the PR. Tokens are not
+stored in the board database or returned by the API.
 
     cp harness/forge-tokens.example ~/.odonian/forge-tokens
     # add e.g.  fAIctory=ghp_…   then:
