@@ -282,11 +282,12 @@ change any other file."
     </figure>
 
     <figure class="term">
-      <pre tabindex="0" aria-label="Command line: odonian pending lists the approved task, odonian diff shows the worker's commit, odonian approve records the human decision."><span class="t-prompt">$ </span><span class="t-cmd">odonian pending --project 012b03b7</span>
+      <pre tabindex="0" aria-label="Command line: odonian pending lists the approved task, odonian diff shows the worker's commit, odonian approve records the human decision."><span class="t-muted"># PROJECT_ID and TASK_ID contain full UUIDs from JSON output.</span>
+<span class="t-prompt">$ </span><span class="t-cmd">odonian pending --project "$PROJECT_ID"</span>
 ID        STATE     KIND       TITLE
 bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line #3 to GREETINGS.md
 
-<span class="t-prompt">$ </span><span class="t-cmd">odonian diff bc02c73f</span>
+<span class="t-prompt">$ </span><span class="t-cmd">odonian diff "$TASK_ID"</span>
 <span class="t-muted">diff --git a/GREETINGS.md b/GREETINGS.md
 --- a/GREETINGS.md
 +++ b/GREETINGS.md
@@ -294,14 +295,16 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
  hello</span>
 <span class="t-ok">+hello from the fleet (#3)</span>
 
-<span class="t-prompt">$ </span><span class="t-cmd">odonian approve bc02c73f</span>  <span class="t-muted"># approved → done; or: odonian reject bc02c73f --note "…"</span></pre>
-      <figcaption>The human step, from the CLI. Until <code>approve</code> runs (or, with pull-request delivery, the PR
-      is merged on the forge), nothing has reached <code>main</code>.</figcaption>
+<span class="t-prompt">$ </span><span class="t-cmd">odonian approve "$TASK_ID"</span>  <span class="t-muted"># approved → done; or: odonian reject "$TASK_ID" --note "…"</span></pre>
+      <figcaption>The human step, from the CLI. Commands use full UUIDs; table rows abbreviate them.
+      In local delivery, <code>approve</code> records completion and freezes a branch for you to merge;
+      it does not change <code>main</code>. In pull-request delivery, merge on the forge.</figcaption>
     </figure>
     <p class="intro" style="margin:0">How these frames were made: they are text captured from the real <code>odonian-tui</code>
     and <code>odonian</code> binaries (v0.16.3) during a run of the guided demo on 2026-09-12, in a Docker
     sandbox, recoloured for the page. The task, the commit, the review, and the timestamps are from that run;
-    the repository is the demo's throwaway one. The reviewer's note is cut where the terminal was.</p>
+    the repository is the demo's throwaway one. Commands above use variables for the full IDs;
+    the reviewer's note is cut where the terminal was.</p>
   </section>
 
   <section id="evidence">
@@ -365,7 +368,7 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
         <div class="num">03 · DECIDE</div>
         <h3>A person approves</h3>
         <p>Approved work waits. You read the diff and approve, reject with a note, or act on the PR itself;
-        a reconciler keeps the board in step with the forge. Notifications tell you when something needs a
+        a reconciler keeps the board in step with the forge. Configured notifications tell you when something needs a
         decision.</p>
       </div>
     </div>
@@ -378,15 +381,16 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
         predicate: ready (or a lapsed lease), not held, every dependency done. SQLite serializes writers, so
         exactly one of N concurrent claimers wins and the rest are told why they lost.</p>
         <p><strong>Why it matters:</strong> run as many workers as your rate limits allow against one board.
-        No duplicate work, no scheduler, no coordinator to keep alive.</p>
+        One successful claimant per live lease, with no scheduler to keep alive. Workers must renew
+        leases during long tasks to prevent another agent reclaiming their work.</p>
       </div>
       <div class="card">
         <h3>Leases instead of a reaper</h3>
         <p>Every claim carries a lease. The lease check lives inside the claim predicate itself, so a
         crashed agent's task becomes claimable the moment its lease lapses, with no sweeper and no
         race. The rework lands on the same deterministic branch.</p>
-        <p><strong>Why it matters:</strong> kill a worker mid-task and nothing is lost or stuck. Recovery is
-        as slow as the lease TTL and no slower.</p>
+        <p><strong>Why it matters:</strong> after the lease expires, another available worker can reclaim
+        the task on its next poll. Pushed commits can be resumed; unpushed work in a lost container may be lost.</p>
       </div>
       <div class="card">
         <h3>Review routing and a circuit breaker</h3>
@@ -403,20 +407,22 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
         it on the PR. <code>odonian submit</code> refuses while any item remains. A PR-watch reconciler applies
         what humans do on the forge (merge, close, request changes) back to the board.</p>
         <p><strong>Why it matters:</strong> feedback cannot be skipped by a forgetful prompt, and the board
-        never drifts from what actually happened on GitHub.</p>
+        converges with GitHub on later checks. PR-watch needs a token for the repository owner;
+        missing credentials and rate limits delay those checks.</p>
       </div>
     </div>
 
     <div class="gatebox">
       <h3>Human approval is the default, not a guarantee</h3>
-      <p>Every task is created with <code>agent_merge=false</code>. After the reviewers approve, it sits in
+      <p>Tasks default to <code>agent_merge=false</code>. After the reviewers approve, the work sits in
       <strong>approved</strong> until a person records a verdict or merges the PR. Setting
       <code>agent_merge=true</code> on a task opts that task into a non-LLM merger that squash-merges once
-      reviewers approve. Nothing else on the board can reach <code>done</code>.</p>
+      reviewers approve. Review and merge subtasks have their own completion paths.</p>
       <p>The board is a workflow, not a permission system. What actually stops an agent from reaching
       <code>main</code> is branch protection on your forge and the scopes on the tokens you hand the fleet.
-      Odonian is built to sit behind those controls, not to replace them; agents run with permission prompts
-      disabled and belong in disposable containers.</p>
+      The shared board token gives access to every project and task, and worktrees do not restrict
+      filesystem or forge access. Agents run with permission prompts disabled and belong in disposable
+      containers with credentials scoped to the work they need to do.</p>
     </div>
   </section>
 
@@ -424,7 +430,8 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
     <h2>Run the demo</h2>
     <p class="intro">One example task, implemented by a real <code>haiku</code> worker and reviewed by a real
     <code>opus</code> reviewer, ending in <strong>approved</strong> for you to decide. Everything runs in a throwaway
-    sandbox with a throwaway repository; nothing touches your repos, your <code>~/.odonian</code>, or GitHub.
+    sandbox with a throwaway repository under <code>/tmp/odonian</code>; the fleet does not push to GitHub.
+    The Odonian source checkout is mounted from your host and remains writable from the sandbox.
     The full walkthrough, with expected output at each step, is
     <a href="https://github.com/boldfield/odonian/blob/main/docs/demo.md">docs/demo.md</a>.</p>
 
@@ -435,12 +442,13 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
         fleet runs <code>claude</code> with permission prompts off, so it belongs in an isolated container.</li>
         <li><strong>Go 1.25.6+</strong>, <code>git</code>, <code>jq</code>, <code>curl</code> inside the sandbox. The script builds the binary there.</li>
         <li><strong>Claude Code CLI, logged in.</strong> Workers and reviewers are <code>claude -p</code> sessions. The run
-        uses real model calls on your Claude account (one capped auth probe, one haiku session, one opus
-        session); on a subscription that is plan usage, on an API key it is billed. In three measured runs
+        uses real model calls on your Claude account (a capped auth probe, then worker and reviewer
+        sessions; competing claims and rework can add sessions). On a subscription that is plan usage,
+        on an API key it is billed. In three measured runs
         on 2026-09-12 the task took 68 to 112 seconds from <code>ready</code> to <code>approved</code>, after a
         boot that includes building the binary.</li>
-        <li><strong>Optional:</strong> the OpenAI Codex CLI. The demo task is reviewed by <code>opus</code>, so the boot only
-        warns if <code>codex</code> is missing.</li>
+        <li>The setup script installs missing agent CLIs using <code>npm</code> and passwordless
+        <code>sudo</code>. Codex authentication is optional for this demo, whose reviewer is <code>opus</code>.</li>
       </ul>
     </div>
 
@@ -448,41 +456,56 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
       <div>
         <h3>1 · Sandbox and boot</h3>
         <pre class="quick" tabindex="0"><span class="c"># on the host</span>
+mkdir -p ~/src
 git clone https://github.com/boldfield/odonian ~/src/odonian
-sbx run claude ~/src/odonian   <span class="c"># log claude in, then exit</span>
-sbx exec &lt;sandbox&gt; -- bash      <span class="c"># a shell in the same sandbox</span>
-
-<span class="c"># inside the sandbox</span>
 cd ~/src/odonian
+sbx run --name odonian-demo claude .   <span class="c"># log claude in, then exit</span>
+sbx exec -it --workdir "$PWD" odonian-demo bash
+
+<span class="c"># inside the sandbox, already at the mounted checkout's absolute path</span>
 bash harness/sbx-agent-setup.sh
 bash harness/sbx.sh --seed-demo</pre>
       </div>
       <div>
         <h3>2 · Watch, inspect, decide</h3>
-        <pre class="quick" tabindex="0"><span class="c"># second shell in the sandbox; the boot banner prints these</span>
+        <pre class="quick" tabindex="0"><span class="c"># on the host, from the Odonian checkout: open a second sandbox shell</span>
+sbx exec -it --workdir "$PWD" odonian-demo bash
+
+<span class="c"># inside that second shell; the boot banner prints these</span>
 export ODONIAN_URL=http://localhost:8080 ODONIAN_TOKEN=sbx-local-token ODONIAN_HOME=/tmp/odonian
 export ODONIAN_DELIVERY_MODE=local_commit ODONIAN_REPO=/tmp/odonian/repo ODONIAN_WORKTREE_HOME=/tmp/odonian/worktrees
 export PATH=/tmp/odonian/bin:$PATH
 
 tail -f /tmp/odonian/logs/workers.log /tmp/odonian/logs/reviewers.log
-odonian pending --project &lt;project-id&gt;   <span class="c"># review → approved</span>
-odonian diff &lt;task-id&gt;
-odonian approve &lt;task-id&gt;                 <span class="c"># or reject --note "…"</span></pre>
+<span class="c"># Ctrl-C stops this log viewer; leave the boot shell running.</span>
+odonian projects --json | jq -r '.[] | [.id, .name] | @tsv'
+odonian pending --project &lt;full-project-uuid&gt; --json | jq -r '.[] | [.id, .state, .title] | @tsv'
+odonian diff &lt;full-task-uuid&gt;
+odonian approve &lt;full-task-uuid&gt;   <span class="c"># freezes a branch; or reject --note "…"</span></pre>
       </div>
     </div>
     <div class="qs">
       <p>The boot builds the binary, checks that <code>claude</code> is authenticated with a live probe, starts the
-      server on <code>:8080</code> with a fresh SQLite file, creates the repo and the project, posts the task, and
+      server on <code>:8080</code> (reusing its SQLite file on later runs), creates the repo and the project, posts the task, and
       starts two workers and two reviewers. It ends with <code>[sbx] Odonian fleet is UP.</code> and the exact
-      commands for your board. Clean up with <code>bash harness/sbx.sh stop</code>, then <code>rm -rf /tmp/odonian</code>.</p>
+      commands for your board. Approval records <code>done</code> and preserves a branch for you to merge;
+      it does not merge into <code>main</code>. Clean up with <code>bash harness/sbx.sh stop</code>, then
+      <code>rm -rf /tmp/odonian</code> after saving any work you want to keep.</p>
       <h3>Run it on your own repository</h3>
-      <pre class="quick" tabindex="0"><span class="c"># Go 1.25+; build from source (no packages are published)</span>
+      <p>Run the fleet in a disposable sandbox or container with authenticated Claude and GitHub CLIs.
+      The repository you give it must have <code>origin/main</code>.</p>
+      <pre class="quick" tabindex="0"><span class="c"># Go 1.25.6+; build and start the server</span>
 git clone https://github.com/boldfield/odonian &amp;&amp; cd odonian &amp;&amp; make build
 ODONIAN_TOKEN=your-secret-token ./bin/odonian server   <span class="c"># REST API on :8080, SQLite at ./odonian.db</span>
 
-<span class="c"># create a project, register a design doc, post tasks (docs/api.md or the odonian-breakdown skill),</span>
-<span class="c"># then point workers and reviewers at the board, one per terminal:</span>
-cd harness &amp;&amp; ./worker.sh worker-1     <span class="c"># and ./reviewer.sh reviewer-1</span></pre>
+<span class="c"># in each fleet terminal, from the built Odonian checkout</span>
+export PATH="$PWD/bin:$PATH"
+mkdir -p ~/.odonian
+test -e ~/.odonian/env || cp harness/env.example ~/.odonian/env
+chmod 600 ~/.odonian/env
+${EDITOR:-vi} ~/.odonian/env   <span class="c"># set URL, matching token, full project UUID, absolute repo path</span>
+<span class="c"># create a project, register a design doc, post and promote tasks through docs/api.md first</span>
+cd harness &amp;&amp; ./worker.sh worker-1     <span class="c"># ./reviewer.sh reviewer-1 in another terminal</span></pre>
       <p>The <a href="https://github.com/boldfield/odonian/blob/main/docs/running.md">running guide</a> covers the fleet on a
       laptop, in a sandbox, and on Kubernetes; the
       <a href="https://github.com/boldfield/odonian/blob/main/harness/README.md">harness README</a> covers slots, worktrees,

@@ -14,6 +14,8 @@ Key facts:
 - Model hierarchy: Project → Document (design/feature_spec) → Task. Docs live in the project's repo; the board stores refs.
 - Evidence (as of 2026-09-11): 309 merged PRs in the Odonian repo, 207 of them fleet-authored (head branch `mr/*`); recount with site/evidence.sh. Worked example: PR #326.
 - Guided demo: `bash harness/sbx.sh --seed-demo` inside a Docker `sbx` sandbox; walkthrough in docs/demo.md.
+- CLI IDs: pass full UUIDs from `--json` output; table views abbreviate IDs for display only.
+- Trust boundary: the shared bearer token grants access across the board. Worktrees do not restrict filesystem or forge permissions. PR-watch requires a matching per-owner token, including for public repositories.
 - Named for Ursula K. Le Guin's *The Dispossessed* (Odonian voluntary association).
 
 ## Docs

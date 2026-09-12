@@ -74,8 +74,10 @@ decisions from GitHub, and applies:
 
 ### Forge tokens
 
-Tokens are server-side and per GitHub owner. The file is one `owner=token` pair per line;
-quoted tokens and `#` comments are allowed:
+The server reads a per-owner token file for PR-watch and stale-PR cleanup. The fleet and merger
+need credentials in their own runtime environments as well; configuring only the server does
+not authenticate workers. Each file contains one `owner=token` pair per line; quoted tokens and
+`#` comments are allowed:
 
 ```
 # ~/.odonian/forge-tokens (or $FORGE_TOKENS)
@@ -83,9 +85,12 @@ owner1=token_for_owner1
 owner2="token_for_owner2"
 ```
 
-If the file does not exist, GitHub calls are made unauthenticated. Public repos may work under
-GitHub's 60 requests/hour unauthenticated limit; private repos fail with 401/404, logged every
-tick. For a deployment with no GitHub integration, point `FORGE_TOKENS` at an empty file.
+PR-watch skips an owner when its token is missing, even for public repositories. It logs
+`no forge token for owner` when the skipped count first appears or changes, and logs when the
+owner is no longer skipped. Add the matching token to the server's file to enable checks;
+the file is read again on later passes. For a deployment with no GitHub integration, an empty
+file leaves those checks disabled. The worker harness has a separate fallback to its local
+`gh` authentication; that does not authenticate the server.
 
 ## CLI (`odonian <command>`)
 
@@ -99,7 +104,7 @@ tick. For a deployment with no GitHub integration, point `FORGE_TOKENS` at an em
 | `GH_TOKEN` | | Fallback GitHub token for `pr-feedback` when no per-owner forge token applies. |
 | `ODONIAN_DELIVERY_MODE` | `pull_request` | `pull_request` (branch + PR on a forge) or `local_commit` (the CLI commits into a local repo; no forge). |
 | `ODONIAN_HOME` | `~/.odonian` | Root for harness state: agent ids, worktrees, repo clones, `env`, `forge-tokens`. |
-| `ODONIAN_WORKTREE_HOME` | `$ODONIAN_HOME` | Per-task worktree root in `local_commit` mode. One of the two must be set in that mode, and the harness refuses a root under `/tmp` because bounced work must survive a reboot. |
+| `ODONIAN_WORKTREE_HOME` | `$ODONIAN_HOME` in the CLI | Per-task worktree root in `local_commit` mode. The CLI requires one of these variables; the worker harness requires `ODONIAN_WORKTREE_HOME` explicitly. Use persistent storage for work that must survive a reboot. The sandbox demo deliberately uses `/tmp/odonian/worktrees`. |
 
 ## Harness (`harness/agent.sh` and its wrappers)
 
@@ -109,7 +114,7 @@ overridden per invocation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ODONIAN_URL`, `ODONIAN_TOKEN` | required | As above. |
-| `ODONIAN_PROJECT` | required | A project id to pin the slot to one board, or `all` to discover and drain every project with claimable work, cloning repos on demand. |
+| `ODONIAN_PROJECT` | all projects when unset/empty | Set a full project UUID to pin the slot to one board, or `all` to discover and drain every project with claimable work, cloning repos on demand. Set this explicitly when you intend to work on one repository. |
 | `ODONIAN_PROJECTS` | unset | In `all` mode, a comma-separated allowlist of project ids. |
 | `ODONIAN_REPO` | | Local checkout for single-project mode. Ignored in `all` mode. |
 | `ODONIAN_MAIN_REPO` | `$ODONIAN_REPO` | The canonical clone that worktrees are detached from. |

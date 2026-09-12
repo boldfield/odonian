@@ -216,7 +216,7 @@ missed tick is caught by the next one.
 | PR merged or closed outside the board | PR-watch converges the task to `done` or `abandoned`. |
 | Server restarts | Reconcilers re-derive from state. Writers wait on SQLite's 5s busy timeout instead of failing fast. |
 | Webhook endpoint down | Logged. Level-triggered, so the next tick resends. |
-| Forge token missing for an owner | Falls back to unauthenticated GitHub calls; private repos log 401/404 each cycle. |
+| Forge token missing for an owner | PR-watch skips that owner's repositories, including public ones, and logs when the skipped count changes. Configure the server's per-owner token to resume convergence. |
 | A task is wedged | `hold` pins it out of automated flow; `supersede` replaces it and closes its stale PR; `transition` to `blocked` or `failed` retires it. |
 
 ### What broke
@@ -246,11 +246,15 @@ the peek-without-claim amplifier. Postmortem and spec:
 - `claude -p` runs with permission prompts disabled and Codex runs with
   `--sandbox danger-full-access`. That is why agents run in disposable containers or an `sbx`
   sandbox, never on a workstation that holds other credentials.
-- With branch protection on `main`, the blast radius of a misbehaving agent is one branch on one
-  repo and one row on the board. Reaching `main` takes either a human or an explicit per-task
-  `agent_merge` opt-in.
-- Forge tokens are held server-side, per GitHub owner, in a file the server reads. They are never
-  stored in the database or returned by the API.
+- The shared board token grants access across every project and task; there are no per-agent or
+  per-project permissions. A worktree separates working directories but does not restrict an
+  agent's access to other files, branches, or API operations.
+- Forge access is bounded by token permissions and branch protection, including who can bypass
+  it. Protect `main` and scope fleet credentials to the repositories and operations they need.
+  `agent_merge` controls the board's workflow; it does not revoke an agent's forge permissions.
+- The server, fleet, and merger each read forge credentials where they run. Tokens are kept in
+  per-owner files and the fleet exports the selected token to its agent; they are never stored
+  in the board database or returned by the API.
 - The fleet shares one GitHub identity with its human. Agents self-identify in PR comments with
   `<model>-<role>:` markers (`haiku-worker:`, `opus-reviewer:`, `odonian-reconciler:`); that
   convention is how the tooling tells agent comments from human ones. See
@@ -260,20 +264,29 @@ the peek-without-claim amplifier. Postmortem and spec:
 
 ```bash
 make build
+export PATH="$PWD/bin:$PATH"
 export ODONIAN_TOKEN="your-secret-token"
 ./bin/odonian server            # REST API on :8080, SQLite at ./odonian.db, created on first run
 ```
 
 Create a project, register a design doc, and post tasks through the [API](./docs/api.md), or let
 the `odonian-breakdown` skill do it conversationally. Then point the fleet at the board, one agent
-per terminal:
+per terminal, in a disposable sandbox or container with authenticated agent and GitHub CLIs.
+From the Odonian checkout in each fleet terminal:
 
 ```bash
+export PATH="$PWD/bin:$PATH"
+export ODONIAN_URL=http://localhost:8080 ODONIAN_TOKEN="your-secret-token"
+export ODONIAN_PROJECT="full-project-uuid" ODONIAN_REPO="/absolute/path/to/project-repo"
 cd harness
-export ODONIAN_URL=http://localhost:8080 ODONIAN_TOKEN=... ODONIAN_PROJECT=<id> ODONIAN_REPO=~/src/<repo>
 ./worker.sh worker-1
 ./reviewer.sh reviewer-1
 ```
+
+Run one wrapper per terminal. Set the URL to an address reachable from the fleet environment;
+`localhost` works when the server runs in that same environment. The
+[running guide](./docs/running.md#the-fleet-in-your-development-environment) covers persistent
+configuration and the separate server token file needed by PR-watch.
 
 For a self-contained throwaway demo inside an `sbx` sandbox, `bash harness/sbx.sh --seed-demo`
 boots the server and a small fleet with all state under `/tmp/odonian`, posts one example task,
