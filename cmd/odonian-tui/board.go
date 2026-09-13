@@ -592,9 +592,17 @@ func (m *BoardModel) fetchActiveTasks() tea.Cmd {
 }
 
 // fetchActiveTasksAndMerge creates a command that fetches only active-state tasks and merges
-// them with the existing terminal columns from the board model. This is used during polling
-// to avoid re-fetching the slow-changing terminal columns.
+// them with captured terminal columns. Terminal columns are captured at command creation time
+// to avoid concurrent map access (data race) with Update, which runs on the main goroutine.
+// This is used during polling to avoid re-fetching the slow-changing terminal columns.
 func (m *BoardModel) fetchActiveTasksAndMerge() tea.Cmd {
+	// Capture terminal columns on the main goroutine, before spawning the async Cmd.
+	terminalCols := make(map[string][]tuiclient.Task)
+	terminalStates := []string{stateDone, stateFailed, stateAbandoned}
+	for _, state := range terminalStates {
+		terminalCols[state] = m.tasks[state]
+	}
+
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -615,10 +623,9 @@ func (m *BoardModel) fetchActiveTasksAndMerge() tea.Cmd {
 
 		activeBucketed := bucketTasksByState(activeTasks)
 
-		// Merge with existing terminal columns (done, failed, abandoned)
-		terminalStates := []string{stateDone, stateFailed, stateAbandoned}
+		// Merge with captured terminal columns (done, failed, abandoned)
 		for _, state := range terminalStates {
-			activeBucketed[state] = m.tasks[state]
+			activeBucketed[state] = terminalCols[state]
 		}
 
 		return tasksFetchedMsg{
@@ -627,8 +634,6 @@ func (m *BoardModel) fetchActiveTasksAndMerge() tea.Cmd {
 	}
 }
 
-// fetchTerminalColumns creates a command that fetches terminal-state tasks (done, failed, abandoned)
-// with fields=summary to reduce bandwidth. The results are merged with the existing active tasks.
 // fetchTasksFullRefresh creates a command that fetches both active and terminal tasks,
 // used for the initial load and manual refresh.
 func (m *BoardModel) fetchTasksFullRefresh() tea.Cmd {
