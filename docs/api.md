@@ -803,6 +803,62 @@ task is decided to be unrecoverable, use `blocked` → `failed` to retire it cle
 
 ---
 
+#### `POST /tasks/{id}/supersede`
+
+Create a replacement task with the same specification and dependencies. The old task is marked
+as superseded. This is typically used when a task needs to be retried with an escalated model
+or when the original task should not be reused.
+
+**Request:**
+```json
+{
+  "model": "opus"
+}
+```
+
+**Parameters:**
+- `model` (optional): Override the model for the replacement task. If not provided, the replacement uses the original task's model.
+
+**Response (200 OK):**
+```json
+{
+  "id": "cc0e8400-e29b-41d4-a716-446655440007",
+  "project_id": "550e8400-e29b-41d4-a716-446655440000",
+  "document_id": "660e8400-e29b-41d4-a716-446655440001",
+  "title": "Implement authentication",
+  "spec": "Add bearer token authentication to all endpoints\n\n## Prior attempt feedback\n\n**opus-reviewer-1 (verdict: reject)**\nNeed better error handling\n\n",
+  "state": "backlog",
+  "kind": "implement",
+  "model": "opus",
+  "review_models": ["opus"],
+  "review_round": 0,
+  "assignee": null,
+  "lease_expires_at": null,
+  "result": null,
+  "track": "design",
+  "created_at": "2026-06-05T21:05:00.000000000Z",
+  "updated_at": "2026-06-05T21:05:00.000000000Z"
+}
+```
+
+**Status Codes:**
+- `200 OK`: Task superseded successfully
+- `400 UNKNOWN_MODEL`: The provided model is not in the deployment allowlist
+- `400 JSON_DECODE_ERROR`: Invalid JSON in request body
+- `404 NOT_FOUND`: Task not found
+- `409 CONFLICT`: Task cannot be superseded
+- `500 SUPERSEDE_ERROR`: Server error superseding task
+
+**Behavior:**
+- The replacement task inherits the title, spec, dependencies, and other task configuration from the original
+- Prior rejection feedback is prepended to the replacement's spec
+- The `track` field is preserved from the original task to the replacement
+- All downstream dependencies (tasks that depend on the original) are re-pointed to the replacement
+- The original task is marked with `state: superseded` and `superseded_by` set to the replacement task ID
+- The replacement task starts in `backlog` state and must be promoted to `ready` before claiming
+
+---
+
 ## Full Lifecycle Walkthrough
 
 Below is a copy-paste example of the complete task lifecycle using the modern model-assigned,

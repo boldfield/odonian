@@ -8626,6 +8626,62 @@ func TestSupersedeTaskForgeFailureStillSucceeds(t *testing.T) {
 	}
 }
 
+// TestSupersededTaskPreservesTrack verifies that the track field is preserved
+// when superseding a task (both in direct supersession and escalation paths).
+func TestSupersededTaskPreservesTrack(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "Test Project", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a task with track="design"
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Design Task", Spec: "Spec", DocumentID: doc.ID, Track: "design"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	oldTask := tasks[0]
+
+	// Verify the original task has track="design"
+	if oldTask.Track != "design" {
+		t.Errorf("expected oldTask.Track to be 'design', got %q", oldTask.Track)
+	}
+
+	// Supersede the task
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+
+	// Verify the replacement task preserves track="design"
+	if newTask.Track != "design" {
+		t.Errorf("expected newTask.Track to be 'design', got %q", newTask.Track)
+	}
+
+	// Verify via GetTask as well
+	newTaskFull, err := store.GetTask(ctx, newTask.ID)
+	if err != nil {
+		t.Fatalf("failed to get new task: %v", err)
+	}
+	if newTaskFull.Track != "design" {
+		t.Errorf("expected newTaskFull.Track to be 'design', got %q", newTaskFull.Track)
+	}
+}
+
 // TestReadsNotBlockedByWrites verifies that read queries do not block behind write transactions.
 // Opens a store, starts a writer holding a transaction, then concurrently issues reads
 // and verifies they complete promptly without waiting for the write to finish.
