@@ -105,3 +105,33 @@ Acceptance: `GetTask` (and therefore every `/tasks/{id}/...` route) resolves an 
 listing the candidates. Minimum prefix length 8. Store and API tests cover the three cases; the CLI
 needs no change; `docs/api.md` documents prefix resolution once, in the task-id conventions, and
 the `--json | jq` detours in `docs/demo.md`, `docs/running.md`, and `site/index.html` are removed.
+
+## 10. Task lists stop shipping the whole board
+
+Observed 2026-09-12: the Odonian project has 782 tasks, and `GET /projects/{id}/tasks` with no
+filter returns 2 MB, 72% of it `spec` and `result` bodies of terminal tasks. The TUI fetches that
+list every 2 seconds, and `odonian pending` / `odonian tasks` fetch it too. Under that load, large
+responses across the operator's network stalled after the first TCP window until the client's
+30 s deadline, which the TUI shows as `read: operation timed out`. Direct to the pod and from
+inside the cluster the same response takes under 0.2 s, so this is payload size, not the server.
+
+The API already supports `?state=`; the client library does not expose it. Four steps:
+
+(a) `internal/tuiclient`: add a `WithState(state string)` option to `ListTasks` that emits
+`?state=`, composable with the existing model/kind/claimable options; unit test on the URL.
+
+(b) TUI board: poll only the active states (`backlog`, `ready`, `in_progress`, `review`,
+`approved`, `blocked`) on the poll interval; fetch the terminal columns (`done`, `failed`,
+`abandoned`) once at startup and on manual refresh (`r`). Selection and column counts must behave
+exactly as before; board tests updated to the per-state client calls.
+
+(c) CLI: `odonian pending` requests `?state=review` and `?state=approved` only; `odonian tasks`
+gains `--state` and passes it through; `odonian next` is unchanged. Tests on the requested URLs.
+
+(d) API: `GET /projects/{id}/tasks?fields=summary` omits `spec` and `result` (the TUI detail view
+and `odonian show` already fetch the full task by id). Documented in `docs/api.md`; API test
+asserts the fields are absent with `summary` and present without it. Once (d) lands, (b) and (c)
+add `fields=summary` to their list calls.
+
+Acceptance overall: with the Odonian board as of this spec, the TUI's steady-state poll is under
+50 KB per tick and `odonian pending` under 10 KB.
