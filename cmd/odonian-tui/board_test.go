@@ -4552,3 +4552,91 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 		t.Errorf("Expected task-5 NOT in final render (scrolled out), got:\n%s", output)
 	}
 }
+
+// TestBoardModel_ProjectSwitchPopulatesTerminalColumns tests that switching projects
+// populates terminal columns (done, failed, abandoned) via the full refresh.
+func TestBoardModel_ProjectSwitchPopulatesTerminalColumns(t *testing.T) {
+	mockClient := &tuiclient.MockClient{
+		Tasks: []tuiclient.Task{
+			{ID: "task-1", Title: "Active Task", State: "in_progress"},
+			{ID: "task-2", Title: "Done Task", State: "done"},
+			{ID: "task-3", Title: "Failed Task", State: "failed"},
+			{ID: "task-4", Title: "Abandoned Task", State: "abandoned"},
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project1 := tuiclient.Project{ID: "project-1", Name: "Project 1"}
+	project2 := tuiclient.Project{ID: "project-2", Name: "Project 2"}
+
+	model := NewBoardModel(mockClient, config, project1)
+	model.width = 80
+	model.height = 24
+
+	// Initialize with projects
+	projects := []tuiclient.Project{project1, project2}
+	m, _ := model.Update(projectsFetchedMsg{projects: projects})
+	model = m.(*BoardModel)
+
+	// Initialize project 1 with only active tasks
+	bucketed := make(map[string][]tuiclient.Task)
+	for _, state := range stateOrder {
+		bucketed[state] = []tuiclient.Task{}
+	}
+	bucketed["in_progress"] = []tuiclient.Task{{ID: "task-1", Title: "Active Task", State: "in_progress"}}
+
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+
+	// Verify initial state has no terminal tasks
+	if len(model.tasks["done"]) != 0 || len(model.tasks["failed"]) != 0 || len(model.tasks["abandoned"]) != 0 {
+		t.Errorf("Expected no terminal tasks initially, got done=%d failed=%d abandoned=%d",
+			len(model.tasks["done"]), len(model.tasks["failed"]), len(model.tasks["abandoned"]))
+	}
+
+	// Press 'P' to open project switcher
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	model = m.(*BoardModel)
+
+	// Navigate to second project
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = m.(*BoardModel)
+
+	// Select the second project (press enter)
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	// Verify project switched
+	if model.project.ID != project2.ID {
+		t.Errorf("Expected project to be %s, got %s", project2.ID, model.project.ID)
+	}
+
+	// Now simulate the full refresh response with all states including terminal columns
+	fullRefreshBucketed := make(map[string][]tuiclient.Task)
+	for _, state := range stateOrder {
+		fullRefreshBucketed[state] = []tuiclient.Task{}
+	}
+	fullRefreshBucketed["in_progress"] = []tuiclient.Task{{ID: "task-1", Title: "Active Task", State: "in_progress"}}
+	fullRefreshBucketed["done"] = []tuiclient.Task{{ID: "task-2", Title: "Done Task", State: "done"}}
+	fullRefreshBucketed["failed"] = []tuiclient.Task{{ID: "task-3", Title: "Failed Task", State: "failed"}}
+	fullRefreshBucketed["abandoned"] = []tuiclient.Task{{ID: "task-4", Title: "Abandoned Task", State: "abandoned"}}
+
+	m, _ = model.Update(tasksFetchedMsg{tasks: fullRefreshBucketed})
+	model = m.(*BoardModel)
+
+	// Verify terminal columns are now populated
+	if len(model.tasks["done"]) != 1 || model.tasks["done"][0].ID != "task-2" {
+		t.Errorf("Expected 1 done task (task-2), got %v", model.tasks["done"])
+	}
+	if len(model.tasks["failed"]) != 1 || model.tasks["failed"][0].ID != "task-3" {
+		t.Errorf("Expected 1 failed task (task-3), got %v", model.tasks["failed"])
+	}
+	if len(model.tasks["abandoned"]) != 1 || model.tasks["abandoned"][0].ID != "task-4" {
+		t.Errorf("Expected 1 abandoned task (task-4), got %v", model.tasks["abandoned"])
+	}
+}

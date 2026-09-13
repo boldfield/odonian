@@ -629,42 +629,6 @@ func (m *BoardModel) fetchActiveTasksAndMerge() tea.Cmd {
 
 // fetchTerminalColumns creates a command that fetches terminal-state tasks (done, failed, abandoned)
 // with fields=summary to reduce bandwidth. The results are merged with the existing active tasks.
-func (m *BoardModel) fetchTerminalColumns() tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		terminalStates := []string{stateDone, stateFailed, stateAbandoned}
-		terminalTasks := []tuiclient.Task{}
-
-		// Fetch tasks for each terminal state
-		for _, state := range terminalStates {
-			tasks, err := m.client.ListTasks(ctx, m.project.ID, tuiclient.WithState(state), tuiclient.WithFields("summary"))
-			if err != nil {
-				return tasksFetchedMsg{
-					err: err,
-				}
-			}
-			terminalTasks = append(terminalTasks, tasks...)
-		}
-
-		bucketed := bucketTasksByState(terminalTasks)
-
-		return tasksFetchedMsg{
-			tasks: bucketed,
-		}
-	}
-}
-
-// mergeTaskBuckets merges terminal column tasks into the main bucketed task map
-// while preserving all active-state tasks.
-func mergeTaskBuckets(main, terminal map[string][]tuiclient.Task) map[string][]tuiclient.Task {
-	for state, tasks := range terminal {
-		main[state] = tasks
-	}
-	return main
-}
-
 // fetchTasksFullRefresh creates a command that fetches both active and terminal tasks,
 // used for the initial load and manual refresh.
 func (m *BoardModel) fetchTasksFullRefresh() tea.Cmd {
@@ -1152,7 +1116,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Refetch tasks for the new project
 				m.loading = true
 				m.tasks = make(map[string][]tuiclient.Task)
-				return m, m.fetchTasks()
+				return m, m.fetchTasksFullRefresh()
 			}
 		}
 		m.mode = modeNormal
@@ -1321,7 +1285,7 @@ func (m *BoardModel) updateProjectSwitchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd
 				m.mode = modeNormal
 				m.loading = true
 				// Refetch tasks for the new project
-				return m, m.fetchTasks()
+				return m, m.fetchTasksFullRefresh()
 			}
 			// Same project selected: just close the switcher
 			m.mode = modeNormal
