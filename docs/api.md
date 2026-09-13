@@ -864,6 +864,78 @@ or when the original task should not be reused.
 
 ---
 
+### Hold and Release
+
+Hold/Release provides an orthogonal task lock independent of state transitions. A held task cannot be claimed. This is useful for pausing work without transitioning state (e.g., pausing a review task while waiting for external input) or for temporarily preventing auto-transitions during maintenance.
+
+#### `POST /tasks/{id}/hold`
+
+Hold a task, preventing it from being claimed and blocking automatic state transitions.
+
+**Request:**
+```bash
+curl -X POST -H "Authorization: Bearer token" \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/hold
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": "770e8400-e29b-41d4-a716-446655440002",
+  "state": "ready",
+  "held": true,
+  "...": "other task fields"
+}
+```
+
+**Status Codes:**
+- `200 OK`: Task held successfully
+- `404 NOT_FOUND`: Task not found
+- `500 HOLD_ERROR`: Server error holding task
+
+**Behavior:**
+- Hold works from any state (orthogonal lock)
+- A held task cannot be claimed; `POST /tasks/{id}/claim` returns `409 CONFLICT`
+- Automatic state transitions (e.g., from review aggregation) skip held tasks
+- The `held` flag persists across state transitions until explicitly released
+
+---
+
+#### `POST /tasks/{id}/release`
+
+Release a held task, restoring normal automated flow.
+
+**Request:**
+```bash
+curl -X POST -H "Authorization: Bearer token" \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/release
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": "770e8400-e29b-41d4-a716-446655440002",
+  "state": "approved",
+  "held": false,
+  "...": "other task fields"
+}
+```
+
+**Status Codes:**
+- `200 OK`: Task released successfully
+- `404 NOT_FOUND`: Task not found
+- `500 RELEASE_ERROR`: Server error releasing task
+
+**Behavior:**
+- Release clears the `held` flag, allowing the task to be claimed again
+- If a task is released while in `review` state and all review tasks targeting it are done, the review round is aggregated automatically in the same transaction. This allows a held parent task to complete review aggregation when released (e.g., if all reviewers submitted verdicts while the parent was held).
+  - If all reviewers approved, the parent moves to `approved`
+  - If any reviewer rejected (and under escalation threshold), the parent moves to `ready` with `review_round` incremented
+  - If escalation threshold exceeded, the task may be escalated or blocked instead
+- For non-review tasks or review tasks with pending review tasks, release is a simple unlock with no state change
+
+---
+
 ## Full Lifecycle Walkthrough
 
 Below is a copy-paste example of the complete task lifecycle using the modern model-assigned,
