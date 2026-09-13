@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -658,6 +659,117 @@ func setupProjectAndDocument(t *testing.T, server *Server, authHeader string) (s
 	json.NewDecoder(docW.Body).Decode(&doc)
 
 	return project.ID, doc.ID
+}
+
+// TestGetTaskPrefixResolution verifies that GET /tasks/{id} accepts a unique
+// 8-to-35-character id prefix (returning the resolved task), 404s when the
+// prefix matches nothing or is shorter than 8 characters, and returns 409
+// AMBIGUOUS_ID with the candidate ids in the response body when the prefix
+// matches several tasks.
+func TestGetTaskPrefixResolution(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	insertTask := func(id, title string) {
+		if _, err := server.store.Conn().Exec(`
+			INSERT INTO task (id, project_id, document_id, title, spec, state, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, id, projectID, docID, title, "spec", "backlog", now, now); err != nil {
+			t.Fatalf("failed to insert task %s: %v", id, err)
+		}
+	}
+
+	const (
+		uniqueTaskID = "uniq-task-full-id-000001"
+		ambiguousID1 = "ambig0001-task-full-a"
+		ambiguousID2 = "ambig0001-task-full-b"
+		uniquePfx    = "uniq-tas" // uniqueTaskID[:8]
+		ambiguousPfx = "ambig0001"
+	)
+
+	insertTask(uniqueTaskID, "Unique Prefix Task")
+	insertTask(ambiguousID1, "Ambiguous Task 1")
+	insertTask(ambiguousID2, "Ambiguous Task 2")
+
+	t.Run("unique prefix resolves", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/tasks/"+uniquePfx, nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var task store.TaskWithDepsAndLinks
+		if err := json.NewDecoder(w.Body).Decode(&task); err != nil {
+			t.Fatalf("failed to decode task: %v", err)
+		}
+		if task.ID != uniqueTaskID {
+			t.Errorf("expected resolved id %s, got %s", uniqueTaskID, task.ID)
+		}
+	})
+
+	t.Run("no match returns 404", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/tasks/zzzzzzzz", nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("short prefix returns 404", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/tasks/ambig", nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("ambiguous prefix returns 409 with candidates", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/tasks/"+ambiguousPfx, nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp map[string]interface{}
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		errObj, ok := resp["error"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("response missing 'error' field: %v", resp)
+		}
+		if code, _ := errObj["code"].(string); code != "AMBIGUOUS_ID" {
+			t.Errorf("expected code AMBIGUOUS_ID, got %v", errObj["code"])
+		}
+		candidatesRaw, ok := errObj["candidates"].([]interface{})
+		if !ok {
+			t.Fatalf("expected candidates array in error response, got %v", errObj["candidates"])
+		}
+		candidates := make([]string, 0, len(candidatesRaw))
+		for _, c := range candidatesRaw {
+			s, _ := c.(string)
+			candidates = append(candidates, s)
+		}
+		sort.Strings(candidates)
+		want := []string{ambiguousID1, ambiguousID2}
+		if len(candidates) != 2 || candidates[0] != want[0] || candidates[1] != want[1] {
+			t.Errorf("expected candidates %v, got %v", want, candidates)
+		}
+	})
 }
 
 // TestBulkCreateTasksWithIntraBatchDependency verifies bulk create persists tasks and edges.

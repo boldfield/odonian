@@ -181,6 +181,21 @@ func (s *Server) errorResponse(w http.ResponseWriter, statusCode int, code, mess
 	json.NewEncoder(w).Encode(resp)
 }
 
+// errorResponseWithCandidates writes a conflict error whose payload also
+// lists candidate ids, e.g. AMBIGUOUS_ID from an unresolved task-id prefix.
+func (s *Server) errorResponseWithCandidates(w http.ResponseWriter, statusCode int, code, message string, candidates []string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	resp := map[string]interface{}{
+		"error": map[string]interface{}{
+			"code":       code,
+			"message":    message,
+			"candidates": candidates,
+		},
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
 // Mux returns the underlying http.ServeMux for testing or direct access.
 func (s *Server) Mux() *http.ServeMux {
 	return s.mux
@@ -367,6 +382,11 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	task, err := s.store.GetTask(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+		return
+	}
+	var conflictErr *store.ConflictError
+	if errors.As(err, &conflictErr) {
+		s.errorResponseWithCandidates(w, http.StatusConflict, conflictErr.Code, conflictErr.Message, conflictErr.Candidates)
 		return
 	}
 	if err != nil {
