@@ -2290,6 +2290,12 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 		return "", fmt.Errorf("failed to load old task: %w", err)
 	}
 
+	// 1a. Check if task is in a terminal state
+	switch oldTask.State {
+	case "done", "failed", "abandoned", "superseded":
+		return "", ErrConflict
+	}
+
 	// Unmarshal review_models
 	oldTask.ReviewModels = []string{}
 	if reviewModelsJSON != nil {

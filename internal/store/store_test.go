@@ -6448,6 +6448,134 @@ func TestSupersededTaskNotFound(t *testing.T) {
 	}
 }
 
+func TestSupersededTaskTerminalState(t *testing.T) {
+	tests := []string{"done", "failed", "abandoned", "superseded"}
+
+	for _, terminalState := range tests {
+		t.Run("state_"+terminalState, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+			if err != nil {
+				t.Fatalf("failed to open database: %v", err)
+			}
+			defer store.Close()
+
+			proj, err := store.CreateProject(ctx, "Test Project", "test-repo")
+			if err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Doc", "main", nil)
+			if err != nil {
+				t.Fatalf("failed to create document: %v", err)
+			}
+
+			// Create task and dependent
+			tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+				{Title: "Task", Spec: "Spec", DocumentID: doc.ID},
+				{Title: "Dependent", Spec: "Spec", DocumentID: doc.ID},
+			})
+			if err != nil {
+				t.Fatalf("failed to create tasks: %v", err)
+			}
+			task := tasks[0]
+			dependent := tasks[1]
+
+			// Set dependent to depend on task
+			_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{task.ID})
+			if err != nil {
+				t.Fatalf("failed to set dependency: %v", err)
+			}
+
+			// Manually update task state to terminal state
+			conn := store.Conn()
+			_, err = conn.ExecContext(ctx, "UPDATE task SET state = ? WHERE id = ?", terminalState, task.ID)
+			if err != nil {
+				t.Fatalf("failed to update task state: %v", err)
+			}
+
+			// Attempt to supersede terminal task should return ErrConflict
+			_, err = store.SupersedeTask(ctx, task.ID, nil)
+			if !errors.Is(err, ErrConflict) {
+				t.Errorf("expected ErrConflict for terminal state %s, got %v", terminalState, err)
+			}
+
+			// Verify dependent is unchanged
+			depAfter, err := store.GetTask(ctx, dependent.ID)
+			if err != nil {
+				t.Fatalf("failed to get dependent: %v", err)
+			}
+			if len(depAfter.DependsOn) != 1 || depAfter.DependsOn[0] != task.ID {
+				t.Errorf("expected dependent to still depend on original task, got %v", depAfter.DependsOn)
+			}
+
+			// Verify task state is unchanged
+			taskAfter, err := store.GetTask(ctx, task.ID)
+			if err != nil {
+				t.Fatalf("failed to get task: %v", err)
+			}
+			if taskAfter.State != terminalState {
+				t.Errorf("expected task state to remain %s, got %s", terminalState, taskAfter.State)
+			}
+		})
+	}
+}
+
+func TestSupersededTaskNonTerminal(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "Test Project", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create task and dependent in backlog state
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Task", Spec: "Spec", DocumentID: doc.ID},
+		{Title: "Dependent", Spec: "Spec", DocumentID: doc.ID},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+	task := tasks[0]
+	dependent := tasks[1]
+
+	// Set dependent to depend on task
+	_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{task.ID})
+	if err != nil {
+		t.Fatalf("failed to set dependency: %v", err)
+	}
+
+	// Supersede non-terminal task should succeed
+	newTask, err := store.SupersedeTask(ctx, task.ID, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+
+	if newTask.ID == task.ID {
+		t.Errorf("expected new task ID to be different from old task ID")
+	}
+
+	// Verify dependent now depends on new task
+	depAfter, err := store.GetTask(ctx, dependent.ID)
+	if err != nil {
+		t.Fatalf("failed to get dependent: %v", err)
+	}
+	if len(depAfter.DependsOn) != 1 || depAfter.DependsOn[0] != newTask.ID {
+		t.Errorf("expected dependent to depend on new task, got %v", depAfter.DependsOn)
+	}
+}
+
 func TestSupersededTaskWithPriorFeedback(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())

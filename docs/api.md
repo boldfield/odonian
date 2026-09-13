@@ -803,6 +803,53 @@ task is decided to be unrecoverable, use `blocked` → `failed` to retire it cle
 
 ---
 
+#### `POST /tasks/{id}/supersede`
+
+Create a replacement task with the same spec as an existing task, copying dependencies and
+re-pointing all dependents. This is used when a task needs to be retried after prior attempts
+have failed or were rejected. The old task is marked as superseded.
+
+**Request:**
+```json
+{
+  "model": "haiku"
+}
+```
+
+**Parameters:**
+- `model` (optional): Override the model for the replacement task. If not provided, the new task inherits the model from the old task.
+
+**Response (201 Created):**
+```json
+{
+  "id": "880e8400-e29b-41d4-a716-446655440003",
+  "project_id": "550e8400-e29b-41d4-a716-446655440000",
+  "document_id": "660e8400-e29b-41d4-a716-446655440001",
+  "title": "Implement authentication",
+  "spec": "Add bearer token authentication to all endpoints",
+  "state": "backlog",
+  "kind": "implement",
+  "model": "haiku",
+  "review_models": ["opus"],
+  "review_round": 0,
+  "assignee": null,
+  "lease_expires_at": null,
+  "result": null,
+  "created_at": "2026-06-05T21:00:00.000000000Z",
+  "updated_at": "2026-06-05T21:00:00.000000000Z"
+}
+```
+
+**Status Codes:**
+- `201 Created`: Replacement task successfully created
+- `400 JSON_DECODE_ERROR`: Invalid JSON in request body
+- `400 UNKNOWN_MODEL`: The provided model is not in the allowed models list
+- `404 NOT_FOUND`: Task not found
+- `409 CONFLICT`: Task is in a terminal state (done, failed, abandoned, or superseded) and cannot be superseded
+- `500 SUPERSEDE_ERROR`: Server error creating replacement task
+
+---
+
 ## Full Lifecycle Walkthrough
 
 Below is a copy-paste example of the complete task lifecycle using the modern model-assigned,
