@@ -859,7 +859,7 @@ func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 
-	task, err := s.store.ReleaseTask(r.Context(), taskID)
+	task, err := s.store.ReleaseTask(r.Context(), taskID, s.maxReviewRounds, s.escalationThresholds)
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 		return

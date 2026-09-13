@@ -50,7 +50,7 @@ type Store interface {
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
-	ReleaseTask(ctx context.Context, taskID string) (Task, error)
+	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int) (Task, error)
 	ArchiveTask(ctx context.Context, taskID string) (Task, error)
 	UnarchiveTask(ctx context.Context, taskID string) (Task, error)
 	ArchiveProject(ctx context.Context, projectID string) (Project, error)
@@ -2845,9 +2845,10 @@ func (s *sqliteStore) HoldTask(ctx context.Context, taskID string) (Task, error)
 
 // ReleaseTask clears the held flag on a task, restoring normal automated flow.
 // Release works from any state (it is an orthogonal lock, not a state transition).
+// If the task is in review and all review tasks targeting it are done, aggregates the review round.
 // Returns the updated Task on success.
 // Returns ErrNotFound if the task doesn't exist.
-func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string) (Task, error) {
+func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
@@ -2888,6 +2889,45 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string) (Task, err
 	if reviewModelsJSON != nil {
 		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
 			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	// If task is in review, check if all review tasks are done and aggregate if so
+	if t.State == "review" {
+		var totalReviewTasks, doneReviewTasks int
+		err = tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) as total,
+				SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done
+			FROM task
+			WHERE target_task_id = ? AND review_round = ?
+		`, taskID, t.ReviewRound).Scan(&totalReviewTasks, &doneReviewTasks)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to tally review tasks: %w", err)
+		}
+
+		// If all review tasks are done, aggregate the round
+		if totalReviewTasks > 0 && doneReviewTasks == totalReviewTasks {
+			_, err = s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds)
+			if err != nil {
+				return Task{}, err
+			}
+
+			// Re-fetch the task to get the updated state
+			err = tx.QueryRowContext(ctx, `
+				SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+				FROM task WHERE id = ?
+			`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+			if err != nil {
+				return Task{}, fmt.Errorf("failed to fetch task after aggregation: %w", err)
+			}
+
+			t.ReviewModels = []string{}
+			if reviewModelsJSON != nil {
+				if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+					return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+				}
+			}
 		}
 	}
 

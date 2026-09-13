@@ -27,6 +27,10 @@ func defaultTestAllowedModels() []string {
 	return []string{"haiku", "sonnet", "opus"}
 }
 
+func ptrStr(s string) *string {
+	return &s
+}
+
 // createTestFSWithBadMigration creates a test filesystem with the standard migrations
 // plus a bad migration (0003_bad.sql) that leaves a dangling foreign key.
 // It wraps the embedded migrations and adds the bad migration on top.
@@ -5346,7 +5350,7 @@ func TestReleaseRestoresFlow(t *testing.T) {
 	}
 
 	// Release the task
-	_, err = store.ReleaseTask(ctx, taskID)
+	_, err = store.ReleaseTask(ctx, taskID, 5, nil)
 	if err != nil {
 		t.Fatalf("failed to release task: %v", err)
 	}
@@ -5374,6 +5378,349 @@ func TestReleaseRestoresFlow(t *testing.T) {
 	}
 	if releasedTask.Held {
 		t.Error("task should have held=false after release")
+	}
+}
+
+// TestReleaseAggregatesReviewWithApproval verifies that releasing a held review task aggregates verdicts when all reviews are done.
+func TestReleaseAggregatesReviewWithApproval(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create an implement task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Test implementation",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Promote and claim
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit for review
+	maxReviewRounds := 5
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Verify task is in review
+	reviewTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if reviewTask.State != "review" {
+		t.Errorf("task should be in review state, got %s", reviewTask.State)
+	}
+
+	// Get the review task
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+	if len(reviewTasks) != 1 {
+		t.Fatalf("expected 1 review task, got %d", len(reviewTasks))
+	}
+	reviewTaskID := reviewTasks[0].ID
+
+	// Claim and approve the review
+	_, err = store.ClaimTask(ctx, reviewTaskID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	// Task should be approved now
+	approvedTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if approvedTask.State != "approved" {
+		t.Errorf("task should be approved, got %s", approvedTask.State)
+	}
+
+	// Now hold the task and re-run the test with SubmitTask that skips aggregation due to hold
+	// First, transition back to review by superseding and re-submitting (not part of test scenario)
+	// Instead, we'll test the scenario where task is held before final review verdict is submitted
+
+	// Create a new test scenario: hold task, submit final verdict while held, release and aggregate
+	tasks2, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Test implementation 2",
+			Spec:         "Test spec 2",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task 2: %v", err)
+	}
+	taskID2 := tasks2[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID2)
+	if err != nil {
+		t.Fatalf("failed to promote task 2: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID2, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task 2: %v", err)
+	}
+
+	_, err = store.SubmitTask(ctx, taskID2, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#101"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task 2: %v", err)
+	}
+
+	// Get the review task
+	reviewTasks2, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks 2: %v", err)
+	}
+	var reviewTaskID2 string
+	for _, rt := range reviewTasks2 {
+		if rt.TargetTaskID != nil && *rt.TargetTaskID == taskID2 {
+			reviewTaskID2 = rt.ID
+			break
+		}
+	}
+	if reviewTaskID2 == "" {
+		t.Fatalf("could not find review task for task 2")
+	}
+
+	// Hold the parent task
+	_, err = store.HoldTask(ctx, taskID2)
+	if err != nil {
+		t.Fatalf("failed to hold task 2: %v", err)
+	}
+
+	// Claim and approve the review while parent is held
+	_, err = store.ClaimTask(ctx, reviewTaskID2, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task 2: %v", err)
+	}
+
+	_, err = store.SubmitTask(ctx, reviewTaskID2, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict 2: %v", err)
+	}
+
+	// Task should still be in review because it was held
+	heldReviewTask, err := store.GetTask(ctx, taskID2)
+	if err != nil {
+		t.Fatalf("failed to get held task: %v", err)
+	}
+	if heldReviewTask.State != "review" {
+		t.Errorf("held task should remain in review, got %s", heldReviewTask.State)
+	}
+
+	// Release the task - should trigger aggregation and move to approved
+	releasedTask2, err := store.ReleaseTask(ctx, taskID2, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to release task 2: %v", err)
+	}
+
+	if releasedTask2.State != "approved" {
+		t.Errorf("released task should be approved after aggregation, got %s", releasedTask2.State)
+	}
+}
+
+// TestReleaseAggregatesReviewWithRejection verifies that releasing a held review task with rejection moves to ready.
+func TestReleaseAggregatesReviewWithRejection(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Test implementation",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	maxReviewRounds := 5
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Get the review task
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+	var reviewTaskID string
+	for _, rt := range reviewTasks {
+		if rt.TargetTaskID != nil && *rt.TargetTaskID == taskID {
+			reviewTaskID = rt.ID
+			break
+		}
+	}
+
+	// Hold the parent task
+	_, err = store.HoldTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to hold task: %v", err)
+	}
+
+	// Claim and reject the review while parent is held
+	_, err = store.ClaimTask(ctx, reviewTaskID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	reject := "reject"
+	_, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	// Task should still be in review because it was held
+	heldReviewTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get held task: %v", err)
+	}
+	if heldReviewTask.State != "review" {
+		t.Errorf("held task should remain in review, got %s", heldReviewTask.State)
+	}
+
+	// Release the task - should trigger aggregation and move to ready
+	releasedTask, err := store.ReleaseTask(ctx, taskID, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to release task: %v", err)
+	}
+
+	if releasedTask.State != "ready" {
+		t.Errorf("released task should be ready after rejection, got %s", releasedTask.State)
+	}
+
+	// Verify review_round was incremented
+	if releasedTask.ReviewRound != 1 {
+		t.Errorf("review_round should be 1 after rejection, got %d", releasedTask.ReviewRound)
+	}
+}
+
+// TestReleaseNonReviewTaskUnchanged verifies that releasing a non-review task doesn't trigger aggregation.
+func TestReleaseNonReviewTaskUnchanged(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Test implementation",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	// Hold the task in ready state
+	_, err = store.HoldTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to hold task: %v", err)
+	}
+
+	// Release the task
+	releasedTask, err := store.ReleaseTask(ctx, taskID, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to release task: %v", err)
+	}
+
+	// Task should still be in ready state
+	if releasedTask.State != "ready" {
+		t.Errorf("non-review task should remain in ready state, got %s", releasedTask.State)
 	}
 }
 
@@ -7216,7 +7563,7 @@ func TestEscalateRoundTrip(t *testing.T) {
 	}
 
 	// Test ReleaseTask preserves escalate
-	releasedTask, err := store.ReleaseTask(ctx, readyTaskID)
+	releasedTask, err := store.ReleaseTask(ctx, readyTaskID, 5, nil)
 	if err != nil {
 		t.Fatalf("failed to release task: %v", err)
 	}
