@@ -16,7 +16,7 @@
 # Run it straight from the repo's harness/ dir. Code + prompts live next to this script (the dir is
 # resolved from this script's own path, and still works if invoked via a symlink); the prompt is read
 # FRESH each dispatch. STATE — env, agent ids, repo clones, worktrees — lives under $ODONIAN_HOME
-# (~/.odonian) and is NOT versioned. Ctrl-C is a GRACEFUL stop (in-flight task finishes; again = force-quit).
+# (~/.odonian) and is NOT versioned. Ctrl-C can interrupt in-flight work; it does not guarantee a drain.
 #
 # NOTE: assumes each repo's default branch is `main` (matches the implement prompt). master-default repos
 # need the prompt parameterized — not supported yet.
@@ -72,7 +72,7 @@ if [ "$KIND" = "merge" ]; then
   request_stop() {
     [ "$STOP" -eq 1 ] && return
     STOP=1
-    echo "[$AGENT_ID] stop requested — finishing the current $ROLE task, then exiting. Ctrl-C again to force-quit."
+    echo "[$AGENT_ID] stop requested — exiting the $ROLE loop. Check PR and task state if a merge was interrupted."
     trap - INT TERM
   }
   trap request_stop INT TERM
