@@ -274,7 +274,7 @@ func (c *HTTPClient) ListProjects(ctx context.Context, options ...ProjectListOpt
 	}
 	defer resp.Body.Close()
 
-	var projects []Project
+	projects := []Project{}
 	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -359,7 +359,7 @@ func (c *HTTPClient) ListTasks(ctx context.Context, projectID string, options ..
 	}
 	defer resp.Body.Close()
 
-	var tasks []Task
+	tasks := []Task{}
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}

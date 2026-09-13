@@ -179,6 +179,35 @@ func TestExecuteProjectsJSON(t *testing.T) {
 	}
 }
 
+func TestExecuteProjectsEmptyResultJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Project{})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeProjects(context.Background(), server.URL, "test-token", true, []string{}, buf)
+	if err != nil {
+		t.Fatalf("executeProjects with empty result JSON failed: %v", err)
+	}
+
+	output := buf.String()
+	var result []tuiclient.Project
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	if result == nil {
+		t.Error("expected non-nil empty slice [], got null")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected 0 projects in JSON, got %d", len(result))
+	}
+}
+
 func TestExecuteProjectsMissingURL(t *testing.T) {
 	buf := &bytes.Buffer{}
 	err := executeProjects(context.Background(), "", "test-token", false, []string{}, buf)
