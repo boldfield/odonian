@@ -37,7 +37,7 @@ func executePending(ctx context.Context, baseURL, token string, jsonOutput bool,
 	}
 
 	// Filter to review and approved states only
-	var filtered []tuiclient.Task
+	filtered := []tuiclient.Task{}
 	for _, task := range tasks {
 		if task.State == "review" || task.State == "approved" {
 			filtered = append(filtered, task)
