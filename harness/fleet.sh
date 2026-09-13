@@ -63,9 +63,9 @@ STOP=0
 request_stop() {
   [ "$STOP" -eq 1 ] && return
   STOP=1
-  echo "[fleet] stop requested — stopping agents; in-flight work may be interrupted. Ctrl-C again to force-quit."
+  echo "[fleet] stop requested — signaling the process group; in-flight work may be interrupted."
   trap - INT TERM
-  # Signal all child processes
+  # This also signals this wrapper; it may exit before waiting for child cleanup below.
   kill -TERM 0 2>/dev/null || true
 }
 trap request_stop INT TERM

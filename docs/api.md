@@ -86,7 +86,8 @@ Create a new project.
 
 #### `GET /projects/{id}`
 
-Retrieve a project by ID.
+Retrieve a project by ID, including an archived project. This read currently returns
+`archived_at: null` even when the project is archived; see the listing limitation below.
 
 **Request:**
 ```bash
@@ -131,6 +132,12 @@ curl -H "Authorization: Bearer token" \
 
 **Response:** `200 OK` with an array of project objects, or `[]` if none match. Returns
 `400 INVALID_KIND` for an unsupported kind and `500 LIST_ERROR` on a storage failure.
+
+**Archive visibility limitation:** `include_archived=true` includes archived projects, but
+both this listing and `GET /projects/{id}` currently return `archived_at: null` for every
+project. Only the archive/unarchive responses expose the stored archive value. To identify
+archived projects from listings, compare IDs in otherwise identical requests with and without
+`include_archived=true`; do not filter on the returned `archived_at` field.
 
 #### `POST /projects/{id}/archive`
 
@@ -297,8 +304,14 @@ Bulk-create tasks for a project.
 
 These combinations have worker and reviewer prompts in the bundled harness. With an unsupported
 combination (including `local_commit` + `design`), the API still accepts the task, but the
-harness logs `prompt not found` and skips it. The task can remain `ready` without a board error.
-Choose a supported combination, or supply the corresponding prompts before promoting the task.
+harness cannot dispatch it. If it is first in the claimable queue, later tasks of the same kind
+in that project are blocked behind it. In single-project mode, the harness logs
+`prompt not found` and repeatedly fetches the same task without sleeping, generating continuous API traffic.
+In multi-project mode, it skips that project for the pass and tries other projects; if none can
+dispatch, it sleeps ten seconds. The incompatible task remains `ready` without a board error.
+Hold it to let later tasks proceed, then supply the missing prompts or replace it with a task
+using a supported combination. Supersession currently resets `track` to `build`, as described
+below; it does not preserve a design task's track.
 
 **Response (201 Created):**
 ```json
@@ -880,7 +893,8 @@ never enters `approved` and will not appear in a script that drains that lane. A
 from `in_progress` to `done` after merging.
 
 `blocked` is recoverable via `blocked` → `ready`; use `blocked` → `failed` to retire it.
-`done`, `failed`, `superseded`, and `abandoned` have no outgoing operator transitions.
+The `/transition` endpoint cannot move a task out of `done`, `failed`, `superseded`, or `abandoned`.
+The separate `/supersede` endpoint currently has no state guard, including for these states.
 
 ---
 
@@ -943,6 +957,17 @@ Create a replacement task and atomically repoint dependents to it. The old task 
 review round zero, copies the title, spec, model, reviewer models, merge/escalation settings,
 and upstream dependencies, and appends prior rejection feedback to the spec when present.
 
+**Track is not preserved:** the replacement currently defaults to `track: "build"`, even when
+the original was `design`. Circuit-breaker escalation uses the same replacement logic, so it
+also loses the track and automatically promotes the replacement with build prompts. Check the
+replacement before allowing a fleet to work on it.
+
+**There is no state guard:** unlike `/transition`, this endpoint accepts terminal tasks,
+including `done`, `failed`, `abandoned`, and already `superseded` tasks. All dependents are
+repointed to the new backlog task. Superseding a completed dependency therefore makes that
+dependency unsatisfied again: otherwise claimable dependents disappear from claimable listings
+until the replacement is done. Check dependent tasks before superseding completed work.
+
 ```bash
 curl -X POST -H "Authorization: Bearer token" -H 'Content-Type: application/json' \
   https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/supersede \
@@ -957,9 +982,12 @@ differs from circuit-breaker escalation, which automatically promotes its replac
 `400 UNKNOWN_MODEL`, `400 JSON_DECODE_ERROR`, `404 NOT_FOUND`, or `500 SUPERSEDE_ERROR`.
 
 After the board transaction commits, the server attempts to close the old task's open PR and
-delete its head branch using forge credentials. That cleanup runs asynchronously; a successful
-response confirms the board change, not completion of GitHub cleanup. PR-watch retries stale
-open PR cleanup on later passes. Supersession does not stop a running agent process.
+delete its head branch using its per-owner forge token. A missing file or owner entry does not
+disable this cleanup: it still attempts unauthenticated GitHub requests, whose failures are
+logged without undoing the board change. There is no `gh` or `GH_TOKEN` fallback. That cleanup
+runs asynchronously; a successful response confirms the board change, not completion of GitHub
+cleanup. PR-watch retries stale open PR cleanup on later passes only when it has a matching
+owner token. Supersession does not stop a running agent process.
 
 #### `POST /tasks/{id}/hold`
 
@@ -973,6 +1001,10 @@ curl -X POST -H "Authorization: Bearer token" \
 Held tasks cannot be claimed, and reviewer submission skips automatic aggregation for a held
 parent. Holding does not terminate an already running worker or revoke its lease; it is not a
 general ban on API transitions or forge actions.
+
+Release a parent in `review` **before the final reviewer submits**. If the final verdict arrives
+while it is held, all review tasks can finish while the parent stays in `review`; releasing
+afterward does not apply their verdicts. See the recovery steps under `/release`.
 
 **Response:** `200 OK` with the task object and `held: true`; `404 NOT_FOUND` if absent,
 or `500 HOLD_ERROR` on failure.
@@ -988,6 +1020,12 @@ curl -X POST -H "Authorization: Bearer token" \
 
 Claimability still depends on state, dependencies, and lease expiry. Releasing is not an
 unclaim operation and does not rerun review aggregation by itself.
+
+If the parent was held through its final reviewer verdict, it remains stranded in `review`
+after release, even with unanimous approval. To recover, release it and use `/transition` to
+move `review` → `blocked` → `ready`, then let a worker implement and submit it again for a new
+review round. The old verdicts will not complete the new round. Alternatively, supersede it,
+accounting for the dependency and track changes documented above.
 
 **Response:** `200 OK` with the task object and `held: false`; `404 NOT_FOUND` if absent,
 or `500 RELEASE_ERROR` on failure.
@@ -1023,7 +1061,7 @@ curl -X POST -H "Authorization: Bearer token" \
 
 ## Full Lifecycle Walkthrough
 
-This exercises the API against a running server with the default `haiku`/`opus` model allowlist.
+This exercises the API against a running server with the default `haiku`, `sonnet`, `opus` model allowlist.
 Save the Bash block to a file and run it with `bash`; it stops on HTTP errors or missing IDs.
 Set `ODONIAN_URL` and `ODONIAN_TOKEN` to your test server, or use the defaults below.
 
@@ -1119,31 +1157,31 @@ TASK=$(curl -fsS -X POST "$BASE/tasks/$TASK_ID/submit" \
     ]
   }')
 echo "$TASK" | jq .
-echo "(Auto-spawned review tasks are now ready for Opus reviewers)"
+echo "(Auto-spawned review tasks are now ready for the configured reviewer models)"
 
-echo "=== 10. List review tasks claimable by Opus ==="
-REVIEW_TASKS=$(curl -fsS "$BASE/projects/$PROJECT_ID/tasks?claimable=true&model=opus&kind=review" -H "$AUTH")
+echo "=== 10. List claimable review tasks ==="
+REVIEW_TASKS=$(curl -fsS "$BASE/projects/$PROJECT_ID/tasks?claimable=true&kind=review" -H "$AUTH")
 echo "$REVIEW_TASKS" | jq .
-REVIEW_TASK_ID=$(echo "$REVIEW_TASKS" | jq -er --arg parent "$TASK_ID" \
-  '.[] | select(.target_task_id == $parent) | .id')
+REVIEW_ROWS=$(echo "$REVIEW_TASKS" | jq -er --arg parent "$TASK_ID" \
+  '.[] | select(.target_task_id == $parent) | [.id, .model] | @tsv')
 
-echo "=== 11. Opus reviewer claims the review task ==="
-REVIEW_TASK=$(curl -fsS -X POST "$BASE/tasks/$REVIEW_TASK_ID/claim" \
-  -H "Content-Type: application/json" \
-  -H "$AUTH" \
-  -d '{"agent_id":"opus-1","model":"opus"}')
-echo "$REVIEW_TASK" | jq .
+# Handle every configured reviewer, even if review_models contains multiple entries.
+while IFS=$'\t' read -r REVIEW_TASK_ID REVIEW_MODEL; do
+  REVIEW_AGENT="reviewer-$REVIEW_TASK_ID"
+  echo "=== 11. $REVIEW_MODEL reviewer claims $REVIEW_TASK_ID ==="
+  CLAIM=$(jq -n --arg agent "$REVIEW_AGENT" --arg model "$REVIEW_MODEL" \
+    '{agent_id: $agent, model: $model}')
+  REVIEW_TASK=$(curl -fsS -X POST "$BASE/tasks/$REVIEW_TASK_ID/claim" \
+    -H "Content-Type: application/json" -H "$AUTH" -d "$CLAIM")
+  echo "$REVIEW_TASK" | jq .
 
-echo "=== 12. Opus reviewer submits verdict (approve) ==="
-VERDICT=$(curl -fsS -X POST "$BASE/tasks/$REVIEW_TASK_ID/submit" \
-  -H "Content-Type: application/json" \
-  -H "$AUTH" \
-  -d '{
-    "agent_id":"opus-1",
-    "verdict":"approve",
-    "result":"Code looks good. Well tested and documented."
-  }')
-echo "$VERDICT" | jq .
+  echo "=== 12. $REVIEW_MODEL reviewer submits verdict (approve) ==="
+  APPROVAL=$(jq -n --arg agent "$REVIEW_AGENT" \
+    '{agent_id: $agent, verdict: "approve", result: "Example review approved"}')
+  VERDICT=$(curl -fsS -X POST "$BASE/tasks/$REVIEW_TASK_ID/submit" \
+    -H "Content-Type: application/json" -H "$AUTH" -d "$APPROVAL")
+  echo "$VERDICT" | jq .
+done <<< "$REVIEW_ROWS"
 echo "(The parent task automatically moves to 'approved' since all reviewers approved)"
 
 echo "=== 13. Check that parent task is now approved ==="
@@ -1177,7 +1215,7 @@ curl -fsS "$BASE/tasks/$TASK_ID" -H "$AUTH" | jq -e 'select(.state == "done")'
 8. Workers extend their lease via heartbeat to prevent task expiry
 9. Dependencies are enforced at claim time — tasks with undone deps cannot be claimed
 10. The second task `task2` cannot be claimed until `task1` is `done` (due to `depends_on`)
-11. Operator transitions cannot reopen `done`, `failed`, `superseded`, or `abandoned` tasks. Unblocking applies to `blocked` tasks.
+11. `/transition` cannot reopen `done`, `failed`, `superseded`, or `abandoned` tasks. The separate `/supersede` endpoint currently accepts them and repoints dependents to a new backlog task. Unblocking applies to `blocked` tasks.
 
 ---
 
@@ -1252,8 +1290,8 @@ its state to `ready`.
 - `done`: Completed by a human or merger, or automatically finalized as an opted-in reviewed no-op
 - `blocked`: Off-ramp; task cannot proceed (blocked on external dependency)
 - `failed`: Terminal; task attempt retired as failed
-- `superseded`: Terminal for operator transitions; the supersede endpoint creates a replacement and repoints dependencies
-- `abandoned`: Terminal for operator transitions; approved work retired without merging, including a PR closed unmerged
+- `superseded`: Terminal for `/transition`; the supersede endpoint creates a replacement and repoints dependencies
+- `abandoned`: Terminal for `/transition`; approved work retired without merging, including a PR closed unmerged
 
 **For review tasks** (auto-spawned when parent enters `review`):
 ```

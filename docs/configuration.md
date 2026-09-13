@@ -16,13 +16,15 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_MAX_REVIEW_ROUNDS` | `5` | Threshold for models with no entry in `ODONIAN_ESCALATION_THRESHOLDS`. |
 | `ODONIAN_LEASE_TTL` | `5m` | Lease granted on claim and extended by each heartbeat. A task whose lease has lapsed is claimable again, so a session that outlives its lease loses the task to another worker. Kept generous in production because renewal is agent-driven. |
 | `ODONIAN_EVENT_TERMINAL_RETENTION_DAYS` | `1` | At startup, audit events for tasks in terminal states older than this are pruned. Events for live tasks are never pruned. |
-| `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by the PR-watch reconciler and by `odonian merge`. See [Forge tokens](#forge-tokens). |
+| `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by PR-watch, supersession PR cleanup, and `odonian merge`. See [Forge tokens](#forge-tokens). |
 
 The review circuit breaker, in full: when every review task for a parent is done and at least one
 rejected, the parent's `review_round` is compared with its model's threshold. At or under the
 threshold, the parent returns to `ready`. Over it, if the task has `escalate=true` (the default at
 creation) and its model is not the top of the ladder, the task is superseded by a copy pinned to
 the next tier and that copy is promoted to `ready`; otherwise the parent moves to `blocked`.
+The replacement currently loses the original `track` and defaults to `build`, including when
+escalating design work; see the [supersession limitations](./api.md#post-tasksidsupersede).
 Unblocking (`blocked → ready`) clears the assignee and lease but does not yet reset the review
 round, so one more rejection re-trips the breaker. Resetting it is specced in
 [`docs/specs/2026-08-06-unblock-resets-review-round.md`](./specs/2026-08-06-unblock-resets-review-round.md).
@@ -88,10 +90,14 @@ owner2="token_for_owner2"
 PR-watch skips an owner when its token is missing, even for public repositories. It logs
 `no forge token for owner` when the skipped count first appears or changes, and logs when the
 owner is no longer skipped. Add the matching token to the server's file to enable checks;
-the file is read again on later passes. For a deployment with no GitHub integration, an empty
-file leaves those checks disabled. The worker/reviewer harness has a separate fallback to its
-local `gh` authentication; that does not authenticate the server or merger. The merger reads
-only its per-owner token file. It does not fall back to `gh` authentication or `GH_TOKEN`; a
+the file is read again on later passes. An empty file disables PR-watch's checks, including its
+stale-PR cleanup. The separate cleanup triggered by `/supersede` still attempts unauthenticated
+GitHub requests when the file or owner entry is missing; failures are logged after the board
+change has committed. An empty file is therefore not a general switch to disable GitHub calls.
+
+The worker/reviewer harness has a separate fallback to its local `gh` authentication; that does
+not authenticate the server or merger. The merger reads only its per-owner token file.
+It does not fall back to `gh` authentication or `GH_TOKEN`; a
 missing owner entry results in an unauthenticated merge request, which cannot merge the PR.
 
 ## CLI (`odonian <command>`)
@@ -116,7 +122,7 @@ overridden per invocation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ODONIAN_URL`, `ODONIAN_TOKEN` | required | As above. |
-| `ODONIAN_PROJECT` | depends on the env file; see below | Set a full project UUID for one board, or literal `all` to discover and drain every project with claimable work, cloning repos on demand. |
+| `ODONIAN_PROJECT` | depends on the env file; see below | Set a full project UUID for one board. In `pull_request` mode, literal `all` discovers and drains projects with claimable work, cloning repos on demand. `local_commit` workers/reviewers require a UUID. |
 | `ODONIAN_PROJECTS` | unset | In `all` mode, a comma-separated allowlist of project ids. |
 | `ODONIAN_REPO` | | Local checkout for single-project mode. Ignored in `all` mode. |
 | `ODONIAN_MAIN_REPO` | `$ODONIAN_REPO` | The canonical clone that worktrees are detached from. |
@@ -129,9 +135,12 @@ overridden per invocation.
 Project selection is evaluated after sourcing `$ODONIAN_HOME/env`. The example file supplies
 the placeholder `<project-uuid-or-all>` when the variable was unset or empty; replace it before
 starting the fleet. That placeholder is treated as a project ID and can leave the slot polling
-an empty queue indefinitely. If the value is still unset or empty after configuration is
-loaded, the current harness selects **all projects visible to the shared board token**. Choose
-an explicit UUID or literal `all` instead of relying on that implicit scope.
+an empty queue indefinitely. With a different env file, or none, an unset or empty value after
+configuration selects **all projects visible to the shared board token** in `pull_request`
+mode. `local_commit` workers and reviewers reject this multi-project mode and exit; set a full
+UUID for them, as the demo does. Choose an explicit UUID or, for `pull_request`, literal `all`
+instead of relying on implicit scope. The repo-less merger uses all-project discovery for an
+unset/empty value regardless of delivery mode.
 
 Codex-routed reviewers authenticate with a `codex-auth` secret seeded from `~/.codex/auth.json`.
 That credential rotates on every refresh and revokes its predecessor, so a snapshot copied into

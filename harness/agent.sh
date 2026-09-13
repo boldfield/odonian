@@ -12,6 +12,7 @@
 #                      project's repo on demand and standing up a per-(slot,repo) worktree (a
 #                      worktree can't span repositories). Optional $ODONIAN_PROJECTS (comma-sep
 #                      ids) restricts which projects multi-mode will touch.
+#                      local_commit workers/reviewers reject multi-project mode; use a UUID.
 #
 # Run it straight from the repo's harness/ dir. Code + prompts live next to this script (the dir is
 # resolved from this script's own path, and still works if invoked via a symlink); the prompt is read
@@ -182,7 +183,7 @@ CLAUDE_PID=""   # pid (== pgid, via `set -m`) of the in-flight `claude -p`, if a
 request_stop() {
   [ "$STOP" -eq 1 ] && return
   STOP=1
-  echo "[$AGENT_ID] stop requested — stopping the in-flight $ROLE task and exiting. Ctrl-C again to force-quit."
+  echo "[$AGENT_ID] stop requested — stopping the in-flight $ROLE task and exiting."
   # The in-flight claude runs in its OWN process group (`set -m`, to shield it from the terminal's
   # Ctrl-C), so a group-kill aimed at the fleet's group never reaches it. TERM its group here so it
   # winds down WITH us — otherwise a force-kill of this agent would orphan the claude.

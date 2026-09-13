@@ -282,12 +282,12 @@ change any other file."
     </figure>
 
     <figure class="term">
-      <pre tabindex="0" aria-label="Command line: odonian pending lists the approved task, odonian diff shows the worker's commit, odonian approve records the human decision."><span class="t-muted"># PROJECT_ID and TASK_ID contain the full UUIDs printed by the boot banner.</span>
-<span class="t-prompt">$ </span><span class="t-cmd">odonian pending --project "$PROJECT_ID"</span>
+      <pre tabindex="0" aria-label="Command line: odonian pending lists the approved task, odonian diff shows the worker's commit, odonian approve records the human decision."><span class="t-muted"># Replace placeholders with full UUIDs, or copy commands from the boot banner.</span>
+<span class="t-prompt">$ </span><span class="t-cmd">odonian pending --project &lt;project-id&gt;</span>
 ID        STATE     KIND       TITLE
 bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line #3 to GREETINGS.md
 
-<span class="t-prompt">$ </span><span class="t-cmd">odonian diff "$TASK_ID"</span>
+<span class="t-prompt">$ </span><span class="t-cmd">odonian diff &lt;task-id&gt;</span>
 <span class="t-muted">diff --git a/GREETINGS.md b/GREETINGS.md
 --- a/GREETINGS.md
 +++ b/GREETINGS.md
@@ -295,7 +295,7 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
  hello</span>
 <span class="t-ok">+hello from the fleet (#3)</span>
 
-<span class="t-prompt">$ </span><span class="t-cmd">odonian approve "$TASK_ID"</span>  <span class="t-muted"># approved → done; or: odonian reject "$TASK_ID" --note "…"</span></pre>
+<span class="t-prompt">$ </span><span class="t-cmd">odonian approve &lt;task-id&gt;</span>  <span class="t-muted"># approved → done; or: odonian reject &lt;task-id&gt; --note "…"</span></pre>
       <figcaption>The human step, from the CLI. Commands use full UUIDs; table rows abbreviate them.
       In local delivery, <code>approve</code> records completion and freezes a branch for you to merge;
       it does not change <code>main</code>. In pull-request delivery, merge on the forge.</figcaption>
@@ -303,7 +303,7 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
     <p class="intro" style="margin:0">How these frames were made: they are text captured from the real <code>odonian-tui</code>
     and <code>odonian</code> binaries (v0.16.3) during a run of the guided demo on 2026-09-12, in a Docker
     sandbox, recoloured for the page. The task, the commit, the review, and the timestamps are from that run;
-    the repository is the demo's throwaway one. Commands above use variables for the full IDs;
+    the repository is the demo's throwaway one. Commands above use placeholders for the full IDs;
     the reviewer's note is cut where the terminal was.</p>
   </section>
 
@@ -447,8 +447,10 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
         on an API key it is billed. In three measured runs
         on 2026-09-12 the task took 68 to 112 seconds from <code>ready</code> to <code>approved</code>, after a
         boot that includes building the binary.</li>
-        <li>The setup script installs missing agent CLIs using <code>npm</code> and passwordless
-        <code>sudo</code>. Codex authentication is optional for this demo, whose reviewer is <code>opus</code>.</li>
+        <li><strong>Codex is optional for this demo</strong>, whose reviewer is <code>opus</code>.
+        With Claude installed and authenticated, skip <code>sbx-agent-setup.sh</code> and boot directly.
+        That optional setup script installs missing Claude and Codex CLIs using <code>npm</code>,
+        registry access, and passwordless <code>sudo</code>; installation failures stop that script.</li>
       </ul>
     </div>
 
@@ -463,7 +465,8 @@ sbx run --name odonian-demo claude .   <span class="c"># log claude in, then exi
 sbx exec -it --workdir "$PWD" odonian-demo bash
 
 <span class="c"># inside the sandbox, already at the mounted checkout's absolute path</span>
-bash harness/sbx-agent-setup.sh
+<span class="c"># optional broader setup; skip if claude is installed and authenticated</span>
+<span class="c"># bash harness/sbx-agent-setup.sh</span>
 bash harness/sbx.sh --seed-demo</pre>
       </div>
       <div>

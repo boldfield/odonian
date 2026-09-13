@@ -19,7 +19,7 @@ script creates for the purpose.
 | Go 1.25.6 or newer inside the sandbox | The script builds the `odonian` binary for the container's own architecture. |
 | `claude` (Claude Code CLI), **logged in** | Workers and reviewers are `claude -p` dispatches. Either the sandbox's own `claude` login or a `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. |
 | `git`, `jq`, `curl`, `bash` 3.2+ | Used by the harness. `gh` is only needed for pull-request mode, which the demo does not use. |
-| `codex` (OpenAI Codex CLI) | **Installed by the setup step below.** Installation must succeed even though the demo is reviewed by `opus`. Codex authentication is not needed for this demo; tasks with a `gpt-5.5` reviewer need it separately. |
+| `codex` (OpenAI Codex CLI) | **Optional for the seeded demo**, whose reviewer is `opus`. `sbx.sh --seed-demo` warns and continues without it. Tasks with a `gpt-5.5` reviewer need Codex installed and authenticated separately. |
 
 **Usage and cost.** The run makes real model calls on your Claude account: one boot-time
 authentication probe (capped at $0.02 with `--max-budget-usd`), then `haiku` implementation
@@ -51,10 +51,13 @@ sbx exec -it --workdir "$PWD" odonian-demo bash
 directory: the sandbox's home is typically `/home/agent`, so `~/src/odonian` inside it is a
 different path. The `-it` flags keep the shell interactive.
 
-Inside that shell, make sure the agent tooling is present (idempotent; installs `claude` and
-`codex` if missing and wires the repo's Claude Code skills). This setup script requires `npm`
-and passwordless `sudo` when a CLI needs installing, even though Codex authentication is not
-needed for the demo:
+With `claude` installed and authenticated, continue directly to step 2. The seeded demo does
+not require the skills or settings installed by `sbx-agent-setup.sh`.
+
+For the broader agent setup, this **optional** script installs missing `claude` and `codex`
+CLIs and wires the repo's Claude Code skills. It requires `npm`, registry access, and passwordless
+`sudo` when a CLI needs installing, and it fails if either installation fails. Skip it for the
+demo when authenticated `claude` is already available:
 
 ```bash
 bash harness/sbx-agent-setup.sh

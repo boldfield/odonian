@@ -67,8 +67,10 @@ collide. One `claude -p` (or `codex exec`) dispatch per task; the prompt under
 applies to the next task without a restart. For workers and reviewers, Ctrl-C sends `SIGTERM`
 to the active agent session and exits; it does not wait for the task to finish. Cleanup removes
 the slot worktree in pull-request mode, so unpushed work may be lost. To let a task finish, wait
-until it has submitted before stopping its slot. A second Ctrl-C force-quits. The non-LLM merger
-also has no guaranteed drain: Ctrl-C can interrupt its foreground `odonian merge` command
+until it has submitted before stopping its slot. When using `fleet.sh`, its stop handler sends
+`SIGTERM` to its whole process group, including itself; it can exit on the first Ctrl-C without
+waiting for child cleanup. Do not rely on a second-interrupt phase or a final exit message.
+The non-LLM merger also has no guaranteed drain: Ctrl-C can interrupt its foreground `odonian merge` command
 between merging on GitHub and recording completion on the board. Check both the PR and task
 state after interrupting it.
 

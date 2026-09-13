@@ -32,8 +32,10 @@ Each agent takes a persistent id (per slot), stands up its own detached git work
 claimable work of its `kind`, and the task specifies the model. One `claude -p` dispatch per task,
 then repeats. Ctrl-C interrupts the active worker/reviewer session and exits. Pull-request slot
 worktrees are removed during cleanup, including unpushed changes; wait for submission first if
-you want the task to finish. Ctrl-C again force-quits. The non-LLM merger has no guaranteed
-drain either: Ctrl-C can interrupt its foreground merge command after GitHub merges the PR but
+you want the task to finish. `fleet.sh` signals its own process group and can exit on the first
+Ctrl-C without waiting for child cleanup; there is no guaranteed second-interrupt phase or
+final exit message. The non-LLM merger has no guaranteed drain either: Ctrl-C can interrupt its
+foreground merge command after GitHub merges the PR but
 before the board records completion. Check both states after an interruption.
 
 ## Code vs. state
@@ -59,9 +61,11 @@ right token **from the repo owner** (which Odonian already exposes via each proj
 Optional `~/.odonian/forge-tokens` pairs an owner with a PAT (`owner=token` per line; `#` comments
 ok). The worker derives the owner from the project's repo URL, exports that owner's token as
 `GH_TOKEN` for the clone + the dispatched worker's `git push`/`gh`, and **falls back to your default
-`gh` auth** when an owner has no entry. The server separately reads its own `FORGE_TOKENS` file
-for PR-watch and stale-PR cleanup; without a matching owner token it skips those checks, even
-for public repositories. The merger reads its token only from `FORGE_TOKENS`, defaulting to
+`gh` auth** when an owner has no entry. The server separately reads its own `FORGE_TOKENS` file.
+PR-watch, including its stale-PR cleanup, skips owners without a matching token, even for public
+repositories. Cleanup triggered directly by `/supersede` instead attempts unauthenticated
+requests and logs failures when the token is missing. The merger reads its token only from
+`FORGE_TOKENS`, defaulting to
 `~/.odonian/forge-tokens`; it has **no fallback to `gh` authentication or `GH_TOKEN`**. A missing
 owner entry makes its merge request unauthenticated and unable to merge the PR. Tokens are not
 stored in the board database or returned by the API.
