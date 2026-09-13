@@ -2035,6 +2035,150 @@ func TestTaskFieldsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestGetTaskPrefixResolution verifies that GetTask resolves a unique
+// 8-to-35-character id prefix to the full task, that dependencies and links
+// are looked up against the resolved full id (not the truncated prefix),
+// that no match or an id shorter than 8 characters returns ErrNotFound, that
+// several matches return a *ConflictError with Code AMBIGUOUS_ID listing
+// every candidate, and that the 36-character exact-id path is unchanged.
+func TestGetTaskPrefixResolution(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	proj, err := store.CreateProject(ctx, "prefix-test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	insertTask := func(id, title string) {
+		if _, err := store.Conn().ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, id, proj.ID, doc.ID, title, "spec", "backlog", now, now); err != nil {
+			t.Fatalf("failed to insert task %s: %v", id, err)
+		}
+	}
+
+	const (
+		depTaskID     = "dep-task-full-id-000001"
+		uniqueTaskID  = "uniq-task-full-id-000001"
+		ambiguousID1  = "ambig0001-task-full-a"
+		ambiguousID2  = "ambig0001-task-full-b"
+		ambiguousPfx  = "ambig0001"
+		uniquePfx     = "uniq-tas" // uniqueTaskID[:8]
+		noMatchPfx    = "zzzzzzzz"
+		tooShortInput = "ambig" // shorter than 8, must not even query
+	)
+
+	insertTask(depTaskID, "Dependency Task")
+	insertTask(uniqueTaskID, "Unique Prefix Task")
+	insertTask(ambiguousID1, "Ambiguous Task 1")
+	insertTask(ambiguousID2, "Ambiguous Task 2")
+
+	if _, err := store.Conn().ExecContext(ctx, `
+		INSERT INTO task_dep (task_id, depends_on_id) VALUES (?, ?)
+	`, uniqueTaskID, depTaskID); err != nil {
+		t.Fatalf("failed to insert task_dep: %v", err)
+	}
+	if _, err := store.Conn().ExecContext(ctx, `
+		INSERT INTO task_link (id, task_id, kind, value) VALUES (?, ?, ?, ?)
+	`, "prefix-test-link", uniqueTaskID, "pr", "#456"); err != nil {
+		t.Fatalf("failed to insert task_link: %v", err)
+	}
+
+	t.Run("exact id unchanged", func(t *testing.T) {
+		got, err := store.GetTask(ctx, uniqueTaskID)
+		if err != nil {
+			t.Fatalf("GetTask(exact id) failed: %v", err)
+		}
+		if got.ID != uniqueTaskID {
+			t.Errorf("expected id %s, got %s", uniqueTaskID, got.ID)
+		}
+	})
+
+	t.Run("unique prefix resolves and preserves deps and links", func(t *testing.T) {
+		got, err := store.GetTask(ctx, uniquePfx)
+		if err != nil {
+			t.Fatalf("GetTask(prefix) failed: %v", err)
+		}
+		if got.ID != uniqueTaskID {
+			t.Errorf("expected resolved id %s, got %s", uniqueTaskID, got.ID)
+		}
+		if len(got.DependsOn) != 1 || got.DependsOn[0] != depTaskID {
+			t.Errorf("expected DependsOn=[%s], got %v (prefix lookup must resolve the full id before querying task_dep)", depTaskID, got.DependsOn)
+		}
+		if len(got.Links) != 1 || got.Links[0].Value != "#456" {
+			t.Errorf("expected one link with value #456, got %v (prefix lookup must resolve the full id before querying task_link)", got.Links)
+		}
+	})
+
+	t.Run("no match returns not found", func(t *testing.T) {
+		_, err := store.GetTask(ctx, noMatchPfx)
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("shorter than 8 chars returns not found", func(t *testing.T) {
+		_, err := store.GetTask(ctx, tooShortInput)
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for a %d-char id, got %v", len(tooShortInput), err)
+		}
+	})
+
+	t.Run("ambiguous prefix returns conflict with candidates", func(t *testing.T) {
+		_, err := store.GetTask(ctx, ambiguousPfx)
+		var conflictErr *ConflictError
+		if !errors.As(err, &conflictErr) {
+			t.Fatalf("expected *ConflictError, got %v", err)
+		}
+		if conflictErr.Code != "AMBIGUOUS_ID" {
+			t.Errorf("expected Code=AMBIGUOUS_ID, got %s", conflictErr.Code)
+		}
+		gotCandidates := append([]string(nil), conflictErr.Candidates...)
+		sort.Strings(gotCandidates)
+		wantCandidates := []string{ambiguousID1, ambiguousID2}
+		if len(gotCandidates) != len(wantCandidates) || gotCandidates[0] != wantCandidates[0] || gotCandidates[1] != wantCandidates[1] {
+			t.Errorf("expected candidates %v, got %v", wantCandidates, gotCandidates)
+		}
+		for _, id := range wantCandidates {
+			if !strings.Contains(conflictErr.Message, id) {
+				t.Errorf("expected message to mention candidate %s, got %q", id, conflictErr.Message)
+			}
+		}
+	})
+
+	t.Run("LIKE wildcards in prefix are matched literally", func(t *testing.T) {
+		// A prefix of eight underscores must not behave as LIKE single-char
+		// wildcards matching every row; an unescaped `LIKE '________%'` would
+		// match all four tasks and report AMBIGUOUS_ID. Escaped, it matches no
+		// id (no stored id contains a literal underscore) -> not found.
+		if _, err := store.GetTask(ctx, "________"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for all-underscore prefix (wildcards must be escaped), got %v", err)
+		}
+		// '_' standing in for a real character must not match either:
+		// uniqueTaskID is "uniq-task-...", so "uniq_tas" resolves to it only if
+		// '_' is treated as a wildcard. It must be literal -> not found.
+		if _, err := store.GetTask(ctx, "uniq_tas"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for underscore-as-wildcard prefix, got %v", err)
+		}
+		// '%' (multi-char wildcard) must likewise be literal.
+		if _, err := store.GetTask(ctx, "%%%%%%%%"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for all-percent prefix (wildcards must be escaped), got %v", err)
+		}
+	})
+}
+
 // TestCreateTasksWithConfiguredAllowlist verifies that model allowlist validation works.
 // Models not in the allowlist are rejected with UNKNOWN_MODEL.
 func TestCreateTasksWithConfiguredAllowlist(t *testing.T) {

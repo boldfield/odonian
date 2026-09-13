@@ -200,6 +200,28 @@ curl -H "Authorization: Bearer token" \
 
 ### Tasks
 
+#### Task ID Conventions
+
+Task ids are 36-character UUIDs, but table output (CLI, TUI) truncates them to
+8 characters for readability. Every task-id route — `GET /tasks/{id}` and each
+`/tasks/{id}/...` operation (claim, heartbeat, promote, submit, review,
+transition, supersede, hold, release, archive, unarchive, events, and `PATCH
+/tasks/{id}`) — accepts either the full id or any unique prefix of at least 8
+characters, so a truncated id copied from a table can be used directly without
+a `--json | jq` round trip to recover the full UUID:
+- **Exact id** (36 characters): looked up as-is.
+- **Unique prefix** (8-35 characters) matching exactly one task: resolved to
+  that task.
+- **No match**: `404 NOT_FOUND`.
+- **Several matches**: `409 AMBIGUOUS_ID`, with the candidate ids listed in
+  the error's `candidates` field.
+- **Fewer than 8 characters**: always `404 NOT_FOUND` (too short to safely
+  disambiguate).
+
+The prefix is matched literally: `%` and `_` are not treated as SQL wildcards,
+so a prefix such as `________` resolves to `404 NOT_FOUND` rather than matching
+every task.
+
 #### `POST /projects/{id}/tasks`
 
 Bulk-create tasks for a project.
@@ -437,10 +459,11 @@ curl -H "Authorization: Bearer token" \
 
 **Status Codes:**
 - `200 OK`: Task retrieved
-- `404 NOT_FOUND`: Task not found
+- `404 NOT_FOUND`: Task not found (including an id prefix with no matches, or shorter than 8 characters)
+- `409 AMBIGUOUS_ID`: The id prefix matches more than one task; the response's `candidates` field lists the matching ids
 - `500 GET_ERROR`: Server error retrieving task
 
-**Note:** This endpoint returns a rich response with field names in lowercase (unlike most other endpoints which use uppercase). It includes the full dependency list and all linked resources.
+**Note:** This endpoint returns a rich response with field names in lowercase (unlike most other endpoints which use uppercase). It includes the full dependency list and all linked resources. `{id}` accepts a unique prefix — see [Task ID Conventions](#task-id-conventions).
 
 ---
 
@@ -1135,6 +1158,7 @@ All error responses follow a consistent format:
 - `NOT_FOUND` (404): Resource not found
 - `CONFLICT` (409): State transition or constraint violation (generic)
 - `MODEL_MISMATCH` (409): Task's model doesn't match declared model on claim
+- `AMBIGUOUS_ID` (409): A task id prefix matched more than one task; the response includes a `candidates` field listing the matching ids (see [Task ID Conventions](#task-id-conventions))
 - `UNKNOWN_MODEL` (400): Model is not in the deployment allowlist (create time)
 - `UNKNOWN_TRACK` (400): Track is not one of the valid values (`"build"` or `"design"`)
 - `JSON_DECODE_ERROR` (400): Invalid JSON in request body

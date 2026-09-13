@@ -38,6 +38,7 @@ type Store interface {
 	CreateDocument(ctx context.Context, projectID, kind, title, ref string, commit *string) (Document, error)
 	ListDocuments(ctx context.Context, projectID string, kind *string) ([]Document, error)
 	CreateTasks(ctx context.Context, projectID string, tasks []TaskInput) ([]Task, error)
+	ResolveTaskID(ctx context.Context, id string) (string, error)
 	GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error)
 	ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error)
 	ListDependents(ctx context.Context, taskID string) ([]string, error)
@@ -627,10 +628,12 @@ var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 
 // ConflictError is a typed conflict with an error code and message.
-// Handlers map it to HTTP 409 via errors.As.
+// Handlers map it to HTTP 409 via errors.As. Candidates is optional structured
+// data for conflicts that need to surface more than a message, e.g. AMBIGUOUS_ID.
 type ConflictError struct {
-	Code    string
-	Message string
+	Code       string
+	Message    string
+	Candidates []string
 }
 
 func (e *ConflictError) Error() string {
@@ -642,6 +645,14 @@ func (e *ConflictError) Error() string {
 
 func conflict(code, message string) error {
 	return &ConflictError{Code: code, Message: message}
+}
+
+func ambiguousTaskID(candidates []string) error {
+	return &ConflictError{
+		Code:       "AMBIGUOUS_ID",
+		Message:    fmt.Sprintf("task id prefix matches multiple tasks: %s", strings.Join(candidates, ", ")),
+		Candidates: candidates,
+	}
 }
 
 // ValidationError is a client-input error. Handlers map it to HTTP 400 via errors.As,
@@ -1095,12 +1106,74 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 	return createdTasks, nil
 }
 
+// likeEscape escapes the SQL LIKE metacharacters ('%', '_') and the escape
+// character itself so a caller-supplied string matches literally under a
+// `LIKE ? ESCAPE '\'` clause. Without this, a prefix such as "____" or "%"
+// would be treated as a wildcard pattern and match unrelated task ids.
+func likeEscape(s string) string {
+	return likeEscaper.Replace(s)
+}
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// ResolveTaskID resolves a possibly-truncated task id to the full stored id.
+// Stored ids are 36-char UUIDs, so an id of that length or longer is treated
+// as exact and returned unchanged (existing exact-match callers see no
+// behavior change). A shorter id is resolved as a prefix: exactly one match
+// returns that id, no match returns ErrNotFound, and several matches return a
+// *ConflictError with Code AMBIGUOUS_ID and the candidate ids attached. An id
+// shorter than 8 characters is too short to safely disambiguate and is
+// rejected as not-found without a database lookup. The prefix is matched
+// literally — LIKE wildcards in the input are escaped, so "________" resolves
+// to not-found rather than matching every task.
+func (s *sqliteStore) ResolveTaskID(ctx context.Context, id string) (string, error) {
+	if len(id) >= 36 {
+		return id, nil
+	}
+	if len(id) < 8 {
+		return "", ErrNotFound
+	}
+
+	rows, err := s.readConn.QueryContext(ctx, `SELECT id FROM task WHERE id LIKE ? ESCAPE '\' ORDER BY id`, likeEscape(id)+"%")
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve task id prefix: %w", err)
+	}
+	defer rows.Close()
+
+	var candidates []string
+	for rows.Next() {
+		var candidate string
+		if err := rows.Scan(&candidate); err != nil {
+			return "", fmt.Errorf("failed to scan candidate task id: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating candidate task ids: %w", err)
+	}
+
+	switch len(candidates) {
+	case 0:
+		return "", ErrNotFound
+	case 1:
+		return candidates[0], nil
+	default:
+		return "", ambiguousTaskID(candidates)
+	}
+}
+
 // GetTask retrieves a task by id, including its dependencies and links.
-// Returns ErrNotFound if the task does not exist.
+// The id may be a unique prefix (at least 8 characters) of the full id; see
+// ResolveTaskID. Returns ErrNotFound if the task does not exist.
 func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error) {
+	id, err := s.ResolveTaskID(ctx, id)
+	if err != nil {
+		return TaskWithDepsAndLinks{}, err
+	}
+
 	var t Task
 	var reviewModelsJSON *string
-	err := s.readConn.QueryRowContext(ctx, `
+	err = s.readConn.QueryRowContext(ctx, `
 		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
 	`, id).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
