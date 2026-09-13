@@ -304,6 +304,7 @@ type TaskListOptions struct {
 	Kind      string
 	Claimable bool
 	State     string
+	Fields    string
 }
 
 // TaskListOption is a functional option for ListTasks.
@@ -337,6 +338,13 @@ func WithState(state string) TaskListOption {
 	}
 }
 
+// WithFields sets the fields filter (e.g. "summary").
+func WithFields(fields string) TaskListOption {
+	return func(opts *TaskListOptions) {
+		opts.Fields = fields
+	}
+}
+
 // ListTasks fetches tasks for a project, optionally filtered by model, kind, claimable status, and state.
 func (c *HTTPClient) ListTasks(ctx context.Context, projectID string, options ...TaskListOption) ([]Task, error) {
 	opts := &TaskListOptions{}
@@ -345,7 +353,7 @@ func (c *HTTPClient) ListTasks(ctx context.Context, projectID string, options ..
 	}
 
 	path := fmt.Sprintf("/projects/%s/tasks", projectID)
-	if opts.Model != "" || opts.Kind != "" || opts.Claimable || opts.State != "" {
+	if opts.Model != "" || opts.Kind != "" || opts.Claimable || opts.State != "" || opts.Fields != "" {
 		var params []string
 		if opts.Model != "" {
 			params = append(params, fmt.Sprintf("model=%s", opts.Model))
@@ -358,6 +366,9 @@ func (c *HTTPClient) ListTasks(ctx context.Context, projectID string, options ..
 		}
 		if opts.State != "" {
 			params = append(params, fmt.Sprintf("state=%s", opts.State))
+		}
+		if opts.Fields != "" {
+			params = append(params, fmt.Sprintf("fields=%s", opts.Fields))
 		}
 		if len(params) > 0 {
 			path += "?" + join(params, "&")

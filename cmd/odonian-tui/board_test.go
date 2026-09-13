@@ -581,10 +581,39 @@ func runCmd(cmd tea.Cmd) []tea.Msg {
 	}
 }
 
+// extractStateFromOptions extracts the State field from TaskListOptions if set.
+func extractStateFromOptions(options ...tuiclient.TaskListOption) string {
+	opts := &tuiclient.TaskListOptions{}
+	for _, opt := range options {
+		opt(opts)
+	}
+	return opts.State
+}
+
+// filterTasksByState filters a list of tasks to only those matching the given state.
+// If state is empty, returns all tasks.
+func filterTasksByState(tasks []tuiclient.Task, state string) []tuiclient.Task {
+	if state == "" {
+		return tasks
+	}
+	var filtered []tuiclient.Task
+	for _, t := range tasks {
+		if t.State == state {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered
+}
+
 // TestBoardModel_PromoteTask tests promoting a backlog task to ready.
 func TestBoardModel_PromoteTask(t *testing.T) {
 	promoteWasCalled := false
 	var promoteTaskID string
+
+	allTasks := []tuiclient.Task{
+		{ID: "task-1", Title: "Task 1", State: "ready"},
+		{ID: "task-2", Title: "Task 2", State: "backlog"},
+	}
 
 	mockClient := &tuiclient.MockClient{
 		PromoteTaskFunc: func(ctx context.Context, id string) error {
@@ -594,10 +623,8 @@ func TestBoardModel_PromoteTask(t *testing.T) {
 		},
 		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
 			// On refetch after promotion, task-1 should be in ready
-			return []tuiclient.Task{
-				{ID: "task-1", Title: "Task 1", State: "ready"},
-				{ID: "task-2", Title: "Task 2", State: "backlog"},
-			}, nil
+			state := extractStateFromOptions(options...)
+			return filterTasksByState(allTasks, state), nil
 		},
 	}
 

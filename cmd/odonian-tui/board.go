@@ -159,9 +159,10 @@ func (m *BoardModel) defaultTickCmd() tea.Cmd {
 
 // Init starts the initial fetch and the polling loop.
 // Exactly one tick chain is started here; it perpetuates itself in the tickMsg handler.
+// The initial fetch includes both active and terminal columns.
 func (m *BoardModel) Init() tea.Cmd {
 	return tea.Batch(
-		m.fetchTasks(),
+		m.fetchTasksFullRefresh(),
 		m.fetchProjects(),
 		m.newTickCmd(),
 	)
@@ -191,8 +192,8 @@ func (m *BoardModel) promoteTask(taskID string) tea.Cmd {
 		}
 
 		// Promotion succeeded; refetch to get updated board state
-		// Issue a new fetch command and return its result
-		return m.fetchTasks()()
+		// Use full refresh to get all states after the state-changing action
+		return m.fetchTasksFullRefresh()()
 	}
 }
 
@@ -540,6 +541,7 @@ func (m *BoardModel) releaseTaskCmd(taskID string, fromDetail bool) tea.Cmd {
 // closure (i.e. uses an already-created context) and returns a reviewActionMsg so the
 // result surfaces through the reviewActionMsg handler instead of tasksFetchedMsg. This
 // avoids starting a second tea.Cmd goroutine from within the first.
+// This fetches all states (active and terminal) in a single call.
 func (m *BoardModel) fetchTasksInline(ctx context.Context, errPrefix string) reviewActionMsg {
 	tasks, fetchErr := m.client.ListTasks(ctx, m.project.ID)
 	if fetchErr != nil {
@@ -559,25 +561,143 @@ func (m *BoardModel) fetchTasksInline(ctx context.Context, errPrefix string) rev
 	return msg
 }
 
-// fetchTasks creates a command that fetches tasks and returns them.
-func (m *BoardModel) fetchTasks() tea.Cmd {
+// fetchActiveTasks creates a command that fetches only active-state tasks (backlog, ready,
+// in_progress, review, approved, blocked) with fields=summary to reduce bandwidth.
+// The results are merged with the existing terminal columns (done, failed, abandoned).
+func (m *BoardModel) fetchActiveTasks() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		tasks, err := m.client.ListTasks(ctx, m.project.ID)
-		if err != nil {
-			return tasksFetchedMsg{
-				err: err,
+		activeStates := []string{stateBacklog, stateReady, stateInProgress, stateReview, stateApproved, stateBlocked}
+		allTasks := []tuiclient.Task{}
+
+		// Fetch tasks for each active state
+		for _, state := range activeStates {
+			tasks, err := m.client.ListTasks(ctx, m.project.ID, tuiclient.WithState(state), tuiclient.WithFields("summary"))
+			if err != nil {
+				return tasksFetchedMsg{
+					err: err,
+				}
 			}
+			allTasks = append(allTasks, tasks...)
 		}
 
-		bucketed := bucketTasksByState(tasks)
+		bucketed := bucketTasksByState(allTasks)
 
 		return tasksFetchedMsg{
 			tasks: bucketed,
 		}
 	}
+}
+
+// fetchActiveTasksAndMerge creates a command that fetches only active-state tasks and merges
+// them with the existing terminal columns from the board model. This is used during polling
+// to avoid re-fetching the slow-changing terminal columns.
+func (m *BoardModel) fetchActiveTasksAndMerge() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		activeStates := []string{stateBacklog, stateReady, stateInProgress, stateReview, stateApproved, stateBlocked}
+		activeTasks := []tuiclient.Task{}
+
+		// Fetch tasks for each active state
+		for _, state := range activeStates {
+			tasks, err := m.client.ListTasks(ctx, m.project.ID, tuiclient.WithState(state), tuiclient.WithFields("summary"))
+			if err != nil {
+				return tasksFetchedMsg{
+					err: err,
+				}
+			}
+			activeTasks = append(activeTasks, tasks...)
+		}
+
+		activeBucketed := bucketTasksByState(activeTasks)
+
+		// Merge with existing terminal columns (done, failed, abandoned)
+		terminalStates := []string{stateDone, stateFailed, stateAbandoned}
+		for _, state := range terminalStates {
+			activeBucketed[state] = m.tasks[state]
+		}
+
+		return tasksFetchedMsg{
+			tasks: activeBucketed,
+		}
+	}
+}
+
+// fetchTerminalColumns creates a command that fetches terminal-state tasks (done, failed, abandoned)
+// with fields=summary to reduce bandwidth. The results are merged with the existing active tasks.
+func (m *BoardModel) fetchTerminalColumns() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		terminalStates := []string{stateDone, stateFailed, stateAbandoned}
+		terminalTasks := []tuiclient.Task{}
+
+		// Fetch tasks for each terminal state
+		for _, state := range terminalStates {
+			tasks, err := m.client.ListTasks(ctx, m.project.ID, tuiclient.WithState(state), tuiclient.WithFields("summary"))
+			if err != nil {
+				return tasksFetchedMsg{
+					err: err,
+				}
+			}
+			terminalTasks = append(terminalTasks, tasks...)
+		}
+
+		bucketed := bucketTasksByState(terminalTasks)
+
+		return tasksFetchedMsg{
+			tasks: bucketed,
+		}
+	}
+}
+
+// mergeTaskBuckets merges terminal column tasks into the main bucketed task map
+// while preserving all active-state tasks.
+func mergeTaskBuckets(main, terminal map[string][]tuiclient.Task) map[string][]tuiclient.Task {
+	for state, tasks := range terminal {
+		main[state] = tasks
+	}
+	return main
+}
+
+// fetchTasksFullRefresh creates a command that fetches both active and terminal tasks,
+// used for the initial load and manual refresh.
+func (m *BoardModel) fetchTasksFullRefresh() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		allStates := []string{stateBacklog, stateReady, stateInProgress, stateReview, stateApproved, stateBlocked, stateDone, stateFailed, stateAbandoned}
+		allTasks := []tuiclient.Task{}
+
+		// Fetch tasks for each state
+		for _, state := range allStates {
+			tasks, err := m.client.ListTasks(ctx, m.project.ID, tuiclient.WithState(state), tuiclient.WithFields("summary"))
+			if err != nil {
+				return tasksFetchedMsg{
+					err: err,
+				}
+			}
+			allTasks = append(allTasks, tasks...)
+		}
+
+		bucketed := bucketTasksByState(allTasks)
+
+		return tasksFetchedMsg{
+			tasks: bucketed,
+		}
+	}
+}
+
+// fetchTasks creates a command that fetches only active-state tasks for polling.
+// Use fetchTasksFullRefresh for initial load and manual refresh.
+func (m *BoardModel) fetchTasks() tea.Cmd {
+	return m.fetchActiveTasks()
 }
 
 // bucketTasksByState groups tasks into buckets by state, filtering out review-kind
@@ -782,10 +902,10 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.clampScrollToSelection()
 
-		// Refresh: issue one-shot fetch; do NOT arm a new tick.
+		// Refresh: issue one-shot fetch of all columns; do NOT arm a new tick.
 		// The single perpetual tick chain started in Init re-arms itself from tickMsg.
 		case "r":
-			return m, m.fetchTasks()
+			return m, m.fetchTasksFullRefresh()
 
 		// Open detail view for the selected task.
 		case "enter":
@@ -1041,8 +1161,9 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		// Re-arm exactly one next tick and issue a fetch.
 		// This is the ONLY place (besides Init) where a new tick is armed.
+		// Merge the active-state results with the existing terminal columns.
 		return m, tea.Batch(
-			m.fetchTasks(),
+			m.fetchActiveTasksAndMerge(),
 			m.newTickCmd(),
 		)
 	}
