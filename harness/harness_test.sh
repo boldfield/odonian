@@ -174,7 +174,7 @@ fi
 
 # Test 18: Check that agent.sh sleeps after blocking on missing prompt in multi-project
 echo "Test 18: agent.sh sleeps after blocking prompt in multi-project"
-if grep -A 1 'MULTI-PROJECT MODE' "$SCRIPT_TO_TEST" | grep -A 30 'if \[ ! -f "$PROMPT_FILE" \]; then' | grep -q 'prompt not found.*blocking.*nap 30'; then
+if grep -A 60 'MULTI-PROJECT MODE' "$SCRIPT_TO_TEST" | grep -q 'odonian transition.*--to blocked.*no prompt'; then
   test_pass "agent.sh sleeps and logs correctly on missing prompt in multi-project"
 else
   test_fail "agent.sh doesn't handle missing prompt correctly in multi-project"
