@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"text/tabwriter"
 
 	"github.com/boldfield/odonian/internal/tuiclient"
@@ -31,18 +32,27 @@ func executePending(ctx context.Context, baseURL, token string, jsonOutput bool,
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	tasks, err := client.ListTasks(ctx, *projectFlag)
+
+	// Fetch tasks in review state
+	reviewTasks, err := client.ListTasks(ctx, *projectFlag, tuiclient.WithState("review"), tuiclient.WithFields("summary"))
 	if err != nil {
 		return fmt.Errorf("failed to list tasks: %w", err)
 	}
 
-	// Filter to review and approved states only
-	filtered := []tuiclient.Task{}
-	for _, task := range tasks {
-		if task.State == "review" || task.State == "approved" {
-			filtered = append(filtered, task)
-		}
+	// Fetch tasks in approved state
+	approvedTasks, err := client.ListTasks(ctx, *projectFlag, tuiclient.WithState("approved"), tuiclient.WithFields("summary"))
+	if err != nil {
+		return fmt.Errorf("failed to list tasks: %w", err)
 	}
+
+	// Combine results and sort by created_at then id to preserve chronological order
+	filtered := append(reviewTasks, approvedTasks...)
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].CreatedAt != filtered[j].CreatedAt {
+			return filtered[i].CreatedAt < filtered[j].CreatedAt
+		}
+		return filtered[i].ID < filtered[j].ID
+	})
 
 	// Output results
 	if jsonOutput {
