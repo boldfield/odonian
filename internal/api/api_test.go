@@ -3900,6 +3900,108 @@ func TestSupersedTaskRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestSupersedTaskTerminalStateReturns409 verifies that superseding a task in a terminal state returns 409.
+func TestSupersedTaskTerminalStateReturns409(t *testing.T) {
+	terminalStates := []string{"done", "failed", "abandoned", "superseded"}
+
+	for _, terminalState := range terminalStates {
+		t.Run("state_"+terminalState, func(t *testing.T) {
+			server := setupTestServer(t, "test-token")
+			authHeader := "Bearer test-token"
+
+			projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+			// Create a task and a dependent
+			taskPayload := []store.TaskInput{
+				{
+					Title:      "Task to Supersede",
+					Spec:       "Test specification",
+					DocumentID: docID,
+					Model:      "haiku",
+				},
+				{
+					Title:      "Dependent Task",
+					Spec:       "Dependent specification",
+					DocumentID: docID,
+					Model:      "haiku",
+				},
+			}
+			taskBody, _ := json.Marshal(taskPayload)
+			createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+			createReq.Header.Set("Authorization", authHeader)
+			createReq.Header.Set("Content-Type", "application/json")
+			createW := httptest.NewRecorder()
+			server.mux.ServeHTTP(createW, createReq)
+
+			var createdTasks []store.Task
+			json.NewDecoder(createW.Body).Decode(&createdTasks)
+			taskID := createdTasks[0].ID
+			dependentID := createdTasks[1].ID
+
+			// Set the dependent to depend on the task
+			depPayload := map[string]interface{}{"depends_on": []string{taskID}}
+			depBody, _ := json.Marshal(depPayload)
+			depReq := httptest.NewRequest("PATCH", "/tasks/"+dependentID, bytes.NewReader(depBody))
+			depReq.Header.Set("Authorization", authHeader)
+			depReq.Header.Set("Content-Type", "application/json")
+			depW := httptest.NewRecorder()
+			server.mux.ServeHTTP(depW, depReq)
+
+			// Manually set the task to terminal state
+			conn := server.store.Conn()
+			_, err := conn.ExecContext(context.Background(), "UPDATE task SET state = ? WHERE id = ?", terminalState, taskID)
+			if err != nil {
+				t.Fatalf("failed to set task to terminal state: %v", err)
+			}
+
+			// Attempt to supersede the task in terminal state
+			supersedePayload := map[string]interface{}{}
+			supersedeBody, _ := json.Marshal(supersedePayload)
+			supersedeReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/supersede", bytes.NewReader(supersedeBody))
+			supersedeReq.Header.Set("Authorization", authHeader)
+			supersedeReq.Header.Set("Content-Type", "application/json")
+			supersedeW := httptest.NewRecorder()
+			server.mux.ServeHTTP(supersedeW, supersedeReq)
+
+			// Verify 409 status
+			if supersedeW.Code != http.StatusConflict {
+				t.Errorf("expected status 409, got %d; body: %s", supersedeW.Code, supersedeW.Body.String())
+			}
+
+			// Verify error response
+			var errResp map[string]interface{}
+			json.NewDecoder(supersedeW.Body).Decode(&errResp)
+			if errResp["error"] == nil {
+				t.Errorf("expected error in response, got none")
+			}
+
+			// Verify task state is unchanged
+			getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+			getReq.Header.Set("Authorization", authHeader)
+			getW := httptest.NewRecorder()
+			server.mux.ServeHTTP(getW, getReq)
+
+			var taskAfter store.TaskWithDepsAndLinks
+			json.NewDecoder(getW.Body).Decode(&taskAfter)
+			if taskAfter.State != terminalState {
+				t.Errorf("expected task state to remain %q, got %q", terminalState, taskAfter.State)
+			}
+
+			// Verify dependent still depends on original task
+			getDepReq := httptest.NewRequest("GET", "/tasks/"+dependentID, nil)
+			getDepReq.Header.Set("Authorization", authHeader)
+			getDepW := httptest.NewRecorder()
+			server.mux.ServeHTTP(getDepW, getDepReq)
+
+			var depAfter store.TaskWithDepsAndLinks
+			json.NewDecoder(getDepW.Body).Decode(&depAfter)
+			if len(depAfter.DependsOn) != 1 || depAfter.DependsOn[0] != taskID {
+				t.Errorf("expected dependent to still depend on task %q, got %v", taskID, depAfter.DependsOn)
+			}
+		})
+	}
+}
+
 // TestListTasksWithIncludeSupersededFilter verifies that superseded tasks are excluded by default
 // but can be included with the include_superseded filter.
 func TestListTasksWithIncludeSupersededFilter(t *testing.T) {
@@ -4457,5 +4559,194 @@ func TestEscalateOptOutBlocksAtFirstThreshold(t *testing.T) {
 	}
 	if finalTask.SupersededBy != nil {
 		t.Errorf("expected no supersession for escalate=false task, but SupersededBy is %v", finalTask.SupersededBy)
+	}
+}
+
+// TestArchiveProjectAndGetArchivedAt verifies that archiving a project sets archived_at and GET returns it.
+func TestArchiveProjectAndGetArchivedAt(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a project
+	createPayload := map[string]string{
+		"name": "archive-test-project",
+		"repo": "https://github.com/example/test-repo",
+	}
+	createBody, _ := json.Marshal(createPayload)
+	createReq := httptest.NewRequest("POST", "/projects", bytes.NewReader(createBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var project store.Project
+	json.NewDecoder(createW.Body).Decode(&project)
+
+	// Verify initial archived_at is nil
+	if project.ArchivedAt != nil {
+		t.Errorf("expected ArchivedAt to be nil for new project, got %v", project.ArchivedAt)
+	}
+
+	// Archive the project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+project.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	if archiveW.Code != http.StatusOK {
+		t.Errorf("expected status 200 for archive, got %d", archiveW.Code)
+	}
+
+	var archivedProject store.Project
+	json.NewDecoder(archiveW.Body).Decode(&archivedProject)
+
+	// Verify archived_at is set
+	if archivedProject.ArchivedAt == nil {
+		t.Error("expected ArchivedAt to be set after archiving, got nil")
+	}
+
+	// Get the project and verify archived_at is returned
+	getReq := httptest.NewRequest("GET", "/projects/"+project.ID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+
+	var retrievedProject store.Project
+	json.NewDecoder(getW.Body).Decode(&retrievedProject)
+
+	if retrievedProject.ArchivedAt == nil {
+		t.Error("expected ArchivedAt in GET response, got nil")
+	}
+	// Compare string values, not pointers
+	if *archivedProject.ArchivedAt != *retrievedProject.ArchivedAt {
+		t.Errorf("archived_at mismatch: archive response %q != get response %q", *archivedProject.ArchivedAt, *retrievedProject.ArchivedAt)
+	}
+}
+
+// TestListProjectsExcludesArchivedByDefault verifies that GET /projects excludes archived projects.
+func TestListProjectsExcludesArchivedByDefault(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create two projects
+	p1 := map[string]string{"name": "active-project", "repo": "https://github.com/example/active"}
+	p1Body, _ := json.Marshal(p1)
+	p1Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p1Body))
+	p1Req.Header.Set("Authorization", authHeader)
+	p1Req.Header.Set("Content-Type", "application/json")
+	p1W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p1W, p1Req)
+	var activeProject store.Project
+	json.NewDecoder(p1W.Body).Decode(&activeProject)
+
+	p2 := map[string]string{"name": "archived-project", "repo": "https://github.com/example/archived"}
+	p2Body, _ := json.Marshal(p2)
+	p2Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p2Body))
+	p2Req.Header.Set("Authorization", authHeader)
+	p2Req.Header.Set("Content-Type", "application/json")
+	p2W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p2W, p2Req)
+	var archivedProject store.Project
+	json.NewDecoder(p2W.Body).Decode(&archivedProject)
+
+	// Archive the second project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+archivedProject.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	// List projects without include_archived
+	listReq := httptest.NewRequest("GET", "/projects", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var projects []store.Project
+	json.NewDecoder(listW.Body).Decode(&projects)
+
+	// Find our projects in the list (filter by name to handle test isolation)
+	var foundActive, foundArchived bool
+	for _, p := range projects {
+		if p.ID == activeProject.ID && p.Name == "active-project" {
+			foundActive = true
+		}
+		if p.ID == archivedProject.ID && p.Name == "archived-project" {
+			foundArchived = true
+		}
+	}
+
+	// Verify only the active project is returned
+	if !foundActive {
+		t.Error("expected active project in list")
+	}
+	if foundArchived {
+		t.Error("did not expect archived project in default list (should exclude archived)")
+	}
+}
+
+// TestListProjectsIncludesArchivedWithFlag verifies that GET /projects?include_archived=true returns archived projects.
+func TestListProjectsIncludesArchivedWithFlag(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create two projects
+	p1 := map[string]string{"name": "active-project-2", "repo": "https://github.com/example/active2"}
+	p1Body, _ := json.Marshal(p1)
+	p1Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p1Body))
+	p1Req.Header.Set("Authorization", authHeader)
+	p1Req.Header.Set("Content-Type", "application/json")
+	p1W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p1W, p1Req)
+	var activeProject store.Project
+	json.NewDecoder(p1W.Body).Decode(&activeProject)
+
+	p2 := map[string]string{"name": "archived-project-2", "repo": "https://github.com/example/archived2"}
+	p2Body, _ := json.Marshal(p2)
+	p2Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p2Body))
+	p2Req.Header.Set("Authorization", authHeader)
+	p2Req.Header.Set("Content-Type", "application/json")
+	p2W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p2W, p2Req)
+	var archivedProject store.Project
+	json.NewDecoder(p2W.Body).Decode(&archivedProject)
+
+	// Archive the second project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+archivedProject.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	// List projects WITH include_archived=true
+	listReq := httptest.NewRequest("GET", "/projects?include_archived=true", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var projects []store.Project
+	json.NewDecoder(listW.Body).Decode(&projects)
+
+	// Verify archived_at is set on archived project (filter by name to handle test isolation)
+	hasActiveProject := false
+	hasArchivedProject := false
+	for _, p := range projects {
+		if p.ID == activeProject.ID && p.Name == "active-project-2" {
+			hasActiveProject = true
+			if p.ArchivedAt != nil {
+				t.Errorf("expected ArchivedAt to be nil for active project, got %v", p.ArchivedAt)
+			}
+		}
+		if p.ID == archivedProject.ID && p.Name == "archived-project-2" {
+			hasArchivedProject = true
+			if p.ArchivedAt == nil {
+				t.Error("expected ArchivedAt to be set for archived project, got nil")
+			}
+		}
+	}
+
+	if !hasActiveProject {
+		t.Error("active project not found in list")
+	}
+	if !hasArchivedProject {
+		t.Error("archived project not found in list")
 	}
 }
