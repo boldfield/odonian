@@ -1393,6 +1393,168 @@ func TestCreateTasksMissingDocumentID(t *testing.T) {
 	}
 }
 
+// TestCreateTasksAcceptsBuildTrack verifies CreateTasks accepts build track.
+func TestCreateTasksAcceptsBuildTrack(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Build Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			Track:      "build",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", w.Code)
+	}
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(createdTasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(createdTasks))
+	}
+
+	if createdTasks[0].Track != "build" {
+		t.Errorf("expected track 'build', got %q", createdTasks[0].Track)
+	}
+}
+
+// TestCreateTasksAcceptsDesignTrack verifies CreateTasks accepts design track.
+func TestCreateTasksAcceptsDesignTrack(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Design Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			Track:      "design",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", w.Code)
+	}
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(createdTasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(createdTasks))
+	}
+
+	if createdTasks[0].Track != "design" {
+		t.Errorf("expected track 'design', got %q", createdTasks[0].Track)
+	}
+}
+
+// TestCreateTasksDefaultsTrackToBuild verifies CreateTasks defaults track to build when empty.
+func TestCreateTasksDefaultsTrackToBuild(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Default Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			// Track not specified - should default to build
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", w.Code)
+	}
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(createdTasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(createdTasks))
+	}
+
+	if createdTasks[0].Track != "build" {
+		t.Errorf("expected track to default to 'build', got %q", createdTasks[0].Track)
+	}
+}
+
+// TestCreateTasksRejectsUnknownTrack verifies CreateTasks rejects unknown track with UNKNOWN_TRACK error.
+func TestCreateTasksRejectsUnknownTrack(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Unknown Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			Track:      "testing",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+
+	var errResp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+
+	errObj, ok := errResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error response missing 'error' field")
+	}
+
+	code, ok := errObj["code"].(string)
+	if !ok || code != "UNKNOWN_TRACK" {
+		t.Errorf("expected error code 'UNKNOWN_TRACK', got %q", code)
+	}
+}
+
 // TestPromoteTaskBacklogToReady verifies promoting a backlog task to ready succeeds.
 func TestPromoteTaskBacklogToReady(t *testing.T) {
 	server := setupTestServer(t, "test-token")
