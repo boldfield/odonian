@@ -992,6 +992,178 @@ func TestBoardModel_TickGeneration(t *testing.T) {
 	}
 }
 
+// extractFieldsFromOptions extracts the Fields field from TaskListOptions if set.
+func extractFieldsFromOptions(options ...tuiclient.TaskListOption) string {
+	opts := &tuiclient.TaskListOptions{}
+	for _, opt := range options {
+		opt(opts)
+	}
+	return opts.Fields
+}
+
+// TestBoardModel_PerStatePollingWithSummaryFields verifies the per-state polling contract:
+// - On tick: exactly 6 active-state WithState(...)+fields=summary calls
+// - On startup/manual refresh: exactly 9 state-filtered summary calls
+// - Terminal columns (done, failed, abandoned) preserved without being fetched during polling
+func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
+	type listTasksCall struct {
+		state  string
+		fields string
+	}
+
+	var pollCalls []listTasksCall
+	var refreshCalls []listTasksCall
+	var allCalls []listTasksCall
+
+	mockClient := &tuiclient.MockClient{
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			state := extractStateFromOptions(options...)
+			fields := extractFieldsFromOptions(options...)
+			call := listTasksCall{state: state, fields: fields}
+			allCalls = append(allCalls, call)
+			return []tuiclient.Task{}, nil
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test"}
+
+	model := NewBoardModel(mockClient, config, project)
+
+	// Set up initial state with active and terminal tasks
+	initialBucketed := make(map[string][]tuiclient.Task)
+	for _, state := range stateOrder {
+		initialBucketed[state] = []tuiclient.Task{}
+	}
+	initialBucketed["in_progress"] = []tuiclient.Task{
+		{ID: "task-1", Title: "Active", State: "in_progress"},
+	}
+	initialBucketed["done"] = []tuiclient.Task{
+		{ID: "task-done", Title: "Done", State: "done"},
+	}
+	initialBucketed["failed"] = []tuiclient.Task{
+		{ID: "task-failed", Title: "Failed", State: "failed"},
+	}
+	initialBucketed["abandoned"] = []tuiclient.Task{
+		{ID: "task-abandoned", Title: "Abandoned", State: "abandoned"},
+	}
+
+	m, _ := model.Update(tasksFetchedMsg{tasks: initialBucketed})
+	model = m.(*BoardModel)
+
+	// Trigger a tick (polling)
+	allCalls = []listTasksCall{}
+	m, tickCmd := model.Update(tickMsg{})
+	model = m.(*BoardModel)
+
+	// Execute the tick command to trigger the fetch
+	if tickCmd != nil {
+		// Run the batch command to get messages
+		tickMsgs := runCmd(tickCmd)
+		for _, msg := range tickMsgs {
+			m, _ := model.Update(msg)
+			model = m.(*BoardModel)
+		}
+	}
+
+	// Extract just the polling calls (exclude the initial fetch if any)
+	// The tick should trigger fetchActiveTasks which makes one call per active state
+	activeStateNames := []string{stateBacklog, stateReady, stateInProgress, stateReview, stateApproved, stateBlocked}
+	pollCalls = allCalls
+
+	// Verify active state polling: exactly 6 calls with WithState and fields=summary
+	if len(pollCalls) != 6 {
+		t.Errorf("Expected 6 active-state poll calls, got %d", len(pollCalls))
+	}
+
+	// Create a map of expected active states
+	expectedActiveStates := make(map[string]bool)
+	for _, state := range activeStateNames {
+		expectedActiveStates[state] = true
+	}
+
+	// Verify each call has the right state and fields
+	seenStates := make(map[string]int)
+	for _, call := range pollCalls {
+		if !expectedActiveStates[call.state] {
+			t.Errorf("Unexpected state in poll call: %s (expected only active states)", call.state)
+		}
+		if call.fields != "summary" {
+			t.Errorf("Expected fields=summary in poll call, got %q", call.fields)
+		}
+		seenStates[call.state]++
+	}
+
+	// Verify all active states are covered exactly once
+	for _, state := range activeStateNames {
+		if seenStates[state] != 1 {
+			t.Errorf("State %s: expected 1 poll call, got %d", state, seenStates[state])
+		}
+	}
+
+	// Verify terminal columns are preserved from the initial data without fetching
+	if len(model.tasks["done"]) != 1 || model.tasks["done"][0].ID != "task-done" {
+		t.Errorf("Expected done column preserved with task-done, got %v", model.tasks["done"])
+	}
+	if len(model.tasks["failed"]) != 1 || model.tasks["failed"][0].ID != "task-failed" {
+		t.Errorf("Expected failed column preserved with task-failed, got %v", model.tasks["failed"])
+	}
+	if len(model.tasks["abandoned"]) != 1 || model.tasks["abandoned"][0].ID != "task-abandoned" {
+		t.Errorf("Expected abandoned column preserved with task-abandoned, got %v", model.tasks["abandoned"])
+	}
+
+	// --- Test manual refresh (r key) fetches all 9 states ---
+	allCalls = []listTasksCall{}
+	m, refreshCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = m.(*BoardModel)
+
+	if refreshCmd == nil {
+		t.Errorf("Expected refresh command from 'r' key, got nil")
+	} else {
+		refreshMsgs := runCmd(refreshCmd)
+		for _, msg := range refreshMsgs {
+			m, _ := model.Update(msg)
+			model = m.(*BoardModel)
+		}
+	}
+
+	refreshCalls = allCalls
+
+	// Verify full refresh: exactly 9 calls with WithState and fields=summary
+	if len(refreshCalls) != 9 {
+		t.Errorf("Expected 9 state poll calls on refresh, got %d", len(refreshCalls))
+	}
+
+	allStateNames := stateOrder
+	expectedAllStates := make(map[string]bool)
+	for _, state := range allStateNames {
+		expectedAllStates[state] = true
+	}
+
+	seenRefreshStates := make(map[string]int)
+	for _, call := range refreshCalls {
+		if !expectedAllStates[call.state] {
+			t.Errorf("Unexpected state in refresh call: %s", call.state)
+		}
+		if call.fields != "summary" {
+			t.Errorf("Expected fields=summary in refresh call, got %q", call.fields)
+		}
+		seenRefreshStates[call.state]++
+	}
+
+	// Verify all states are covered exactly once
+	for _, state := range allStateNames {
+		if seenRefreshStates[state] != 1 {
+			t.Errorf("State %s: expected 1 refresh call, got %d", state, seenRefreshStates[state])
+		}
+	}
+}
+
 // --- TUI-4: Review action tests ---
 
 // reviewTestBucketed returns a bucketed task map with one review task.
