@@ -8627,7 +8627,7 @@ func TestSupersedeTaskForgeFailureStillSucceeds(t *testing.T) {
 }
 
 // TestSupersededTaskPreservesTrack verifies that the track field is preserved
-// when superseding a task (both in direct supersession and escalation paths).
+// when directly superseding a task via store.SupersedeTask.
 func TestSupersededTaskPreservesTrack(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
@@ -8679,6 +8679,139 @@ func TestSupersededTaskPreservesTrack(t *testing.T) {
 	}
 	if newTaskFull.Track != "design" {
 		t.Errorf("expected newTaskFull.Track to be 'design', got %q", newTaskFull.Track)
+	}
+}
+
+// TestSupersededTaskPreservesTrackEscalation verifies that the track field is preserved
+// when superseding a task via the circuit-breaker escalation path.
+func TestSupersededTaskPreservesTrackEscalation(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	escalateTrue := true
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Design Task",
+			Spec:         "Do the thing",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			Escalate:     &escalateTrue,
+			Track:        "design",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	maxReviewRounds := 5
+
+	submitAndReject := func(roundNum int) {
+		task, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get task (round %d): %v", roundNum, err)
+		}
+		if task.State == "backlog" {
+			_, err := store.PromoteTask(ctx, taskID)
+			if err != nil {
+				t.Fatalf("failed to promote task (round %d): %v", roundNum, err)
+			}
+		}
+
+		_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+		if err != nil {
+			t.Fatalf("failed to claim task (round %d): %v", roundNum, err)
+		}
+
+		_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, maxReviewRounds, nil)
+		if err != nil {
+			t.Fatalf("failed to submit implement task (round %d): %v", roundNum, err)
+		}
+
+		allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks (round %d): %v", roundNum, err)
+		}
+
+		var reviewTask *Task
+		for i := range allTasks {
+			if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID && allTasks[i].State == "ready" {
+				reviewTask = &allTasks[i]
+				break
+			}
+		}
+		if reviewTask == nil {
+			t.Fatalf("review task not found (round %d)", roundNum)
+		}
+
+		_, err = store.ClaimTask(ctx, reviewTask.ID, "opus-reviewer", "opus", 5*time.Minute)
+		if err != nil {
+			t.Fatalf("failed to claim review task (round %d): %v", roundNum, err)
+		}
+
+		reject := "reject"
+		_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, maxReviewRounds, nil)
+		if err != nil {
+			t.Fatalf("failed to submit review task (round %d): %v", roundNum, err)
+		}
+	}
+
+	// Rounds 1-8: should transition to ready
+	for i := 1; i <= 8; i++ {
+		submitAndReject(i)
+
+		parent, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get task (round %d): %v", i, err)
+		}
+		if parent.State != "ready" {
+			t.Errorf("round %d: expected parent state 'ready', got '%s'", i, parent.State)
+		}
+	}
+
+	// Round 9: should escalate to sonnet
+	submitAndReject(9)
+
+	// Original task should be superseded
+	parent, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get original task: %v", err)
+	}
+	if parent.State != "superseded" {
+		t.Errorf("expected original task state 'superseded', got '%s'", parent.State)
+	}
+	if parent.SupersededBy == nil {
+		t.Errorf("expected original task SupersededBy to be set")
+	} else {
+		// Verify the escalated task exists and preserves track="design"
+		escalatedTask, err := store.GetTask(ctx, *parent.SupersededBy)
+		if err != nil {
+			t.Fatalf("failed to get escalated task: %v", err)
+		}
+		if escalatedTask.Model != "sonnet" {
+			t.Errorf("expected escalated task model 'sonnet', got '%s'", escalatedTask.Model)
+		}
+		if escalatedTask.State != "ready" {
+			t.Errorf("expected escalated task state 'ready', got '%s'", escalatedTask.State)
+		}
+		if escalatedTask.Track != "design" {
+			t.Errorf("expected escalated task Track to be 'design', got %q", escalatedTask.Track)
+		}
 	}
 }
 
