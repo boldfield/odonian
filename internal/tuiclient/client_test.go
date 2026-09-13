@@ -359,6 +359,61 @@ func TestListTasksWithPartialFilters(t *testing.T) {
 	}
 }
 
+func TestListTasksWithState(t *testing.T) {
+	// Create a test server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the exact request URL for state alone
+		if r.RequestURI != "/projects/proj123/tasks?state=ready" {
+			t.Errorf("expected /projects/proj123/tasks?state=ready, got %s", r.RequestURI)
+		}
+
+		// Write response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode([]Task{})
+	}))
+	defer server.Close()
+
+	// Create client
+	client := NewHTTPClient(server.URL, "testtoken")
+
+	// Test with only the state filter
+	_, err := client.ListTasks(context.Background(), "proj123",
+		WithState("ready"),
+	)
+	if err != nil {
+		t.Fatalf("ListTasks with state failed: %v", err)
+	}
+}
+
+func TestListTasksWithStateAndKind(t *testing.T) {
+	// Create a test server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the exact request URL for state combined with kind
+		if r.RequestURI != "/projects/proj123/tasks?kind=review&state=in_progress" {
+			t.Errorf("expected /projects/proj123/tasks?kind=review&state=in_progress, got %s", r.RequestURI)
+		}
+
+		// Write response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode([]Task{})
+	}))
+	defer server.Close()
+
+	// Create client
+	client := NewHTTPClient(server.URL, "testtoken")
+
+	// Test with the state filter combined with kind
+	_, err := client.ListTasks(context.Background(), "proj123",
+		WithKind("review"),
+		WithState("in_progress"),
+	)
+	if err != nil {
+		t.Fatalf("ListTasks with state and kind failed: %v", err)
+	}
+}
+
 func TestGetTask(t *testing.T) {
 	// Create a test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
