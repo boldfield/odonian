@@ -772,6 +772,106 @@ func TestGetTaskPrefixResolution(t *testing.T) {
 	})
 }
 
+// TestTaskRoutePrefixResolution verifies that prefix resolution is wired through
+// the operational /tasks/{id}/... routes, not just GET /tasks/{id}. It drives
+// POST /tasks/{id}/claim — an exact-id store operation — with a unique prefix
+// (must resolve and claim), an ambiguous prefix (must return 409 AMBIGUOUS_ID
+// with candidates), and a no-match prefix (must return 404).
+func TestTaskRoutePrefixResolution(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	insertReadyTask := func(id, title string) {
+		if _, err := server.store.Conn().Exec(`
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, held, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'ready', 'haiku', 0, ?, ?)
+		`, id, projectID, docID, title, "spec", now, now); err != nil {
+			t.Fatalf("failed to insert task %s: %v", id, err)
+		}
+	}
+
+	const (
+		uniqueTaskID = "clmuniq0-task-full-id-01"
+		ambiguousID1 = "clmambg0-task-full-a"
+		ambiguousID2 = "clmambg0-task-full-b"
+		uniquePfx    = "clmuniq0" // uniqueTaskID[:8]
+		ambiguousPfx = "clmambg0"
+	)
+
+	insertReadyTask(uniqueTaskID, "Claim Unique Prefix Task")
+	insertReadyTask(ambiguousID1, "Claim Ambiguous Task 1")
+	insertReadyTask(ambiguousID2, "Claim Ambiguous Task 2")
+
+	claim := func(idOrPrefix string) *httptest.ResponseRecorder {
+		payload, _ := json.Marshal(map[string]string{"agent_id": "test-agent", "model": "haiku"})
+		req := httptest.NewRequest("POST", "/tasks/"+idOrPrefix+"/claim", bytes.NewReader(payload))
+		req.Header.Set("Authorization", authHeader)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("unique prefix resolves and claims", func(t *testing.T) {
+		w := claim(uniquePfx)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 claiming by unique prefix, got %d: %s", w.Code, w.Body.String())
+		}
+		var claimed store.Task
+		if err := json.NewDecoder(w.Body).Decode(&claimed); err != nil {
+			t.Fatalf("failed to decode claimed task: %v", err)
+		}
+		if claimed.ID != uniqueTaskID {
+			t.Errorf("expected resolved id %s, got %s", uniqueTaskID, claimed.ID)
+		}
+		if claimed.State != "in_progress" {
+			t.Errorf("expected state in_progress after claim, got %s", claimed.State)
+		}
+	})
+
+	t.Run("no match returns 404", func(t *testing.T) {
+		w := claim("zzzzzzzz")
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404 claiming by non-matching prefix, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("ambiguous prefix returns 409 with candidates", func(t *testing.T) {
+		w := claim(ambiguousPfx)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409 claiming by ambiguous prefix, got %d: %s", w.Code, w.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		errObj, ok := resp["error"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("response missing 'error' field: %v", resp)
+		}
+		if code, _ := errObj["code"].(string); code != "AMBIGUOUS_ID" {
+			t.Errorf("expected code AMBIGUOUS_ID, got %v", errObj["code"])
+		}
+		candidatesRaw, ok := errObj["candidates"].([]interface{})
+		if !ok {
+			t.Fatalf("expected candidates array in error response, got %v", errObj["candidates"])
+		}
+		candidates := make([]string, 0, len(candidatesRaw))
+		for _, c := range candidatesRaw {
+			s, _ := c.(string)
+			candidates = append(candidates, s)
+		}
+		sort.Strings(candidates)
+		want := []string{ambiguousID1, ambiguousID2}
+		if len(candidates) != 2 || candidates[0] != want[0] || candidates[1] != want[1] {
+			t.Errorf("expected candidates %v, got %v", want, candidates)
+		}
+	})
+}
+
 // TestBulkCreateTasksWithIntraBatchDependency verifies bulk create persists tasks and edges.
 func TestBulkCreateTasksWithIntraBatchDependency(t *testing.T) {
 	server := setupTestServer(t, "test-token")

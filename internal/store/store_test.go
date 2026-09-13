@@ -2157,6 +2157,26 @@ func TestGetTaskPrefixResolution(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("LIKE wildcards in prefix are matched literally", func(t *testing.T) {
+		// A prefix of eight underscores must not behave as LIKE single-char
+		// wildcards matching every row; an unescaped `LIKE '________%'` would
+		// match all four tasks and report AMBIGUOUS_ID. Escaped, it matches no
+		// id (no stored id contains a literal underscore) -> not found.
+		if _, err := store.GetTask(ctx, "________"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for all-underscore prefix (wildcards must be escaped), got %v", err)
+		}
+		// '_' standing in for a real character must not match either:
+		// uniqueTaskID is "uniq-task-...", so "uniq_tas" resolves to it only if
+		// '_' is treated as a wildcard. It must be literal -> not found.
+		if _, err := store.GetTask(ctx, "uniq_tas"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for underscore-as-wildcard prefix, got %v", err)
+		}
+		// '%' (multi-char wildcard) must likewise be literal.
+		if _, err := store.GetTask(ctx, "%%%%%%%%"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for all-percent prefix (wildcards must be escaped), got %v", err)
+		}
+	})
 }
 
 // TestCreateTasksWithConfiguredAllowlist verifies that model allowlist validation works.

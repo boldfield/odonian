@@ -203,10 +203,12 @@ curl -H "Authorization: Bearer token" \
 #### Task ID Conventions
 
 Task ids are 36-character UUIDs, but table output (CLI, TUI) truncates them to
-8 characters for readability. `GET /tasks/{id}` accepts either the full id or
-any unique prefix of at least 8 characters, so a truncated id copied from a
-table can be used directly without a `--json | jq` round trip to recover the
-full UUID:
+8 characters for readability. Every task-id route — `GET /tasks/{id}` and each
+`/tasks/{id}/...` operation (claim, heartbeat, promote, submit, review,
+transition, supersede, hold, release, archive, unarchive, events, and `PATCH
+/tasks/{id}`) — accepts either the full id or any unique prefix of at least 8
+characters, so a truncated id copied from a table can be used directly without
+a `--json | jq` round trip to recover the full UUID:
 - **Exact id** (36 characters): looked up as-is.
 - **Unique prefix** (8-35 characters) matching exactly one task: resolved to
   that task.
@@ -215,6 +217,10 @@ full UUID:
   the error's `candidates` field.
 - **Fewer than 8 characters**: always `404 NOT_FOUND` (too short to safely
   disambiguate).
+
+The prefix is matched literally: `%` and `_` are not treated as SQL wildcards,
+so a prefix such as `________` resolves to `404 NOT_FOUND` rather than matching
+every task.
 
 #### `POST /projects/{id}/tasks`
 

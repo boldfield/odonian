@@ -38,6 +38,7 @@ type Store interface {
 	CreateDocument(ctx context.Context, projectID, kind, title, ref string, commit *string) (Document, error)
 	ListDocuments(ctx context.Context, projectID string, kind *string) ([]Document, error)
 	CreateTasks(ctx context.Context, projectID string, tasks []TaskInput) ([]Task, error)
+	ResolveTaskID(ctx context.Context, id string) (string, error)
 	GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error)
 	ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error)
 	ListDependents(ctx context.Context, taskID string) ([]string, error)
@@ -1105,15 +1106,27 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 	return createdTasks, nil
 }
 
-// resolveTaskID resolves a possibly-truncated task id to the full stored id.
+// likeEscape escapes the SQL LIKE metacharacters ('%', '_') and the escape
+// character itself so a caller-supplied string matches literally under a
+// `LIKE ? ESCAPE '\'` clause. Without this, a prefix such as "____" or "%"
+// would be treated as a wildcard pattern and match unrelated task ids.
+func likeEscape(s string) string {
+	return likeEscaper.Replace(s)
+}
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// ResolveTaskID resolves a possibly-truncated task id to the full stored id.
 // Stored ids are 36-char UUIDs, so an id of that length or longer is treated
 // as exact and returned unchanged (existing exact-match callers see no
 // behavior change). A shorter id is resolved as a prefix: exactly one match
 // returns that id, no match returns ErrNotFound, and several matches return a
 // *ConflictError with Code AMBIGUOUS_ID and the candidate ids attached. An id
 // shorter than 8 characters is too short to safely disambiguate and is
-// rejected as not-found without a database lookup.
-func (s *sqliteStore) resolveTaskID(ctx context.Context, id string) (string, error) {
+// rejected as not-found without a database lookup. The prefix is matched
+// literally — LIKE wildcards in the input are escaped, so "________" resolves
+// to not-found rather than matching every task.
+func (s *sqliteStore) ResolveTaskID(ctx context.Context, id string) (string, error) {
 	if len(id) >= 36 {
 		return id, nil
 	}
@@ -1121,7 +1134,7 @@ func (s *sqliteStore) resolveTaskID(ctx context.Context, id string) (string, err
 		return "", ErrNotFound
 	}
 
-	rows, err := s.readConn.QueryContext(ctx, `SELECT id FROM task WHERE id LIKE ? || '%' ORDER BY id`, id)
+	rows, err := s.readConn.QueryContext(ctx, `SELECT id FROM task WHERE id LIKE ? ESCAPE '\' ORDER BY id`, likeEscape(id)+"%")
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve task id prefix: %w", err)
 	}
@@ -1151,9 +1164,9 @@ func (s *sqliteStore) resolveTaskID(ctx context.Context, id string) (string, err
 
 // GetTask retrieves a task by id, including its dependencies and links.
 // The id may be a unique prefix (at least 8 characters) of the full id; see
-// resolveTaskID. Returns ErrNotFound if the task does not exist.
+// ResolveTaskID. Returns ErrNotFound if the task does not exist.
 func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error) {
-	id, err := s.resolveTaskID(ctx, id)
+	id, err := s.ResolveTaskID(ctx, id)
 	if err != nil {
 		return TaskWithDepsAndLinks{}, err
 	}
