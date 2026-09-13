@@ -1157,7 +1157,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	// Fetch dependencies
 	depRows, err := s.readConn.QueryContext(ctx, `
 		SELECT depends_on_id FROM task_dep WHERE task_id = ? ORDER BY depends_on_id
-	`, id)
+	`, resolvedID)
 	if err != nil {
 		return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query dependencies: %w", err)
 	}
@@ -1178,7 +1178,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	// Fetch links
 	linkRows, err := s.readConn.QueryContext(ctx, `
 		SELECT id, task_id, kind, value, tombstoned_at FROM task_link WHERE task_id = ? ORDER BY id
-	`, id)
+	`, resolvedID)
 	if err != nil {
 		return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query links: %w", err)
 	}
