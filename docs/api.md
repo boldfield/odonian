@@ -4,13 +4,20 @@
 
 The Odonian API is a RESTful coordination substrate for managing a backlog of work claimed and executed by AI agents. All endpoints (except `/healthz`) require a bearer token authentication.
 
+Task URL paths accept full UUIDs or unique prefixes of at least eight characters; see
+[Task ID Conventions](#task-id-conventions). Project IDs, document IDs, and dependency references
+still require full UUIDs (or intra-batch task keys where supported).
+JSON field names are lowercase (`id`, `project_id`, etc.).
+The shared token authorizes access across every project and task; agent IDs identify actors
+and lease owners, not separate authenticated principals.
+
 ## Authentication
 
 All endpoints except `GET /healthz` require the `Authorization: Bearer <token>` header.
 
 **Server Configuration:**
 - `ODONIAN_TOKEN` (required): The bearer token to authenticate requests
-- `ODONIAN_DB` (required): SQLite database path (e.g., `/data/odonian.db`)
+- `ODONIAN_DB` (optional, default `odonian.db`): SQLite database path (e.g., `/data/odonian.db`)
 - `ODONIAN_ADDR` (optional, default `:8080`): Server address and port
 
 **Example:**
@@ -82,7 +89,7 @@ Create a new project.
 
 #### `GET /projects/{id}`
 
-Retrieve a project by ID.
+Retrieve a project by ID, including an archived project.
 
 **Request:**
 ```bash
@@ -107,6 +114,61 @@ curl -H "Authorization: Bearer token" \
 - `500 GET_ERROR`: Server error retrieving project
 
 **Note:** The `archived_at` field is `null` for active projects or contains the timestamp when the project was archived.
+
+---
+
+#### `GET /projects`
+
+List projects, ordered by creation time. Archived projects are excluded by default.
+
+```bash
+curl -H "Authorization: Bearer token" \
+  'https://api.example.com/projects?claimable=true&model=haiku&kind=implement'
+```
+
+**Query Parameters:**
+
+- `claimable=true`: Include only projects with at least one claimable, unarchived task.
+- `model`: Restrict matching work to this model when `claimable=true`.
+- `kind`: Restrict matching work to `implement`, `review`, or `merge` when `claimable=true`.
+- `include_archived=true`: Include archived projects in the listing.
+- `include_superseded=true`: Accepted by the discovery filter; superseded tasks remain
+  unclaimable, so they do not cause a project to appear in claimable discovery.
+
+**Response:** `200 OK` with an array of project objects, or `[]` if none match. Returns
+`400 INVALID_KIND` for an unsupported kind and `500 LIST_ERROR` on a storage failure.
+
+Project objects include `archived_at`: `null` for active projects and the archive timestamp
+for archived projects. Use `include_archived=true` to list both, then inspect this field to
+identify projects to unarchive.
+
+#### `POST /projects/{id}/archive`
+
+Soft-archive a project by setting `archived_at`. No request body is required.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" \
+  https://api.example.com/projects/550e8400-e29b-41d4-a716-446655440000/archive
+```
+
+**Response:** `200 OK` with the project object and its `archived_at` timestamp;
+`404 NOT_FOUND` if absent, or `500 ARCHIVE_ERROR` on failure.
+
+Archiving hides the project from default project listings and fleet discovery. It does not
+archive its tasks, cancel active workers, or prevent direct requests using known IDs. It is
+not an access control or a substitute for stopping a fleet pinned to that project.
+
+#### `POST /projects/{id}/unarchive`
+
+Restore a project's visibility by clearing `archived_at`. No request body is required.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" \
+  https://api.example.com/projects/550e8400-e29b-41d4-a716-446655440000/unarchive
+```
+
+**Response:** `200 OK` with the project object and `archived_at: null`;
+`404 NOT_FOUND` if absent, or `500 UNARCHIVE_ERROR` on failure. Tasks retain their existing states.
 
 ---
 
@@ -209,18 +271,30 @@ transition, supersede, hold, release, archive, unarchive, events, and `PATCH
 /tasks/{id}`) — accepts either the full id or any unique prefix of at least 8
 characters, so a truncated id copied from a table can be used directly without
 a `--json | jq` round trip to recover the full UUID:
+
 - **Exact id** (36 characters): looked up as-is.
 - **Unique prefix** (8-35 characters) matching exactly one task: resolved to
   that task.
-- **No match**: `404 NOT_FOUND`.
+- **No matching prefix**: `404 NOT_FOUND`.
 - **Several matches**: `409 AMBIGUOUS_ID`, with the candidate ids listed in
-  the error's `candidates` field.
+  `error.candidates`.
 - **Fewer than 8 characters**: always `404 NOT_FOUND` (too short to safely
   disambiguate).
 
 The prefix is matched literally: `%` and `_` are not treated as SQL wildcards,
 so a prefix such as `________` resolves to `404 NOT_FOUND` rather than matching
 every task.
+
+Resolution covers all tasks on the board, including archived and superseded tasks; it is not
+scoped to the project currently displayed. Use a longer prefix or the full UUID on ambiguity.
+IDs in response bodies remain full UUIDs. Prefix support applies to task IDs in URL paths,
+not to project/document IDs or task IDs inside `depends_on` arrays.
+
+**CLI local-worktree limitation:** `show` and `diff` can use a unique task prefix. In
+`local_commit` mode, continue using full UUIDs for `wt-ensure`, implement-task `submit`,
+`approve`, and `reject --abandon`: their filesystem operations still construct worktree and
+`wip/<id>` names from the argument as typed. A prefix can resolve on the board but fail to find
+the full-ID worktree or branch. The [demo](./demo.md#4-inspect-the-work-and-decide) uses full IDs.
 
 #### `POST /projects/{id}/tasks`
 
@@ -254,9 +328,25 @@ Bulk-create tasks for a project.
 - `spec` (required): Task specification/description
 - `document_id` (required): ID of the design or feature document this task is decomposed from
 - `model` (optional): Assigned model (e.g., `haiku`, `sonnet`, `opus`); must be in the deployment allowlist if provided. If omitted or empty, defaults to the deployment default model.
-- `track` (optional): Task track that determines the prompt path (e.g., `build`, `design`, `security`). Defaults to `build`. If the delivery mode + track + kind combination has no prompt file, the task will be transitioned to `blocked` with a note.
 - `review_models` (optional): List of reviewer models for this task (e.g., `["opus", "sonnet"]`); each must be in the allowlist. Default is `["opus"]` if unset/empty. Ignored for review tasks (auto-spawned only).
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
+- `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
+- `escalate` (optional, default `true`): Allow replacement by a higher model tier after the review threshold is exceeded.
+- `track` (optional, default `build`): `build` or `design`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
+
+| Delivery mode | Supported tracks |
+|---|---|
+| `pull_request` | `build`, `design` |
+| `local_commit` | `build` |
+
+These combinations have worker and reviewer prompts in the bundled harness. The API validates
+the track name, but delivery mode is a harness setting: `design` is accepted even when a slot
+uses `local_commit`. If the selected prompt file is missing, the harness transitions the task
+to `blocked` with a `no prompt for <delivery-mode>/<track>/<kind>: <path>` note, logs the missing
+file, and sleeps 30 seconds before continuing. Once blocked, the task no longer prevents later
+claimable work from being selected. Supply the missing prompt or use a compatible delivery
+mode, then transition `blocked` → `ready` to retry. Supersession preserves the track, so merely
+superseding the task will not resolve a missing prompt.
 
 **Response (201 Created):**
 ```json
@@ -347,12 +437,14 @@ curl -H "Authorization: Bearer token" \
 ```
 
 **Query Parameters:**
-- `state` (optional): Filter by task state (`backlog`, `ready`, `in_progress`, `review`, `approved`, `done`, `blocked`, `failed`)
+- `state` (optional): Filter by task state (`backlog`, `ready`, `in_progress`, `review`, `approved`, `done`, `blocked`, `failed`, `superseded`, `abandoned`)
 - `model` (optional): Filter by assigned model (e.g., `haiku`, `sonnet`, `opus`)
-- `kind` (optional): Filter by task kind (`implement` or `review`)
+- `kind` (optional): Filter by task kind (`implement`, `review`, or `merge`)
 - `assignee` (optional): Filter by agent ID
-- `claimable` (optional): If `true`, only return tasks that can be claimed (in `ready` state with no live lease and all dependencies done)
-- `fields` (optional): If `summary`, omit `spec` and `result` from each task (reduces response size; the full task is still available from `GET /tasks/{id}`)
+- `claimable` (optional): If `true`, only return tasks in `ready`, or `in_progress` with an expired lease, that are not held and have all dependencies done.
+- `include_archived` (optional): If `true`, include archived tasks; otherwise they are hidden.
+- `include_superseded` (optional): If `true`, include superseded tasks; otherwise they are hidden even when filtering by `state=superseded`.
+- `fields` (optional): `summary` omits `spec` and `result` while retaining the other task fields. Omitted or unrecognized values return the full listing representation. Fetch `GET /tasks/{id}` for the full task with dependencies and links.
 
 **Response (200 OK):**
 
@@ -404,7 +496,9 @@ With `fields=summary` (omits `spec` and `result`):
 - `200 OK`: Tasks retrieved
 - `500 LIST_ERROR`: Server error listing tasks
 
-**Note:** Response contains an empty array if no tasks match the filters. Tasks can only be claimed if they are in the `ready` state, have no active lease, and all their dependencies are `done`. All tasks have a `kind` (implement or review) and a `model`; review tasks additionally have a `target_task_id` pointing to their parent implement task. The `fields=summary` parameter reduces response size by omitting `spec` and `result`; the full task is still available from `GET /tasks/{id}`.
+**Note:** Response contains an empty array if no tasks match the filters. Claims require `ready`
+or an expired `in_progress` lease, `held=false`, and every dependency in `done`. All tasks have a
+`kind` and a `model`; review and merge tasks have a `target_task_id` pointing to their parent.
 
 ---
 
@@ -460,10 +554,11 @@ curl -H "Authorization: Bearer token" \
 **Status Codes:**
 - `200 OK`: Task retrieved
 - `404 NOT_FOUND`: Task not found (including an id prefix with no matches, or shorter than 8 characters)
-- `409 AMBIGUOUS_ID`: The id prefix matches more than one task; the response's `candidates` field lists the matching ids
+- `409 AMBIGUOUS_ID`: The id prefix matches more than one task; `error.candidates` lists the matching ids
 - `500 GET_ERROR`: Server error retrieving task
 
-**Note:** This endpoint returns a rich response with field names in lowercase (unlike most other endpoints which use uppercase). It includes the full dependency list and all linked resources. `{id}` accepts a unique prefix — see [Task ID Conventions](#task-id-conventions).
+**Note:** This endpoint returns lowercase field names, the full dependency list, and linked
+resources. `{id}` accepts a unique prefix — see [Task ID Conventions](#task-id-conventions).
 
 ---
 
@@ -808,7 +903,7 @@ to drain the `approved` lane by merging and marking done, or to override an appr
 ```
 
 **Parameters:**
-- `to` (required): Target state (`done`, `blocked`, `ready`, or `failed`)
+- `to` (required): Target state (`done`, `blocked`, `ready`, `failed`, `superseded`, or `abandoned`)
 - `note` (optional): Reason or context for the transition
 
 **Response (200 OK):**
@@ -844,185 +939,232 @@ to drain the `approved` lane by merging and marking done, or to override an appr
 The state machine enforces these rules:
 - `ready` → `in_progress` (via claim)
 - `in_progress` → `review` (via submit for implement tasks)
-- `review` → `approved` (when all reviewers approve; automatic, via verdict)
-- `review` → `ready` (when any reviewer rejects; automatic, via verdict)
+- `review` → `approved` (when all reviewers approve; via the final verdict, or release after a held round finishes)
+- `review` → `done` (automatic after unanimous approval when `agent_merge=true`, a `no_op` link exists, and no `pr` link exists)
+- `review` → `ready` (once every review finishes and at least one rejects, unless the circuit breaker escalates or blocks the task)
 - `approved` → `done` (human merges PR)
 - `approved` → `ready` (human disagrees with reviewers, requests rework)
 - `blocked` → `ready` (human unblocks / retries; clears stale assignee and lease)
 - `blocked` → `failed` (retire a dead blocked task without re-entering the queue)
 - Any active state → `blocked` (off-ramp: external blocker)
 - Any active state → `failed` (off-ramp: task cannot be done as specified)
+- Any active state → `superseded` (retire without creating a replacement; use `/supersede` to create one)
+- `approved` → `abandoned` (retire without merging)
+- `in_progress` → `done` for `merge` tasks only
 
-Note: `review` → `done` is no longer a direct transition. All paths to `done` now go through
-`approved`. The `approved` state is the human merge gate. `blocked` is recoverable via the
-`blocked` → `ready` transition, unlike terminal states `done` and `failed`. Once a `blocked`
-task is decided to be unrecoverable, use `blocked` → `failed` to retire it cleanly.
+The operator `/transition` endpoint does not permit `review` → `done`. Review aggregation does
+perform that direct transition for the opted-in no-op case above, in a single update; the parent
+never enters `approved` and will not appear in a script that drains that lane. A no-op task with
+`agent_merge=false` still waits in `approved` for a human decision. Merge subtasks instead go
+from `in_progress` to `done` after merging.
+
+`blocked` is recoverable via `blocked` → `ready`; use `blocked` → `failed` to retire it.
+The `/transition` endpoint cannot move a task out of `done`, `failed`, `superseded`, or `abandoned`.
+The separate `/supersede` endpoint also rejects these terminal states with `409 CONFLICT`.
 
 ---
+
+### Task events and operator actions
+
+#### `GET /tasks/{id}/events`
+
+Return the task's retained audit events, oldest first, ordered by `created_at` and then `id`.
+
+```bash
+curl -H "Authorization: Bearer token" \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/events
+```
+
+**Response (200 OK):**
+
+```json
+[
+  {
+    "id": "990e8400-e29b-41d4-a716-446655440004",
+    "task_id": "770e8400-e29b-41d4-a716-446655440002",
+    "actor": "haiku-1",
+    "kind": "claim",
+    "verdict": null,
+    "note": null,
+    "created_at": "2026-06-05T21:00:00.000000000Z"
+  }
+]
+```
+
+Returns `[]` when there are no retained events, including for an unknown full-length task UUID.
+An unmatched or too-short prefix returns `404 NOT_FOUND`; an ambiguous prefix returns
+`409 AMBIGUOUS_ID`. Use `GET /tasks/{id}` to check existence when passing a full UUID.
+Storage failures return `500 GET_ERROR`.
+See [event retention configuration](./configuration.md#server-odonian-server).
+
+#### `PATCH /tasks/{id}`
+
+Replace the task's complete dependency list. This endpoint currently updates only dependencies;
+it does not edit the title, spec, model, or other task fields.
+
+```bash
+curl -X PATCH -H "Authorization: Bearer token" -H 'Content-Type: application/json' \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002 \
+  -d '{"depends_on":["880e8400-e29b-41d4-a716-446655440003"]}'
+```
+
+Use full existing task UUIDs inside `depends_on`; the URL's task ID can be a unique prefix.
+`{"depends_on":[]}` clears dependencies; omitting `depends_on`
+or setting it to `null` also clears the list. Unknown JSON fields are ignored, so sending only
+an unsupported field would clear dependencies too. Send an explicit `depends_on` array.
+
+**Response:** `200 OK` with the task object. Fetch `GET /tasks/{id}` to read back `depends_on`;
+the PATCH response does not include the dependency list. Errors include `400 SELF_DEPENDENCY`,
+`400 JSON_DECODE_ERROR`, `409 CYCLE_DETECTED`, and `404 NOT_FOUND` for a missing task with an
+empty replacement list. Invalid dependency IDs, duplicates, or other storage failures currently
+return `500 UPDATE_ERROR`.
 
 #### `POST /tasks/{id}/supersede`
 
-Create a replacement task with the same specification and dependencies. The old task is marked
-as superseded. This is typically used when a task needs to be retried with an escalated model
-or when the original task should not be reused.
+Create a replacement task and atomically repoint dependents to it. The old task becomes
+`superseded` with `superseded_by` set to the new ID. The replacement starts in `backlog` with
+review round zero, copies the title, spec, model, reviewer models, track, merge/escalation settings,
+and upstream dependencies, and appends prior rejection feedback to the spec when present.
 
-**Request:**
-```json
-{
-  "model": "opus"
-}
+Supersession accepts `backlog`, `ready`, `in_progress`, `review`, `approved`, and `blocked` tasks.
+It rejects `done`, `failed`, `abandoned`, and already `superseded` tasks with `409 CONFLICT`,
+leaving their dependencies unchanged. Track is preserved for both manual supersession and
+circuit-breaker escalation, so a design task's replacement still uses design prompts.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" -H 'Content-Type: application/json' \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/supersede \
+  -d '{"model":"sonnet"}'
 ```
 
-**Parameters:**
-- `model` (optional): Override the model for the replacement task. If not provided, the replacement uses the original task's model.
+`model` is optional and must be in the server's allowlist. Send `{}` to keep the current model;
+a JSON body is required. The replacement must be promoted separately. This operator endpoint
+differs from circuit-breaker escalation, which automatically promotes its replacement.
 
-**Response (200 OK):**
-```json
-{
-  "id": "cc0e8400-e29b-41d4-a716-446655440007",
-  "project_id": "550e8400-e29b-41d4-a716-446655440000",
-  "document_id": "660e8400-e29b-41d4-a716-446655440001",
-  "title": "Implement authentication",
-  "spec": "Add bearer token authentication to all endpoints\n\n## Prior attempt feedback\n\n**opus-reviewer-1 (verdict: reject)**\nNeed better error handling\n\n",
-  "state": "backlog",
-  "kind": "implement",
-  "model": "opus",
-  "review_models": ["opus"],
-  "review_round": 0,
-  "assignee": null,
-  "lease_expires_at": null,
-  "result": null,
-  "track": "design",
-  "created_at": "2026-06-05T21:05:00.000000000Z",
-  "updated_at": "2026-06-05T21:05:00.000000000Z"
-}
-```
+**Response:** `201 Created` with the **new task**, including its full UUID. Returns
+`400 UNKNOWN_MODEL`, `400 JSON_DECODE_ERROR`, `404 NOT_FOUND`, `409 CONFLICT` for a terminal
+task, or `500 SUPERSEDE_ERROR`.
 
-**Status Codes:**
-- `200 OK`: Task superseded successfully
-- `400 UNKNOWN_MODEL`: The provided model is not in the deployment allowlist
-- `400 JSON_DECODE_ERROR`: Invalid JSON in request body
-- `404 NOT_FOUND`: Task not found
-- `409 CONFLICT`: Task is in a terminal state (done, failed, abandoned, or superseded) and cannot be superseded
-- `500 SUPERSEDE_ERROR`: Server error superseding task
-
-**Behavior:**
-- The replacement task inherits the title, spec, dependencies, and other task configuration from the original
-- Prior rejection feedback is prepended to the replacement's spec
-- The `track` field is preserved from the original task to the replacement
-- All downstream dependencies (tasks that depend on the original) are re-pointed to the replacement
-- The original task is marked with `state: superseded` and `superseded_by` set to the replacement task ID
-- The replacement task starts in `backlog` state and must be promoted to `ready` before claiming
-
----
-
-### Hold and Release
-
-Hold/Release provides an orthogonal task lock independent of state transitions. A held task cannot be claimed. This is useful for pausing work without transitioning state (e.g., pausing a review task while waiting for external input) or for temporarily preventing auto-transitions during maintenance.
+After the board transaction commits, the server attempts to close the old task's open PR and
+delete its head branch using its per-owner forge token. If the file or matching token is
+missing or empty, cleanup is skipped without any GitHub requests and one log line identifies
+the owner and PR. There is no `gh` or `GH_TOKEN` fallback. Cleanup runs asynchronously;
+a successful response confirms the board change, not completion of GitHub
+cleanup. PR-watch retries stale open PR cleanup on later passes only when it has a matching
+owner token. Supersession does not stop a running agent process.
 
 #### `POST /tasks/{id}/hold`
 
-Hold a task, preventing it from being claimed and blocking automatic state transitions.
+Set `held=true` without changing the task state or lease. No request body is required.
 
-**Request:**
 ```bash
 curl -X POST -H "Authorization: Bearer token" \
   https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/hold
 ```
 
-**Response (200 OK):**
-```json
-{
-  "id": "770e8400-e29b-41d4-a716-446655440002",
-  "state": "ready",
-  "held": true,
-  "...": "other task fields"
-}
-```
+Held tasks cannot be claimed, and reviewer submission skips automatic aggregation for a held
+parent. Holding does not terminate an already running worker or revoke its lease; it is not a
+general ban on API transitions or forge actions.
 
-**Status Codes:**
-- `200 OK`: Task held successfully
-- `404 NOT_FOUND`: Task not found
-- `500 HOLD_ERROR`: Server error holding task
+Reviewers may finish while their parent is held. The parent stays in `review` until released;
+`/release` applies the completed round's verdicts in the same transaction as clearing the hold.
 
-**Behavior:**
-- Hold works from any state (orthogonal lock)
-- A held task cannot be claimed; `POST /tasks/{id}/claim` returns `409 CONFLICT`
-- Automatic state transitions (e.g., from review aggregation) skip held tasks
-- The `held` flag persists across state transitions until explicitly released
-
----
+**Response:** `200 OK` with the task object and `held: true`; `404 NOT_FOUND` if absent,
+or `500 HOLD_ERROR` on failure.
 
 #### `POST /tasks/{id}/release`
 
-Release a held task, restoring normal automated flow.
+Clear `held` and, for a parent in `review` whose current round is complete, apply the review
+verdicts in the same transaction. No request body is required.
 
-**Request:**
 ```bash
 curl -X POST -H "Authorization: Bearer token" \
   https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/release
 ```
 
-**Response (200 OK):**
-```json
-{
-  "id": "770e8400-e29b-41d4-a716-446655440002",
-  "state": "approved",
-  "held": false,
-  "...": "other task fields"
-}
+If every review in the current round is done, release uses the same aggregation rules as
+review submission: unanimous approval moves the parent to `approved` (or directly to `done`
+for an opted-in no-op); rejection returns it to `ready`, escalates it, or blocks it according
+to the circuit breaker. Release itself does not increment `review_round`; the next implement
+submission starts a new round. A parent held through the final verdict needs only `/release`,
+not another implement pass, to apply that verdict.
+
+Outside `review`, or while reviews are unfinished, release only clears the hold. It does not
+revoke a lease or unclaim the task. Claimability still depends on state, dependencies, and lease expiry.
+
+**Response:** `200 OK` with the task object and `held: false`; `404 NOT_FOUND` if absent,
+or `500 RELEASE_ERROR` on failure.
+
+#### `POST /tasks/{id}/archive`
+
+Set `archived_at` to hide a task from default task listings and discovery. No request body is required.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/archive
 ```
 
-**Status Codes:**
-- `200 OK`: Task released successfully
-- `404 NOT_FOUND`: Task not found
-- `500 RELEASE_ERROR`: Server error releasing task
+**Response:** `200 OK` with the task object and its `archived_at` timestamp;
+`404 NOT_FOUND` if absent, or `500 ARCHIVE_ERROR` on failure.
 
-**Behavior:**
-- Release clears the `held` flag, allowing the task to be claimed again
-- If a task is released while in `review` state and all review tasks targeting it are done, the review round is aggregated automatically in the same transaction. This allows a held parent task to complete review aggregation when released (e.g., if all reviewers submitted verdicts while the parent was held).
-  - If all reviewers approved, the parent moves to `approved`
-  - If any reviewer rejected (and under escalation threshold), the parent moves to `ready` with `review_round` incremented
-  - If escalation threshold exceeded, the task may be escalated or blocked instead
-- For non-review tasks or review tasks with pending review tasks, release is a simple unlock with no state change
+Archiving preserves the task, state, dependencies, and links. It does not complete the task,
+satisfy dependents, stop an active worker, or prevent direct requests using the task UUID.
+
+#### `POST /tasks/{id}/unarchive`
+
+Clear `archived_at` to restore default listing visibility. No request body is required.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/unarchive
+```
+
+**Response:** `200 OK` with the task object and `archived_at: null`;
+`404 NOT_FOUND` if absent, or `500 UNARCHIVE_ERROR` on failure. The task keeps its existing state.
 
 ---
 
 ## Full Lifecycle Walkthrough
 
-Below is a copy-paste example of the complete task lifecycle using the modern model-assigned,
-review-as-a-task flow. A Haiku worker implements a feature, Opus reviewers approve it
-in parallel, and a human drains the `approved` lane to merge.
+This exercises the API against a running server with the default `haiku`, `sonnet`, `opus` model allowlist.
+Save the Bash block to a file and run it with `bash`; it stops on HTTP errors or missing IDs.
+Set `ODONIAN_URL` and `ODONIAN_TOKEN` to your test server, or use the defaults below.
+
+The script sends example worker and reviewer requests itself. It does not invoke an LLM,
+create commits, open a PR, or merge code; the repository, PR link, and verdicts are example data.
+Use a throwaway board with no fleet attached. For a real agent run, use the
+[guided demo](./demo.md).
 
 ```bash
 #!/bin/bash
+set -euo pipefail
 
 # Configuration
-BASE="http://localhost:8080"
-TOKEN="your-secret-token"
+BASE="${ODONIAN_URL:-http://localhost:8080}"
+TOKEN="${ODONIAN_TOKEN:-your-secret-token}"
 AUTH="Authorization: Bearer $TOKEN"
 
 echo "=== 1. Health check (no auth) ==="
-curl -s "$BASE/healthz" | jq .
+curl -fsS "$BASE/healthz" | jq .
 
 echo "=== 2. Create project ==="
-PROJECT=$(curl -s -X POST "$BASE/projects" \
+PROJECT=$(curl -fsS -X POST "$BASE/projects" \
   -H "Content-Type: application/json" \
   -H "$AUTH" \
-  -d '{"name":"Example Project","repo":"https://github.com/user/repo"}')
+  -d '{"name":"Example Project","repo":"https://github.com/example/odonian-api-demo"}')
 echo "$PROJECT" | jq .
-PROJECT_ID=$(echo "$PROJECT" | jq -r '.ID')
+PROJECT_ID=$(echo "$PROJECT" | jq -er '.id')
 
 echo "=== 3. Register design document ==="
-DOC=$(curl -s -X POST "$BASE/projects/$PROJECT_ID/documents" \
+DOC=$(curl -fsS -X POST "$BASE/projects/$PROJECT_ID/documents" \
   -H "Content-Type: application/json" \
   -H "$AUTH" \
   -d '{"kind":"design","title":"DESIGN.md","ref":"DESIGN.md"}')
 echo "$DOC" | jq .
-DOC_ID=$(echo "$DOC" | jq -r '.ID')
+DOC_ID=$(echo "$DOC" | jq -er '.id')
 
 echo "=== 4. Bulk-create tasks with model assignment ==="
-TASKS=$(curl -s -X POST "$BASE/projects/$PROJECT_ID/tasks" \
+TASKS=$(curl -fsS -X POST "$BASE/projects/$PROJECT_ID/tasks" \
   -H "Content-Type: application/json" \
   -H "$AUTH" \
   -d "[
@@ -1044,97 +1186,101 @@ TASKS=$(curl -s -X POST "$BASE/projects/$PROJECT_ID/tasks" \
     }
   ]")
 echo "$TASKS" | jq .
-TASK_ID=$(echo "$TASKS" | jq -r '.[0].id')
+TASK_ID=$(echo "$TASKS" | jq -er '.[0].id')
 
 echo "=== 5. List backlog tasks ==="
-curl -s "$BASE/projects/$PROJECT_ID/tasks?state=backlog" -H "$AUTH" | jq .
+curl -fsS "$BASE/projects/$PROJECT_ID/tasks?state=backlog" -H "$AUTH" | jq .
 
 echo "=== 6. Promote task to ready ==="
-TASK=$(curl -s -X POST "$BASE/tasks/$TASK_ID/promote" -H "$AUTH")
+TASK=$(curl -fsS -X POST "$BASE/tasks/$TASK_ID/promote" -H "$AUTH")
 echo "$TASK" | jq .
 
 echo "=== 7. Claim task as Haiku worker (model-matched) ==="
-TASK=$(curl -s -X POST "$BASE/tasks/$TASK_ID/claim" \
+TASK=$(curl -fsS -X POST "$BASE/tasks/$TASK_ID/claim" \
   -H "Content-Type: application/json" \
   -H "$AUTH" \
   -d '{"agent_id":"haiku-1","model":"haiku"}')
 echo "$TASK" | jq .
 
 echo "=== 8. Send heartbeat to extend lease ==="
-TASK=$(curl -s -X POST "$BASE/tasks/$TASK_ID/heartbeat" \
+TASK=$(curl -fsS -X POST "$BASE/tasks/$TASK_ID/heartbeat" \
   -H "Content-Type: application/json" \
   -H "$AUTH" \
-  -d '{"agent_id":"agent-1"}')
+  -d '{"agent_id":"haiku-1"}')
 echo "$TASK" | jq .
 
 echo "=== 9. Submit implement task for review with PR links ==="
-TASK=$(curl -s -X POST "$BASE/tasks/$TASK_ID/submit" \
+TASK=$(curl -fsS -X POST "$BASE/tasks/$TASK_ID/submit" \
   -H "Content-Type: application/json" \
   -H "$AUTH" \
   -d '{
     "agent_id":"haiku-1",
     "result":"Feature implemented and tested",
     "links":[
-      {"kind":"pr","value":"#123"},
+      {"kind":"pr","value":"https://github.com/example/odonian-api-demo/pull/123"},
       {"kind":"commit","value":"abc123def456"}
     ]
   }')
 echo "$TASK" | jq .
-echo "(Auto-spawned review tasks are now ready for Opus reviewers)"
+echo "(Auto-spawned review tasks are now ready for the configured reviewer models)"
 
-echo "=== 10. List review tasks claimable by Opus ==="
-REVIEW_TASKS=$(curl -s "$BASE/projects/$PROJECT_ID/tasks?claimable=true&model=opus" -H "$AUTH")
+echo "=== 10. List claimable review tasks ==="
+REVIEW_TASKS=$(curl -fsS "$BASE/projects/$PROJECT_ID/tasks?claimable=true&kind=review" -H "$AUTH")
 echo "$REVIEW_TASKS" | jq .
-REVIEW_TASK_ID=$(echo "$REVIEW_TASKS" | jq -r '.[0].id')
+REVIEW_ROWS=$(echo "$REVIEW_TASKS" | jq -er --arg parent "$TASK_ID" \
+  '.[] | select(.target_task_id == $parent) | [.id, .model] | @tsv')
 
-echo "=== 11. Opus reviewer claims the review task ==="
-REVIEW_TASK=$(curl -s -X POST "$BASE/tasks/$REVIEW_TASK_ID/claim" \
-  -H "Content-Type: application/json" \
-  -H "$AUTH" \
-  -d '{"agent_id":"opus-1","model":"opus"}')
-echo "$REVIEW_TASK" | jq .
+# Handle every configured reviewer, even if review_models contains multiple entries.
+while IFS=$'\t' read -r REVIEW_TASK_ID REVIEW_MODEL; do
+  REVIEW_AGENT="reviewer-$REVIEW_TASK_ID"
+  echo "=== 11. $REVIEW_MODEL reviewer claims $REVIEW_TASK_ID ==="
+  CLAIM=$(jq -n --arg agent "$REVIEW_AGENT" --arg model "$REVIEW_MODEL" \
+    '{agent_id: $agent, model: $model}')
+  REVIEW_TASK=$(curl -fsS -X POST "$BASE/tasks/$REVIEW_TASK_ID/claim" \
+    -H "Content-Type: application/json" -H "$AUTH" -d "$CLAIM")
+  echo "$REVIEW_TASK" | jq .
 
-echo "=== 12. Opus reviewer submits verdict (approve) ==="
-VERDICT=$(curl -s -X POST "$BASE/tasks/$REVIEW_TASK_ID/submit" \
-  -H "Content-Type: application/json" \
-  -H "$AUTH" \
-  -d '{
-    "agent_id":"opus-1",
-    "verdict":"approve",
-    "result":"Code looks good. Well tested and documented."
-  }')
-echo "$VERDICT" | jq .
+  echo "=== 12. $REVIEW_MODEL reviewer submits verdict (approve) ==="
+  APPROVAL=$(jq -n --arg agent "$REVIEW_AGENT" \
+    '{agent_id: $agent, verdict: "approve", result: "Example review approved"}')
+  VERDICT=$(curl -fsS -X POST "$BASE/tasks/$REVIEW_TASK_ID/submit" \
+    -H "Content-Type: application/json" -H "$AUTH" -d "$APPROVAL")
+  echo "$VERDICT" | jq .
+done <<< "$REVIEW_ROWS"
 echo "(The parent task automatically moves to 'approved' since all reviewers approved)"
 
 echo "=== 13. Check that parent task is now approved ==="
-PARENT=$(curl -s "$BASE/tasks/$TASK_ID" -H "$AUTH")
+PARENT=$(curl -fsS "$BASE/tasks/$TASK_ID" -H "$AUTH")
 echo "$PARENT" | jq '{state, kind}'
+echo "$PARENT" | jq -e '.state == "approved"' >/dev/null
 
-echo "=== 14. Human drains approved lane: merge the PR ==="
-echo "(Human would run: git pull && git merge --ff-only pr/feature && git push)"
+echo "=== 14. Human decision (example data only) ==="
+# For a real PR, merge it on GitHub before marking the board task done.
+# This script only demonstrates the board transition; there is no real PR to merge.
 
 echo "=== 15. Human transitions approved task to done ==="
-TASK=$(curl -s -X POST "$BASE/tasks/$TASK_ID/transition" \
+TASK=$(curl -fsS -X POST "$BASE/tasks/$TASK_ID/transition" \
   -H "Content-Type: application/json" \
   -H "$AUTH" \
-  -d '{"to":"done","note":"Merged to main"}')
+  -d '{"to":"done","note":"API example complete; no real PR was created or merged"}')
 echo "$TASK" | jq .
 
 echo "=== 16. Retrieve final task state ==="
-curl -s "$BASE/tasks/$TASK_ID" -H "$AUTH" | jq .
+curl -fsS "$BASE/tasks/$TASK_ID" -H "$AUTH" | jq -e 'select(.state == "done")'
 ```
 
 **Key Points:**
 1. Tasks are created with a `model` field; workers claim by declaring their model (e.g., `haiku`, `opus`)
 2. Claiming is atomic and model-matched — if the model doesn't match, you get `409 MODEL_MISMATCH`
-3. Implement tasks (the default `kind`) transition `in_progress` → `review` → `approved` → `done`
+3. In this human-gated example, implement tasks transition `in_progress` → `review` → `approved` → `done`. An `agent_merge=true` task with a `no_op` link and no `pr` link goes directly from `review` to `done` after unanimous approval.
 4. Submitting an implement task auto-spawns review tasks for each required reviewer (default: Opus)
 5. Review tasks are claimed and completed by reviewers submitting verdicts (approve or reject)
-6. When all reviewers of a round approve, the parent moves to `approved`; if any reject, it goes to `ready`
+6. When all reviewers of a round approve, the parent moves to `approved` (or directly to `done` for the opted-in no-op case); if any reject, it returns to `ready` unless the circuit breaker escalates or blocks it
 7. The human gates the final merge: tasks in `approved` are merged and transitioned to `done` by humans
 8. Workers extend their lease via heartbeat to prevent task expiry
 9. Dependencies are enforced at claim time — tasks with undone deps cannot be claimed
 10. The second task `task2` cannot be claimed until `task1` is `done` (due to `depends_on`)
+11. `/transition` cannot reopen `done`, `failed`, `superseded`, or `abandoned` tasks, and `/supersede` also rejects them. Unblocking applies to `blocked` tasks.
 
 ---
 
@@ -1158,7 +1304,7 @@ All error responses follow a consistent format:
 - `NOT_FOUND` (404): Resource not found
 - `CONFLICT` (409): State transition or constraint violation (generic)
 - `MODEL_MISMATCH` (409): Task's model doesn't match declared model on claim
-- `AMBIGUOUS_ID` (409): A task id prefix matched more than one task; the response includes a `candidates` field listing the matching ids (see [Task ID Conventions](#task-id-conventions))
+- `AMBIGUOUS_ID` (409): A task id prefix matched more than one task; `error.candidates` lists the matching ids (see [Task ID Conventions](#task-id-conventions))
 - `UNKNOWN_MODEL` (400): Model is not in the deployment allowlist (create time)
 - `UNKNOWN_TRACK` (400): Track is not one of the valid values (`"build"` or `"design"`)
 - `JSON_DECODE_ERROR` (400): Invalid JSON in request body
@@ -1180,36 +1326,43 @@ All error responses follow a consistent format:
 
 ## State Machine
 
-Implement tasks follow this state machine:
+The default human-gated implement flow is:
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    backlog --> ready: promote
+    ready --> in_progress: claim
+    in_progress --> review: submit
+    review --> approved: all approve
+    review --> ready: rejection, unless escalated or blocked
+    approved --> done: human completes
+    approved --> ready: human requests rework
 ```
-backlog ──promote──► ready ──claim──► in_progress ──submit──► review ──┐
-                       ▲                    │                        │
-                       │                    │      all approve       ▼
-                       │              lease expiry       ┌──────► approved ──human──► done
-                       │                    │           │            │
-                       └────────────────────┴──────────┴ any reject  │
-                                                                     │
-                                           human disagrees ◄────────┘
 
-blocked / failed are off-ramps from any active state.
-```
+`blocked`, `failed`, and `superseded` are off-ramps from active states.
+`approved` → `abandoned` retires work without merging.
+
+With `agent_merge=true`, unanimous review of a task carrying a `no_op` link and no `pr` link
+performs **`review` → `done` directly**, skipping `approved`. With a PR link, approval instead
+spawns a merge subtask. Lease expiry makes `in_progress` work reclaimable without first changing
+its state to `ready`.
 
 **For implement tasks:**
 - `backlog`: Initial state; tasks are not yet ready for work
-- `ready`: Promoted and ready to claim; dependencies met
+- `ready`: Promoted; claimability still depends on dependencies, hold, and model
 - `in_progress`: Claimed by an agent; work is in progress; lease-based crash recovery
 - `review`: Work submitted; reviewers are working; auto-spawned review tasks are claimable
-- `approved`: All reviewers approved; awaiting human merge
-- `done`: Approved and merged; task is complete
+- `approved`: All reviewers approved; awaiting the human decision or an opted-in merger
+- `done`: Completed by a human or merger, or automatically finalized as an opted-in reviewed no-op
 - `blocked`: Off-ramp; task cannot proceed (blocked on external dependency)
-- `failed`: Off-ramp; task attempt failed; consider rework or cancellation
+- `failed`: Terminal; task attempt retired as failed
+- `superseded`: Terminal for `/transition`; the supersede endpoint creates a replacement and repoints dependencies
+- `abandoned`: Terminal for `/transition`; approved work retired without merging, including a PR closed unmerged
 
 **For review tasks** (auto-spawned when parent enters `review`):
 ```
 ready ──claim──► in_progress ──submit verdict──► done
-           │                        │
-           └────── lease expiry ────┘
 
 blocked / failed are off-ramps.
 ```
@@ -1230,4 +1383,3 @@ When a task is claimed, a lease expiration time is set (`lease_expires_at`). If 
 
 **No Sweeper:**
 The MVP does not run a background sweeper. Lease expiry is checked lazily inside the atomic claim query. For target concurrency of 2–5 agents, this is sufficient and keeps the system simple.
-

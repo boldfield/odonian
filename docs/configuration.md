@@ -16,13 +16,15 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_MAX_REVIEW_ROUNDS` | `5` | Threshold for models with no entry in `ODONIAN_ESCALATION_THRESHOLDS`. |
 | `ODONIAN_LEASE_TTL` | `5m` | Lease granted on claim and extended by each heartbeat. A task whose lease has lapsed is claimable again, so a session that outlives its lease loses the task to another worker. Kept generous in production because renewal is agent-driven. |
 | `ODONIAN_EVENT_TERMINAL_RETENTION_DAYS` | `1` | At startup, audit events for tasks in terminal states older than this are pruned. Events for live tasks are never pruned. |
-| `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by the PR-watch reconciler and by `odonian merge`. See [Forge tokens](#forge-tokens). |
+| `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by PR-watch, supersession PR cleanup, and `odonian merge`. See [Forge tokens](#forge-tokens). |
 
 The review circuit breaker, in full: when every review task for a parent is done and at least one
 rejected, the parent's `review_round` is compared with its model's threshold. At or under the
 threshold, the parent returns to `ready`. Over it, if the task has `escalate=true` (the default at
 creation) and its model is not the top of the ladder, the task is superseded by a copy pinned to
 the next tier and that copy is promoted to `ready`; otherwise the parent moves to `blocked`.
+The replacement preserves the original `track`, including for design work; see
+[supersession](./api.md#post-tasksidsupersede).
 Unblocking (`blocked → ready`) clears the assignee and lease but does not yet reset the review
 round, so one more rejection re-trips the breaker. Resetting it is specced in
 [`docs/specs/2026-08-06-unblock-resets-review-round.md`](./specs/2026-08-06-unblock-resets-review-round.md).
@@ -74,8 +76,10 @@ decisions from GitHub, and applies:
 
 ### Forge tokens
 
-Tokens are server-side and per GitHub owner. The file is one `owner=token` pair per line;
-quoted tokens and `#` comments are allowed:
+The server reads a per-owner token file for PR-watch and stale-PR cleanup. The fleet and merger
+need credentials in their own runtime environments as well; configuring only the server does
+not authenticate workers. Each file contains one `owner=token` pair per line; quoted tokens and
+`#` comments are allowed:
 
 ```
 # ~/.odonian/forge-tokens (or $FORGE_TOKENS)
@@ -83,13 +87,18 @@ owner1=token_for_owner1
 owner2="token_for_owner2"
 ```
 
-If the file does not exist, GitHub calls are made unauthenticated. Public repos may work under
-GitHub's 60 requests/hour unauthenticated limit; private repos fail with 401/404, logged every
-tick. For a deployment with no GitHub integration, point `FORGE_TOKENS` at an empty file.
+PR-watch skips an owner when its token is missing, even for public repositories. It logs
+`no forge token for owner` when the skipped count first appears or changes, and logs when the
+owner is no longer skipped. Add the matching token to the server's file to enable checks;
+the file is read again on later passes. An empty file disables PR-watch's checks, including its
+stale-PR cleanup. Cleanup triggered by `/supersede` also skips GitHub requests when the matching
+token is missing or empty, logging the owner and PR once for that cleanup attempt. The board
+supersession still commits successfully.
 
-When a task is superseded and its pull request cannot be cleaned up due to a missing or empty owner
-token, the cleanup is skipped and one log line is emitted naming the owner and PR link. No unauthenticated
-GitHub calls are made in this case.
+The worker/reviewer harness has a separate fallback to its local `gh` authentication; that does
+not authenticate the server or merger. The merger reads only its per-owner token file.
+It does not fall back to `gh` authentication or `GH_TOKEN`; a
+missing owner entry results in an unauthenticated merge request, which cannot merge the PR.
 
 ## CLI (`odonian <command>`)
 
@@ -103,7 +112,7 @@ GitHub calls are made in this case.
 | `GH_TOKEN` | | Fallback GitHub token for `pr-feedback` when no per-owner forge token applies. |
 | `ODONIAN_DELIVERY_MODE` | `pull_request` | `pull_request` (branch + PR on a forge) or `local_commit` (the CLI commits into a local repo; no forge). |
 | `ODONIAN_HOME` | `~/.odonian` | Root for harness state: agent ids, worktrees, repo clones, `env`, `forge-tokens`. |
-| `ODONIAN_WORKTREE_HOME` | `$ODONIAN_HOME` | Per-task worktree root in `local_commit` mode. One of the two must be set in that mode, and the harness refuses a root under `/tmp` because bounced work must survive a reboot. |
+| `ODONIAN_WORKTREE_HOME` | `$ODONIAN_HOME` in the CLI | Per-task worktree root in `local_commit` mode. The CLI requires one of these variables; the worker harness requires `ODONIAN_WORKTREE_HOME` explicitly. Use persistent storage for work that must survive a reboot. The sandbox demo deliberately uses `/tmp/odonian/worktrees`. |
 
 ## Harness (`harness/agent.sh` and its wrappers)
 
@@ -113,7 +122,7 @@ overridden per invocation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ODONIAN_URL`, `ODONIAN_TOKEN` | required | As above. |
-| `ODONIAN_PROJECT` | required | A project id to pin the slot to one board, or `all` to discover and drain every project with claimable work, cloning repos on demand. |
+| `ODONIAN_PROJECT` | depends on the env file; see below | Set a full project UUID for one board. In `pull_request` mode, literal `all` discovers and drains projects with claimable work, cloning repos on demand. `local_commit` workers/reviewers require a UUID. |
 | `ODONIAN_PROJECTS` | unset | In `all` mode, a comma-separated allowlist of project ids. |
 | `ODONIAN_REPO` | | Local checkout for single-project mode. Ignored in `all` mode. |
 | `ODONIAN_MAIN_REPO` | `$ODONIAN_REPO` | The canonical clone that worktrees are detached from. |
@@ -122,6 +131,16 @@ overridden per invocation.
 | `AGENT_CLAUDE_FLAGS` | empty | Extra flags appended to every `claude -p` dispatch. `sbx.sh` uses it to pass the flag a nested `claude` needs inside a sandbox. |
 | `AGENT_CODEX_MODELS` | unset | Comma-separated models to dispatch through `codex exec` instead of `claude -p`, e.g. `gpt-5.5`. Review-only in practice. |
 | `AGENT_CODEX_FLAGS` | unset | Extra flags for `codex exec`, on top of the hardcoded `-c model_reasoning_effort=high`. |
+
+Project selection is evaluated after sourcing `$ODONIAN_HOME/env`. The example file supplies
+the placeholder `<project-uuid-or-all>` when the variable was unset or empty; replace it before
+starting the fleet. That placeholder is treated as a project ID and can leave the slot polling
+an empty queue indefinitely. With a different env file, or none, an unset or empty value after
+configuration selects **all projects visible to the shared board token** in `pull_request`
+mode. `local_commit` workers and reviewers reject this multi-project mode and exit; set a full
+UUID for them, as the demo does. Choose an explicit UUID or, for `pull_request`, literal `all`
+instead of relying on implicit scope. The repo-less merger uses all-project discovery for an
+unset/empty value regardless of delivery mode.
 
 Codex-routed reviewers authenticate with a `codex-auth` secret seeded from `~/.codex/auth.json`.
 That credential rotates on every refresh and revokes its predecessor, so a snapshot copied into
