@@ -8626,6 +8626,59 @@ func TestSupersedeTaskForgeFailureStillSucceeds(t *testing.T) {
 	}
 }
 
+func TestSupersedeTaskWithEmptyForgeTokenSkipsCleanup(t *testing.T) {
+	ctx := context.Background()
+	// Explicitly set an empty FORGE_TOKENS file so the owner token lookup fails
+	path := filepath.Join(t.TempDir(), "forge-tokens")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatalf("failed to write forge tokens file: %v", err)
+	}
+	t.Setenv("FORGE_TOKENS", path)
+
+	server, calls := newSupersedePRTestServer(t, "open")
+	defer server.Close()
+	withMockForge(t, server)
+
+	st, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer st.Close()
+
+	oldTask := createSupersedableTaskWithPRLink(t, ctx, st, "https://github.com/testowner/testrepo/pull/123")
+
+	waitForClose := armSupersedeCloseSync(t, st)
+	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+	waitForClose()
+
+	// Verify that SupersedeTask still succeeds and creates a new task
+	if newTask.ID == oldTask.ID {
+		t.Errorf("expected a new task ID, got the same as old task")
+	}
+	if newTask.State != "backlog" {
+		t.Errorf("expected new task state to be backlog, got %q", newTask.State)
+	}
+
+	// Verify that no forge calls were made (no token was available)
+	calls.mu.Lock()
+	defer calls.mu.Unlock()
+	if calls.getStateCount != 0 {
+		t.Errorf("expected GetPRState not to be called when token is empty, got %d calls", calls.getStateCount)
+	}
+	if calls.closeCount != 0 {
+		t.Errorf("expected ClosePR not to be called when token is empty, got %d calls", calls.closeCount)
+	}
+	if len(calls.comments) != 0 {
+		t.Errorf("expected no comments to be posted when token is empty, got %v", calls.comments)
+	}
+	if calls.deletedBranch != "" {
+		t.Errorf("expected no branch delete when token is empty, got %q", calls.deletedBranch)
+	}
+}
+
 // TestReadsNotBlockedByWrites verifies that read queries do not block behind write transactions.
 // Opens a store, starts a writer holding a transaction, then concurrently issues reads
 // and verifies they complete promptly without waiting for the write to finish.

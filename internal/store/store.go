@@ -2505,6 +2505,11 @@ func (s *sqliteStore) closeSupersededPR(ctx context.Context, oldTaskID, newTaskI
 		return
 	}
 
+	if token == "" {
+		logger.Info("skipped supersede PR cleanup: no forge token", "task_id", oldTaskID, "owner", owner, "pr_url", prLink.Value)
+		return
+	}
+
 	state, err := forge.GetPRState(ctx, owner, repo, prNumber, token)
 	if err != nil {
 		logger.Error("failed to get PR state for superseded task", "task_id", oldTaskID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
