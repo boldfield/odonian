@@ -161,7 +161,7 @@ func (m *BoardModel) defaultTickCmd() tea.Cmd {
 // Exactly one tick chain is started here; it perpetuates itself in the tickMsg handler.
 func (m *BoardModel) Init() tea.Cmd {
 	return tea.Batch(
-		m.fetchTasks(),
+		m.fetchTasksFullRefresh(),
 		m.fetchProjects(),
 		m.newTickCmd(),
 	)
@@ -192,7 +192,7 @@ func (m *BoardModel) promoteTask(taskID string) tea.Cmd {
 
 		// Promotion succeeded; refetch to get updated board state
 		// Issue a new fetch command and return its result
-		return m.fetchTasks()()
+		return m.fetchTasksFullRefresh()()
 	}
 }
 
@@ -559,24 +559,90 @@ func (m *BoardModel) fetchTasksInline(ctx context.Context, errPrefix string) rev
 	return msg
 }
 
-// fetchTasks creates a command that fetches tasks and returns them.
-func (m *BoardModel) fetchTasks() tea.Cmd {
+// activeStates are the states re-fetched on every poll tick. Terminal states change
+// far less often, so they are excluded from the steady-state poll to keep it cheap.
+var activeStates = []string{stateBacklog, stateReady, stateInProgress, stateReview, stateApproved, stateBlocked}
+
+// terminalStates are fetched only at startup, on manual refresh, and after project switches.
+var terminalStates = []string{stateDone, stateFailed, stateAbandoned}
+
+// fetchStatesSummary issues one ListTasks call per state with fields=summary and
+// concatenates the results. Splitting into per-state calls lets each call ask the server
+// to filter server-side, and fields=summary drops the Spec/Result payload per task.
+func (m *BoardModel) fetchStatesSummary(ctx context.Context, states []string) ([]tuiclient.Task, error) {
+	var all []tuiclient.Task
+	for _, state := range states {
+		tasks, err := m.client.ListTasks(ctx, m.project.ID, tuiclient.WithState(state), tuiclient.WithFields("summary"))
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, tasks...)
+	}
+	return all, nil
+}
+
+// fetchActiveTasks creates a command that fetches only the active-state tasks (backlog,
+// ready, in_progress, review, approved, blocked). Used as the steady-state poll body when
+// there is no existing terminal-column data to preserve (e.g. tests exercising it directly).
+func (m *BoardModel) fetchActiveTasks() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		tasks, err := m.client.ListTasks(ctx, m.project.ID)
+		tasks, err := m.fetchStatesSummary(ctx, activeStates)
 		if err != nil {
-			return tasksFetchedMsg{
-				err: err,
-			}
+			return tasksFetchedMsg{err: err}
+		}
+
+		return tasksFetchedMsg{tasks: bucketTasksByState(tasks)}
+	}
+}
+
+// fetchActiveTasksAndMerge creates a command that fetches only the active-state tasks and
+// merges them with the existing terminal columns (done, failed, abandoned), which are not
+// re-fetched on every tick. The terminal columns are captured here, on the goroutine calling
+// this method (the main Bubble Tea event loop), rather than inside the returned tea.Cmd's
+// closure: tea.Cmd bodies run on their own goroutine concurrently with Update, and Update is
+// the only other place that mutates m.tasks, so reading m.tasks from inside the closure would
+// be a data race.
+func (m *BoardModel) fetchActiveTasksAndMerge() tea.Cmd {
+	terminalCols := make(map[string][]tuiclient.Task, len(terminalStates))
+	for _, state := range terminalStates {
+		terminalCols[state] = m.tasks[state]
+	}
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		tasks, err := m.fetchStatesSummary(ctx, activeStates)
+		if err != nil {
+			return tasksFetchedMsg{err: err}
 		}
 
 		bucketed := bucketTasksByState(tasks)
-
-		return tasksFetchedMsg{
-			tasks: bucketed,
+		for _, state := range terminalStates {
+			bucketed[state] = terminalCols[state]
 		}
+
+		return tasksFetchedMsg{tasks: bucketed}
+	}
+}
+
+// fetchTasksFullRefresh creates a command that fetches every state (active and terminal),
+// one ListTasks call per state with fields=summary. Used for the initial load, manual
+// refresh ('r'), and project switches, none of which are on the steady-state poll path.
+func (m *BoardModel) fetchTasksFullRefresh() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		tasks, err := m.fetchStatesSummary(ctx, stateOrder)
+		if err != nil {
+			return tasksFetchedMsg{err: err}
+		}
+
+		return tasksFetchedMsg{tasks: bucketTasksByState(tasks)}
 	}
 }
 
@@ -782,10 +848,11 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.clampScrollToSelection()
 
-		// Refresh: issue one-shot fetch; do NOT arm a new tick.
-		// The single perpetual tick chain started in Init re-arms itself from tickMsg.
+		// Refresh: issue one-shot fetch of all columns (active and terminal); do NOT arm
+		// a new tick. The single perpetual tick chain started in Init re-arms itself from
+		// tickMsg.
 		case "r":
-			return m, m.fetchTasks()
+			return m, m.fetchTasksFullRefresh()
 
 		// Open detail view for the selected task.
 		case "enter":
@@ -1029,10 +1096,11 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if !currentProjectFound && len(msg.projects) > 0 {
 				m.project = msg.projects[0]
-				// Refetch tasks for the new project
+				// Refetch tasks for the new project; a project switch needs the terminal
+				// columns too, so use the full refresh rather than the active-only poll.
 				m.loading = true
 				m.tasks = make(map[string][]tuiclient.Task)
-				return m, m.fetchTasks()
+				return m, m.fetchTasksFullRefresh()
 			}
 		}
 		m.mode = modeNormal
@@ -1041,8 +1109,10 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		// Re-arm exactly one next tick and issue a fetch.
 		// This is the ONLY place (besides Init) where a new tick is armed.
+		// The fetch merges freshly-polled active states with the existing terminal
+		// columns rather than re-fetching them.
 		return m, tea.Batch(
-			m.fetchTasks(),
+			m.fetchActiveTasksAndMerge(),
 			m.newTickCmd(),
 		)
 	}
@@ -1199,8 +1269,9 @@ func (m *BoardModel) updateProjectSwitchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd
 				m.detailEvents = nil
 				m.mode = modeNormal
 				m.loading = true
-				// Refetch tasks for the new project
-				return m, m.fetchTasks()
+				// Refetch tasks for the new project; use the full refresh so the
+				// terminal columns (done, failed, abandoned) are populated too.
+				return m, m.fetchTasksFullRefresh()
 			}
 			// Same project selected: just close the switcher
 			m.mode = modeNormal
