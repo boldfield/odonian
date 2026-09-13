@@ -4849,7 +4849,7 @@ func TestListTasksWithoutFieldsSummary(t *testing.T) {
 		t.Errorf("expected status 200, got %d", listW.Code)
 	}
 
-	var tasks []store.Task
+	var tasks []map[string]interface{}
 	if err := json.NewDecoder(listW.Body).Decode(&tasks); err != nil {
 		t.Fatalf("failed to decode tasks: %v", err)
 	}
@@ -4859,8 +4859,16 @@ func TestListTasksWithoutFieldsSummary(t *testing.T) {
 	}
 
 	task := tasks[0]
-	if task.Spec != "This is the spec" {
-		t.Errorf("expected spec 'This is the spec', got %q", task.Spec)
+	// Verify spec is present
+	if _, hasSpec := task["spec"]; !hasSpec {
+		t.Error("spec should be present in normal task response")
+	}
+	if spec, ok := task["spec"].(string); !ok || spec != "This is the spec" {
+		t.Errorf("expected spec 'This is the spec', got %v", task["spec"])
+	}
+	// Verify result field is present (even if nil)
+	if _, hasResult := task["result"]; !hasResult {
+		t.Error("result field should be present in normal task response")
 	}
 }
 
@@ -4906,7 +4914,7 @@ func TestListTasksFieldsSummaryComposesWithFilters(t *testing.T) {
 		t.Fatalf("failed to set task to review kind: %v", err)
 	}
 
-	// List with fields=summary and kind=implement filter
+	// Test 1: List with fields=summary and kind=implement filter
 	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary&kind=implement", nil)
 	listReq.Header.Set("Authorization", authHeader)
 	listW := httptest.NewRecorder()
@@ -4937,5 +4945,40 @@ func TestListTasksFieldsSummaryComposesWithFilters(t *testing.T) {
 	// Verify kind filter was applied
 	if kind, ok := task["kind"]; !ok || kind != "implement" {
 		t.Errorf("expected kind 'implement', got %v", kind)
+	}
+
+	// Test 2: List with fields=summary and state=backlog filter
+	listReq2 := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary&state=backlog", nil)
+	listReq2.Header.Set("Authorization", authHeader)
+	listW2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW2, listReq2)
+
+	if listW2.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", listW2.Code)
+	}
+
+	var tasks2 []map[string]interface{}
+	if err := json.NewDecoder(listW2.Body).Decode(&tasks2); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+
+	// Both tasks should be in backlog state (initial state after creation)
+	if len(tasks2) != 2 {
+		t.Errorf("expected 2 tasks with state=backlog, got %d", len(tasks2))
+	}
+
+	for i, task2 := range tasks2 {
+		// Verify spec and result are absent
+		if _, hasSpec := task2["spec"]; hasSpec {
+			t.Error("spec should be absent in summary response with state= filter")
+		}
+		if _, hasResult := task2["result"]; hasResult {
+			t.Error("result should be absent in summary response with state= filter")
+		}
+
+		// Verify state filter was applied
+		if state, ok := task2["state"]; !ok || state != "backlog" {
+			t.Errorf("task %d: expected state 'backlog', got %v", i, state)
+		}
 	}
 }
