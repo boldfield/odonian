@@ -12,6 +12,33 @@ import (
 	"github.com/boldfield/odonian/internal/store"
 )
 
+// taskToSummary converts a Task to a summary representation, omitting Spec and Result.
+func taskToSummary(task store.Task) map[string]interface{} {
+	return map[string]interface{}{
+		"id":               task.ID,
+		"project_id":       task.ProjectID,
+		"document_id":      task.DocumentID,
+		"title":            task.Title,
+		"state":            task.State,
+		"assignee":         task.Assignee,
+		"lease_expires_at": task.LeaseExpiresAt,
+		"model":            task.Model,
+		"kind":             task.Kind,
+		"review_models":    task.ReviewModels,
+		"review_round":     task.ReviewRound,
+		"target_task_id":   task.TargetTaskID,
+		"verdict":          task.Verdict,
+		"agent_merge":      task.AgentMerge,
+		"held":             task.Held,
+		"escalate":         task.Escalate,
+		"track":            task.Track,
+		"created_at":       task.CreatedAt,
+		"updated_at":       task.UpdatedAt,
+		"archived_at":      task.ArchivedAt,
+		"superseded_by":    task.SupersededBy,
+	}
+}
+
 // Server wraps the HTTP server with its dependencies: store, auth token, and lease TTL.
 type Server struct {
 	mux                  *http.ServeMux
@@ -415,6 +442,16 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	// Ensure we return an empty array, not null
 	if tasks == nil {
 		tasks = make([]store.Task, 0)
+	}
+
+	fieldsSummary := r.URL.Query().Get("fields") == "summary"
+	if fieldsSummary {
+		summaries := make([]map[string]interface{}, len(tasks))
+		for i, task := range tasks {
+			summaries[i] = taskToSummary(task)
+		}
+		s.encodeJSON(w, http.StatusOK, summaries)
+		return
 	}
 
 	s.encodeJSON(w, http.StatusOK, tasks)

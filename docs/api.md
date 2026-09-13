@@ -318,6 +318,10 @@ curl -H "Authorization: Bearer token" \
 # Filter by claimable and model (worker polls for its own work)
 curl -H "Authorization: Bearer token" \
   "https://api.example.com/projects/550e8400-e29b-41d4-a716-446655440000/tasks?claimable=true&model=haiku"
+
+# Return summary view (omit spec and result)
+curl -H "Authorization: Bearer token" \
+  "https://api.example.com/projects/550e8400-e29b-41d4-a716-446655440000/tasks?fields=summary"
 ```
 
 **Query Parameters:**
@@ -326,8 +330,11 @@ curl -H "Authorization: Bearer token" \
 - `kind` (optional): Filter by task kind (`implement` or `review`)
 - `assignee` (optional): Filter by agent ID
 - `claimable` (optional): If `true`, only return tasks that can be claimed (in `ready` state with no live lease and all dependencies done)
+- `fields` (optional): If `summary`, omit `spec` and `result` from each task (reduces response size; the full task is still available from `GET /tasks/{id}`)
 
 **Response (200 OK):**
+
+Without `fields=summary`:
 ```json
 [
   {
@@ -350,11 +357,32 @@ curl -H "Authorization: Bearer token" \
 ]
 ```
 
+With `fields=summary` (omits `spec` and `result`):
+```json
+[
+  {
+    "id": "770e8400-e29b-41d4-a716-446655440002",
+    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+    "document_id": "660e8400-e29b-41d4-a716-446655440001",
+    "title": "Implement authentication",
+    "state": "ready",
+    "kind": "implement",
+    "model": "haiku",
+    "review_models": ["opus"],
+    "review_round": 0,
+    "assignee": null,
+    "lease_expires_at": null,
+    "created_at": "2026-06-05T21:00:00.000000000Z",
+    "updated_at": "2026-06-05T21:00:00.000000000Z"
+  }
+]
+```
+
 **Status Codes:**
 - `200 OK`: Tasks retrieved
 - `500 LIST_ERROR`: Server error listing tasks
 
-**Note:** Response contains an empty array if no tasks match the filters. Tasks can only be claimed if they are in the `ready` state, have no active lease, and all their dependencies are `done`. All tasks have a `kind` (implement or review) and a `model`; review tasks additionally have a `target_task_id` pointing to their parent implement task.
+**Note:** Response contains an empty array if no tasks match the filters. Tasks can only be claimed if they are in the `ready` state, have no active lease, and all their dependencies are `done`. All tasks have a `kind` (implement or review) and a `model`; review tasks additionally have a `target_task_id` pointing to their parent implement task. The `fields=summary` parameter reduces response size by omitting `spec` and `result`; the full task is still available from `GET /tasks/{id}`.
 
 ---
 
