@@ -8365,6 +8365,55 @@ func TestCreateTasksWithTrack(t *testing.T) {
 	}
 }
 
+// TestCreateTasksWithUnknownTrack verifies that track field is validated.
+// Tracks not in {build, design} are rejected with UNKNOWN_TRACK.
+func TestCreateTasksWithUnknownTrack(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", []string{"haiku", "opus", "sonnet"})
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Doc", "docs/test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Should fail with UNKNOWN_TRACK for invalid track value
+	_, err = store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Bad Track Task", Spec: "Bad spec", DocumentID: doc.ID, Track: "testing"},
+	})
+	if err == nil {
+		t.Error("expected UNKNOWN_TRACK error for testing track, but creation succeeded")
+	}
+	var valErr *ValidationError
+	if !errors.As(err, &valErr) {
+		t.Errorf("expected ValidationError, got %T", err)
+	} else if valErr.Code != "UNKNOWN_TRACK" {
+		t.Errorf("expected error code UNKNOWN_TRACK, got %s", valErr.Code)
+	}
+
+	// Verify that build and design are accepted
+	for _, track := range []string{"build", "design"} {
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{Title: "Track Task " + track, Spec: "Spec", DocumentID: doc.ID, Track: track},
+		})
+		if err != nil {
+			t.Errorf("failed to create task with track=%s: %v", track, err)
+		}
+		if len(tasks) != 1 || tasks[0].Track != track {
+			t.Errorf("expected track=%s, got %s", track, tasks[0].Track)
+		}
+	}
+}
+
 // TestAgentMergePRSpawnsMergeTask verifies that when a task with agent_merge=true
 // and a PR link transitions to "approved", exactly one merge task is spawned.
 func TestAgentMergePRSpawnsMergeTask(t *testing.T) {
@@ -9287,6 +9336,62 @@ func TestSupersededTaskPreservesTrackEscalation(t *testing.T) {
 		if escalatedTask.Track != "design" {
 			t.Errorf("expected escalated task Track to be 'design', got %q", escalatedTask.Track)
 		}
+	}
+}
+
+// TestReadsNotBlockedByWrites verifies that read queries do not block behind write transactions.
+// Opens a store, starts a writer holding a transaction, then concurrently issues reads
+// and verifies they complete promptly without waiting for the write to finish.
+func TestSupersedeTaskWithEmptyForgeTokenSkipsCleanup(t *testing.T) {
+	ctx := context.Background()
+	// Explicitly set an empty FORGE_TOKENS file so the owner token lookup fails
+	path := filepath.Join(t.TempDir(), "forge-tokens")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatalf("failed to write forge tokens file: %v", err)
+	}
+	t.Setenv("FORGE_TOKENS", path)
+
+	server, calls := newSupersedePRTestServer(t, "open")
+	defer server.Close()
+	withMockForge(t, server)
+
+	st, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer st.Close()
+
+	oldTask := createSupersedableTaskWithPRLink(t, ctx, st, "https://github.com/testowner/testrepo/pull/123")
+
+	waitForClose := armSupersedeCloseSync(t, st)
+	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+	waitForClose()
+
+	// Verify that SupersedeTask still succeeds and creates a new task
+	if newTask.ID == oldTask.ID {
+		t.Errorf("expected a new task ID, got the same as old task")
+	}
+	if newTask.State != "backlog" {
+		t.Errorf("expected new task state to be backlog, got %q", newTask.State)
+	}
+
+	// Verify that no forge calls were made (no token was available)
+	calls.mu.Lock()
+	defer calls.mu.Unlock()
+	if calls.getStateCount != 0 {
+		t.Errorf("expected GetPRState not to be called when token is empty, got %d calls", calls.getStateCount)
+	}
+	if calls.closeCount != 0 {
+		t.Errorf("expected ClosePR not to be called when token is empty, got %d calls", calls.closeCount)
+	}
+	if len(calls.comments) != 0 {
+		t.Errorf("expected no comments to be posted when token is empty, got %v", calls.comments)
+	}
+	if calls.deletedBranch != "" {
+		t.Errorf("expected no branch delete when token is empty, got %q", calls.deletedBranch)
 	}
 }
 

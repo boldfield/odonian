@@ -1000,6 +1000,9 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 
 		track := "build"
 		if input.Track != "" {
+			if input.Track != "build" && input.Track != "design" {
+				return nil, invalid("UNKNOWN_TRACK", fmt.Sprintf("unknown track: %s", input.Track))
+			}
 			track = input.Track
 		}
 
@@ -2560,6 +2563,11 @@ func (s *sqliteStore) closeSupersededPR(ctx context.Context, oldTaskID, newTaskI
 	token, err := forge.OwnerToken(owner)
 	if err != nil {
 		logger.Error("failed to get forge token for PR close", "task_id", oldTaskID, "owner", owner, "error", err)
+		return
+	}
+
+	if token == "" {
+		logger.Info("skipped supersede PR cleanup: no forge token", "task_id", oldTaskID, "owner", owner, "pr_url", prLink.Value)
 		return
 	}
 

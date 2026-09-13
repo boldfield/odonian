@@ -233,6 +233,7 @@ Bulk-create tasks for a project.
 - `document_id` (required): ID of the design or feature document this task is decomposed from
 - `model` (optional): Assigned model (e.g., `haiku`, `sonnet`, `opus`); must be in the deployment allowlist if provided. If omitted or empty, defaults to the deployment default model.
 - `review_models` (optional): List of reviewer models for this task (e.g., `["opus", "sonnet"]`); each must be in the allowlist. Default is `["opus"]` if unset/empty. Ignored for review tasks (auto-spawned only).
+- `track` (optional): Task track category; must be one of `"build"` or `"design"`. If omitted or empty, defaults to `"build"`.
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
 
 **Response (201 Created):**
@@ -279,6 +280,7 @@ Bulk-create tasks for a project.
 - `201 Created`: Tasks successfully created
 - `400 INVALID_DOCUMENT_ID`: One or more document IDs do not exist
 - `400 UNKNOWN_MODEL`: The `model` or a `review_models` entry is not in the deployment allowlist
+- `400 UNKNOWN_TRACK`: The `track` field is not one of `"build"` or `"design"`
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `400 <other validation errors>`: Client input validation errors
 - `500 CREATE_ERROR`: Server error creating tasks
@@ -1116,6 +1118,7 @@ All error responses follow a consistent format:
 - `CONFLICT` (409): State transition or constraint violation (generic)
 - `MODEL_MISMATCH` (409): Task's model doesn't match declared model on claim
 - `UNKNOWN_MODEL` (400): Model is not in the deployment allowlist (create time)
+- `UNKNOWN_TRACK` (400): Track is not one of the valid values (`"build"` or `"design"`)
 - `JSON_DECODE_ERROR` (400): Invalid JSON in request body
 - `EMPTY_<FIELD>` (400): Required field is empty
 - `INVALID_<FIELD>` (400): Field value is invalid (e.g., verdict not "approve" or "reject")
