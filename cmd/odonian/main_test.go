@@ -1803,6 +1803,48 @@ func TestExecutePendingMissingProject(t *testing.T) {
 	}
 }
 
+func TestExecutePendingOrdering(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/proj-1/tasks" {
+			state := r.URL.Query().Get("state")
+			w.Header().Set("Content-Type", "application/json")
+			if state == "review" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-2", State: "review", Kind: "implement", Title: "Task 2", CreatedAt: "2026-09-12T00:00:00Z"},
+				})
+			} else if state == "approved" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "approved", Kind: "implement", Title: "Task 1", CreatedAt: "2026-09-11T00:00:00Z"},
+				})
+			}
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePending(context.Background(), server.URL, "test-token", true, []string{"--project", "proj-1"}, buf)
+	if err != nil {
+		t.Fatalf("executePending failed: %v", err)
+	}
+
+	output := buf.String()
+	var result []tuiclient.Task
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	if len(result) != 2 {
+		t.Errorf("expected 2 tasks, got %d", len(result))
+	}
+
+	if result[0].ID != "task-1" {
+		t.Errorf("expected first task to be task-1 (older created_at), got %q", result[0].ID)
+	}
+	if result[1].ID != "task-2" {
+		t.Errorf("expected second task to be task-2 (newer created_at), got %q", result[1].ID)
+	}
+}
+
 func TestExecuteHeartbeatSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" && r.URL.Path == "/tasks/task123/heartbeat" {

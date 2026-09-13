@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"text/tabwriter"
 
 	"github.com/boldfield/odonian/internal/tuiclient"
@@ -44,8 +45,14 @@ func executePending(ctx context.Context, baseURL, token string, jsonOutput bool,
 		return fmt.Errorf("failed to list tasks: %w", err)
 	}
 
-	// Combine results
+	// Combine results and sort by created_at then id to preserve chronological order
 	filtered := append(reviewTasks, approvedTasks...)
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].CreatedAt != filtered[j].CreatedAt {
+			return filtered[i].CreatedAt < filtered[j].CreatedAt
+		}
+		return filtered[i].ID < filtered[j].ID
+	})
 
 	// Output results
 	if jsonOutput {
