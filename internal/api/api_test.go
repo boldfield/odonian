@@ -4750,3 +4750,92 @@ func TestListProjectsIncludesArchivedWithFlag(t *testing.T) {
 		t.Error("archived project not found in list")
 	}
 }
+
+// TestGetTaskPrefixResolution tests prefix resolution in the API.
+func TestGetTaskPrefixResolution(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test Spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var tasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&tasks)
+	taskID := tasks[0].ID
+
+	// Test 1: Exact ID match works
+	getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+
+	if getW.Code != http.StatusOK {
+		t.Errorf("exact ID GET failed with status %d: %s", getW.Code, getW.Body.String())
+	}
+	var retrievedTask store.TaskWithDepsAndLinks
+	json.NewDecoder(getW.Body).Decode(&retrievedTask)
+	if retrievedTask.ID != taskID {
+		t.Errorf("exact ID GET returned wrong task: expected %s, got %s", taskID, retrievedTask.ID)
+	}
+
+	// Test 2: 8-char prefix match works
+	prefix8 := taskID[:8]
+	prefixReq := httptest.NewRequest("GET", "/tasks/"+prefix8, nil)
+	prefixReq.Header.Set("Authorization", authHeader)
+	prefixW := httptest.NewRecorder()
+	server.mux.ServeHTTP(prefixW, prefixReq)
+
+	if prefixW.Code != http.StatusOK {
+		t.Errorf("8-char prefix GET failed with status %d: %s", prefixW.Code, prefixW.Body.String())
+	}
+	var prefixTask store.TaskWithDepsAndLinks
+	json.NewDecoder(prefixW.Body).Decode(&prefixTask)
+	if prefixTask.ID != taskID {
+		t.Errorf("8-char prefix GET returned wrong task: expected %s, got %s", taskID, prefixTask.ID)
+	}
+
+	// Test 3: Longer prefix also works
+	prefix32 := taskID[:32]
+	prefixReq32 := httptest.NewRequest("GET", "/tasks/"+prefix32, nil)
+	prefixReq32.Header.Set("Authorization", authHeader)
+	prefixW32 := httptest.NewRecorder()
+	server.mux.ServeHTTP(prefixW32, prefixReq32)
+
+	if prefixW32.Code != http.StatusOK {
+		t.Errorf("32-char prefix GET failed with status %d", prefixW32.Code)
+	}
+
+	// Test 4: Non-matching prefix returns 404
+	nonMatchingReq := httptest.NewRequest("GET", "/tasks/00000000", nil)
+	nonMatchingReq.Header.Set("Authorization", authHeader)
+	nonMatchingW := httptest.NewRecorder()
+	server.mux.ServeHTTP(nonMatchingW, nonMatchingReq)
+
+	if nonMatchingW.Code != http.StatusNotFound {
+		t.Errorf("non-matching prefix GET should return 404, got %d", nonMatchingW.Code)
+	}
+
+	// Test 5: Prefix shorter than 8 chars returns 404
+	shortPrefixReq := httptest.NewRequest("GET", "/tasks/1234567", nil)
+	shortPrefixReq.Header.Set("Authorization", authHeader)
+	shortPrefixW := httptest.NewRecorder()
+	server.mux.ServeHTTP(shortPrefixW, shortPrefixReq)
+
+	if shortPrefixW.Code != http.StatusNotFound {
+		t.Errorf("short prefix GET should return 404, got %d", shortPrefixW.Code)
+	}
+}

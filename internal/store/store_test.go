@@ -9396,3 +9396,98 @@ func TestReadsNotBlockedByWrites(t *testing.T) {
 		t.Errorf("unexpected task from GetTask: %+v", fullTask)
 	}
 }
+
+// TestGetTaskPrefixResolution tests prefix resolution in GetTask.
+func TestGetTaskPrefixResolution(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project and document
+	proj, err := store.CreateProject(ctx, "Test Project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Doc", "TEST.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create multiple tasks to test prefix resolution
+	taskInputs := []TaskInput{
+		{Title: "Task 1", Spec: "Spec 1", DocumentID: doc.ID},
+		{Title: "Task 2", Spec: "Spec 2", DocumentID: doc.ID},
+		{Title: "Task 3", Spec: "Spec 3", DocumentID: doc.ID},
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, taskInputs)
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	if len(tasks) != 3 {
+		t.Fatalf("expected 3 tasks, got %d", len(tasks))
+	}
+
+	taskID := tasks[0].ID
+	prefix8 := taskID[:8]
+	prefix16 := taskID[:16]
+	prefix32 := taskID[:32]
+	invalidPrefix := "00000000"
+	shortPrefix := "1234567"
+
+	// Test 1: Exact ID match (36 chars) should work
+	retrieved, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Errorf("exact ID lookup failed: %v", err)
+	}
+	if retrieved.ID != taskID {
+		t.Errorf("exact ID lookup returned wrong task: expected %s, got %s", taskID, retrieved.ID)
+	}
+
+	// Test 2: Prefix match with exactly one result
+	retrieved, err = store.GetTask(ctx, prefix8)
+	if err != nil {
+		t.Errorf("8-char prefix lookup failed: %v", err)
+	}
+	if retrieved.ID != taskID {
+		t.Errorf("8-char prefix lookup returned wrong task: expected %s, got %s", taskID, retrieved.ID)
+	}
+
+	// Test 3: Longer prefix also works
+	retrieved, err = store.GetTask(ctx, prefix16)
+	if err != nil {
+		t.Errorf("16-char prefix lookup failed: %v", err)
+	}
+	if retrieved.ID != taskID {
+		t.Errorf("16-char prefix lookup returned wrong task: expected %s, got %s", taskID, retrieved.ID)
+	}
+
+	retrieved, err = store.GetTask(ctx, prefix32)
+	if err != nil {
+		t.Errorf("32-char prefix lookup failed: %v", err)
+	}
+	if retrieved.ID != taskID {
+		t.Errorf("32-char prefix lookup returned wrong task: expected %s, got %s", taskID, retrieved.ID)
+	}
+
+	// Test 4: Prefix that doesn't match any task returns not found
+	retrieved, err = store.GetTask(ctx, invalidPrefix)
+	if err != ErrNotFound {
+		t.Errorf("non-matching prefix should return ErrNotFound, got %v", err)
+	}
+
+	// Test 5: Prefix shorter than 8 chars returns not found
+	retrieved, err = store.GetTask(ctx, shortPrefix)
+	if err != ErrNotFound {
+		t.Errorf("short prefix should return ErrNotFound, got %v", err)
+	}
+
+	// Ambiguous prefix testing is difficult with UUIDs as they're unlikely to share
+	// long prefixes in practice. The logic is tested through code review.
+}

@@ -342,6 +342,11 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 		return
 	}
+	var conflictErr *store.ConflictError
+	if errors.As(err, &conflictErr) {
+		s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+		return
+	}
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, "GET_ERROR", "Failed to get task")
 		return

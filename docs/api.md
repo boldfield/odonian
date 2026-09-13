@@ -408,7 +408,17 @@ curl -H "Authorization: Bearer token" \
 **Status Codes:**
 - `200 OK`: Task retrieved
 - `404 NOT_FOUND`: Task not found
+- `409 AMBIGUOUS_ID`: Task ID prefix matches multiple tasks
 - `500 GET_ERROR`: Server error retrieving task
+
+**Task ID Resolution:**
+
+The `{id}` parameter supports prefix resolution for convenience. When the provided ID is between 8 and 35 characters (shorter than a full UUID), it is treated as a prefix:
+- If exactly one task ID matches the prefix, that task is returned
+- If no tasks match the prefix, returns `404 NOT_FOUND`
+- If multiple tasks match the prefix, returns `409 AMBIGUOUS_ID` with a list of candidate task IDs
+
+For full UUID identifiers (36 characters), the standard exact-match lookup is used.
 
 **Note:** This endpoint returns a rich response with field names in lowercase (unlike most other endpoints which use uppercase). It includes the full dependency list and all linked resources.
 

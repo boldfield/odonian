@@ -1095,12 +1095,46 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 // GetTask retrieves a task by id, including its dependencies and links.
 // Returns ErrNotFound if the task does not exist.
 func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error) {
+	// Resolve prefix: if id is 8-35 chars, try to match as a prefix
+	resolvedID := id
+	if len(id) >= 8 && len(id) < 36 {
+		var candidates []string
+		rows, err := s.readConn.QueryContext(ctx, `
+			SELECT id FROM task WHERE id LIKE ?
+		`, id+"%")
+		if err != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query task prefix: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var candidate string
+			if err := rows.Scan(&candidate); err != nil {
+				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to scan candidate: %w", err)
+			}
+			candidates = append(candidates, candidate)
+		}
+		if err := rows.Err(); err != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("error iterating candidates: %w", err)
+		}
+
+		if len(candidates) == 0 {
+			return TaskWithDepsAndLinks{}, ErrNotFound
+		} else if len(candidates) > 1 {
+			return TaskWithDepsAndLinks{}, &ConflictError{
+				Code:    "AMBIGUOUS_ID",
+				Message: fmt.Sprintf("Ambiguous task ID prefix; matches multiple tasks: %v", candidates),
+			}
+		}
+		resolvedID = candidates[0]
+	}
+
 	var t Task
 	var reviewModelsJSON *string
 	err := s.readConn.QueryRowContext(ctx, `
 		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, id).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, resolvedID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return TaskWithDepsAndLinks{}, ErrNotFound
