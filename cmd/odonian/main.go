@@ -506,7 +506,7 @@ func executeTasks(ctx context.Context, baseURL, token string, jsonOutput bool, a
 	}
 
 	// Filter by state and model
-	var filtered []tuiclient.Task
+	filtered := []tuiclient.Task{}
 	for _, task := range tasks {
 		if *stateFlag != "" && task.State != *stateFlag {
 			continue

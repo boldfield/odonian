@@ -1530,6 +1530,37 @@ func TestExecuteTasksJSON(t *testing.T) {
 	}
 }
 
+func TestExecuteTasksEmptyResultJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/proj-1/tasks" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Task{
+				{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeTasks(context.Background(), server.URL, "test-token", true, []string{"--project", "proj-1", "--state", "review"}, buf)
+	if err != nil {
+		t.Fatalf("executeTasks with filter resulting in empty set failed: %v", err)
+	}
+
+	output := buf.String()
+	var result []tuiclient.Task
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	if result == nil {
+		t.Error("expected non-nil empty slice [], got null")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected 0 tasks in JSON, got %d", len(result))
+	}
+}
+
 func TestExecuteTasksMissingProject(t *testing.T) {
 	buf := &bytes.Buffer{}
 	err := executeTasks(context.Background(), "http://localhost:8080", "test-token", false, []string{}, buf)
@@ -1630,6 +1661,35 @@ func TestExecutePendingJSON(t *testing.T) {
 	}
 	if result[1].State != "review" && result[1].State != "approved" {
 		t.Errorf("expected task state to be review or approved, got %q", result[1].State)
+	}
+}
+
+func TestExecutePendingEmptyQueueJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/proj-1/tasks" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Task{})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePending(context.Background(), server.URL, "test-token", true, []string{"--project", "proj-1"}, buf)
+	if err != nil {
+		t.Fatalf("executePending with empty queue JSON failed: %v", err)
+	}
+
+	output := buf.String()
+	var result []tuiclient.Task
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	if result == nil {
+		t.Error("expected non-nil empty slice [], got null")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected 0 tasks in JSON, got %d", len(result))
 	}
 }
 
