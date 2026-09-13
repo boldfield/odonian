@@ -87,6 +87,10 @@ If the file does not exist, GitHub calls are made unauthenticated. Public repos 
 GitHub's 60 requests/hour unauthenticated limit; private repos fail with 401/404, logged every
 tick. For a deployment with no GitHub integration, point `FORGE_TOKENS` at an empty file.
 
+When a task is superseded and its pull request cannot be cleaned up due to a missing or empty owner
+token, the cleanup is skipped and one log line is emitted naming the owner and PR link. No unauthenticated
+GitHub calls are made in this case.
+
 ## CLI (`odonian <command>`)
 
 | Variable | Default | Meaning |
