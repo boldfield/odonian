@@ -148,6 +148,38 @@ else
   test_fail "agent.sh doesn't export ODONIAN_MODEL"
 fi
 
+# Test 15: Check that agent.sh transitions tasks when prompt file is missing
+echo "Test 15: agent.sh transitions blocked when prompt not found"
+if grep -q 'odonian transition.*blocked.*no prompt' "$SCRIPT_TO_TEST"; then
+  test_pass "agent.sh transitions task to blocked on missing prompt"
+else
+  test_fail "agent.sh doesn't transition task on missing prompt"
+fi
+
+# Test 16: Check that agent.sh sleeps after blocking on missing prompt in single-project
+echo "Test 16: agent.sh sleeps after blocking prompt in single-project"
+if grep -B 1 'prompt not found.*blocking.*nap 30' "$SCRIPT_TO_TEST" | grep -q 'odonian transition.*blocked'; then
+  test_pass "agent.sh sleeps and transitions on missing prompt in single-project"
+else
+  test_fail "agent.sh doesn't sleep/transition correctly on missing prompt"
+fi
+
+# Test 17: Check that agent.sh uses correct --to flag syntax for transition
+echo "Test 17: agent.sh uses correct --to flag for transition"
+if grep -q 'odonian transition.*--to blocked' "$SCRIPT_TO_TEST"; then
+  test_pass "agent.sh uses correct --to syntax for transition"
+else
+  test_fail "agent.sh doesn't use --to flag in transition command"
+fi
+
+# Test 18: Check that agent.sh sleeps after blocking on missing prompt in multi-project
+echo "Test 18: agent.sh sleeps after blocking prompt in multi-project"
+if grep -A 60 'MULTI-PROJECT MODE' "$SCRIPT_TO_TEST" | grep -q 'odonian transition.*--to blocked.*no prompt'; then
+  test_pass "agent.sh sleeps and logs correctly on missing prompt in multi-project"
+else
+  test_fail "agent.sh doesn't handle missing prompt correctly in multi-project"
+fi
+
 echo ""
 echo "=== Test Summary ==="
 echo "Total: $test_count | Passed: $pass_count | Failed: $fail_count"

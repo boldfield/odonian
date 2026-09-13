@@ -429,7 +429,8 @@ if [ "$MULTI" = 0 ]; then
       task_track=$(echo "$task_json" | jq -r '.track // "build"')
       PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
       if [ ! -f "$PROMPT_FILE" ]; then
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; skipping task $task_id"; continue
+        odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
       fi
       echo "[$AGENT_ID] $(date '+%H:%M:%S') claimable $KIND; dispatching ($task_model/$task_track)…"
       export AGENT_MODEL="$task_model"
@@ -497,7 +498,8 @@ while true; do
     task_track=$(echo "$task_json" | jq -r '.track // "build"')
     PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
     if [ ! -f "$PROMPT_FILE" ]; then
-      continue   # prompt file not found, try next project
+      odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
+      echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
     fi
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatching ($task_model/$task_track/$KIND) on $(norm_repo "$prepo") [${pid:0:8}]…"
     export AGENT_MODEL="$task_model"

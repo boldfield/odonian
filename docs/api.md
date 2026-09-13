@@ -232,8 +232,8 @@ Bulk-create tasks for a project.
 - `spec` (required): Task specification/description
 - `document_id` (required): ID of the design or feature document this task is decomposed from
 - `model` (optional): Assigned model (e.g., `haiku`, `sonnet`, `opus`); must be in the deployment allowlist if provided. If omitted or empty, defaults to the deployment default model.
+- `track` (optional): Task track that determines the prompt path (e.g., `build`, `design`, `security`). Defaults to `build`. If the delivery mode + track + kind combination has no prompt file, the task will be transitioned to `blocked` with a note.
 - `review_models` (optional): List of reviewer models for this task (e.g., `["opus", "sonnet"]`); each must be in the allowlist. Default is `["opus"]` if unset/empty. Ignored for review tasks (auto-spawned only).
-- `track` (optional): Task track category; must be one of `"build"` or `"design"`. If omitted or empty, defaults to `"build"`.
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
 
 **Response (201 Created):**
