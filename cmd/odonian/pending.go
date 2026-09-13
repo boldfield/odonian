@@ -33,13 +33,13 @@ func executePending(ctx context.Context, baseURL, token string, jsonOutput bool,
 	client := tuiclient.NewHTTPClient(baseURL, token)
 
 	// Fetch tasks in review state
-	reviewTasks, err := client.ListTasks(ctx, *projectFlag, tuiclient.WithState("review"))
+	reviewTasks, err := client.ListTasks(ctx, *projectFlag, tuiclient.WithState("review"), tuiclient.WithFields("summary"))
 	if err != nil {
 		return fmt.Errorf("failed to list tasks: %w", err)
 	}
 
 	// Fetch tasks in approved state
-	approvedTasks, err := client.ListTasks(ctx, *projectFlag, tuiclient.WithState("approved"))
+	approvedTasks, err := client.ListTasks(ctx, *projectFlag, tuiclient.WithState("approved"), tuiclient.WithFields("summary"))
 	if err != nil {
 		return fmt.Errorf("failed to list tasks: %w", err)
 	}

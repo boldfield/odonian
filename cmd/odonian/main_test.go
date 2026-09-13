@@ -1646,6 +1646,10 @@ func TestExecutePendingTable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" {
 			state := r.URL.Query().Get("state")
+			fields := r.URL.Query().Get("fields")
+			if fields != "summary" {
+				t.Errorf("expected fields=summary in request, got: %s", fields)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			if state == "review" {
 				json.NewEncoder(w).Encode([]tuiclient.Task{
@@ -1691,6 +1695,10 @@ func TestExecutePendingJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" {
 			state := r.URL.Query().Get("state")
+			fields := r.URL.Query().Get("fields")
+			if fields != "summary" {
+				t.Errorf("expected fields=summary in request, got: %s", fields)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			if state == "review" {
 				json.NewEncoder(w).Encode([]tuiclient.Task{
