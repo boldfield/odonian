@@ -31,18 +31,21 @@ func executePending(ctx context.Context, baseURL, token string, jsonOutput bool,
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	tasks, err := client.ListTasks(ctx, *projectFlag)
+
+	// Fetch tasks in review state
+	reviewTasks, err := client.ListTasks(ctx, *projectFlag, tuiclient.WithState("review"))
 	if err != nil {
 		return fmt.Errorf("failed to list tasks: %w", err)
 	}
 
-	// Filter to review and approved states only
-	filtered := []tuiclient.Task{}
-	for _, task := range tasks {
-		if task.State == "review" || task.State == "approved" {
-			filtered = append(filtered, task)
-		}
+	// Fetch tasks in approved state
+	approvedTasks, err := client.ListTasks(ctx, *projectFlag, tuiclient.WithState("approved"))
+	if err != nil {
+		return fmt.Errorf("failed to list tasks: %w", err)
 	}
+
+	// Combine results
+	filtered := append(reviewTasks, approvedTasks...)
 
 	// Output results
 	if jsonOutput {

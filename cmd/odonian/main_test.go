@@ -1477,11 +1477,18 @@ func TestExecuteTasksTable(t *testing.T) {
 func TestExecuteTasksWithStateFilter(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" {
+			state := r.URL.Query().Get("state")
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Task{
-				{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
-				{ID: "task-2", State: "in_progress", Model: "sonnet", Kind: "review", Title: "Task 2"},
-			})
+			if state == "ready" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
+				})
+			} else {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
+					{ID: "task-2", State: "in_progress", Model: "sonnet", Kind: "review", Title: "Task 2"},
+				})
+			}
 		}
 	}))
 	defer server.Close()
@@ -1504,11 +1511,18 @@ func TestExecuteTasksWithStateFilter(t *testing.T) {
 func TestExecuteTasksWithModelFilter(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" {
+			model := r.URL.Query().Get("model")
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Task{
-				{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
-				{ID: "task-2", State: "in_progress", Model: "sonnet", Kind: "review", Title: "Task 2"},
-			})
+			if model == "sonnet" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-2", State: "in_progress", Model: "sonnet", Kind: "review", Title: "Task 2"},
+				})
+			} else {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
+					{ID: "task-2", State: "in_progress", Model: "sonnet", Kind: "review", Title: "Task 2"},
+				})
+			}
 		}
 	}))
 	defer server.Close()
@@ -1562,10 +1576,15 @@ func TestExecuteTasksJSON(t *testing.T) {
 func TestExecuteTasksEmptyResultJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" {
+			state := r.URL.Query().Get("state")
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Task{
-				{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
-			})
+			if state == "review" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{})
+			} else {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
+				})
+			}
 		}
 	}))
 	defer server.Close()
@@ -1626,12 +1645,23 @@ func TestExecuteTasksMissingToken(t *testing.T) {
 func TestExecutePendingTable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" {
+			state := r.URL.Query().Get("state")
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Task{
-				{ID: "task-1", State: "review", Kind: "implement", Title: "Task 1"},
-				{ID: "task-2", State: "approved", Kind: "review", Title: "Task 2"},
-				{ID: "task-3", State: "ready", Kind: "implement", Title: "Task 3"},
-			})
+			if state == "review" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "review", Kind: "implement", Title: "Task 1"},
+				})
+			} else if state == "approved" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-2", State: "approved", Kind: "review", Title: "Task 2"},
+				})
+			} else {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "review", Kind: "implement", Title: "Task 1"},
+					{ID: "task-2", State: "approved", Kind: "review", Title: "Task 2"},
+					{ID: "task-3", State: "ready", Kind: "implement", Title: "Task 3"},
+				})
+			}
 		}
 	}))
 	defer server.Close()
@@ -1660,12 +1690,23 @@ func TestExecutePendingTable(t *testing.T) {
 func TestExecutePendingJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" {
+			state := r.URL.Query().Get("state")
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Task{
-				{ID: "task-1", State: "review", Kind: "implement", Title: "Task 1"},
-				{ID: "task-2", State: "approved", Kind: "review", Title: "Task 2"},
-				{ID: "task-3", State: "ready", Kind: "implement", Title: "Task 3"},
-			})
+			if state == "review" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "review", Kind: "implement", Title: "Task 1"},
+				})
+			} else if state == "approved" {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-2", State: "approved", Kind: "review", Title: "Task 2"},
+				})
+			} else {
+				json.NewEncoder(w).Encode([]tuiclient.Task{
+					{ID: "task-1", State: "review", Kind: "implement", Title: "Task 1"},
+					{ID: "task-2", State: "approved", Kind: "review", Title: "Task 2"},
+					{ID: "task-3", State: "ready", Kind: "implement", Title: "Task 3"},
+				})
+			}
 		}
 	}))
 	defer server.Close()
