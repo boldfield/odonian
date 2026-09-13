@@ -724,8 +724,8 @@ func (s *sqliteStore) CreateProject(ctx context.Context, name, repo string) (Pro
 func (s *sqliteStore) GetProject(ctx context.Context, id string) (Project, error) {
 	var p Project
 	err := s.readConn.QueryRowContext(ctx, `
-		SELECT id, name, repo, created_at FROM project WHERE id = ?
-	`, id).Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt)
+		SELECT id, name, repo, created_at, archived_at FROM project WHERE id = ?
+	`, id).Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt, &p.ArchivedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return Project{}, ErrNotFound
@@ -744,7 +744,7 @@ func (s *sqliteStore) GetProject(ctx context.Context, id string) (Project, error
 // Returns an empty slice (not nil) when no projects exist.
 func (s *sqliteStore) ListProjects(ctx context.Context, filter ProjectListFilter) ([]Project, error) {
 	query := `
-		SELECT id, name, repo, created_at FROM project
+		SELECT id, name, repo, created_at, archived_at FROM project
 	`
 	args := []interface{}{}
 	whereAdded := false
@@ -796,7 +796,7 @@ func (s *sqliteStore) ListProjects(ctx context.Context, filter ProjectListFilter
 	projects := make([]Project, 0)
 	for rows.Next() {
 		var p Project
-		err := rows.Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt)
+		err := rows.Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt, &p.ArchivedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan project: %w", err)
 		}

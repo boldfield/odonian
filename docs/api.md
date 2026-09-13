@@ -65,7 +65,8 @@ Create a new project.
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "My Project",
   "repo": "https://github.com/user/my-project",
-  "created_at": "2026-06-05T21:00:00.000000000Z"
+  "created_at": "2026-06-05T21:00:00.000000000Z",
+  "archived_at": null
 }
 ```
 
@@ -95,7 +96,8 @@ curl -H "Authorization: Bearer token" \
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "My Project",
   "repo": "https://github.com/user/my-project",
-  "created_at": "2026-06-05T21:00:00.000000000Z"
+  "created_at": "2026-06-05T21:00:00.000000000Z",
+  "archived_at": null
 }
 ```
 
@@ -103,6 +105,8 @@ curl -H "Authorization: Bearer token" \
 - `200 OK`: Project found
 - `404 NOT_FOUND`: Project not found
 - `500 GET_ERROR`: Server error retrieving project
+
+**Note:** The `archived_at` field is `null` for active projects or contains the timestamp when the project was archived.
 
 ---
 
