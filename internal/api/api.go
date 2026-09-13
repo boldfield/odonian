@@ -12,6 +12,33 @@ import (
 	"github.com/boldfield/odonian/internal/store"
 )
 
+// taskToSummary converts a Task to a summary representation, omitting Spec and Result.
+func taskToSummary(task store.Task) map[string]interface{} {
+	return map[string]interface{}{
+		"id":               task.ID,
+		"project_id":       task.ProjectID,
+		"document_id":      task.DocumentID,
+		"title":            task.Title,
+		"state":            task.State,
+		"assignee":         task.Assignee,
+		"lease_expires_at": task.LeaseExpiresAt,
+		"model":            task.Model,
+		"kind":             task.Kind,
+		"review_models":    task.ReviewModels,
+		"review_round":     task.ReviewRound,
+		"target_task_id":   task.TargetTaskID,
+		"verdict":          task.Verdict,
+		"agent_merge":      task.AgentMerge,
+		"held":             task.Held,
+		"escalate":         task.Escalate,
+		"track":            task.Track,
+		"created_at":       task.CreatedAt,
+		"updated_at":       task.UpdatedAt,
+		"archived_at":      task.ArchivedAt,
+		"superseded_by":    task.SupersededBy,
+	}
+}
+
 // Server wraps the HTTP server with its dependencies: store, auth token, and lease TTL.
 type Server struct {
 	mux                  *http.ServeMux
@@ -152,6 +179,46 @@ func (s *Server) errorResponse(w http.ResponseWriter, statusCode int, code, mess
 		},
 	}
 	json.NewEncoder(w).Encode(resp)
+}
+
+// errorResponseWithCandidates writes a conflict error whose payload also
+// lists candidate ids, e.g. AMBIGUOUS_ID from an unresolved task-id prefix.
+func (s *Server) errorResponseWithCandidates(w http.ResponseWriter, statusCode int, code, message string, candidates []string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	resp := map[string]interface{}{
+		"error": map[string]interface{}{
+			"code":       code,
+			"message":    message,
+			"candidates": candidates,
+		},
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// resolveTaskID reads the {id} path value and resolves any unique task-id
+// prefix (8-35 chars) to the full stored id so every /tasks/{id}/... route
+// accepts a table-truncated id, not just GET /tasks/{id}. It writes the
+// appropriate error response and returns ok=false on failure: 404 for a
+// no-match or too-short prefix, and 409 AMBIGUOUS_ID (with candidate ids) when
+// the prefix matches several tasks. A full 36-char id is returned unchanged.
+func (s *Server) resolveTaskID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.PathValue("id")
+	resolved, err := s.store.ResolveTaskID(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+		return "", false
+	}
+	var conflictErr *store.ConflictError
+	if errors.As(err, &conflictErr) {
+		s.errorResponseWithCandidates(w, http.StatusConflict, conflictErr.Code, conflictErr.Message, conflictErr.Candidates)
+		return "", false
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "GET_ERROR", "Failed to resolve task id")
+		return "", false
+	}
+	return resolved, true
 }
 
 // Mux returns the underlying http.ServeMux for testing or direct access.
@@ -342,6 +409,11 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 		return
 	}
+	var conflictErr *store.ConflictError
+	if errors.As(err, &conflictErr) {
+		s.errorResponseWithCandidates(w, http.StatusConflict, conflictErr.Code, conflictErr.Message, conflictErr.Candidates)
+		return
+	}
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, "GET_ERROR", "Failed to get task")
 		return
@@ -352,7 +424,10 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 
 // handleGetTaskEvents handles GET /tasks/{id}/events to retrieve the task's event log.
 func (s *Server) handleGetTaskEvents(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	events, err := s.store.ListEvents(r.Context(), id)
 	if err != nil {
@@ -417,12 +492,25 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		tasks = make([]store.Task, 0)
 	}
 
+	fieldsSummary := r.URL.Query().Get("fields") == "summary"
+	if fieldsSummary {
+		summaries := make([]map[string]interface{}, len(tasks))
+		for i, task := range tasks {
+			summaries[i] = taskToSummary(task)
+		}
+		s.encodeJSON(w, http.StatusOK, summaries)
+		return
+	}
+
 	s.encodeJSON(w, http.StatusOK, tasks)
 }
 
 // handleClaimTask handles POST /tasks/{id}/claim to claim a task as in_progress.
 func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	var payload struct {
 		AgentID string `json:"agent_id"`
@@ -473,7 +561,10 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 
 // handleHeartbeat handles POST /tasks/{id}/heartbeat to extend a task's lease.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	var payload struct {
 		AgentID string `json:"agent_id"`
@@ -509,7 +600,10 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 // handlePromoteTask handles POST /tasks/{id}/promote to promote a task from backlog to ready.
 func (s *Server) handlePromoteTask(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	// Promote the task
 	task, err := s.store.PromoteTask(r.Context(), taskID)
@@ -531,7 +625,10 @@ func (s *Server) handlePromoteTask(w http.ResponseWriter, r *http.Request) {
 
 // handleSubmit handles POST /tasks/{id}/submit to transition a task from in_progress to review.
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	var payload struct {
 		AgentID string            `json:"agent_id"`
@@ -576,7 +673,10 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 // handleReview handles POST /tasks/{id}/review to record a review verdict event.
 func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	var payload struct {
 		Actor   string  `json:"actor"`
@@ -620,7 +720,10 @@ func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
 
 // handleTransition handles POST /tasks/{id}/transition to move a task to a new state.
 func (s *Server) handleTransition(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	var payload struct {
 		To   string  `json:"to"`
@@ -657,7 +760,10 @@ func (s *Server) handleTransition(w http.ResponseWriter, r *http.Request) {
 
 // handleSupersede handles POST /tasks/{id}/supersede to create a new task with the same spec.
 func (s *Server) handleSupersede(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	var payload struct {
 		Model *string `json:"model"`
@@ -693,7 +799,10 @@ func (s *Server) handleSupersede(w http.ResponseWriter, r *http.Request) {
 
 // handleUpdateTask handles PATCH /tasks/{id} to update a task's dependencies.
 func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	var payload struct {
 		DependsOn []string `json:"depends_on"`
@@ -735,7 +844,10 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 
 // handleArchiveTask handles POST /tasks/{id}/archive to soft-archive a task.
 func (s *Server) handleArchiveTask(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	task, err := s.store.ArchiveTask(r.Context(), taskID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -752,7 +864,10 @@ func (s *Server) handleArchiveTask(w http.ResponseWriter, r *http.Request) {
 
 // handleUnarchiveTask handles POST /tasks/{id}/unarchive to restore an archived task.
 func (s *Server) handleUnarchiveTask(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	task, err := s.store.UnarchiveTask(r.Context(), taskID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -803,7 +918,10 @@ func (s *Server) handleUnarchiveProject(w http.ResponseWriter, r *http.Request) 
 
 // handleHold handles POST /tasks/{id}/hold to pin a task out of automated flow.
 func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
 	task, err := s.store.HoldTask(r.Context(), taskID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -820,9 +938,12 @@ func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
 
 // handleRelease handles POST /tasks/{id}/release to restore normal automated flow.
 func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
 
-	task, err := s.store.ReleaseTask(r.Context(), taskID)
+	task, err := s.store.ReleaseTask(r.Context(), taskID, s.maxReviewRounds, s.escalationThresholds)
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 		return

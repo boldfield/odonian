@@ -581,10 +581,38 @@ func runCmd(cmd tea.Cmd) []tea.Msg {
 	}
 }
 
+// extractStateFromOptions extracts the State field a ListTasks call was made with, if any.
+func extractStateFromOptions(options ...tuiclient.TaskListOption) string {
+	opts := &tuiclient.TaskListOptions{}
+	for _, opt := range options {
+		opt(opts)
+	}
+	return opts.State
+}
+
+// filterTasksByState filters tasks to those matching state. An empty state returns all tasks.
+func filterTasksByState(tasks []tuiclient.Task, state string) []tuiclient.Task {
+	if state == "" {
+		return tasks
+	}
+	var filtered []tuiclient.Task
+	for _, task := range tasks {
+		if task.State == state {
+			filtered = append(filtered, task)
+		}
+	}
+	return filtered
+}
+
 // TestBoardModel_PromoteTask tests promoting a backlog task to ready.
 func TestBoardModel_PromoteTask(t *testing.T) {
 	promoteWasCalled := false
 	var promoteTaskID string
+
+	allTasks := []tuiclient.Task{
+		{ID: "task-1", Title: "Task 1", State: "ready"},
+		{ID: "task-2", Title: "Task 2", State: "backlog"},
+	}
 
 	mockClient := &tuiclient.MockClient{
 		PromoteTaskFunc: func(ctx context.Context, id string) error {
@@ -593,11 +621,10 @@ func TestBoardModel_PromoteTask(t *testing.T) {
 			return nil
 		},
 		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
-			// On refetch after promotion, task-1 should be in ready
-			return []tuiclient.Task{
-				{ID: "task-1", Title: "Task 1", State: "ready"},
-				{ID: "task-2", Title: "Task 2", State: "backlog"},
-			}, nil
+			// On refetch after promotion, task-1 should be in ready. The refetch is a
+			// per-state fields=summary call, so filter to the requested state like the
+			// real server does.
+			return filterTasksByState(allTasks, extractStateFromOptions(options...)), nil
 		},
 	}
 
@@ -963,6 +990,112 @@ func TestBoardModel_TickGeneration(t *testing.T) {
 			}
 		}
 	}
+}
+
+// extractFieldsFromOptions extracts the Fields field a ListTasks call was made with, if any.
+func extractFieldsFromOptions(options ...tuiclient.TaskListOption) string {
+	opts := &tuiclient.TaskListOptions{}
+	for _, opt := range options {
+		opt(opts)
+	}
+	return opts.Fields
+}
+
+// TestBoardModel_PerStatePollingWithSummaryFields verifies the per-state poll contract:
+// a tick issues exactly one WithState(...)+fields=summary ListTasks call per active state
+// (backlog, ready, in_progress, review, approved, blocked) and leaves the terminal columns
+// (done, failed, abandoned) untouched, while startup/manual refresh issues one such call per
+// state across all nine states.
+func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
+	type listTasksCall struct {
+		state  string
+		fields string
+	}
+	var calls []listTasksCall
+
+	mockClient := &tuiclient.MockClient{
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			calls = append(calls, listTasksCall{
+				state:  extractStateFromOptions(options...),
+				fields: extractFieldsFromOptions(options...),
+			})
+			return []tuiclient.Task{}, nil
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test"}
+	model := NewBoardModel(mockClient, config, project)
+
+	// Seed the board with terminal-column data so the merge path has something to preserve.
+	seeded := make(map[string][]tuiclient.Task)
+	for _, state := range stateOrder {
+		seeded[state] = []tuiclient.Task{}
+	}
+	seeded["done"] = []tuiclient.Task{{ID: "task-done", Title: "Done", State: "done"}}
+	seeded["failed"] = []tuiclient.Task{{ID: "task-failed", Title: "Failed", State: "failed"}}
+	seeded["abandoned"] = []tuiclient.Task{{ID: "task-abandoned", Title: "Abandoned", State: "abandoned"}}
+	m, _ := model.Update(tasksFetchedMsg{tasks: seeded})
+	model = m.(*BoardModel)
+
+	assertCalls := func(t *testing.T, calls []listTasksCall, wantStates []string) {
+		t.Helper()
+		if len(calls) != len(wantStates) {
+			t.Fatalf("expected %d ListTasks calls, got %d: %v", len(wantStates), len(calls), calls)
+		}
+		seen := make(map[string]int)
+		for _, call := range calls {
+			if call.fields != "summary" {
+				t.Errorf("expected fields=summary, got %q (state=%q)", call.fields, call.state)
+			}
+			seen[call.state]++
+		}
+		for _, state := range wantStates {
+			if seen[state] != 1 {
+				t.Errorf("expected exactly 1 call for state %q, got %d", state, seen[state])
+			}
+		}
+	}
+
+	// --- Tick polls only the active states and preserves the terminal columns ---
+	calls = nil
+	m, tickCmd := model.Update(tickMsg{})
+	model = m.(*BoardModel)
+	for _, msg := range runCmd(tickCmd) {
+		m, _ = model.Update(msg)
+		model = m.(*BoardModel)
+	}
+
+	assertCalls(t, calls, activeStates)
+
+	if len(model.tasks["done"]) != 1 || model.tasks["done"][0].ID != "task-done" {
+		t.Errorf("expected done column preserved with task-done, got %v", model.tasks["done"])
+	}
+	if len(model.tasks["failed"]) != 1 || model.tasks["failed"][0].ID != "task-failed" {
+		t.Errorf("expected failed column preserved with task-failed, got %v", model.tasks["failed"])
+	}
+	if len(model.tasks["abandoned"]) != 1 || model.tasks["abandoned"][0].ID != "task-abandoned" {
+		t.Errorf("expected abandoned column preserved with task-abandoned, got %v", model.tasks["abandoned"])
+	}
+
+	// --- Manual refresh ('r') fetches all 9 states ---
+	calls = nil
+	m, refreshCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = m.(*BoardModel)
+	if refreshCmd == nil {
+		t.Fatalf("expected a refresh command from 'r', got nil")
+	}
+	for _, msg := range runCmd(refreshCmd) {
+		m, _ = model.Update(msg)
+		model = m.(*BoardModel)
+	}
+
+	assertCalls(t, calls, stateOrder)
 }
 
 // --- TUI-4: Review action tests ---
@@ -2763,6 +2896,92 @@ func TestBoardModel_ProjectSwitchSameProject(t *testing.T) {
 	// Verify selection was NOT reset (same project is a no-op)
 	if model.selectedTaskID != "task-1" {
 		t.Errorf("Expected selectedTaskID to remain 'task-1', got %s", model.selectedTaskID)
+	}
+}
+
+// TestBoardModel_ProjectSwitchFetchesTerminalColumns verifies that switching projects issues
+// a full refresh (all 9 states, not just the active-only poll set), so terminal columns
+// (done, failed, abandoned) are populated for the newly selected project instead of staying
+// blank until the next manual refresh.
+func TestBoardModel_ProjectSwitchFetchesTerminalColumns(t *testing.T) {
+	type listTasksCall struct {
+		state  string
+		fields string
+	}
+	var calls []listTasksCall
+
+	project2Tasks := []tuiclient.Task{
+		{ID: "task-active", Title: "Active", State: "in_progress"},
+		{ID: "task-done", Title: "Done", State: "done"},
+		{ID: "task-failed", Title: "Failed", State: "failed"},
+		{ID: "task-abandoned", Title: "Abandoned", State: "abandoned"},
+	}
+
+	mockClient := &tuiclient.MockClient{
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			state := extractStateFromOptions(options...)
+			calls = append(calls, listTasksCall{state: state, fields: extractFieldsFromOptions(options...)})
+			return filterTasksByState(project2Tasks, state), nil
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project1 := tuiclient.Project{ID: "project-1", Name: "Project 1"}
+	project2 := tuiclient.Project{ID: "project-2", Name: "Project 2"}
+
+	model := NewBoardModel(mockClient, config, project1)
+	model.width = 80
+	model.height = 24
+
+	m, _ := model.Update(projectsFetchedMsg{projects: []tuiclient.Project{project1, project2}})
+	model = m.(*BoardModel)
+
+	bucketed := make(map[string][]tuiclient.Task)
+	for _, state := range stateOrder {
+		bucketed[state] = []tuiclient.Task{}
+	}
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+
+	// Open the project switcher, move to project2, and select it.
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	model = m.(*BoardModel)
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = m.(*BoardModel)
+	calls = nil
+	m, switchCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	if switchCmd == nil {
+		t.Fatalf("expected a fetch command after switching projects, got nil")
+	}
+	for _, msg := range runCmd(switchCmd) {
+		m, _ = model.Update(msg)
+		model = m.(*BoardModel)
+	}
+
+	if len(calls) != len(stateOrder) {
+		t.Fatalf("expected %d ListTasks calls (one per state) on project switch, got %d: %v", len(stateOrder), len(calls), calls)
+	}
+	for _, call := range calls {
+		if call.fields != "summary" {
+			t.Errorf("expected fields=summary on project-switch fetch, got %q (state=%q)", call.fields, call.state)
+		}
+	}
+
+	if len(model.tasks["done"]) != 1 || model.tasks["done"][0].ID != "task-done" {
+		t.Errorf("expected done column populated after project switch, got %v", model.tasks["done"])
+	}
+	if len(model.tasks["failed"]) != 1 || model.tasks["failed"][0].ID != "task-failed" {
+		t.Errorf("expected failed column populated after project switch, got %v", model.tasks["failed"])
+	}
+	if len(model.tasks["abandoned"]) != 1 || model.tasks["abandoned"][0].ID != "task-abandoned" {
+		t.Errorf("expected abandoned column populated after project switch, got %v", model.tasks["abandoned"])
 	}
 }
 

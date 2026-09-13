@@ -23,8 +23,8 @@ rejected, the parent's `review_round` is compared with its model's threshold. At
 threshold, the parent returns to `ready`. Over it, if the task has `escalate=true` (the default at
 creation) and its model is not the top of the ladder, the task is superseded by a copy pinned to
 the next tier and that copy is promoted to `ready`; otherwise the parent moves to `blocked`.
-The replacement currently loses the original `track` and defaults to `build`, including when
-escalating design work; see the [supersession limitations](./api.md#post-tasksidsupersede).
+The replacement preserves the original `track`, including for design work; see
+[supersession](./api.md#post-tasksidsupersede).
 Unblocking (`blocked → ready`) clears the assignee and lease but does not yet reset the review
 round, so one more rejection re-trips the breaker. Resetting it is specced in
 [`docs/specs/2026-08-06-unblock-resets-review-round.md`](./specs/2026-08-06-unblock-resets-review-round.md).
@@ -91,9 +91,9 @@ PR-watch skips an owner when its token is missing, even for public repositories.
 `no forge token for owner` when the skipped count first appears or changes, and logs when the
 owner is no longer skipped. Add the matching token to the server's file to enable checks;
 the file is read again on later passes. An empty file disables PR-watch's checks, including its
-stale-PR cleanup. The separate cleanup triggered by `/supersede` still attempts unauthenticated
-GitHub requests when the file or owner entry is missing; failures are logged after the board
-change has committed. An empty file is therefore not a general switch to disable GitHub calls.
+stale-PR cleanup. Cleanup triggered by `/supersede` also skips GitHub requests when the matching
+token is missing or empty, logging the owner and PR once for that cleanup attempt. The board
+supersession still commits successfully.
 
 The worker/reviewer harness has a separate fallback to its local `gh` authentication; that does
 not authenticate the server or merger. The merger reads only its per-owner token file.

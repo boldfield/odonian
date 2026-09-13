@@ -34,6 +34,22 @@ The container image is distroless (`gcr.io/distroless/static:nonroot`) with the 
 binary as its entrypoint. There is no shell in it; anything that needs to touch the database file
 directly runs as a separate pod that mounts the same volume.
 
+## CLI
+
+`pending` lists tasks in `review` or `approved`, using summary queries. Fetch `show` for the
+complete spec, result, dependencies, and links; `pending --json` does not contain their full
+contents. JSON list commands return `[]` when empty. `tasks` supports server-side filtering:
+
+```bash
+./bin/odonian tasks --project <project-id> --state ready --model haiku
+./bin/odonian pending --project <project-id>
+./bin/odonian show <task-id-or-unique-prefix>
+```
+
+Task API routes accept unique prefixes of at least eight characters. Project IDs still require
+full UUIDs. Local worktree operations also need full task UUIDs; see
+[Task ID Conventions](./api.md#task-id-conventions).
+
 ## TUI
 
 `odonian-tui` shows projects, documents, and tasks by state with filtering and search, and offers
@@ -43,6 +59,9 @@ confirm-gated archive and unarchive actions. It talks to the server over the sam
 ```bash
 ./bin/odonian-tui
 ```
+
+Active-state columns are polled automatically. Terminal columns are loaded at startup and on
+refresh; press `r` to refresh them when looking for newly completed work.
 
 ## The fleet in your development environment
 

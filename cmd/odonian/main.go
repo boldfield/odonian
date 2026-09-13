@@ -500,22 +500,19 @@ func executeTasks(ctx context.Context, baseURL, token string, jsonOutput bool, a
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	tasks, err := client.ListTasks(ctx, *projectFlag)
+	var opts []tuiclient.TaskListOption
+	if *stateFlag != "" {
+		opts = append(opts, tuiclient.WithState(*stateFlag))
+	}
+	if *modelFlag != "" {
+		opts = append(opts, tuiclient.WithModel(*modelFlag))
+	}
+	tasks, err := client.ListTasks(ctx, *projectFlag, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to list tasks: %w", err)
 	}
 
-	// Filter by state and model
-	var filtered []tuiclient.Task
-	for _, task := range tasks {
-		if *stateFlag != "" && task.State != *stateFlag {
-			continue
-		}
-		if *modelFlag != "" && task.Model != *modelFlag {
-			continue
-		}
-		filtered = append(filtered, task)
-	}
+	filtered := tasks
 
 	// Output results
 	if jsonOutput {

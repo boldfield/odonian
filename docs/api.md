@@ -4,8 +4,10 @@
 
 The Odonian API is a RESTful coordination substrate for managing a backlog of work claimed and executed by AI agents. All endpoints (except `/healthz`) require a bearer token authentication.
 
-Pass full UUIDs in URL paths and dependency references; eight-character IDs displayed in CLI
-tables are not accepted as prefixes. JSON field names are lowercase (`id`, `project_id`, etc.).
+Task URL paths accept full UUIDs or unique prefixes of at least eight characters; see
+[Task ID Conventions](#task-id-conventions). Project IDs, document IDs, and dependency references
+still require full UUIDs (or intra-batch task keys where supported).
+JSON field names are lowercase (`id`, `project_id`, etc.).
 The shared token authorizes access across every project and task; agent IDs identify actors
 and lease owners, not separate authenticated principals.
 
@@ -70,7 +72,8 @@ Create a new project.
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "My Project",
   "repo": "https://github.com/user/my-project",
-  "created_at": "2026-06-05T21:00:00.000000000Z"
+  "created_at": "2026-06-05T21:00:00.000000000Z",
+  "archived_at": null
 }
 ```
 
@@ -86,8 +89,7 @@ Create a new project.
 
 #### `GET /projects/{id}`
 
-Retrieve a project by ID, including an archived project. This read currently returns
-`archived_at: null` even when the project is archived; see the listing limitation below.
+Retrieve a project by ID, including an archived project.
 
 **Request:**
 ```bash
@@ -101,7 +103,8 @@ curl -H "Authorization: Bearer token" \
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "My Project",
   "repo": "https://github.com/user/my-project",
-  "created_at": "2026-06-05T21:00:00.000000000Z"
+  "created_at": "2026-06-05T21:00:00.000000000Z",
+  "archived_at": null
 }
 ```
 
@@ -109,6 +112,8 @@ curl -H "Authorization: Bearer token" \
 - `200 OK`: Project found
 - `404 NOT_FOUND`: Project not found
 - `500 GET_ERROR`: Server error retrieving project
+
+**Note:** The `archived_at` field is `null` for active projects or contains the timestamp when the project was archived.
 
 ---
 
@@ -133,11 +138,9 @@ curl -H "Authorization: Bearer token" \
 **Response:** `200 OK` with an array of project objects, or `[]` if none match. Returns
 `400 INVALID_KIND` for an unsupported kind and `500 LIST_ERROR` on a storage failure.
 
-**Archive visibility limitation:** `include_archived=true` includes archived projects, but
-both this listing and `GET /projects/{id}` currently return `archived_at: null` for every
-project. Only the archive/unarchive responses expose the stored archive value. To identify
-archived projects from listings, compare IDs in otherwise identical requests with and without
-`include_archived=true`; do not filter on the returned `archived_at` field.
+Project objects include `archived_at`: `null` for active projects and the archive timestamp
+for archived projects. Use `include_archived=true` to list both, then inspect this field to
+identify projects to unarchive.
 
 #### `POST /projects/{id}/archive`
 
@@ -259,6 +262,40 @@ curl -H "Authorization: Bearer token" \
 
 ### Tasks
 
+#### Task ID Conventions
+
+Task ids are 36-character UUIDs, but table output (CLI, TUI) truncates them to
+8 characters for readability. Every task-id route — `GET /tasks/{id}` and each
+`/tasks/{id}/...` operation (claim, heartbeat, promote, submit, review,
+transition, supersede, hold, release, archive, unarchive, events, and `PATCH
+/tasks/{id}`) — accepts either the full id or any unique prefix of at least 8
+characters, so a truncated id copied from a table can be used directly without
+a `--json | jq` round trip to recover the full UUID:
+
+- **Exact id** (36 characters): looked up as-is.
+- **Unique prefix** (8-35 characters) matching exactly one task: resolved to
+  that task.
+- **No matching prefix**: `404 NOT_FOUND`.
+- **Several matches**: `409 AMBIGUOUS_ID`, with the candidate ids listed in
+  `error.candidates`.
+- **Fewer than 8 characters**: always `404 NOT_FOUND` (too short to safely
+  disambiguate).
+
+The prefix is matched literally: `%` and `_` are not treated as SQL wildcards,
+so a prefix such as `________` resolves to `404 NOT_FOUND` rather than matching
+every task.
+
+Resolution covers all tasks on the board, including archived and superseded tasks; it is not
+scoped to the project currently displayed. Use a longer prefix or the full UUID on ambiguity.
+IDs in response bodies remain full UUIDs. Prefix support applies to task IDs in URL paths,
+not to project/document IDs or task IDs inside `depends_on` arrays.
+
+**CLI local-worktree limitation:** `show` and `diff` can use a unique task prefix. In
+`local_commit` mode, continue using full UUIDs for `wt-ensure`, implement-task `submit`,
+`approve`, and `reject --abandon`: their filesystem operations still construct worktree and
+`wip/<id>` names from the argument as typed. A prefix can resolve on the board but fail to find
+the full-ID worktree or branch. The [demo](./demo.md#4-inspect-the-work-and-decide) uses full IDs.
+
 #### `POST /projects/{id}/tasks`
 
 Bulk-create tasks for a project.
@@ -295,23 +332,21 @@ Bulk-create tasks for a project.
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
 - `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
 - `escalate` (optional, default `true`): Allow replacement by a higher model tier after the review threshold is exceeded.
-- `track` (optional, default `build`): Selects the harness prompt directory. The API stores any nonempty string without validating it. The bundled harness supports `build` in both delivery modes and `design` only in `pull_request` mode; see the supported combinations below.
+- `track` (optional, default `build`): `build` or `design`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
 
 | Delivery mode | Supported tracks |
 |---|---|
 | `pull_request` | `build`, `design` |
 | `local_commit` | `build` |
 
-These combinations have worker and reviewer prompts in the bundled harness. With an unsupported
-combination (including `local_commit` + `design`), the API still accepts the task, but the
-harness cannot dispatch it. If it is first in the claimable queue, later tasks of the same kind
-in that project are blocked behind it. In single-project mode, the harness logs
-`prompt not found` and repeatedly fetches the same task without sleeping, generating continuous API traffic.
-In multi-project mode, it skips that project for the pass and tries other projects; if none can
-dispatch, it sleeps ten seconds. The incompatible task remains `ready` without a board error.
-Hold it to let later tasks proceed, then supply the missing prompts or replace it with a task
-using a supported combination. Supersession currently resets `track` to `build`, as described
-below; it does not preserve a design task's track.
+These combinations have worker and reviewer prompts in the bundled harness. The API validates
+the track name, but delivery mode is a harness setting: `design` is accepted even when a slot
+uses `local_commit`. If the selected prompt file is missing, the harness transitions the task
+to `blocked` with a `no prompt for <delivery-mode>/<track>/<kind>: <path>` note, logs the missing
+file, and sleeps 30 seconds before continuing. Once blocked, the task no longer prevents later
+claimable work from being selected. Supply the missing prompt or use a compatible delivery
+mode, then transition `blocked` → `ready` to retry. Supersession preserves the track, so merely
+superseding the task will not resolve a missing prompt.
 
 **Response (201 Created):**
 ```json
@@ -357,6 +392,7 @@ below; it does not preserve a design task's track.
 - `201 Created`: Tasks successfully created
 - `400 INVALID_DOCUMENT_ID`: One or more document IDs do not exist
 - `400 UNKNOWN_MODEL`: The `model` or a `review_models` entry is not in the deployment allowlist
+- `400 UNKNOWN_TRACK`: The `track` field is not one of `"build"` or `"design"`
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `400 <other validation errors>`: Client input validation errors
 - `500 CREATE_ERROR`: Server error creating tasks
@@ -394,6 +430,10 @@ curl -H "Authorization: Bearer token" \
 # Filter by claimable and model (worker polls for its own work)
 curl -H "Authorization: Bearer token" \
   "https://api.example.com/projects/550e8400-e29b-41d4-a716-446655440000/tasks?claimable=true&model=haiku"
+
+# Return summary view (omit spec and result)
+curl -H "Authorization: Bearer token" \
+  "https://api.example.com/projects/550e8400-e29b-41d4-a716-446655440000/tasks?fields=summary"
 ```
 
 **Query Parameters:**
@@ -404,8 +444,11 @@ curl -H "Authorization: Bearer token" \
 - `claimable` (optional): If `true`, only return tasks in `ready`, or `in_progress` with an expired lease, that are not held and have all dependencies done.
 - `include_archived` (optional): If `true`, include archived tasks; otherwise they are hidden.
 - `include_superseded` (optional): If `true`, include superseded tasks; otherwise they are hidden even when filtering by `state=superseded`.
+- `fields` (optional): `summary` omits `spec` and `result` while retaining the other task fields. Omitted or unrecognized values return the full listing representation. Fetch `GET /tasks/{id}` for the full task with dependencies and links.
 
 **Response (200 OK):**
+
+Without `fields=summary`:
 ```json
 [
   {
@@ -422,6 +465,27 @@ curl -H "Authorization: Bearer token" \
     "assignee": null,
     "lease_expires_at": null,
     "result": null,
+    "created_at": "2026-06-05T21:00:00.000000000Z",
+    "updated_at": "2026-06-05T21:00:00.000000000Z"
+  }
+]
+```
+
+With `fields=summary` (omits `spec` and `result`):
+```json
+[
+  {
+    "id": "770e8400-e29b-41d4-a716-446655440002",
+    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+    "document_id": "660e8400-e29b-41d4-a716-446655440001",
+    "title": "Implement authentication",
+    "state": "ready",
+    "kind": "implement",
+    "model": "haiku",
+    "review_models": ["opus"],
+    "review_round": 0,
+    "assignee": null,
+    "lease_expires_at": null,
     "created_at": "2026-06-05T21:00:00.000000000Z",
     "updated_at": "2026-06-05T21:00:00.000000000Z"
   }
@@ -489,10 +553,12 @@ curl -H "Authorization: Bearer token" \
 
 **Status Codes:**
 - `200 OK`: Task retrieved
-- `404 NOT_FOUND`: Task not found
+- `404 NOT_FOUND`: Task not found (including an id prefix with no matches, or shorter than 8 characters)
+- `409 AMBIGUOUS_ID`: The id prefix matches more than one task; `error.candidates` lists the matching ids
 - `500 GET_ERROR`: Server error retrieving task
 
-**Note:** This endpoint returns a rich response with field names in lowercase (unlike most other endpoints which use uppercase). It includes the full dependency list and all linked resources.
+**Note:** This endpoint returns lowercase field names, the full dependency list, and linked
+resources. `{id}` accepts a unique prefix — see [Task ID Conventions](#task-id-conventions).
 
 ---
 
@@ -873,7 +939,7 @@ to drain the `approved` lane by merging and marking done, or to override an appr
 The state machine enforces these rules:
 - `ready` → `in_progress` (via claim)
 - `in_progress` → `review` (via submit for implement tasks)
-- `review` → `approved` (when all reviewers approve; automatic, via verdict)
+- `review` → `approved` (when all reviewers approve; via the final verdict, or release after a held round finishes)
 - `review` → `done` (automatic after unanimous approval when `agent_merge=true`, a `no_op` link exists, and no `pr` link exists)
 - `review` → `ready` (once every review finishes and at least one rejects, unless the circuit breaker escalates or blocks the task)
 - `approved` → `done` (human merges PR)
@@ -894,7 +960,7 @@ from `in_progress` to `done` after merging.
 
 `blocked` is recoverable via `blocked` → `ready`; use `blocked` → `failed` to retire it.
 The `/transition` endpoint cannot move a task out of `done`, `failed`, `superseded`, or `abandoned`.
-The separate `/supersede` endpoint currently has no state guard, including for these states.
+The separate `/supersede` endpoint also rejects these terminal states with `409 CONFLICT`.
 
 ---
 
@@ -925,8 +991,10 @@ curl -H "Authorization: Bearer token" \
 ]
 ```
 
-Returns `[]` when there are no retained events, including for an unknown task ID. Use
-`GET /tasks/{id}` to check existence. Storage failures return `500 GET_ERROR`.
+Returns `[]` when there are no retained events, including for an unknown full-length task UUID.
+An unmatched or too-short prefix returns `404 NOT_FOUND`; an ambiguous prefix returns
+`409 AMBIGUOUS_ID`. Use `GET /tasks/{id}` to check existence when passing a full UUID.
+Storage failures return `500 GET_ERROR`.
 See [event retention configuration](./configuration.md#server-odonian-server).
 
 #### `PATCH /tasks/{id}`
@@ -940,7 +1008,8 @@ curl -X PATCH -H "Authorization: Bearer token" -H 'Content-Type: application/jso
   -d '{"depends_on":["880e8400-e29b-41d4-a716-446655440003"]}'
 ```
 
-Use full existing task UUIDs. `{"depends_on":[]}` clears dependencies; omitting `depends_on`
+Use full existing task UUIDs inside `depends_on`; the URL's task ID can be a unique prefix.
+`{"depends_on":[]}` clears dependencies; omitting `depends_on`
 or setting it to `null` also clears the list. Unknown JSON fields are ignored, so sending only
 an unsupported field would clear dependencies too. Send an explicit `depends_on` array.
 
@@ -954,19 +1023,13 @@ return `500 UPDATE_ERROR`.
 
 Create a replacement task and atomically repoint dependents to it. The old task becomes
 `superseded` with `superseded_by` set to the new ID. The replacement starts in `backlog` with
-review round zero, copies the title, spec, model, reviewer models, merge/escalation settings,
+review round zero, copies the title, spec, model, reviewer models, track, merge/escalation settings,
 and upstream dependencies, and appends prior rejection feedback to the spec when present.
 
-**Track is not preserved:** the replacement currently defaults to `track: "build"`, even when
-the original was `design`. Circuit-breaker escalation uses the same replacement logic, so it
-also loses the track and automatically promotes the replacement with build prompts. Check the
-replacement before allowing a fleet to work on it.
-
-**There is no state guard:** unlike `/transition`, this endpoint accepts terminal tasks,
-including `done`, `failed`, `abandoned`, and already `superseded` tasks. All dependents are
-repointed to the new backlog task. Superseding a completed dependency therefore makes that
-dependency unsatisfied again: otherwise claimable dependents disappear from claimable listings
-until the replacement is done. Check dependent tasks before superseding completed work.
+Supersession accepts `backlog`, `ready`, `in_progress`, `review`, `approved`, and `blocked` tasks.
+It rejects `done`, `failed`, `abandoned`, and already `superseded` tasks with `409 CONFLICT`,
+leaving their dependencies unchanged. Track is preserved for both manual supersession and
+circuit-breaker escalation, so a design task's replacement still uses design prompts.
 
 ```bash
 curl -X POST -H "Authorization: Bearer token" -H 'Content-Type: application/json' \
@@ -979,13 +1042,14 @@ a JSON body is required. The replacement must be promoted separately. This opera
 differs from circuit-breaker escalation, which automatically promotes its replacement.
 
 **Response:** `201 Created` with the **new task**, including its full UUID. Returns
-`400 UNKNOWN_MODEL`, `400 JSON_DECODE_ERROR`, `404 NOT_FOUND`, or `500 SUPERSEDE_ERROR`.
+`400 UNKNOWN_MODEL`, `400 JSON_DECODE_ERROR`, `404 NOT_FOUND`, `409 CONFLICT` for a terminal
+task, or `500 SUPERSEDE_ERROR`.
 
 After the board transaction commits, the server attempts to close the old task's open PR and
-delete its head branch using its per-owner forge token. A missing file or owner entry does not
-disable this cleanup: it still attempts unauthenticated GitHub requests, whose failures are
-logged without undoing the board change. There is no `gh` or `GH_TOKEN` fallback. That cleanup
-runs asynchronously; a successful response confirms the board change, not completion of GitHub
+delete its head branch using its per-owner forge token. If the file or matching token is
+missing or empty, cleanup is skipped without any GitHub requests and one log line identifies
+the owner and PR. There is no `gh` or `GH_TOKEN` fallback. Cleanup runs asynchronously;
+a successful response confirms the board change, not completion of GitHub
 cleanup. PR-watch retries stale open PR cleanup on later passes only when it has a matching
 owner token. Supersession does not stop a running agent process.
 
@@ -1002,30 +1066,31 @@ Held tasks cannot be claimed, and reviewer submission skips automatic aggregatio
 parent. Holding does not terminate an already running worker or revoke its lease; it is not a
 general ban on API transitions or forge actions.
 
-Release a parent in `review` **before the final reviewer submits**. If the final verdict arrives
-while it is held, all review tasks can finish while the parent stays in `review`; releasing
-afterward does not apply their verdicts. See the recovery steps under `/release`.
+Reviewers may finish while their parent is held. The parent stays in `review` until released;
+`/release` applies the completed round's verdicts in the same transaction as clearing the hold.
 
 **Response:** `200 OK` with the task object and `held: true`; `404 NOT_FOUND` if absent,
 or `500 HOLD_ERROR` on failure.
 
 #### `POST /tasks/{id}/release`
 
-Clear `held` without changing the task state or lease. No request body is required.
+Clear `held` and, for a parent in `review` whose current round is complete, apply the review
+verdicts in the same transaction. No request body is required.
 
 ```bash
 curl -X POST -H "Authorization: Bearer token" \
   https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/release
 ```
 
-Claimability still depends on state, dependencies, and lease expiry. Releasing is not an
-unclaim operation and does not rerun review aggregation by itself.
+If every review in the current round is done, release uses the same aggregation rules as
+review submission: unanimous approval moves the parent to `approved` (or directly to `done`
+for an opted-in no-op); rejection returns it to `ready`, escalates it, or blocks it according
+to the circuit breaker. Release itself does not increment `review_round`; the next implement
+submission starts a new round. A parent held through the final verdict needs only `/release`,
+not another implement pass, to apply that verdict.
 
-If the parent was held through its final reviewer verdict, it remains stranded in `review`
-after release, even with unanimous approval. To recover, release it and use `/transition` to
-move `review` → `blocked` → `ready`, then let a worker implement and submit it again for a new
-review round. The old verdicts will not complete the new round. Alternatively, supersede it,
-accounting for the dependency and track changes documented above.
+Outside `review`, or while reviews are unfinished, release only clears the hold. It does not
+revoke a lease or unclaim the task. Claimability still depends on state, dependencies, and lease expiry.
 
 **Response:** `200 OK` with the task object and `held: false`; `404 NOT_FOUND` if absent,
 or `500 RELEASE_ERROR` on failure.
@@ -1215,7 +1280,7 @@ curl -fsS "$BASE/tasks/$TASK_ID" -H "$AUTH" | jq -e 'select(.state == "done")'
 8. Workers extend their lease via heartbeat to prevent task expiry
 9. Dependencies are enforced at claim time — tasks with undone deps cannot be claimed
 10. The second task `task2` cannot be claimed until `task1` is `done` (due to `depends_on`)
-11. `/transition` cannot reopen `done`, `failed`, `superseded`, or `abandoned` tasks. The separate `/supersede` endpoint currently accepts them and repoints dependents to a new backlog task. Unblocking applies to `blocked` tasks.
+11. `/transition` cannot reopen `done`, `failed`, `superseded`, or `abandoned` tasks, and `/supersede` also rejects them. Unblocking applies to `blocked` tasks.
 
 ---
 
@@ -1239,7 +1304,9 @@ All error responses follow a consistent format:
 - `NOT_FOUND` (404): Resource not found
 - `CONFLICT` (409): State transition or constraint violation (generic)
 - `MODEL_MISMATCH` (409): Task's model doesn't match declared model on claim
+- `AMBIGUOUS_ID` (409): A task id prefix matched more than one task; `error.candidates` lists the matching ids (see [Task ID Conventions](#task-id-conventions))
 - `UNKNOWN_MODEL` (400): Model is not in the deployment allowlist (create time)
+- `UNKNOWN_TRACK` (400): Track is not one of the valid values (`"build"` or `"design"`)
 - `JSON_DECODE_ERROR` (400): Invalid JSON in request body
 - `EMPTY_<FIELD>` (400): Required field is empty
 - `INVALID_<FIELD>` (400): Field value is invalid (e.g., verdict not "approve" or "reject")

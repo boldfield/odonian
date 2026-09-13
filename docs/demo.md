@@ -172,8 +172,9 @@ The optional terminal UI shows the same board by state, with the task's event ti
 make tui && ./bin/odonian-tui
 ```
 
-If the reviewer rejects, the task goes back to `ready` with `review_round` incremented, and a
-worker picks it up again with the reviewer's feedback in the task. After the fourth rejection of a
+If the reviewer rejects, the task goes back to `ready`, and a worker picks it up again with the
+reviewer's feedback in the task. The next implement submission increments `review_round`.
+After the fourth rejection of a
 `haiku` task the circuit breaker supersedes it with a copy pinned to `sonnet` (the sandbox's
 ladder is `haiku → sonnet → opus → fable`; the server default is `haiku → sonnet → opus`).
 
@@ -183,12 +184,13 @@ In `local_commit` mode the worker's output is a commit on a per-task `wip/<task-
 worktree under `/tmp/odonian/worktrees`, recorded on the task as a `commit` link.
 
 Copy the `show`, `diff`, and `approve` commands printed by the boot banner: they already contain
-the task's full UUID. The table's eight-character ID is only for display. If you no longer have
-the banner, this optional lookup lists full IDs of tasks awaiting review or approval and prints
-nothing while that list is empty:
+the task's full UUID. Unique eight-character task prefixes now work for `show` and `diff`.
+Keep the full UUID for local `approve` and other worktree operations: they still use the
+argument as typed to locate `wip/<task-id>` and the worktree directory. If you no longer have
+the banner, this optional lookup recovers full IDs; empty `pending --json` output is `[]`:
 
 ```bash
-odonian pending --project <project-id> --json | jq -r '.[]? | [.id, .state, .title] | @tsv'
+odonian pending --project <project-id> --json | jq -r '.[] | [.id, .state, .title] | @tsv'
 ```
 
 ```bash
@@ -207,7 +209,8 @@ odonian reject  <task-id> --note "..."   # back to ready with your note; a worke
 `/tmp/odonian/repo` and removes the worktree, for you to merge however you like. The two halves are
 separate: if the freeze fails (for example because `ODONIAN_WORKTREE_HOME` was not exported, which
 is the error `neither ODONIAN_WORKTREE_HOME nor ODONIAN_HOME is set`), the board is already `done`;
-export the variable and retry only the freeze with `odonian approve --freeze-only <task-id>`. In
+export the variable and retry only the freeze with `odonian approve --freeze-only <full-task-id>`.
+If a prefix caused the freeze to fail, use the full UUID for that retry. In
 pull-request mode the equivalent step is merging the PR on GitHub, which the PR-watch reconciler
 notices and records as `done`.
 

@@ -159,8 +159,8 @@ case "$DELIVERY_MODE" in pull_request|local_commit) ;; *) echo "delivery mode mu
 # The prompt is keyed on all three axes — delivery_mode, track, kind — as PATH dimensions:
 #   prompts/<delivery_mode>/<track>/<kind>.md
 # No special-casing: a new mode/track/kind is just a file. A combo with no prompt (e.g.
-# local_commit + design) resolves to a missing path, and the caller already skips on "prompt not
-# found" — which is correct (no prompt = no such work).
+# local_commit + design) resolves to a missing path; the caller blocks the task with a note
+# and sleeps before continuing, so it cannot keep selecting the same incompatible task.
 get_prompt_file() {
   local track="${1:-build}"
   local kind="$2"
@@ -430,7 +430,8 @@ if [ "$MULTI" = 0 ]; then
       task_track=$(echo "$task_json" | jq -r '.track // "build"')
       PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
       if [ ! -f "$PROMPT_FILE" ]; then
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; skipping task $task_id"; continue
+        odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
       fi
       echo "[$AGENT_ID] $(date '+%H:%M:%S') claimable $KIND; dispatching ($task_model/$task_track)…"
       export AGENT_MODEL="$task_model"
@@ -498,7 +499,8 @@ while true; do
     task_track=$(echo "$task_json" | jq -r '.track // "build"')
     PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
     if [ ! -f "$PROMPT_FILE" ]; then
-      continue   # prompt file not found, try next project
+      odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
+      echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
     fi
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatching ($task_model/$task_track/$KIND) on $(norm_repo "$prepo") [${pid:0:8}]…"
     export AGENT_MODEL="$task_model"

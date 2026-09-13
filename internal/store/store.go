@@ -38,6 +38,7 @@ type Store interface {
 	CreateDocument(ctx context.Context, projectID, kind, title, ref string, commit *string) (Document, error)
 	ListDocuments(ctx context.Context, projectID string, kind *string) ([]Document, error)
 	CreateTasks(ctx context.Context, projectID string, tasks []TaskInput) ([]Task, error)
+	ResolveTaskID(ctx context.Context, id string) (string, error)
 	GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error)
 	ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error)
 	ListDependents(ctx context.Context, taskID string) ([]string, error)
@@ -50,7 +51,7 @@ type Store interface {
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
-	ReleaseTask(ctx context.Context, taskID string) (Task, error)
+	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int) (Task, error)
 	ArchiveTask(ctx context.Context, taskID string) (Task, error)
 	UnarchiveTask(ctx context.Context, taskID string) (Task, error)
 	ArchiveProject(ctx context.Context, projectID string) (Project, error)
@@ -627,10 +628,12 @@ var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("conflict")
 
 // ConflictError is a typed conflict with an error code and message.
-// Handlers map it to HTTP 409 via errors.As.
+// Handlers map it to HTTP 409 via errors.As. Candidates is optional structured
+// data for conflicts that need to surface more than a message, e.g. AMBIGUOUS_ID.
 type ConflictError struct {
-	Code    string
-	Message string
+	Code       string
+	Message    string
+	Candidates []string
 }
 
 func (e *ConflictError) Error() string {
@@ -642,6 +645,14 @@ func (e *ConflictError) Error() string {
 
 func conflict(code, message string) error {
 	return &ConflictError{Code: code, Message: message}
+}
+
+func ambiguousTaskID(candidates []string) error {
+	return &ConflictError{
+		Code:       "AMBIGUOUS_ID",
+		Message:    fmt.Sprintf("task id prefix matches multiple tasks: %s", strings.Join(candidates, ", ")),
+		Candidates: candidates,
+	}
 }
 
 // ValidationError is a client-input error. Handlers map it to HTTP 400 via errors.As,
@@ -724,8 +735,8 @@ func (s *sqliteStore) CreateProject(ctx context.Context, name, repo string) (Pro
 func (s *sqliteStore) GetProject(ctx context.Context, id string) (Project, error) {
 	var p Project
 	err := s.readConn.QueryRowContext(ctx, `
-		SELECT id, name, repo, created_at FROM project WHERE id = ?
-	`, id).Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt)
+		SELECT id, name, repo, created_at, archived_at FROM project WHERE id = ?
+	`, id).Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt, &p.ArchivedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return Project{}, ErrNotFound
@@ -744,7 +755,7 @@ func (s *sqliteStore) GetProject(ctx context.Context, id string) (Project, error
 // Returns an empty slice (not nil) when no projects exist.
 func (s *sqliteStore) ListProjects(ctx context.Context, filter ProjectListFilter) ([]Project, error) {
 	query := `
-		SELECT id, name, repo, created_at FROM project
+		SELECT id, name, repo, created_at, archived_at FROM project
 	`
 	args := []interface{}{}
 	whereAdded := false
@@ -796,7 +807,7 @@ func (s *sqliteStore) ListProjects(ctx context.Context, filter ProjectListFilter
 	projects := make([]Project, 0)
 	for rows.Next() {
 		var p Project
-		err := rows.Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt)
+		err := rows.Scan(&p.ID, &p.Name, &p.Repo, &p.CreatedAt, &p.ArchivedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan project: %w", err)
 		}
@@ -1000,6 +1011,9 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 
 		track := "build"
 		if input.Track != "" {
+			if input.Track != "build" && input.Track != "design" {
+				return nil, invalid("UNKNOWN_TRACK", fmt.Sprintf("unknown track: %s", input.Track))
+			}
 			track = input.Track
 		}
 
@@ -1092,12 +1106,74 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 	return createdTasks, nil
 }
 
+// likeEscape escapes the SQL LIKE metacharacters ('%', '_') and the escape
+// character itself so a caller-supplied string matches literally under a
+// `LIKE ? ESCAPE '\'` clause. Without this, a prefix such as "____" or "%"
+// would be treated as a wildcard pattern and match unrelated task ids.
+func likeEscape(s string) string {
+	return likeEscaper.Replace(s)
+}
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// ResolveTaskID resolves a possibly-truncated task id to the full stored id.
+// Stored ids are 36-char UUIDs, so an id of that length or longer is treated
+// as exact and returned unchanged (existing exact-match callers see no
+// behavior change). A shorter id is resolved as a prefix: exactly one match
+// returns that id, no match returns ErrNotFound, and several matches return a
+// *ConflictError with Code AMBIGUOUS_ID and the candidate ids attached. An id
+// shorter than 8 characters is too short to safely disambiguate and is
+// rejected as not-found without a database lookup. The prefix is matched
+// literally — LIKE wildcards in the input are escaped, so "________" resolves
+// to not-found rather than matching every task.
+func (s *sqliteStore) ResolveTaskID(ctx context.Context, id string) (string, error) {
+	if len(id) >= 36 {
+		return id, nil
+	}
+	if len(id) < 8 {
+		return "", ErrNotFound
+	}
+
+	rows, err := s.readConn.QueryContext(ctx, `SELECT id FROM task WHERE id LIKE ? ESCAPE '\' ORDER BY id`, likeEscape(id)+"%")
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve task id prefix: %w", err)
+	}
+	defer rows.Close()
+
+	var candidates []string
+	for rows.Next() {
+		var candidate string
+		if err := rows.Scan(&candidate); err != nil {
+			return "", fmt.Errorf("failed to scan candidate task id: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating candidate task ids: %w", err)
+	}
+
+	switch len(candidates) {
+	case 0:
+		return "", ErrNotFound
+	case 1:
+		return candidates[0], nil
+	default:
+		return "", ambiguousTaskID(candidates)
+	}
+}
+
 // GetTask retrieves a task by id, including its dependencies and links.
-// Returns ErrNotFound if the task does not exist.
+// The id may be a unique prefix (at least 8 characters) of the full id; see
+// ResolveTaskID. Returns ErrNotFound if the task does not exist.
 func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error) {
+	id, err := s.ResolveTaskID(ctx, id)
+	if err != nil {
+		return TaskWithDepsAndLinks{}, err
+	}
+
 	var t Task
 	var reviewModelsJSON *string
-	err := s.readConn.QueryRowContext(ctx, `
+	err = s.readConn.QueryRowContext(ctx, `
 		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
 	`, id).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
@@ -1809,170 +1885,10 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append review event on parent: %w", err)
 			}
 
-			// Wait-for-all aggregation: tally the parent's review tasks for the current round
-			var parentReviewRound int
-			var parentState string
-			var parentHeld bool
-			var parentModel string
-			var parentEscalate bool
-			var parentAgentMerge bool
-			var parentProjectID string
-			var parentDocumentID string
-			var parentTitle string
-			var parentTrack string
-			err = tx.QueryRowContext(ctx, `
-				SELECT review_round, state, held, model, escalate, agent_merge, project_id, document_id, title, track FROM task WHERE id = ?
-			`, *targetTaskID).Scan(&parentReviewRound, &parentState, &parentHeld, &parentModel, &parentEscalate, &parentAgentMerge, &parentProjectID, &parentDocumentID, &parentTitle, &parentTrack)
+			// Aggregate review verdicts and update parent state as needed
+			_, err = s.aggregateReviewRound(ctx, tx, *targetTaskID, maxReviewRounds, escalationThresholds)
 			if err != nil {
-				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to fetch parent task review_round: %w", err)
-			}
-
-			// If parent is held, skip auto-transition (hold is an operator lock that overrides auto-flow)
-			if !parentHeld {
-				// Count total, done, and approve verdict review tasks for the parent in the current round
-				var totalReviewTasks int
-				var doneReviewTasks int
-				var approveReviewTasks int
-				err = tx.QueryRowContext(ctx, `
-					SELECT
-						COUNT(*) as total,
-						SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done,
-						SUM(CASE WHEN state='done' AND verdict='approve' THEN 1 ELSE 0 END) as approve
-					FROM task
-					WHERE target_task_id = ? AND review_round = ?
-				`, *targetTaskID, parentReviewRound).Scan(&totalReviewTasks, &doneReviewTasks, &approveReviewTasks)
-				if err != nil {
-					return TaskWithDepsAndLinks{}, fmt.Errorf("failed to tally review tasks: %w", err)
-				}
-
-				// Guard: if parent is in a terminal state (failed/blocked/abandoned), do not resurrect it
-				var newParentState string
-				isTerminal := parentState == "failed" || parentState == "blocked" || parentState == "abandoned"
-
-				if !isTerminal {
-					// Determine the new parent state based on the tally
-					if doneReviewTasks < totalReviewTasks {
-						// Not all done yet; parent stays in review
-						newParentState = ""
-					} else if doneReviewTasks == totalReviewTasks && approveReviewTasks == totalReviewTasks {
-						// All done and all approved; check if this is an agent_merge no_op
-						newParentState = "approved"
-
-						if parentAgentMerge {
-							// Check if parent has a no_op link (and no pr link)
-							var hasNoOp bool
-							var hasPR bool
-							rows, err := tx.QueryContext(ctx, `
-								SELECT kind FROM task_link WHERE task_id = ?
-							`, *targetTaskID)
-							if err == nil {
-								defer rows.Close()
-								for rows.Next() {
-									var kind string
-									if err := rows.Scan(&kind); err == nil {
-										if kind == "no_op" {
-											hasNoOp = true
-										} else if kind == "pr" {
-											hasPR = true
-										}
-									}
-								}
-							}
-
-							// If agent_merge=true and no_op link with no pr link, go straight to done
-							if hasNoOp && !hasPR {
-								newParentState = "done"
-							}
-
-							// Spawn merge task if approved with agent_merge && pr (not the no_op case)
-							if newParentState == "approved" && hasPR {
-								mergeTaskID := GenerateID()
-								mergeTitle := "Merge: " + parentTitle
-								_, err := tx.ExecContext(ctx, `
-									INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, created_at, updated_at)
-									VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-								`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", *targetTaskID, false, parentTrack, now, now)
-								if err != nil {
-									return TaskWithDepsAndLinks{}, fmt.Errorf("failed to create merge task: %w", err)
-								}
-							}
-						}
-					} else if doneReviewTasks == totalReviewTasks && approveReviewTasks < totalReviewTasks {
-						// All done but at least one rejected
-						// Circuit breaker: if review_round > threshold, check escalation vs blocking
-						threshold := thresholdFor(parentModel, escalationThresholds, maxReviewRounds)
-						if parentReviewRound > threshold {
-							// Threshold exceeded: escalate if enabled and not top tier, else block
-							if parentEscalate && !s.isTopTier(parentModel) {
-								nextModel, ok := s.nextTier(parentModel)
-								if ok {
-									// Escalate to next tier via supersession
-									escalatedTaskID, err := s.supersedeTaskTx(ctx, tx, *targetTaskID, &nextModel)
-									if err != nil {
-										return TaskWithDepsAndLinks{}, fmt.Errorf("failed to escalate task: %w", err)
-									}
-									// Promote the escalated task from backlog to ready so the higher-tier worker can claim it immediately
-									_, err = tx.ExecContext(ctx, `
-										UPDATE task
-										SET state='ready', updated_at=?
-										WHERE id=?
-									`, now, escalatedTaskID)
-									if err != nil {
-										return TaskWithDepsAndLinks{}, fmt.Errorf("failed to promote escalated task: %w", err)
-									}
-									// Append transition event for the escalated task
-									escalationNote := "backlog->ready (auto-promoted via escalation)"
-									_, err = s.AppendEvent(ctx, tx, escalatedTaskID, "system", "transition", nil, &escalationNote)
-									if err != nil {
-										return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append escalation transition event: %w", err)
-									}
-									// Emit escalation event on the old (now superseded) task
-									eventNote := fmt.Sprintf("%s→%s round %d, superseded by %s", parentModel, nextModel, parentReviewRound, escalatedTaskID)
-									_, err = s.AppendEvent(ctx, tx, *targetTaskID, "system", "escalation", nil, &eventNote)
-									if err != nil {
-										return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append escalation event: %w", err)
-									}
-									// Parent was superseded by supersedeTaskTx, so skip state update logic below
-									newParentState = ""
-								} else {
-									// nextTier returned false despite !isTopTier (shouldn't happen), fall back to blocking
-									newParentState = "blocked"
-								}
-							} else {
-								// Escalation disabled or already top tier: block
-								newParentState = "blocked"
-							}
-						} else {
-							newParentState = "ready"
-						}
-					}
-				}
-
-				// Update parent state if needed (and not in terminal state)
-				if newParentState != "" && newParentState != parentState && !isTerminal {
-					_, err := tx.ExecContext(ctx, `
-						UPDATE task SET state = ?, updated_at = ? WHERE id = ?
-					`, newParentState, now, *targetTaskID)
-					if err != nil {
-						return TaskWithDepsAndLinks{}, fmt.Errorf("failed to update parent task state: %w", err)
-					}
-
-					// Append transition event for audit trail
-					var eventNote string
-					if newParentState == "approved" {
-						eventNote = "Aggregation: all reviewers approved"
-					} else if newParentState == "done" {
-						eventNote = "auto-finalized: agent_merge no-op approved by all reviewers"
-					} else if newParentState == "ready" {
-						eventNote = "Aggregation: at least one reviewer rejected"
-					} else if newParentState == "blocked" {
-						eventNote = fmt.Sprintf("auto-blocked: %d consecutive review rounds without approval — needs human attention", parentReviewRound)
-					}
-					_, err = s.AppendEvent(ctx, tx, *targetTaskID, "system", "transition", nil, &eventNote)
-					if err != nil {
-						return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append transition event: %w", err)
-					}
-				}
+				return TaskWithDepsAndLinks{}, err
 			}
 		}
 
@@ -2065,6 +1981,184 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 	// Task exists but not submittable (not in_progress or wrong assignee) -> ErrConflict
 	tx.Rollback()
 	return TaskWithDepsAndLinks{}, ErrConflict
+}
+
+// aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.
+// It handles: verdict counting, merge task spawning (if approved with agent_merge),
+// escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
+// A return value of "" means no state change needed. Caller must apply the returned state.
+// All state updates and event appending happen within this function.
+func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, parentID string, maxReviewRounds int, escalationThresholds map[string]int) (string, error) {
+	now := nowTimestamp()
+
+	var parentReviewRound int
+	var parentState string
+	var parentHeld bool
+	var parentModel string
+	var parentEscalate bool
+	var parentAgentMerge bool
+	var parentProjectID string
+	var parentDocumentID string
+	var parentTitle string
+	var parentTrack string
+	err := tx.QueryRowContext(ctx, `
+		SELECT review_round, state, held, model, escalate, agent_merge, project_id, document_id, title, track FROM task WHERE id = ?
+	`, parentID).Scan(&parentReviewRound, &parentState, &parentHeld, &parentModel, &parentEscalate, &parentAgentMerge, &parentProjectID, &parentDocumentID, &parentTitle, &parentTrack)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch parent task review_round: %w", err)
+	}
+
+	// If parent is held, skip auto-transition (hold is an operator lock that overrides auto-flow)
+	if parentHeld {
+		return "", nil
+	}
+
+	// Count total, done, and approve verdict review tasks for the parent in the current round
+	var totalReviewTasks int
+	var doneReviewTasks int
+	var approveReviewTasks int
+	err = tx.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*) as total,
+			SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done,
+			SUM(CASE WHEN state='done' AND verdict='approve' THEN 1 ELSE 0 END) as approve
+		FROM task
+		WHERE target_task_id = ? AND review_round = ?
+	`, parentID, parentReviewRound).Scan(&totalReviewTasks, &doneReviewTasks, &approveReviewTasks)
+	if err != nil {
+		return "", fmt.Errorf("failed to tally review tasks: %w", err)
+	}
+
+	// Guard: if parent is in a terminal state (failed/blocked/abandoned), do not resurrect it
+	var newParentState string
+	isTerminal := parentState == "failed" || parentState == "blocked" || parentState == "abandoned"
+
+	if !isTerminal {
+		// Determine the new parent state based on the tally
+		if doneReviewTasks < totalReviewTasks {
+			// Not all done yet; parent stays in review
+			newParentState = ""
+		} else if doneReviewTasks == totalReviewTasks && approveReviewTasks == totalReviewTasks {
+			// All done and all approved; check if this is an agent_merge no_op
+			newParentState = "approved"
+
+			if parentAgentMerge {
+				// Check if parent has a no_op link (and no pr link)
+				var hasNoOp bool
+				var hasPR bool
+				rows, err := tx.QueryContext(ctx, `
+					SELECT kind FROM task_link WHERE task_id = ?
+				`, parentID)
+				if err == nil {
+					defer rows.Close()
+					for rows.Next() {
+						var kind string
+						if err := rows.Scan(&kind); err == nil {
+							if kind == "no_op" {
+								hasNoOp = true
+							} else if kind == "pr" {
+								hasPR = true
+							}
+						}
+					}
+				}
+
+				// If agent_merge=true and no_op link with no pr link, go straight to done
+				if hasNoOp && !hasPR {
+					newParentState = "done"
+				}
+
+				// Spawn merge task if approved with agent_merge && pr (not the no_op case)
+				if newParentState == "approved" && hasPR {
+					mergeTaskID := GenerateID()
+					mergeTitle := "Merge: " + parentTitle
+					_, err := tx.ExecContext(ctx, `
+						INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, created_at, updated_at)
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, now, now)
+					if err != nil {
+						return "", fmt.Errorf("failed to create merge task: %w", err)
+					}
+				}
+			}
+		} else if doneReviewTasks == totalReviewTasks && approveReviewTasks < totalReviewTasks {
+			// All done but at least one rejected
+			// Circuit breaker: if review_round > threshold, check escalation vs blocking
+			threshold := thresholdFor(parentModel, escalationThresholds, maxReviewRounds)
+			if parentReviewRound > threshold {
+				// Threshold exceeded: escalate if enabled and not top tier, else block
+				if parentEscalate && !s.isTopTier(parentModel) {
+					nextModel, ok := s.nextTier(parentModel)
+					if ok {
+						// Escalate to next tier via supersession
+						escalatedTaskID, err := s.supersedeTaskTx(ctx, tx, parentID, &nextModel)
+						if err != nil {
+							return "", fmt.Errorf("failed to escalate task: %w", err)
+						}
+						// Promote the escalated task from backlog to ready so the higher-tier worker can claim it immediately
+						_, err = tx.ExecContext(ctx, `
+							UPDATE task
+							SET state='ready', updated_at=?
+							WHERE id=?
+						`, now, escalatedTaskID)
+						if err != nil {
+							return "", fmt.Errorf("failed to promote escalated task: %w", err)
+						}
+						// Append transition event for the escalated task
+						escalationNote := "backlog->ready (auto-promoted via escalation)"
+						_, err = s.AppendEvent(ctx, tx, escalatedTaskID, "system", "transition", nil, &escalationNote)
+						if err != nil {
+							return "", fmt.Errorf("failed to append escalation transition event: %w", err)
+						}
+						// Emit escalation event on the old (now superseded) task
+						eventNote := fmt.Sprintf("%s→%s round %d, superseded by %s", parentModel, nextModel, parentReviewRound, escalatedTaskID)
+						_, err = s.AppendEvent(ctx, tx, parentID, "system", "escalation", nil, &eventNote)
+						if err != nil {
+							return "", fmt.Errorf("failed to append escalation event: %w", err)
+						}
+						// Parent was superseded by supersedeTaskTx, so skip state update logic below
+						newParentState = ""
+					} else {
+						// nextTier returned false despite !isTopTier (shouldn't happen), fall back to blocking
+						newParentState = "blocked"
+					}
+				} else {
+					// Escalation disabled or already top tier: block
+					newParentState = "blocked"
+				}
+			} else {
+				newParentState = "ready"
+			}
+		}
+	}
+
+	// Update parent state if needed (and not in terminal state)
+	if newParentState != "" && newParentState != parentState && !isTerminal {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE task SET state = ?, updated_at = ? WHERE id = ?
+		`, newParentState, now, parentID)
+		if err != nil {
+			return "", fmt.Errorf("failed to update parent task state: %w", err)
+		}
+
+		// Append transition event for audit trail
+		var eventNote string
+		if newParentState == "approved" {
+			eventNote = "Aggregation: all reviewers approved"
+		} else if newParentState == "done" {
+			eventNote = "auto-finalized: agent_merge no-op approved by all reviewers"
+		} else if newParentState == "ready" {
+			eventNote = "Aggregation: at least one reviewer rejected"
+		} else if newParentState == "blocked" {
+			eventNote = fmt.Sprintf("auto-blocked: %d consecutive review rounds without approval — needs human attention", parentReviewRound)
+		}
+		_, err = s.AppendEvent(ctx, tx, parentID, "system", "transition", nil, &eventNote)
+		if err != nil {
+			return "", fmt.Errorf("failed to append transition event: %w", err)
+		}
+	}
+
+	return newParentState, nil
 }
 
 // AddReview records a review verdict event for a task.
@@ -2290,6 +2384,12 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 		return "", fmt.Errorf("failed to load old task: %w", err)
 	}
 
+	// 1a. Check if task is in a terminal state
+	switch oldTask.State {
+	case "done", "failed", "abandoned", "superseded":
+		return "", ErrConflict
+	}
+
 	// Unmarshal review_models
 	oldTask.ReviewModels = []string{}
 	if reviewModelsJSON != nil {
@@ -2365,9 +2465,9 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 	}
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, newTaskID, oldTask.ProjectID, oldTask.DocumentID, oldTask.Title, oldTask.Spec, "backlog", model, oldTask.Kind, newReviewModelsJSON, 0, oldTask.AgentMerge, oldTask.Escalate, now, now)
+		INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, track, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, newTaskID, oldTask.ProjectID, oldTask.DocumentID, oldTask.Title, oldTask.Spec, "backlog", model, oldTask.Kind, newReviewModelsJSON, 0, oldTask.AgentMerge, oldTask.Escalate, oldTask.Track, now, now)
 	if err != nil {
 		return "", fmt.Errorf("failed to insert replacement task: %w", err)
 	}
@@ -2502,6 +2602,11 @@ func (s *sqliteStore) closeSupersededPR(ctx context.Context, oldTaskID, newTaskI
 	token, err := forge.OwnerToken(owner)
 	if err != nil {
 		logger.Error("failed to get forge token for PR close", "task_id", oldTaskID, "owner", owner, "error", err)
+		return
+	}
+
+	if token == "" {
+		logger.Info("skipped supersede PR cleanup: no forge token", "task_id", oldTaskID, "owner", owner, "pr_url", prLink.Value)
 		return
 	}
 
@@ -2821,9 +2926,10 @@ func (s *sqliteStore) HoldTask(ctx context.Context, taskID string) (Task, error)
 
 // ReleaseTask clears the held flag on a task, restoring normal automated flow.
 // Release works from any state (it is an orthogonal lock, not a state transition).
+// If the task is in review and all review tasks targeting it are done, aggregates the review round.
 // Returns the updated Task on success.
 // Returns ErrNotFound if the task doesn't exist.
-func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string) (Task, error) {
+func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
@@ -2864,6 +2970,45 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string) (Task, err
 	if reviewModelsJSON != nil {
 		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
 			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	// If task is in review, check if all review tasks are done and aggregate if so
+	if t.State == "review" {
+		var totalReviewTasks, doneReviewTasks int
+		err = tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) as total,
+				SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done
+			FROM task
+			WHERE target_task_id = ? AND review_round = ?
+		`, taskID, t.ReviewRound).Scan(&totalReviewTasks, &doneReviewTasks)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to tally review tasks: %w", err)
+		}
+
+		// If all review tasks are done, aggregate the round
+		if totalReviewTasks > 0 && doneReviewTasks == totalReviewTasks {
+			_, err = s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds)
+			if err != nil {
+				return Task{}, err
+			}
+
+			// Re-fetch the task to get the updated state
+			err = tx.QueryRowContext(ctx, `
+				SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+				FROM task WHERE id = ?
+			`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+			if err != nil {
+				return Task{}, fmt.Errorf("failed to fetch task after aggregation: %w", err)
+			}
+
+			t.ReviewModels = []string{}
+			if reviewModelsJSON != nil {
+				if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+					return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+				}
+			}
 		}
 	}
 

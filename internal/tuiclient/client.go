@@ -274,7 +274,7 @@ func (c *HTTPClient) ListProjects(ctx context.Context, options ...ProjectListOpt
 	}
 	defer resp.Body.Close()
 
-	var projects []Project
+	projects := []Project{}
 	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
@@ -303,6 +303,8 @@ type TaskListOptions struct {
 	Model     string
 	Kind      string
 	Claimable bool
+	State     string
+	Fields    string
 }
 
 // TaskListOption is a functional option for ListTasks.
@@ -329,7 +331,21 @@ func WithClaimable(claimable bool) TaskListOption {
 	}
 }
 
-// ListTasks fetches tasks for a project, optionally filtered by model, kind, and claimable status.
+// WithState sets the state filter.
+func WithState(state string) TaskListOption {
+	return func(opts *TaskListOptions) {
+		opts.State = state
+	}
+}
+
+// WithFields sets the fields parameter.
+func WithFields(fields string) TaskListOption {
+	return func(opts *TaskListOptions) {
+		opts.Fields = fields
+	}
+}
+
+// ListTasks fetches tasks for a project, optionally filtered by model, kind, claimable status, and state.
 func (c *HTTPClient) ListTasks(ctx context.Context, projectID string, options ...TaskListOption) ([]Task, error) {
 	opts := &TaskListOptions{}
 	for _, opt := range options {
@@ -337,7 +353,7 @@ func (c *HTTPClient) ListTasks(ctx context.Context, projectID string, options ..
 	}
 
 	path := fmt.Sprintf("/projects/%s/tasks", projectID)
-	if opts.Model != "" || opts.Kind != "" || opts.Claimable {
+	if opts.Model != "" || opts.Kind != "" || opts.Claimable || opts.State != "" || opts.Fields != "" {
 		var params []string
 		if opts.Model != "" {
 			params = append(params, fmt.Sprintf("model=%s", opts.Model))
@@ -347,6 +363,12 @@ func (c *HTTPClient) ListTasks(ctx context.Context, projectID string, options ..
 		}
 		if opts.Claimable {
 			params = append(params, "claimable=true")
+		}
+		if opts.State != "" {
+			params = append(params, fmt.Sprintf("state=%s", opts.State))
+		}
+		if opts.Fields != "" {
+			params = append(params, fmt.Sprintf("fields=%s", opts.Fields))
 		}
 		if len(params) > 0 {
 			path += "?" + join(params, "&")
@@ -359,7 +381,7 @@ func (c *HTTPClient) ListTasks(ctx context.Context, projectID string, options ..
 	}
 	defer resp.Body.Close()
 
-	var tasks []Task
+	tasks := []Task{}
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}

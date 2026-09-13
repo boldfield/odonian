@@ -27,6 +27,10 @@ func defaultTestAllowedModels() []string {
 	return []string{"haiku", "sonnet", "opus"}
 }
 
+func ptrStr(s string) *string {
+	return &s
+}
+
 // createTestFSWithBadMigration creates a test filesystem with the standard migrations
 // plus a bad migration (0003_bad.sql) that leaves a dangling foreign key.
 // It wraps the embedded migrations and adds the bad migration on top.
@@ -2029,6 +2033,150 @@ func TestTaskFieldsRoundTrip(t *testing.T) {
 			t.Errorf("review_models should be a JSON array, got type %T", reviewModelsVal)
 		}
 	}
+}
+
+// TestGetTaskPrefixResolution verifies that GetTask resolves a unique
+// 8-to-35-character id prefix to the full task, that dependencies and links
+// are looked up against the resolved full id (not the truncated prefix),
+// that no match or an id shorter than 8 characters returns ErrNotFound, that
+// several matches return a *ConflictError with Code AMBIGUOUS_ID listing
+// every candidate, and that the 36-character exact-id path is unchanged.
+func TestGetTaskPrefixResolution(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	proj, err := store.CreateProject(ctx, "prefix-test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	insertTask := func(id, title string) {
+		if _, err := store.Conn().ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, id, proj.ID, doc.ID, title, "spec", "backlog", now, now); err != nil {
+			t.Fatalf("failed to insert task %s: %v", id, err)
+		}
+	}
+
+	const (
+		depTaskID     = "dep-task-full-id-000001"
+		uniqueTaskID  = "uniq-task-full-id-000001"
+		ambiguousID1  = "ambig0001-task-full-a"
+		ambiguousID2  = "ambig0001-task-full-b"
+		ambiguousPfx  = "ambig0001"
+		uniquePfx     = "uniq-tas" // uniqueTaskID[:8]
+		noMatchPfx    = "zzzzzzzz"
+		tooShortInput = "ambig" // shorter than 8, must not even query
+	)
+
+	insertTask(depTaskID, "Dependency Task")
+	insertTask(uniqueTaskID, "Unique Prefix Task")
+	insertTask(ambiguousID1, "Ambiguous Task 1")
+	insertTask(ambiguousID2, "Ambiguous Task 2")
+
+	if _, err := store.Conn().ExecContext(ctx, `
+		INSERT INTO task_dep (task_id, depends_on_id) VALUES (?, ?)
+	`, uniqueTaskID, depTaskID); err != nil {
+		t.Fatalf("failed to insert task_dep: %v", err)
+	}
+	if _, err := store.Conn().ExecContext(ctx, `
+		INSERT INTO task_link (id, task_id, kind, value) VALUES (?, ?, ?, ?)
+	`, "prefix-test-link", uniqueTaskID, "pr", "#456"); err != nil {
+		t.Fatalf("failed to insert task_link: %v", err)
+	}
+
+	t.Run("exact id unchanged", func(t *testing.T) {
+		got, err := store.GetTask(ctx, uniqueTaskID)
+		if err != nil {
+			t.Fatalf("GetTask(exact id) failed: %v", err)
+		}
+		if got.ID != uniqueTaskID {
+			t.Errorf("expected id %s, got %s", uniqueTaskID, got.ID)
+		}
+	})
+
+	t.Run("unique prefix resolves and preserves deps and links", func(t *testing.T) {
+		got, err := store.GetTask(ctx, uniquePfx)
+		if err != nil {
+			t.Fatalf("GetTask(prefix) failed: %v", err)
+		}
+		if got.ID != uniqueTaskID {
+			t.Errorf("expected resolved id %s, got %s", uniqueTaskID, got.ID)
+		}
+		if len(got.DependsOn) != 1 || got.DependsOn[0] != depTaskID {
+			t.Errorf("expected DependsOn=[%s], got %v (prefix lookup must resolve the full id before querying task_dep)", depTaskID, got.DependsOn)
+		}
+		if len(got.Links) != 1 || got.Links[0].Value != "#456" {
+			t.Errorf("expected one link with value #456, got %v (prefix lookup must resolve the full id before querying task_link)", got.Links)
+		}
+	})
+
+	t.Run("no match returns not found", func(t *testing.T) {
+		_, err := store.GetTask(ctx, noMatchPfx)
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("shorter than 8 chars returns not found", func(t *testing.T) {
+		_, err := store.GetTask(ctx, tooShortInput)
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for a %d-char id, got %v", len(tooShortInput), err)
+		}
+	})
+
+	t.Run("ambiguous prefix returns conflict with candidates", func(t *testing.T) {
+		_, err := store.GetTask(ctx, ambiguousPfx)
+		var conflictErr *ConflictError
+		if !errors.As(err, &conflictErr) {
+			t.Fatalf("expected *ConflictError, got %v", err)
+		}
+		if conflictErr.Code != "AMBIGUOUS_ID" {
+			t.Errorf("expected Code=AMBIGUOUS_ID, got %s", conflictErr.Code)
+		}
+		gotCandidates := append([]string(nil), conflictErr.Candidates...)
+		sort.Strings(gotCandidates)
+		wantCandidates := []string{ambiguousID1, ambiguousID2}
+		if len(gotCandidates) != len(wantCandidates) || gotCandidates[0] != wantCandidates[0] || gotCandidates[1] != wantCandidates[1] {
+			t.Errorf("expected candidates %v, got %v", wantCandidates, gotCandidates)
+		}
+		for _, id := range wantCandidates {
+			if !strings.Contains(conflictErr.Message, id) {
+				t.Errorf("expected message to mention candidate %s, got %q", id, conflictErr.Message)
+			}
+		}
+	})
+
+	t.Run("LIKE wildcards in prefix are matched literally", func(t *testing.T) {
+		// A prefix of eight underscores must not behave as LIKE single-char
+		// wildcards matching every row; an unescaped `LIKE '________%'` would
+		// match all four tasks and report AMBIGUOUS_ID. Escaped, it matches no
+		// id (no stored id contains a literal underscore) -> not found.
+		if _, err := store.GetTask(ctx, "________"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for all-underscore prefix (wildcards must be escaped), got %v", err)
+		}
+		// '_' standing in for a real character must not match either:
+		// uniqueTaskID is "uniq-task-...", so "uniq_tas" resolves to it only if
+		// '_' is treated as a wildcard. It must be literal -> not found.
+		if _, err := store.GetTask(ctx, "uniq_tas"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for underscore-as-wildcard prefix, got %v", err)
+		}
+		// '%' (multi-char wildcard) must likewise be literal.
+		if _, err := store.GetTask(ctx, "%%%%%%%%"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound for all-percent prefix (wildcards must be escaped), got %v", err)
+		}
+	})
 }
 
 // TestCreateTasksWithConfiguredAllowlist verifies that model allowlist validation works.
@@ -5346,7 +5494,7 @@ func TestReleaseRestoresFlow(t *testing.T) {
 	}
 
 	// Release the task
-	_, err = store.ReleaseTask(ctx, taskID)
+	_, err = store.ReleaseTask(ctx, taskID, 5, nil)
 	if err != nil {
 		t.Fatalf("failed to release task: %v", err)
 	}
@@ -5374,6 +5522,349 @@ func TestReleaseRestoresFlow(t *testing.T) {
 	}
 	if releasedTask.Held {
 		t.Error("task should have held=false after release")
+	}
+}
+
+// TestReleaseAggregatesReviewWithApproval verifies that releasing a held review task aggregates verdicts when all reviews are done.
+func TestReleaseAggregatesReviewWithApproval(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create an implement task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Test implementation",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Promote and claim
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit for review
+	maxReviewRounds := 5
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Verify task is in review
+	reviewTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if reviewTask.State != "review" {
+		t.Errorf("task should be in review state, got %s", reviewTask.State)
+	}
+
+	// Get the review task
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+	if len(reviewTasks) != 1 {
+		t.Fatalf("expected 1 review task, got %d", len(reviewTasks))
+	}
+	reviewTaskID := reviewTasks[0].ID
+
+	// Claim and approve the review
+	_, err = store.ClaimTask(ctx, reviewTaskID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	// Task should be approved now
+	approvedTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if approvedTask.State != "approved" {
+		t.Errorf("task should be approved, got %s", approvedTask.State)
+	}
+
+	// Now hold the task and re-run the test with SubmitTask that skips aggregation due to hold
+	// First, transition back to review by superseding and re-submitting (not part of test scenario)
+	// Instead, we'll test the scenario where task is held before final review verdict is submitted
+
+	// Create a new test scenario: hold task, submit final verdict while held, release and aggregate
+	tasks2, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Test implementation 2",
+			Spec:         "Test spec 2",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task 2: %v", err)
+	}
+	taskID2 := tasks2[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID2)
+	if err != nil {
+		t.Fatalf("failed to promote task 2: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID2, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task 2: %v", err)
+	}
+
+	_, err = store.SubmitTask(ctx, taskID2, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#101"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task 2: %v", err)
+	}
+
+	// Get the review task
+	reviewTasks2, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks 2: %v", err)
+	}
+	var reviewTaskID2 string
+	for _, rt := range reviewTasks2 {
+		if rt.TargetTaskID != nil && *rt.TargetTaskID == taskID2 {
+			reviewTaskID2 = rt.ID
+			break
+		}
+	}
+	if reviewTaskID2 == "" {
+		t.Fatalf("could not find review task for task 2")
+	}
+
+	// Hold the parent task
+	_, err = store.HoldTask(ctx, taskID2)
+	if err != nil {
+		t.Fatalf("failed to hold task 2: %v", err)
+	}
+
+	// Claim and approve the review while parent is held
+	_, err = store.ClaimTask(ctx, reviewTaskID2, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task 2: %v", err)
+	}
+
+	_, err = store.SubmitTask(ctx, reviewTaskID2, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict 2: %v", err)
+	}
+
+	// Task should still be in review because it was held
+	heldReviewTask, err := store.GetTask(ctx, taskID2)
+	if err != nil {
+		t.Fatalf("failed to get held task: %v", err)
+	}
+	if heldReviewTask.State != "review" {
+		t.Errorf("held task should remain in review, got %s", heldReviewTask.State)
+	}
+
+	// Release the task - should trigger aggregation and move to approved
+	releasedTask2, err := store.ReleaseTask(ctx, taskID2, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to release task 2: %v", err)
+	}
+
+	if releasedTask2.State != "approved" {
+		t.Errorf("released task should be approved after aggregation, got %s", releasedTask2.State)
+	}
+}
+
+// TestReleaseAggregatesReviewWithRejection verifies that releasing a held review task with rejection moves to ready.
+func TestReleaseAggregatesReviewWithRejection(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Test implementation",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	maxReviewRounds := 5
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Get the review task
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+	var reviewTaskID string
+	for _, rt := range reviewTasks {
+		if rt.TargetTaskID != nil && *rt.TargetTaskID == taskID {
+			reviewTaskID = rt.ID
+			break
+		}
+	}
+
+	// Hold the parent task
+	_, err = store.HoldTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to hold task: %v", err)
+	}
+
+	// Claim and reject the review while parent is held
+	_, err = store.ClaimTask(ctx, reviewTaskID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	reject := "reject"
+	_, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	// Task should still be in review because it was held
+	heldReviewTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get held task: %v", err)
+	}
+	if heldReviewTask.State != "review" {
+		t.Errorf("held task should remain in review, got %s", heldReviewTask.State)
+	}
+
+	// Release the task - should trigger aggregation and move to ready
+	releasedTask, err := store.ReleaseTask(ctx, taskID, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to release task: %v", err)
+	}
+
+	if releasedTask.State != "ready" {
+		t.Errorf("released task should be ready after rejection, got %s", releasedTask.State)
+	}
+
+	// Verify review_round was incremented
+	if releasedTask.ReviewRound != 1 {
+		t.Errorf("review_round should be 1 after rejection, got %d", releasedTask.ReviewRound)
+	}
+}
+
+// TestReleaseNonReviewTaskUnchanged verifies that releasing a non-review task doesn't trigger aggregation.
+func TestReleaseNonReviewTaskUnchanged(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Test implementation",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	// Hold the task in ready state
+	_, err = store.HoldTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to hold task: %v", err)
+	}
+
+	// Release the task
+	releasedTask, err := store.ReleaseTask(ctx, taskID, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to release task: %v", err)
+	}
+
+	// Task should still be in ready state
+	if releasedTask.State != "ready" {
+		t.Errorf("non-review task should remain in ready state, got %s", releasedTask.State)
 	}
 }
 
@@ -6448,6 +6939,134 @@ func TestSupersededTaskNotFound(t *testing.T) {
 	}
 }
 
+func TestSupersededTaskTerminalState(t *testing.T) {
+	tests := []string{"done", "failed", "abandoned", "superseded"}
+
+	for _, terminalState := range tests {
+		t.Run("state_"+terminalState, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+			if err != nil {
+				t.Fatalf("failed to open database: %v", err)
+			}
+			defer store.Close()
+
+			proj, err := store.CreateProject(ctx, "Test Project", "test-repo")
+			if err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Doc", "main", nil)
+			if err != nil {
+				t.Fatalf("failed to create document: %v", err)
+			}
+
+			// Create task and dependent
+			tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+				{Title: "Task", Spec: "Spec", DocumentID: doc.ID},
+				{Title: "Dependent", Spec: "Spec", DocumentID: doc.ID},
+			})
+			if err != nil {
+				t.Fatalf("failed to create tasks: %v", err)
+			}
+			task := tasks[0]
+			dependent := tasks[1]
+
+			// Set dependent to depend on task
+			_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{task.ID})
+			if err != nil {
+				t.Fatalf("failed to set dependency: %v", err)
+			}
+
+			// Manually update task state to terminal state
+			conn := store.Conn()
+			_, err = conn.ExecContext(ctx, "UPDATE task SET state = ? WHERE id = ?", terminalState, task.ID)
+			if err != nil {
+				t.Fatalf("failed to update task state: %v", err)
+			}
+
+			// Attempt to supersede terminal task should return ErrConflict
+			_, err = store.SupersedeTask(ctx, task.ID, nil)
+			if !errors.Is(err, ErrConflict) {
+				t.Errorf("expected ErrConflict for terminal state %s, got %v", terminalState, err)
+			}
+
+			// Verify dependent is unchanged
+			depAfter, err := store.GetTask(ctx, dependent.ID)
+			if err != nil {
+				t.Fatalf("failed to get dependent: %v", err)
+			}
+			if len(depAfter.DependsOn) != 1 || depAfter.DependsOn[0] != task.ID {
+				t.Errorf("expected dependent to still depend on original task, got %v", depAfter.DependsOn)
+			}
+
+			// Verify task state is unchanged
+			taskAfter, err := store.GetTask(ctx, task.ID)
+			if err != nil {
+				t.Fatalf("failed to get task: %v", err)
+			}
+			if taskAfter.State != terminalState {
+				t.Errorf("expected task state to remain %s, got %s", terminalState, taskAfter.State)
+			}
+		})
+	}
+}
+
+func TestSupersededTaskNonTerminal(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "Test Project", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create task and dependent in backlog state
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Task", Spec: "Spec", DocumentID: doc.ID},
+		{Title: "Dependent", Spec: "Spec", DocumentID: doc.ID},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+	task := tasks[0]
+	dependent := tasks[1]
+
+	// Set dependent to depend on task
+	_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{task.ID})
+	if err != nil {
+		t.Fatalf("failed to set dependency: %v", err)
+	}
+
+	// Supersede non-terminal task should succeed
+	newTask, err := store.SupersedeTask(ctx, task.ID, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+
+	if newTask.ID == task.ID {
+		t.Errorf("expected new task ID to be different from old task ID")
+	}
+
+	// Verify dependent now depends on new task
+	depAfter, err := store.GetTask(ctx, dependent.ID)
+	if err != nil {
+		t.Fatalf("failed to get dependent: %v", err)
+	}
+	if len(depAfter.DependsOn) != 1 || depAfter.DependsOn[0] != newTask.ID {
+		t.Errorf("expected dependent to depend on new task, got %v", depAfter.DependsOn)
+	}
+}
+
 func TestSupersededTaskWithPriorFeedback(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
@@ -7088,7 +7707,7 @@ func TestEscalateRoundTrip(t *testing.T) {
 	}
 
 	// Test ReleaseTask preserves escalate
-	releasedTask, err := store.ReleaseTask(ctx, readyTaskID)
+	releasedTask, err := store.ReleaseTask(ctx, readyTaskID, 5, nil)
 	if err != nil {
 		t.Fatalf("failed to release task: %v", err)
 	}
@@ -7890,6 +8509,55 @@ func TestCreateTasksWithTrack(t *testing.T) {
 	}
 }
 
+// TestCreateTasksWithUnknownTrack verifies that track field is validated.
+// Tracks not in {build, design} are rejected with UNKNOWN_TRACK.
+func TestCreateTasksWithUnknownTrack(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", []string{"haiku", "opus", "sonnet"})
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Doc", "docs/test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Should fail with UNKNOWN_TRACK for invalid track value
+	_, err = store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Bad Track Task", Spec: "Bad spec", DocumentID: doc.ID, Track: "testing"},
+	})
+	if err == nil {
+		t.Error("expected UNKNOWN_TRACK error for testing track, but creation succeeded")
+	}
+	var valErr *ValidationError
+	if !errors.As(err, &valErr) {
+		t.Errorf("expected ValidationError, got %T", err)
+	} else if valErr.Code != "UNKNOWN_TRACK" {
+		t.Errorf("expected error code UNKNOWN_TRACK, got %s", valErr.Code)
+	}
+
+	// Verify that build and design are accepted
+	for _, track := range []string{"build", "design"} {
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{Title: "Track Task " + track, Spec: "Spec", DocumentID: doc.ID, Track: track},
+		})
+		if err != nil {
+			t.Errorf("failed to create task with track=%s: %v", track, err)
+		}
+		if len(tasks) != 1 || tasks[0].Track != track {
+			t.Errorf("expected track=%s, got %s", track, tasks[0].Track)
+		}
+	}
+}
+
 // TestAgentMergePRSpawnsMergeTask verifies that when a task with agent_merge=true
 // and a PR link transitions to "approved", exactly one merge task is spawned.
 func TestAgentMergePRSpawnsMergeTask(t *testing.T) {
@@ -8623,6 +9291,251 @@ func TestSupersedeTaskForgeFailureStillSucceeds(t *testing.T) {
 	}
 	if oldTaskAfter.State != "superseded" || oldTaskAfter.SupersededBy == nil || *oldTaskAfter.SupersededBy != newTask.ID {
 		t.Errorf("expected old task to still be superseded by the new task despite the forge failure, got %+v", oldTaskAfter)
+	}
+}
+
+// TestSupersededTaskPreservesTrack verifies that the track field is preserved
+// when directly superseding a task via store.SupersedeTask.
+func TestSupersededTaskPreservesTrack(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "Test Project", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a task with track="design"
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Design Task", Spec: "Spec", DocumentID: doc.ID, Track: "design"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	oldTask := tasks[0]
+
+	// Verify the original task has track="design"
+	if oldTask.Track != "design" {
+		t.Errorf("expected oldTask.Track to be 'design', got %q", oldTask.Track)
+	}
+
+	// Supersede the task
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+
+	// Verify the replacement task preserves track="design"
+	if newTask.Track != "design" {
+		t.Errorf("expected newTask.Track to be 'design', got %q", newTask.Track)
+	}
+
+	// Verify via GetTask as well
+	newTaskFull, err := store.GetTask(ctx, newTask.ID)
+	if err != nil {
+		t.Fatalf("failed to get new task: %v", err)
+	}
+	if newTaskFull.Track != "design" {
+		t.Errorf("expected newTaskFull.Track to be 'design', got %q", newTaskFull.Track)
+	}
+}
+
+// TestSupersededTaskPreservesTrackEscalation verifies that the track field is preserved
+// when superseding a task via the circuit-breaker escalation path.
+func TestSupersededTaskPreservesTrackEscalation(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	escalateTrue := true
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Design Task",
+			Spec:         "Do the thing",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			Escalate:     &escalateTrue,
+			Track:        "design",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	maxReviewRounds := 5
+
+	submitAndReject := func(roundNum int) {
+		task, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get task (round %d): %v", roundNum, err)
+		}
+		if task.State == "backlog" {
+			_, err := store.PromoteTask(ctx, taskID)
+			if err != nil {
+				t.Fatalf("failed to promote task (round %d): %v", roundNum, err)
+			}
+		}
+
+		_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+		if err != nil {
+			t.Fatalf("failed to claim task (round %d): %v", roundNum, err)
+		}
+
+		_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, maxReviewRounds, nil)
+		if err != nil {
+			t.Fatalf("failed to submit implement task (round %d): %v", roundNum, err)
+		}
+
+		allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks (round %d): %v", roundNum, err)
+		}
+
+		var reviewTask *Task
+		for i := range allTasks {
+			if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID && allTasks[i].State == "ready" {
+				reviewTask = &allTasks[i]
+				break
+			}
+		}
+		if reviewTask == nil {
+			t.Fatalf("review task not found (round %d)", roundNum)
+		}
+
+		_, err = store.ClaimTask(ctx, reviewTask.ID, "opus-reviewer", "opus", 5*time.Minute)
+		if err != nil {
+			t.Fatalf("failed to claim review task (round %d): %v", roundNum, err)
+		}
+
+		reject := "reject"
+		_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, maxReviewRounds, nil)
+		if err != nil {
+			t.Fatalf("failed to submit review task (round %d): %v", roundNum, err)
+		}
+	}
+
+	// Rounds 1-8: should transition to ready
+	for i := 1; i <= 8; i++ {
+		submitAndReject(i)
+
+		parent, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get task (round %d): %v", i, err)
+		}
+		if parent.State != "ready" {
+			t.Errorf("round %d: expected parent state 'ready', got '%s'", i, parent.State)
+		}
+	}
+
+	// Round 9: should escalate to sonnet
+	submitAndReject(9)
+
+	// Original task should be superseded
+	parent, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get original task: %v", err)
+	}
+	if parent.State != "superseded" {
+		t.Errorf("expected original task state 'superseded', got '%s'", parent.State)
+	}
+	if parent.SupersededBy == nil {
+		t.Errorf("expected original task SupersededBy to be set")
+	} else {
+		// Verify the escalated task exists and preserves track="design"
+		escalatedTask, err := store.GetTask(ctx, *parent.SupersededBy)
+		if err != nil {
+			t.Fatalf("failed to get escalated task: %v", err)
+		}
+		if escalatedTask.Model != "sonnet" {
+			t.Errorf("expected escalated task model 'sonnet', got '%s'", escalatedTask.Model)
+		}
+		if escalatedTask.State != "ready" {
+			t.Errorf("expected escalated task state 'ready', got '%s'", escalatedTask.State)
+		}
+		if escalatedTask.Track != "design" {
+			t.Errorf("expected escalated task Track to be 'design', got %q", escalatedTask.Track)
+		}
+	}
+}
+
+// TestReadsNotBlockedByWrites verifies that read queries do not block behind write transactions.
+// Opens a store, starts a writer holding a transaction, then concurrently issues reads
+// and verifies they complete promptly without waiting for the write to finish.
+func TestSupersedeTaskWithEmptyForgeTokenSkipsCleanup(t *testing.T) {
+	ctx := context.Background()
+	// Explicitly set an empty FORGE_TOKENS file so the owner token lookup fails
+	path := filepath.Join(t.TempDir(), "forge-tokens")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatalf("failed to write forge tokens file: %v", err)
+	}
+	t.Setenv("FORGE_TOKENS", path)
+
+	server, calls := newSupersedePRTestServer(t, "open")
+	defer server.Close()
+	withMockForge(t, server)
+
+	st, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer st.Close()
+
+	oldTask := createSupersedableTaskWithPRLink(t, ctx, st, "https://github.com/testowner/testrepo/pull/123")
+
+	waitForClose := armSupersedeCloseSync(t, st)
+	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+	waitForClose()
+
+	// Verify that SupersedeTask still succeeds and creates a new task
+	if newTask.ID == oldTask.ID {
+		t.Errorf("expected a new task ID, got the same as old task")
+	}
+	if newTask.State != "backlog" {
+		t.Errorf("expected new task state to be backlog, got %q", newTask.State)
+	}
+
+	// Verify that no forge calls were made (no token was available)
+	calls.mu.Lock()
+	defer calls.mu.Unlock()
+	if calls.getStateCount != 0 {
+		t.Errorf("expected GetPRState not to be called when token is empty, got %d calls", calls.getStateCount)
+	}
+	if calls.closeCount != 0 {
+		t.Errorf("expected ClosePR not to be called when token is empty, got %d calls", calls.closeCount)
+	}
+	if len(calls.comments) != 0 {
+		t.Errorf("expected no comments to be posted when token is empty, got %v", calls.comments)
+	}
+	if calls.deletedBranch != "" {
+		t.Errorf("expected no branch delete when token is empty, got %q", calls.deletedBranch)
 	}
 }
 

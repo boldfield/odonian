@@ -63,10 +63,9 @@ ok). The worker derives the owner from the project's repo URL, exports that owne
 `GH_TOKEN` for the clone + the dispatched worker's `git push`/`gh`, and **falls back to your default
 `gh` auth** when an owner has no entry. The server separately reads its own `FORGE_TOKENS` file.
 PR-watch, including its stale-PR cleanup, skips owners without a matching token, even for public
-repositories. Cleanup triggered directly by `/supersede` instead attempts unauthenticated
-requests and logs failures when the token is missing. The merger reads its token only from
-`FORGE_TOKENS`, defaulting to
-`~/.odonian/forge-tokens`; it has **no fallback to `gh` authentication or `GH_TOKEN`**. A missing
+repositories. Cleanup triggered directly by `/supersede` also skips GitHub requests without
+a matching token, logging the owner and PR. The merger reads its token only from `FORGE_TOKENS`,
+defaulting to `~/.odonian/forge-tokens`; it has **no fallback to `gh` authentication or `GH_TOKEN`**. A missing
 owner entry makes its merge request unauthenticated and unable to merge the PR. Tokens are not
 stored in the board database or returned by the API.
 

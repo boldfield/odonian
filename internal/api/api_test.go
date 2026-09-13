@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -658,6 +659,217 @@ func setupProjectAndDocument(t *testing.T, server *Server, authHeader string) (s
 	json.NewDecoder(docW.Body).Decode(&doc)
 
 	return project.ID, doc.ID
+}
+
+// TestGetTaskPrefixResolution verifies that GET /tasks/{id} accepts a unique
+// 8-to-35-character id prefix (returning the resolved task), 404s when the
+// prefix matches nothing or is shorter than 8 characters, and returns 409
+// AMBIGUOUS_ID with the candidate ids in the response body when the prefix
+// matches several tasks.
+func TestGetTaskPrefixResolution(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	insertTask := func(id, title string) {
+		if _, err := server.store.Conn().Exec(`
+			INSERT INTO task (id, project_id, document_id, title, spec, state, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, id, projectID, docID, title, "spec", "backlog", now, now); err != nil {
+			t.Fatalf("failed to insert task %s: %v", id, err)
+		}
+	}
+
+	const (
+		uniqueTaskID = "uniq-task-full-id-000001"
+		ambiguousID1 = "ambig0001-task-full-a"
+		ambiguousID2 = "ambig0001-task-full-b"
+		uniquePfx    = "uniq-tas" // uniqueTaskID[:8]
+		ambiguousPfx = "ambig0001"
+	)
+
+	insertTask(uniqueTaskID, "Unique Prefix Task")
+	insertTask(ambiguousID1, "Ambiguous Task 1")
+	insertTask(ambiguousID2, "Ambiguous Task 2")
+
+	t.Run("unique prefix resolves", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/tasks/"+uniquePfx, nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var task store.TaskWithDepsAndLinks
+		if err := json.NewDecoder(w.Body).Decode(&task); err != nil {
+			t.Fatalf("failed to decode task: %v", err)
+		}
+		if task.ID != uniqueTaskID {
+			t.Errorf("expected resolved id %s, got %s", uniqueTaskID, task.ID)
+		}
+	})
+
+	t.Run("no match returns 404", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/tasks/zzzzzzzz", nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("short prefix returns 404", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/tasks/ambig", nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("ambiguous prefix returns 409 with candidates", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/tasks/"+ambiguousPfx, nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp map[string]interface{}
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		errObj, ok := resp["error"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("response missing 'error' field: %v", resp)
+		}
+		if code, _ := errObj["code"].(string); code != "AMBIGUOUS_ID" {
+			t.Errorf("expected code AMBIGUOUS_ID, got %v", errObj["code"])
+		}
+		candidatesRaw, ok := errObj["candidates"].([]interface{})
+		if !ok {
+			t.Fatalf("expected candidates array in error response, got %v", errObj["candidates"])
+		}
+		candidates := make([]string, 0, len(candidatesRaw))
+		for _, c := range candidatesRaw {
+			s, _ := c.(string)
+			candidates = append(candidates, s)
+		}
+		sort.Strings(candidates)
+		want := []string{ambiguousID1, ambiguousID2}
+		if len(candidates) != 2 || candidates[0] != want[0] || candidates[1] != want[1] {
+			t.Errorf("expected candidates %v, got %v", want, candidates)
+		}
+	})
+}
+
+// TestTaskRoutePrefixResolution verifies that prefix resolution is wired through
+// the operational /tasks/{id}/... routes, not just GET /tasks/{id}. It drives
+// POST /tasks/{id}/claim — an exact-id store operation — with a unique prefix
+// (must resolve and claim), an ambiguous prefix (must return 409 AMBIGUOUS_ID
+// with candidates), and a no-match prefix (must return 404).
+func TestTaskRoutePrefixResolution(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	insertReadyTask := func(id, title string) {
+		if _, err := server.store.Conn().Exec(`
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, held, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'ready', 'haiku', 0, ?, ?)
+		`, id, projectID, docID, title, "spec", now, now); err != nil {
+			t.Fatalf("failed to insert task %s: %v", id, err)
+		}
+	}
+
+	const (
+		uniqueTaskID = "clmuniq0-task-full-id-01"
+		ambiguousID1 = "clmambg0-task-full-a"
+		ambiguousID2 = "clmambg0-task-full-b"
+		uniquePfx    = "clmuniq0" // uniqueTaskID[:8]
+		ambiguousPfx = "clmambg0"
+	)
+
+	insertReadyTask(uniqueTaskID, "Claim Unique Prefix Task")
+	insertReadyTask(ambiguousID1, "Claim Ambiguous Task 1")
+	insertReadyTask(ambiguousID2, "Claim Ambiguous Task 2")
+
+	claim := func(idOrPrefix string) *httptest.ResponseRecorder {
+		payload, _ := json.Marshal(map[string]string{"agent_id": "test-agent", "model": "haiku"})
+		req := httptest.NewRequest("POST", "/tasks/"+idOrPrefix+"/claim", bytes.NewReader(payload))
+		req.Header.Set("Authorization", authHeader)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("unique prefix resolves and claims", func(t *testing.T) {
+		w := claim(uniquePfx)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 claiming by unique prefix, got %d: %s", w.Code, w.Body.String())
+		}
+		var claimed store.Task
+		if err := json.NewDecoder(w.Body).Decode(&claimed); err != nil {
+			t.Fatalf("failed to decode claimed task: %v", err)
+		}
+		if claimed.ID != uniqueTaskID {
+			t.Errorf("expected resolved id %s, got %s", uniqueTaskID, claimed.ID)
+		}
+		if claimed.State != "in_progress" {
+			t.Errorf("expected state in_progress after claim, got %s", claimed.State)
+		}
+	})
+
+	t.Run("no match returns 404", func(t *testing.T) {
+		w := claim("zzzzzzzz")
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404 claiming by non-matching prefix, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("ambiguous prefix returns 409 with candidates", func(t *testing.T) {
+		w := claim(ambiguousPfx)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("expected 409 claiming by ambiguous prefix, got %d: %s", w.Code, w.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		errObj, ok := resp["error"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("response missing 'error' field: %v", resp)
+		}
+		if code, _ := errObj["code"].(string); code != "AMBIGUOUS_ID" {
+			t.Errorf("expected code AMBIGUOUS_ID, got %v", errObj["code"])
+		}
+		candidatesRaw, ok := errObj["candidates"].([]interface{})
+		if !ok {
+			t.Fatalf("expected candidates array in error response, got %v", errObj["candidates"])
+		}
+		candidates := make([]string, 0, len(candidatesRaw))
+		for _, c := range candidatesRaw {
+			s, _ := c.(string)
+			candidates = append(candidates, s)
+		}
+		sort.Strings(candidates)
+		want := []string{ambiguousID1, ambiguousID2}
+		if len(candidates) != 2 || candidates[0] != want[0] || candidates[1] != want[1] {
+			t.Errorf("expected candidates %v, got %v", want, candidates)
+		}
+	})
 }
 
 // TestBulkCreateTasksWithIntraBatchDependency verifies bulk create persists tasks and edges.
@@ -1390,6 +1602,168 @@ func TestCreateTasksMissingDocumentID(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected status 400, got %d", w.Code)
+	}
+}
+
+// TestCreateTasksAcceptsBuildTrack verifies CreateTasks accepts build track.
+func TestCreateTasksAcceptsBuildTrack(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Build Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			Track:      "build",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", w.Code)
+	}
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(createdTasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(createdTasks))
+	}
+
+	if createdTasks[0].Track != "build" {
+		t.Errorf("expected track 'build', got %q", createdTasks[0].Track)
+	}
+}
+
+// TestCreateTasksAcceptsDesignTrack verifies CreateTasks accepts design track.
+func TestCreateTasksAcceptsDesignTrack(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Design Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			Track:      "design",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", w.Code)
+	}
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(createdTasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(createdTasks))
+	}
+
+	if createdTasks[0].Track != "design" {
+		t.Errorf("expected track 'design', got %q", createdTasks[0].Track)
+	}
+}
+
+// TestCreateTasksDefaultsTrackToBuild verifies CreateTasks defaults track to build when empty.
+func TestCreateTasksDefaultsTrackToBuild(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Default Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			// Track not specified - should default to build
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", w.Code)
+	}
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(createdTasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(createdTasks))
+	}
+
+	if createdTasks[0].Track != "build" {
+		t.Errorf("expected track to default to 'build', got %q", createdTasks[0].Track)
+	}
+}
+
+// TestCreateTasksRejectsUnknownTrack verifies CreateTasks rejects unknown track with UNKNOWN_TRACK error.
+func TestCreateTasksRejectsUnknownTrack(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Unknown Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			Track:      "testing",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+
+	var errResp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+
+	errObj, ok := errResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error response missing 'error' field")
+	}
+
+	code, ok := errObj["code"].(string)
+	if !ok || code != "UNKNOWN_TRACK" {
+		t.Errorf("expected error code 'UNKNOWN_TRACK', got %q", code)
 	}
 }
 
@@ -3900,6 +4274,108 @@ func TestSupersedTaskRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestSupersedTaskTerminalStateReturns409 verifies that superseding a task in a terminal state returns 409.
+func TestSupersedTaskTerminalStateReturns409(t *testing.T) {
+	terminalStates := []string{"done", "failed", "abandoned", "superseded"}
+
+	for _, terminalState := range terminalStates {
+		t.Run("state_"+terminalState, func(t *testing.T) {
+			server := setupTestServer(t, "test-token")
+			authHeader := "Bearer test-token"
+
+			projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+			// Create a task and a dependent
+			taskPayload := []store.TaskInput{
+				{
+					Title:      "Task to Supersede",
+					Spec:       "Test specification",
+					DocumentID: docID,
+					Model:      "haiku",
+				},
+				{
+					Title:      "Dependent Task",
+					Spec:       "Dependent specification",
+					DocumentID: docID,
+					Model:      "haiku",
+				},
+			}
+			taskBody, _ := json.Marshal(taskPayload)
+			createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+			createReq.Header.Set("Authorization", authHeader)
+			createReq.Header.Set("Content-Type", "application/json")
+			createW := httptest.NewRecorder()
+			server.mux.ServeHTTP(createW, createReq)
+
+			var createdTasks []store.Task
+			json.NewDecoder(createW.Body).Decode(&createdTasks)
+			taskID := createdTasks[0].ID
+			dependentID := createdTasks[1].ID
+
+			// Set the dependent to depend on the task
+			depPayload := map[string]interface{}{"depends_on": []string{taskID}}
+			depBody, _ := json.Marshal(depPayload)
+			depReq := httptest.NewRequest("PATCH", "/tasks/"+dependentID, bytes.NewReader(depBody))
+			depReq.Header.Set("Authorization", authHeader)
+			depReq.Header.Set("Content-Type", "application/json")
+			depW := httptest.NewRecorder()
+			server.mux.ServeHTTP(depW, depReq)
+
+			// Manually set the task to terminal state
+			conn := server.store.Conn()
+			_, err := conn.ExecContext(context.Background(), "UPDATE task SET state = ? WHERE id = ?", terminalState, taskID)
+			if err != nil {
+				t.Fatalf("failed to set task to terminal state: %v", err)
+			}
+
+			// Attempt to supersede the task in terminal state
+			supersedePayload := map[string]interface{}{}
+			supersedeBody, _ := json.Marshal(supersedePayload)
+			supersedeReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/supersede", bytes.NewReader(supersedeBody))
+			supersedeReq.Header.Set("Authorization", authHeader)
+			supersedeReq.Header.Set("Content-Type", "application/json")
+			supersedeW := httptest.NewRecorder()
+			server.mux.ServeHTTP(supersedeW, supersedeReq)
+
+			// Verify 409 status
+			if supersedeW.Code != http.StatusConflict {
+				t.Errorf("expected status 409, got %d; body: %s", supersedeW.Code, supersedeW.Body.String())
+			}
+
+			// Verify error response
+			var errResp map[string]interface{}
+			json.NewDecoder(supersedeW.Body).Decode(&errResp)
+			if errResp["error"] == nil {
+				t.Errorf("expected error in response, got none")
+			}
+
+			// Verify task state is unchanged
+			getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+			getReq.Header.Set("Authorization", authHeader)
+			getW := httptest.NewRecorder()
+			server.mux.ServeHTTP(getW, getReq)
+
+			var taskAfter store.TaskWithDepsAndLinks
+			json.NewDecoder(getW.Body).Decode(&taskAfter)
+			if taskAfter.State != terminalState {
+				t.Errorf("expected task state to remain %q, got %q", terminalState, taskAfter.State)
+			}
+
+			// Verify dependent still depends on original task
+			getDepReq := httptest.NewRequest("GET", "/tasks/"+dependentID, nil)
+			getDepReq.Header.Set("Authorization", authHeader)
+			getDepW := httptest.NewRecorder()
+			server.mux.ServeHTTP(getDepW, getDepReq)
+
+			var depAfter store.TaskWithDepsAndLinks
+			json.NewDecoder(getDepW.Body).Decode(&depAfter)
+			if len(depAfter.DependsOn) != 1 || depAfter.DependsOn[0] != taskID {
+				t.Errorf("expected dependent to still depend on task %q, got %v", taskID, depAfter.DependsOn)
+			}
+		})
+	}
+}
+
 // TestListTasksWithIncludeSupersededFilter verifies that superseded tasks are excluded by default
 // but can be included with the include_superseded filter.
 func TestListTasksWithIncludeSupersededFilter(t *testing.T) {
@@ -4457,5 +4933,426 @@ func TestEscalateOptOutBlocksAtFirstThreshold(t *testing.T) {
 	}
 	if finalTask.SupersededBy != nil {
 		t.Errorf("expected no supersession for escalate=false task, but SupersededBy is %v", finalTask.SupersededBy)
+	}
+}
+
+// TestArchiveProjectAndGetArchivedAt verifies that archiving a project sets archived_at and GET returns it.
+func TestArchiveProjectAndGetArchivedAt(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a project
+	createPayload := map[string]string{
+		"name": "archive-test-project",
+		"repo": "https://github.com/example/test-repo",
+	}
+	createBody, _ := json.Marshal(createPayload)
+	createReq := httptest.NewRequest("POST", "/projects", bytes.NewReader(createBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var project store.Project
+	json.NewDecoder(createW.Body).Decode(&project)
+
+	// Verify initial archived_at is nil
+	if project.ArchivedAt != nil {
+		t.Errorf("expected ArchivedAt to be nil for new project, got %v", project.ArchivedAt)
+	}
+
+	// Archive the project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+project.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	if archiveW.Code != http.StatusOK {
+		t.Errorf("expected status 200 for archive, got %d", archiveW.Code)
+	}
+
+	var archivedProject store.Project
+	json.NewDecoder(archiveW.Body).Decode(&archivedProject)
+
+	// Verify archived_at is set
+	if archivedProject.ArchivedAt == nil {
+		t.Error("expected ArchivedAt to be set after archiving, got nil")
+	}
+
+	// Get the project and verify archived_at is returned
+	getReq := httptest.NewRequest("GET", "/projects/"+project.ID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+
+	var retrievedProject store.Project
+	json.NewDecoder(getW.Body).Decode(&retrievedProject)
+
+	if retrievedProject.ArchivedAt == nil {
+		t.Error("expected ArchivedAt in GET response, got nil")
+	}
+	// Compare string values, not pointers
+	if *archivedProject.ArchivedAt != *retrievedProject.ArchivedAt {
+		t.Errorf("archived_at mismatch: archive response %q != get response %q", *archivedProject.ArchivedAt, *retrievedProject.ArchivedAt)
+	}
+}
+
+// TestListProjectsExcludesArchivedByDefault verifies that GET /projects excludes archived projects.
+func TestListProjectsExcludesArchivedByDefault(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create two projects
+	p1 := map[string]string{"name": "active-project", "repo": "https://github.com/example/active"}
+	p1Body, _ := json.Marshal(p1)
+	p1Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p1Body))
+	p1Req.Header.Set("Authorization", authHeader)
+	p1Req.Header.Set("Content-Type", "application/json")
+	p1W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p1W, p1Req)
+	var activeProject store.Project
+	json.NewDecoder(p1W.Body).Decode(&activeProject)
+
+	p2 := map[string]string{"name": "archived-project", "repo": "https://github.com/example/archived"}
+	p2Body, _ := json.Marshal(p2)
+	p2Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p2Body))
+	p2Req.Header.Set("Authorization", authHeader)
+	p2Req.Header.Set("Content-Type", "application/json")
+	p2W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p2W, p2Req)
+	var archivedProject store.Project
+	json.NewDecoder(p2W.Body).Decode(&archivedProject)
+
+	// Archive the second project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+archivedProject.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	// List projects without include_archived
+	listReq := httptest.NewRequest("GET", "/projects", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var projects []store.Project
+	json.NewDecoder(listW.Body).Decode(&projects)
+
+	// Find our projects in the list (filter by name to handle test isolation)
+	var foundActive, foundArchived bool
+	for _, p := range projects {
+		if p.ID == activeProject.ID && p.Name == "active-project" {
+			foundActive = true
+		}
+		if p.ID == archivedProject.ID && p.Name == "archived-project" {
+			foundArchived = true
+		}
+	}
+
+	// Verify only the active project is returned
+	if !foundActive {
+		t.Error("expected active project in list")
+	}
+	if foundArchived {
+		t.Error("did not expect archived project in default list (should exclude archived)")
+	}
+}
+
+// TestListProjectsIncludesArchivedWithFlag verifies that GET /projects?include_archived=true returns archived projects.
+func TestListProjectsIncludesArchivedWithFlag(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create two projects
+	p1 := map[string]string{"name": "active-project-2", "repo": "https://github.com/example/active2"}
+	p1Body, _ := json.Marshal(p1)
+	p1Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p1Body))
+	p1Req.Header.Set("Authorization", authHeader)
+	p1Req.Header.Set("Content-Type", "application/json")
+	p1W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p1W, p1Req)
+	var activeProject store.Project
+	json.NewDecoder(p1W.Body).Decode(&activeProject)
+
+	p2 := map[string]string{"name": "archived-project-2", "repo": "https://github.com/example/archived2"}
+	p2Body, _ := json.Marshal(p2)
+	p2Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p2Body))
+	p2Req.Header.Set("Authorization", authHeader)
+	p2Req.Header.Set("Content-Type", "application/json")
+	p2W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p2W, p2Req)
+	var archivedProject store.Project
+	json.NewDecoder(p2W.Body).Decode(&archivedProject)
+
+	// Archive the second project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+archivedProject.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	// List projects WITH include_archived=true
+	listReq := httptest.NewRequest("GET", "/projects?include_archived=true", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var projects []store.Project
+	json.NewDecoder(listW.Body).Decode(&projects)
+
+	// Verify archived_at is set on archived project (filter by name to handle test isolation)
+	hasActiveProject := false
+	hasArchivedProject := false
+	for _, p := range projects {
+		if p.ID == activeProject.ID && p.Name == "active-project-2" {
+			hasActiveProject = true
+			if p.ArchivedAt != nil {
+				t.Errorf("expected ArchivedAt to be nil for active project, got %v", p.ArchivedAt)
+			}
+		}
+		if p.ID == archivedProject.ID && p.Name == "archived-project-2" {
+			hasArchivedProject = true
+			if p.ArchivedAt == nil {
+				t.Error("expected ArchivedAt to be set for archived project, got nil")
+			}
+		}
+	}
+
+	if !hasActiveProject {
+		t.Error("active project not found in list")
+	}
+	if !hasArchivedProject {
+		t.Error("archived project not found in list")
+	}
+}
+
+// TestListTasksWithFieldsSummary verifies fields=summary omits spec and result.
+func TestListTasksWithFieldsSummary(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task with spec and result
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Task 1",
+			Spec:       "This is the spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", createW.Code)
+	}
+
+	// List with fields=summary
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", listW.Code)
+	}
+
+	var tasks []map[string]interface{}
+	if err := json.NewDecoder(listW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(tasks))
+	}
+
+	task := tasks[0]
+	// Verify spec and result are absent
+	if _, hasSpec := task["spec"]; hasSpec {
+		t.Error("spec should be absent in summary response")
+	}
+	if _, hasResult := task["result"]; hasResult {
+		t.Error("result should be absent in summary response")
+	}
+
+	// Verify other fields are present
+	if _, hasID := task["id"]; !hasID {
+		t.Error("id should be present in summary response")
+	}
+	if _, hasTitle := task["title"]; !hasTitle {
+		t.Error("title should be present in summary response")
+	}
+	if _, hasState := task["state"]; !hasState {
+		t.Error("state should be present in summary response")
+	}
+}
+
+// TestListTasksWithoutFieldsSummary verifies spec and result are present without fields=summary.
+func TestListTasksWithoutFieldsSummary(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task with spec
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Task 1",
+			Spec:       "This is the spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	// List without fields parameter
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", listW.Code)
+	}
+
+	var tasks []map[string]interface{}
+	if err := json.NewDecoder(listW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(tasks))
+	}
+
+	task := tasks[0]
+	// Verify spec is present
+	if _, hasSpec := task["spec"]; !hasSpec {
+		t.Error("spec should be present in normal task response")
+	}
+	if spec, ok := task["spec"].(string); !ok || spec != "This is the spec" {
+		t.Errorf("expected spec 'This is the spec', got %v", task["spec"])
+	}
+	// Verify result field is present (even if nil)
+	if _, hasResult := task["result"]; !hasResult {
+		t.Error("result field should be present in normal task response")
+	}
+}
+
+// TestListTasksFieldsSummaryComposesWithFilters verifies fields=summary composes with state= and kind=.
+func TestListTasksFieldsSummaryComposesWithFilters(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create tasks
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Task 1",
+			Spec:       "Spec 1",
+			DocumentID: docID,
+		},
+		{
+			Title:      "Task 2",
+			Spec:       "Spec 2",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", createW.Code)
+	}
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+
+	// Manually convert one task to review kind
+	conn := server.store.Conn()
+	reviewTaskID := createdTasks[1].ID
+	_, err := conn.ExecContext(context.Background(), "UPDATE task SET kind = 'review' WHERE id = ?", reviewTaskID)
+	if err != nil {
+		t.Fatalf("failed to set task to review kind: %v", err)
+	}
+
+	// Test 1: List with fields=summary and kind=implement filter
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary&kind=implement", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", listW.Code)
+	}
+
+	var tasks []map[string]interface{}
+	if err := json.NewDecoder(listW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task with kind=implement, got %d", len(tasks))
+	}
+
+	task := tasks[0]
+	// Verify spec and result are absent
+	if _, hasSpec := task["spec"]; hasSpec {
+		t.Error("spec should be absent in summary response")
+	}
+	if _, hasResult := task["result"]; hasResult {
+		t.Error("result should be absent in summary response")
+	}
+
+	// Verify kind filter was applied
+	if kind, ok := task["kind"]; !ok || kind != "implement" {
+		t.Errorf("expected kind 'implement', got %v", kind)
+	}
+
+	// Test 2: List with fields=summary and state=backlog filter
+	listReq2 := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary&state=backlog", nil)
+	listReq2.Header.Set("Authorization", authHeader)
+	listW2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW2, listReq2)
+
+	if listW2.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", listW2.Code)
+	}
+
+	var tasks2 []map[string]interface{}
+	if err := json.NewDecoder(listW2.Body).Decode(&tasks2); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+
+	// Both tasks should be in backlog state (initial state after creation)
+	if len(tasks2) != 2 {
+		t.Errorf("expected 2 tasks with state=backlog, got %d", len(tasks2))
+	}
+
+	for i, task2 := range tasks2 {
+		// Verify spec and result are absent
+		if _, hasSpec := task2["spec"]; hasSpec {
+			t.Error("spec should be absent in summary response with state= filter")
+		}
+		if _, hasResult := task2["result"]; hasResult {
+			t.Error("result should be absent in summary response with state= filter")
+		}
+
+		// Verify state filter was applied
+		if state, ok := task2["state"]; !ok || state != "backlog" {
+			t.Errorf("task %d: expected state 'backlog', got %v", i, state)
+		}
 	}
 }
