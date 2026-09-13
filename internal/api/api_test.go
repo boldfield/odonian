@@ -3900,6 +3900,108 @@ func TestSupersedTaskRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestSupersedTaskTerminalStateReturns409 verifies that superseding a task in a terminal state returns 409.
+func TestSupersedTaskTerminalStateReturns409(t *testing.T) {
+	terminalStates := []string{"done", "failed", "abandoned", "superseded"}
+
+	for _, terminalState := range terminalStates {
+		t.Run("state_"+terminalState, func(t *testing.T) {
+			server := setupTestServer(t, "test-token")
+			authHeader := "Bearer test-token"
+
+			projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+			// Create a task and a dependent
+			taskPayload := []store.TaskInput{
+				{
+					Title:      "Task to Supersede",
+					Spec:       "Test specification",
+					DocumentID: docID,
+					Model:      "haiku",
+				},
+				{
+					Title:      "Dependent Task",
+					Spec:       "Dependent specification",
+					DocumentID: docID,
+					Model:      "haiku",
+				},
+			}
+			taskBody, _ := json.Marshal(taskPayload)
+			createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+			createReq.Header.Set("Authorization", authHeader)
+			createReq.Header.Set("Content-Type", "application/json")
+			createW := httptest.NewRecorder()
+			server.mux.ServeHTTP(createW, createReq)
+
+			var createdTasks []store.Task
+			json.NewDecoder(createW.Body).Decode(&createdTasks)
+			taskID := createdTasks[0].ID
+			dependentID := createdTasks[1].ID
+
+			// Set the dependent to depend on the task
+			depPayload := map[string]interface{}{"depends_on": []string{taskID}}
+			depBody, _ := json.Marshal(depPayload)
+			depReq := httptest.NewRequest("PATCH", "/tasks/"+dependentID, bytes.NewReader(depBody))
+			depReq.Header.Set("Authorization", authHeader)
+			depReq.Header.Set("Content-Type", "application/json")
+			depW := httptest.NewRecorder()
+			server.mux.ServeHTTP(depW, depReq)
+
+			// Manually set the task to terminal state
+			conn := server.store.Conn()
+			_, err := conn.ExecContext(context.Background(), "UPDATE task SET state = ? WHERE id = ?", terminalState, taskID)
+			if err != nil {
+				t.Fatalf("failed to set task to terminal state: %v", err)
+			}
+
+			// Attempt to supersede the task in terminal state
+			supersedePayload := map[string]interface{}{}
+			supersedeBody, _ := json.Marshal(supersedePayload)
+			supersedeReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/supersede", bytes.NewReader(supersedeBody))
+			supersedeReq.Header.Set("Authorization", authHeader)
+			supersedeReq.Header.Set("Content-Type", "application/json")
+			supersedeW := httptest.NewRecorder()
+			server.mux.ServeHTTP(supersedeW, supersedeReq)
+
+			// Verify 409 status
+			if supersedeW.Code != http.StatusConflict {
+				t.Errorf("expected status 409, got %d; body: %s", supersedeW.Code, supersedeW.Body.String())
+			}
+
+			// Verify error response
+			var errResp map[string]interface{}
+			json.NewDecoder(supersedeW.Body).Decode(&errResp)
+			if errResp["error"] == nil {
+				t.Errorf("expected error in response, got none")
+			}
+
+			// Verify task state is unchanged
+			getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+			getReq.Header.Set("Authorization", authHeader)
+			getW := httptest.NewRecorder()
+			server.mux.ServeHTTP(getW, getReq)
+
+			var taskAfter store.TaskWithDepsAndLinks
+			json.NewDecoder(getW.Body).Decode(&taskAfter)
+			if taskAfter.State != terminalState {
+				t.Errorf("expected task state to remain %q, got %q", terminalState, taskAfter.State)
+			}
+
+			// Verify dependent still depends on original task
+			getDepReq := httptest.NewRequest("GET", "/tasks/"+dependentID, nil)
+			getDepReq.Header.Set("Authorization", authHeader)
+			getDepW := httptest.NewRecorder()
+			server.mux.ServeHTTP(getDepW, getDepReq)
+
+			var depAfter store.TaskWithDepsAndLinks
+			json.NewDecoder(getDepW.Body).Decode(&depAfter)
+			if len(depAfter.DependsOn) != 1 || depAfter.DependsOn[0] != taskID {
+				t.Errorf("expected dependent to still depend on task %q, got %v", taskID, depAfter.DependsOn)
+			}
+		})
+	}
+}
+
 // TestListTasksWithIncludeSupersededFilter verifies that superseded tasks are excluded by default
 // but can be included with the include_superseded filter.
 func TestListTasksWithIncludeSupersededFilter(t *testing.T) {

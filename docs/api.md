@@ -850,7 +850,7 @@ or when the original task should not be reused.
 - `400 UNKNOWN_MODEL`: The provided model is not in the deployment allowlist
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `404 NOT_FOUND`: Task not found
-- `409 CONFLICT`: Task cannot be superseded
+- `409 CONFLICT`: Task is in a terminal state (done, failed, abandoned, or superseded) and cannot be superseded
 - `500 SUPERSEDE_ERROR`: Server error superseding task
 
 **Behavior:**
