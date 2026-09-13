@@ -8365,6 +8365,55 @@ func TestCreateTasksWithTrack(t *testing.T) {
 	}
 }
 
+// TestCreateTasksWithUnknownTrack verifies that track field is validated.
+// Tracks not in {build, design} are rejected with UNKNOWN_TRACK.
+func TestCreateTasksWithUnknownTrack(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", []string{"haiku", "opus", "sonnet"})
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Doc", "docs/test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Should fail with UNKNOWN_TRACK for invalid track value
+	_, err = store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Bad Track Task", Spec: "Bad spec", DocumentID: doc.ID, Track: "testing"},
+	})
+	if err == nil {
+		t.Error("expected UNKNOWN_TRACK error for testing track, but creation succeeded")
+	}
+	var valErr *ValidationError
+	if !errors.As(err, &valErr) {
+		t.Errorf("expected ValidationError, got %T", err)
+	} else if valErr.Code != "UNKNOWN_TRACK" {
+		t.Errorf("expected error code UNKNOWN_TRACK, got %s", valErr.Code)
+	}
+
+	// Verify that build and design are accepted
+	for _, track := range []string{"build", "design"} {
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{Title: "Track Task " + track, Spec: "Spec", DocumentID: doc.ID, Track: track},
+		})
+		if err != nil {
+			t.Errorf("failed to create task with track=%s: %v", track, err)
+		}
+		if len(tasks) != 1 || tasks[0].Track != track {
+			t.Errorf("expected track=%s, got %s", track, tasks[0].Track)
+		}
+	}
+}
+
 // TestAgentMergePRSpawnsMergeTask verifies that when a task with agent_merge=true
 // and a PR link transitions to "approved", exactly one merge task is spawned.
 func TestAgentMergePRSpawnsMergeTask(t *testing.T) {
