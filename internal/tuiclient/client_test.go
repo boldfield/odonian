@@ -359,6 +359,127 @@ func TestListTasksWithPartialFilters(t *testing.T) {
 	}
 }
 
+func TestListTasksWithState(t *testing.T) {
+	// Create a test server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify request
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/projects/proj123/tasks" {
+			t.Errorf("expected /projects/proj123/tasks, got %s", r.URL.Path)
+		}
+		// Verify query params contain state filter
+		query := r.URL.Query()
+		if query.Get("state") != "ready" {
+			t.Errorf("expected state=ready, got %s", query.Get("state"))
+		}
+		if query.Get("model") != "" {
+			t.Errorf("expected no model filter, got %s", query.Get("model"))
+		}
+		if query.Get("kind") != "" {
+			t.Errorf("expected no kind filter, got %s", query.Get("kind"))
+		}
+
+		// Write response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		tasks := []Task{
+			{
+				ID:        "task3",
+				ProjectID: "proj123",
+				Title:     "Task 3",
+				State:     "ready",
+				CreatedAt: "2024-01-01T00:00:00Z",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+			},
+		}
+		json.NewEncoder(w).Encode(tasks)
+	}))
+	defer server.Close()
+
+	// Create client
+	client := NewHTTPClient(server.URL, "testtoken")
+
+	// Test with state filter alone
+	tasks, err := client.ListTasks(context.Background(), "proj123",
+		WithState("ready"),
+	)
+	if err != nil {
+		t.Fatalf("ListTasks with state filter failed: %v", err)
+	}
+
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(tasks))
+	}
+
+	if tasks[0].State != "ready" {
+		t.Errorf("expected State 'ready', got %s", tasks[0].State)
+	}
+}
+
+func TestListTasksWithStateAndKind(t *testing.T) {
+	// Create a test server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify request
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/projects/proj123/tasks" {
+			t.Errorf("expected /projects/proj123/tasks, got %s", r.URL.Path)
+		}
+		// Verify query params contain both state and kind filters
+		query := r.URL.Query()
+		if query.Get("state") != "in_progress" {
+			t.Errorf("expected state=in_progress, got %s", query.Get("state"))
+		}
+		if query.Get("kind") != "review" {
+			t.Errorf("expected kind=review, got %s", query.Get("kind"))
+		}
+
+		// Write response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		tasks := []Task{
+			{
+				ID:        "task4",
+				ProjectID: "proj123",
+				Title:     "Task 4",
+				State:     "in_progress",
+				Kind:      "review",
+				CreatedAt: "2024-01-01T00:00:00Z",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+			},
+		}
+		json.NewEncoder(w).Encode(tasks)
+	}))
+	defer server.Close()
+
+	// Create client
+	client := NewHTTPClient(server.URL, "testtoken")
+
+	// Test with state and kind filters combined
+	tasks, err := client.ListTasks(context.Background(), "proj123",
+		WithState("in_progress"),
+		WithKind("review"),
+	)
+	if err != nil {
+		t.Fatalf("ListTasks with state and kind filters failed: %v", err)
+	}
+
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(tasks))
+	}
+
+	if tasks[0].State != "in_progress" {
+		t.Errorf("expected State 'in_progress', got %s", tasks[0].State)
+	}
+
+	if tasks[0].Kind != "review" {
+		t.Errorf("expected Kind 'review', got %s", tasks[0].Kind)
+	}
+}
+
 func TestGetTask(t *testing.T) {
 	// Create a test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
