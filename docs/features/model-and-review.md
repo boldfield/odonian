@@ -166,7 +166,7 @@ not `ADD COLUMN`):
 
 ### Spawn (all reviewers at once)
 
-`SubmitTask` (`store.go:1121`) becomes `kind`-aware. For an **implement** task, after the
+`SubmitTask` (`store.go:1589`) becomes `kind`-aware. For an **implement** task, after the
 existing `in_progress → review` update and link insertion, **in the same transaction**:
 
 - Increment the parent's `review_round` (call it `R`).
@@ -191,8 +191,7 @@ A review worker completes its review task by submitting a verdict. For a **revie
 - Transition **this** review task `in_progress → done`, store the writeup in its `result`.
 - Append a `review` event **on the parent** (`target_task_id`) with the verdict and the worker
   as actor — so the parent's audit trail shows every verdict (mirrors today's `AddReview`).
-- **Aggregate the current round.** Count the parent's review tasks where `review_round =
-  parent.review_round`: `N` total, `done` count, `approve` count (via their review events or a
+- **Aggregate the current round** (`aggregateReviewRound`, `store.go:1915`). Count the parent's review tasks where `review_round = parent.review_round`: `N` total, `done` count, `approve` count (via their review events or a
   verdict column — see note). Then:
   - **`done < N`** (siblings still reviewing) → leave the parent in `review`; do nothing else.
     This worker was not the last; another verdict tx will finish the round.
@@ -216,7 +215,7 @@ worker (existing lease machinery; no new code).
 
 ### Human merge gate (transition rules)
 
-`TransitionTask` (`store.go:1322`) gains the `approved` state:
+`TransitionTask` (`store.go:2155`) gains the `approved` state:
 
 - `approved → done`: allowed (the human merge — replaces today's "approve event required from
   review" check; the `approved` state itself is the gate, since reaching it already required a
