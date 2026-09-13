@@ -4561,3 +4561,192 @@ func TestEscalateOptOutBlocksAtFirstThreshold(t *testing.T) {
 		t.Errorf("expected no supersession for escalate=false task, but SupersededBy is %v", finalTask.SupersededBy)
 	}
 }
+
+// TestArchiveProjectAndGetArchivedAt verifies that archiving a project sets archived_at and GET returns it.
+func TestArchiveProjectAndGetArchivedAt(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a project
+	createPayload := map[string]string{
+		"name": "archive-test-project",
+		"repo": "https://github.com/example/test-repo",
+	}
+	createBody, _ := json.Marshal(createPayload)
+	createReq := httptest.NewRequest("POST", "/projects", bytes.NewReader(createBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var project store.Project
+	json.NewDecoder(createW.Body).Decode(&project)
+
+	// Verify initial archived_at is nil
+	if project.ArchivedAt != nil {
+		t.Errorf("expected ArchivedAt to be nil for new project, got %v", project.ArchivedAt)
+	}
+
+	// Archive the project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+project.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	if archiveW.Code != http.StatusOK {
+		t.Errorf("expected status 200 for archive, got %d", archiveW.Code)
+	}
+
+	var archivedProject store.Project
+	json.NewDecoder(archiveW.Body).Decode(&archivedProject)
+
+	// Verify archived_at is set
+	if archivedProject.ArchivedAt == nil {
+		t.Error("expected ArchivedAt to be set after archiving, got nil")
+	}
+
+	// Get the project and verify archived_at is returned
+	getReq := httptest.NewRequest("GET", "/projects/"+project.ID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+
+	var retrievedProject store.Project
+	json.NewDecoder(getW.Body).Decode(&retrievedProject)
+
+	if retrievedProject.ArchivedAt == nil {
+		t.Error("expected ArchivedAt in GET response, got nil")
+	}
+	// Compare string values, not pointers
+	if *archivedProject.ArchivedAt != *retrievedProject.ArchivedAt {
+		t.Errorf("archived_at mismatch: archive response %q != get response %q", *archivedProject.ArchivedAt, *retrievedProject.ArchivedAt)
+	}
+}
+
+// TestListProjectsExcludesArchivedByDefault verifies that GET /projects excludes archived projects.
+func TestListProjectsExcludesArchivedByDefault(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create two projects
+	p1 := map[string]string{"name": "active-project", "repo": "https://github.com/example/active"}
+	p1Body, _ := json.Marshal(p1)
+	p1Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p1Body))
+	p1Req.Header.Set("Authorization", authHeader)
+	p1Req.Header.Set("Content-Type", "application/json")
+	p1W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p1W, p1Req)
+	var activeProject store.Project
+	json.NewDecoder(p1W.Body).Decode(&activeProject)
+
+	p2 := map[string]string{"name": "archived-project", "repo": "https://github.com/example/archived"}
+	p2Body, _ := json.Marshal(p2)
+	p2Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p2Body))
+	p2Req.Header.Set("Authorization", authHeader)
+	p2Req.Header.Set("Content-Type", "application/json")
+	p2W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p2W, p2Req)
+	var archivedProject store.Project
+	json.NewDecoder(p2W.Body).Decode(&archivedProject)
+
+	// Archive the second project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+archivedProject.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	// List projects without include_archived
+	listReq := httptest.NewRequest("GET", "/projects", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var projects []store.Project
+	json.NewDecoder(listW.Body).Decode(&projects)
+
+	// Find our projects in the list (filter by name to handle test isolation)
+	var foundActive, foundArchived bool
+	for _, p := range projects {
+		if p.ID == activeProject.ID && p.Name == "active-project" {
+			foundActive = true
+		}
+		if p.ID == archivedProject.ID && p.Name == "archived-project" {
+			foundArchived = true
+		}
+	}
+
+	// Verify only the active project is returned
+	if !foundActive {
+		t.Error("expected active project in list")
+	}
+	if foundArchived {
+		t.Error("did not expect archived project in default list (should exclude archived)")
+	}
+}
+
+// TestListProjectsIncludesArchivedWithFlag verifies that GET /projects?include_archived=true returns archived projects.
+func TestListProjectsIncludesArchivedWithFlag(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create two projects
+	p1 := map[string]string{"name": "active-project-2", "repo": "https://github.com/example/active2"}
+	p1Body, _ := json.Marshal(p1)
+	p1Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p1Body))
+	p1Req.Header.Set("Authorization", authHeader)
+	p1Req.Header.Set("Content-Type", "application/json")
+	p1W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p1W, p1Req)
+	var activeProject store.Project
+	json.NewDecoder(p1W.Body).Decode(&activeProject)
+
+	p2 := map[string]string{"name": "archived-project-2", "repo": "https://github.com/example/archived2"}
+	p2Body, _ := json.Marshal(p2)
+	p2Req := httptest.NewRequest("POST", "/projects", bytes.NewReader(p2Body))
+	p2Req.Header.Set("Authorization", authHeader)
+	p2Req.Header.Set("Content-Type", "application/json")
+	p2W := httptest.NewRecorder()
+	server.mux.ServeHTTP(p2W, p2Req)
+	var archivedProject store.Project
+	json.NewDecoder(p2W.Body).Decode(&archivedProject)
+
+	// Archive the second project
+	archiveReq := httptest.NewRequest("POST", "/projects/"+archivedProject.ID+"/archive", nil)
+	archiveReq.Header.Set("Authorization", authHeader)
+	archiveW := httptest.NewRecorder()
+	server.mux.ServeHTTP(archiveW, archiveReq)
+
+	// List projects WITH include_archived=true
+	listReq := httptest.NewRequest("GET", "/projects?include_archived=true", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var projects []store.Project
+	json.NewDecoder(listW.Body).Decode(&projects)
+
+	// Verify archived_at is set on archived project (filter by name to handle test isolation)
+	hasActiveProject := false
+	hasArchivedProject := false
+	for _, p := range projects {
+		if p.ID == activeProject.ID && p.Name == "active-project-2" {
+			hasActiveProject = true
+			if p.ArchivedAt != nil {
+				t.Errorf("expected ArchivedAt to be nil for active project, got %v", p.ArchivedAt)
+			}
+		}
+		if p.ID == archivedProject.ID && p.Name == "archived-project-2" {
+			hasArchivedProject = true
+			if p.ArchivedAt == nil {
+				t.Error("expected ArchivedAt to be set for archived project, got nil")
+			}
+		}
+	}
+
+	if !hasActiveProject {
+		t.Error("active project not found in list")
+	}
+	if !hasArchivedProject {
+		t.Error("archived project not found in list")
+	}
+}
