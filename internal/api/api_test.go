@@ -4750,3 +4750,192 @@ func TestListProjectsIncludesArchivedWithFlag(t *testing.T) {
 		t.Error("archived project not found in list")
 	}
 }
+
+// TestListTasksWithFieldsSummary verifies fields=summary omits spec and result.
+func TestListTasksWithFieldsSummary(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task with spec and result
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Task 1",
+			Spec:       "This is the spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", createW.Code)
+	}
+
+	// List with fields=summary
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", listW.Code)
+	}
+
+	var tasks []map[string]interface{}
+	if err := json.NewDecoder(listW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(tasks))
+	}
+
+	task := tasks[0]
+	// Verify spec and result are absent
+	if _, hasSpec := task["spec"]; hasSpec {
+		t.Error("spec should be absent in summary response")
+	}
+	if _, hasResult := task["result"]; hasResult {
+		t.Error("result should be absent in summary response")
+	}
+
+	// Verify other fields are present
+	if _, hasID := task["id"]; !hasID {
+		t.Error("id should be present in summary response")
+	}
+	if _, hasTitle := task["title"]; !hasTitle {
+		t.Error("title should be present in summary response")
+	}
+	if _, hasState := task["state"]; !hasState {
+		t.Error("state should be present in summary response")
+	}
+}
+
+// TestListTasksWithoutFieldsSummary verifies spec and result are present without fields=summary.
+func TestListTasksWithoutFieldsSummary(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task with spec
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Task 1",
+			Spec:       "This is the spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	// List without fields parameter
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", listW.Code)
+	}
+
+	var tasks []store.Task
+	if err := json.NewDecoder(listW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(tasks))
+	}
+
+	task := tasks[0]
+	if task.Spec != "This is the spec" {
+		t.Errorf("expected spec 'This is the spec', got %q", task.Spec)
+	}
+}
+
+// TestListTasksFieldsSummaryComposesWithFilters verifies fields=summary composes with state= and kind=.
+func TestListTasksFieldsSummaryComposesWithFilters(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create tasks
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Task 1",
+			Spec:       "Spec 1",
+			DocumentID: docID,
+		},
+		{
+			Title:      "Task 2",
+			Spec:       "Spec 2",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", createW.Code)
+	}
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+
+	// Manually convert one task to review kind
+	conn := server.store.Conn()
+	reviewTaskID := createdTasks[1].ID
+	_, err := conn.ExecContext(context.Background(), "UPDATE task SET kind = 'review' WHERE id = ?", reviewTaskID)
+	if err != nil {
+		t.Fatalf("failed to set task to review kind: %v", err)
+	}
+
+	// List with fields=summary and kind=implement filter
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary&kind=implement", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", listW.Code)
+	}
+
+	var tasks []map[string]interface{}
+	if err := json.NewDecoder(listW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+
+	if len(tasks) != 1 {
+		t.Errorf("expected 1 task with kind=implement, got %d", len(tasks))
+	}
+
+	task := tasks[0]
+	// Verify spec and result are absent
+	if _, hasSpec := task["spec"]; hasSpec {
+		t.Error("spec should be absent in summary response")
+	}
+	if _, hasResult := task["result"]; hasResult {
+		t.Error("result should be absent in summary response")
+	}
+
+	// Verify kind filter was applied
+	if kind, ok := task["kind"]; !ok || kind != "implement" {
+		t.Errorf("expected kind 'implement', got %v", kind)
+	}
+}
