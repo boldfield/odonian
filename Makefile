@@ -88,87 +88,12 @@ fleet-image:
 	  -f deploy/fleet/Dockerfile.fleet --push .
 	@echo "Pushed $(FLEET_REGISTRY)/odonian/fleet:$(FLEET_TAG) and :$(VERSION) (linux/amd64)"
 
-# Fail fast if a tag pinned in the worker/reviewer manifests was never built and pushed. This
-# is what would have caught #273: it pins v0.15.0-8-g4beac47 before any VERSION-tagged image
-# had been built, so every pod went ImagePullBackOff and the failure only surfaced as a rollout
-# timeout minutes later. Parses the images actually pinned in the manifests (NOT $(VERSION) —
-# the point is to check what will be APPLIED, which may differ from what would be built) and
-# queries the registry's v2 API for each distinct one. reviewer-deployment.yaml has two image
-# lines (the codex-auth-setup init container and the reviewer container), so all three lines
-# across the two files are checked. The registry serves plain HTTP on port 32050 (HTTPS fails
-# there), so this deliberately uses http://. Uses only curl + POSIX sh (no jq): the tag list is
-# matched as the exact quoted JSON array element "$$tag".
-verify-fleet-tags:
-	@images=$$(grep -h 'image:' deploy/fleet/worker-deployment.yaml deploy/fleet/reviewer-deployment.yaml | sed 's/^[^:]*: *//' | sort -u); \
-	fail=0; \
-	for img in $$images; do \
-	  repo_tag="$${img#$(FLEET_REGISTRY)/}"; \
-	  repo="$${repo_tag%:*}"; \
-	  tag="$${repo_tag##*:}"; \
-	  url="http://$(FLEET_REGISTRY)/v2/$$repo/tags/list"; \
-	  resp=$$(curl -fsS "$$url" 2>/tmp/verify-fleet-tags.$$$$.err); \
-	  rc=$$?; \
-	  if [ $$rc -ne 0 ]; then \
-	    echo "ERROR: registry unreachable for $$img (curl exit $$rc, $$url): $$(cat /tmp/verify-fleet-tags.$$$$.err)"; \
-	    rm -f /tmp/verify-fleet-tags.$$$$.err; \
-	    fail=1; \
-	    continue; \
-	  fi; \
-	  rm -f /tmp/verify-fleet-tags.$$$$.err; \
-	  if printf '%s' "$$resp" | grep -qF "\"$$tag\""; then \
-	    echo "OK: $$img found in $(FLEET_REGISTRY)"; \
-	  else \
-	    echo "ERROR: tag '$$tag' not found for '$$repo' in $(FLEET_REGISTRY) -- build and push it first ('make fleet-image' or 'make merger-image'), or correct the pin in the manifest"; \
-	    fail=1; \
-	  fi; \
-	done; \
-	exit $$fail
-
-# Apply the cp-cluster worker + reviewer manifests, which pin the image tag to deploy. The
-# manifests fully determine what runs, so this is a plain `kubectl apply` — see
-# deploy/fleet/README.md for why the imperative image-patch escape hatch must not be used
-# here. Build and push the image FIRST (`make fleet-image`), THEN bump the pinned tag in the
-# manifests to match — never the other way around (see verify-fleet-tags). Preview the effect
-# with `make diff-fleet`. Assumes the deployments already exist (first-time setup — namespace,
-# secrets, apply — is in deploy/fleet/README.md).
-fleet-deploy: verify-fleet-tags
-	kubectl --context $(CP_CONTEXT) -n $(FLEET_NAMESPACE) apply -f deploy/fleet/worker-deployment.yaml
-	kubectl --context $(CP_CONTEXT) -n $(FLEET_NAMESPACE) apply -f deploy/fleet/reviewer-deployment.yaml
-	kubectl --context $(CP_CONTEXT) -n $(FLEET_NAMESPACE) rollout status deploy/worker   --timeout=300s
-	kubectl --context $(CP_CONTEXT) -n $(FLEET_NAMESPACE) rollout status deploy/reviewer --timeout=300s
-
-# Preview what `make fleet-deploy` would change on the cluster without applying it.
-# `kubectl diff` exits non-zero when it finds differences, so run both diffs even if the
-# first one "fails" and propagate the worst exit status instead of stopping after worker.
-diff-fleet:
-	@rc=0; \
-	kubectl --context $(CP_CONTEXT) -n $(FLEET_NAMESPACE) diff -f deploy/fleet/worker-deployment.yaml || rc=$$?; \
-	kubectl --context $(CP_CONTEXT) -n $(FLEET_NAMESPACE) diff -f deploy/fleet/reviewer-deployment.yaml || rc=$$?; \
-	exit $$rc
-
-# Build + push the multi-arch merger image, then roll the lab-cluster merger onto it
-# (digest-pinned, same mechanism as fleet-deploy). Re-roll without rebuild:
-#   kubectl --context $(LAB_CONTEXT) -n $(FLEET_NAMESPACE) rollout restart deploy/merger
-merger-deploy: merger-image
-	@echo "Resolving digest for $(FLEET_REGISTRY)/odonian/merger:$(FLEET_TAG)..."
-	@STDERR_FILE=$$(mktemp); \
-	DIGEST=""; \
-	for attempt in 1 2 3 4 5; do \
-	  DIGEST=$$(docker buildx imagetools inspect --builder $(FLEET_BUILDER) "$(FLEET_REGISTRY)/odonian/merger:$(FLEET_TAG)" 2>"$$STDERR_FILE" | awk '/^Digest:/{print $$2; exit}'); \
-	  if echo "$$DIGEST" | grep -qE '^sha256:[a-f0-9]{64}$$'; then break; fi; \
-	  if [ $$attempt -lt 5 ]; then sleep 2; fi; \
-	done; \
-	if ! echo "$$DIGEST" | grep -qE '^sha256:[a-f0-9]{64}$$'; then \
-	  STDERR_TEXT=$$(cat "$$STDERR_FILE" 2>/dev/null || echo "(no stderr captured)"); \
-	  rm -f "$$STDERR_FILE"; \
-	  echo "ERROR: could not resolve merger image digest (got '$$DIGEST'). Last error: $$STDERR_TEXT"; \
-	  exit 1; \
-	fi; \
-	rm -f "$$STDERR_FILE"; \
-	REF="$(FLEET_REGISTRY)/odonian/merger@$$DIGEST"; \
-	echo "Deploying $$REF to merger ($(LAB_CONTEXT))"; \
-	kubectl --context $(LAB_CONTEXT) -n $(FLEET_NAMESPACE) set image deploy/merger merger="$$REF"; \
-	kubectl --context $(LAB_CONTEXT) -n $(FLEET_NAMESPACE) rollout status deploy/merger --timeout=300s
+# Fleet desired state is owned by boldfield/manifests and reconciled by ArgoCD.
+# Keep old command names as explicit errors so stale runbooks cannot overwrite GitOps.
+verify-fleet-tags fleet-deploy diff-fleet merger-deploy:
+	@echo "Fleet deployment moved to https://github.com/boldfield/manifests (cp/odonian-fleet, lab/odonian-fleet)."
+	@echo "Build/push images here, then update image pins there and merge the reviewed PR."
+	@exit 1
 
 # --- codex (gpt-5.5) reviewer auth ---
 #

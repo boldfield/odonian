@@ -56,7 +56,7 @@ recreated secrets, clean apply.
       Remember the codex mount gotcha: `~/.codex` must be writable (initContainer copy) —
       the manifests already encode this; don't "fix" it while sedding.
 - [ ] Fresh repos-cache PVCs per the manifests (no data to migrate).
-- [ ] `make fleet-deploy` (workers/reviewers on CP) and `make merger-deploy` (LAB), with the
+- [ ] Update `cp/odonian-fleet` and `lab/odonian-fleet` in `boldfield/manifests`, merge the reviewed PR, and verify ArgoCD convergence, with the
       new images from step 1. Manifests now point at `odonian-fleet` and
       `.../odonian/{fleet,merger}` images.
 - [ ] `make versions` — all four rows healthy.

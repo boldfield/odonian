@@ -258,7 +258,7 @@ if [ "$CLAUDE_AUTH_RC" -eq 0 ]; then
 elif printf '%s' "$CLAUDE_AUTH_OUT" | grep -qiE 'exceeded (usd )?budget'; then
   say "claude: authenticated (probe stopped at its budget cap — reaching billing proves the credentials were accepted)"
 elif printf '%s' "$CLAUDE_AUTH_OUT" | grep -qiE 'failed to authenticate|not logged in|401|invalid api key|oauth (access )?token'; then
-  die "claude is on PATH but not authenticated — every claude-model dispatch would fail (claude -p said: $CLAUDE_AUTH_OUT). Fix: seed a working ~/.claude/.credentials.json (sbx's own interactive login), or export CLAUDE_CODE_OAUTH_TOKEN (a 'claude setup-token' token — the same variable the cluster deployments use, see deploy/fleet/worker-deployment.yaml) before running sbx.sh."
+  die "claude is on PATH but not authenticated — every claude-model dispatch would fail (claude -p said: $CLAUDE_AUTH_OUT). Fix: seed a working ~/.claude/.credentials.json (sbx's own interactive login), or export CLAUDE_CODE_OAUTH_TOKEN (a 'claude setup-token' token — the same variable the cluster deployments use, see boldfield/manifests: cp/odonian-fleet/worker-deployment.yaml) before running sbx.sh."
 else
   die "claude auth probe failed for a NON-auth reason — not a login problem, so re-authenticating will not help (claude -p said: $CLAUDE_AUTH_OUT). Check network/proxy egress to api.anthropic.com from inside the sandbox, then re-run."
 fi
@@ -465,7 +465,7 @@ EOF
 # this is optional secret data: an existing valid ~/.claude/.credentials.json (sbx's own login)
 # already authenticates claude fine on its own, so an operator who has one doesn't need to mint a
 # token, and writing an unset var here would just clobber nothing with nothing. Same variable name
-# the cluster deployments use (deploy/fleet/worker-deployment.yaml, deploy/fleet/reviewer-deployment.yaml)
+# the cluster deployments use (boldfield/manifests: cp/odonian-fleet)
 # — a long-lived `claude setup-token` token, not an API key.
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   echo "export CLAUDE_CODE_OAUTH_TOKEN=\"$CLAUDE_CODE_OAUTH_TOKEN\"" >> "$ODONIAN_HOME/env"

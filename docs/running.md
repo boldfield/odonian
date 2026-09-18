@@ -191,7 +191,7 @@ kustomization with a namespace, PVC, deployment, and service is all it takes. Th
 | `make deploy` | Roll the server image out |
 | `make versions` | Show what is built, tagged, and deployed |
 | `make fleet-image`, `make merger-image` | Build and push the worker/reviewer and merger images |
-| `make fleet-deploy`, `make merger-deploy`, `make diff-fleet` | Apply or diff the fleet manifests in `deploy/fleet/` |
+| `make fleet-deploy`, `make merger-deploy`, `make diff-fleet` | Retired; fleet rollouts go through `boldfield/manifests` and ArgoCD |
 | `make codex-auth`, `make codex-auth-check` | Seed and verify the Codex credential secret |
 
 `deploy/fleet/` stays in this repository because it holds build inputs (`Dockerfile.fleet`,

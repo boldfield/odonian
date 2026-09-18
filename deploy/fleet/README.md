@@ -30,31 +30,20 @@ must be told the registry is http. `make fleet-builder` creates a builder with t
 `buildkitd.toml` + `docker buildx create --driver docker-container`). `merger-image` then builds
 `linux/amd64,linux/arm64` so the same tag runs on both clusters.
 
-## Deploy the merger (to the Pi cluster)
+## Deployments are owned by manifests
 
-```bash
-LAB=admin@summercamp-lab
-kubectl --context $LAB apply -f deploy/fleet/namespace.yaml
+Build and push images here. Update the matching pins in
+[boldfield/manifests](https://github.com/boldfield/manifests), open a PR, and merge after review:
 
-# Secrets (tokens never touch a committed file — see secret.example.yaml):
-TOKEN=$(kubectl --context admin@summercamp-cp -n odonian get secret odonian-secret -o jsonpath='{.data.token}' | base64 -d)
-kubectl --context $LAB -n odonian-fleet create secret generic odonian-fleet --from-literal=token="$TOKEN"
-kubectl --context $LAB -n odonian-fleet create secret generic odonian-forge-tokens \
-  --from-file=forge-tokens="$HOME/.odonian/forge-tokens"
+- `cp/odonian-fleet`: workers and reviewers, including the Codex auth init container.
+- `lab/odonian-fleet`: mergers.
+- `cp/argocd/apps/odonian-fleet-{cp,lab}.yaml`: ArgoCD applications.
 
-kubectl --context $LAB apply -f deploy/fleet/merger-deployment.yaml
-kubectl --context $LAB -n odonian-fleet logs -l app.kubernetes.io/component=merger -f
-```
-
-You should see it poll, claim `merge`-kind tasks across all boards, and squash-merge — no claude
-involved.
-
-## Prerequisites to verify on the lab cluster (first time)
-
-- It can **reach the public server URL** (it can — that's how the laptop fleet connects).
-- Its container runtime can **pull from `docker.summercamp.eastharbor.casa:32050`** (if the registry
-  is insecure/no-auth, Talos needs the registry allow-listed in machine config; the cp cluster
-  already pulls from it). If pulls fail with TLS/forbidden, that's the thing to fix.
+ArgoCD applies the manifests. There are no deployment copies in this repository.
+The retired `fleet-deploy`, `merger-deploy`, `diff-fleet`, and `verify-fleet-tags` targets
+fail with a pointer to the manifests project. This prevents an old command from reverting
+GitOps-managed image pins. Runtime credentials remain out of band; see `secret.example.yaml`
+and the manifests fleet READMEs. Server deployment is a separate migration.
 
 ## Workers + reviewers (amd64 / cp cluster)
 
@@ -128,17 +117,12 @@ Running exactly one codex-capable reviewer reduces the churn (one rotation linea
 the cost of `gpt-5.5` review throughput. `auth_mode: apikey` avoids rotation entirely but moves you
 from subscription to API billing.
 
-### 3. Deploy
+### 3. Request the rollout in manifests
 
-```sh
-kubectl --context admin@summercamp-cp apply -f deploy/fleet/namespace.yaml
-kubectl --context admin@summercamp-cp apply -f deploy/fleet/worker-deployment.yaml
-kubectl --context admin@summercamp-cp apply -f deploy/fleet/reviewer-deployment.yaml
-```
-
-4 workers + 4 reviewers, matching the laptop fleet. They poll the public server, claim
-`implement` / `review` tasks across all boards, clone+build in an ephemeral `emptyDir` HOME, and
-open/PR-review as usual. `replicas` is the only knob to match local concurrency.
+Verify the image tag exists in the internal registry, update every corresponding pin in
+`boldfield/manifests`, and open the rollout PR there. ArgoCD deploys after the human merge gate.
+Preserve existing replica counts and authentication Secret references. Do not apply workload
+YAML or change workload images directly from this repository.
 
 ### Repo clone cache (multi-project mode)
 
@@ -164,46 +148,12 @@ is in scope.
 
 ### Releasing a new fleet image
 
-`worker-deployment.yaml` and `reviewer-deployment.yaml` pin an exact image tag — the manifests
-fully determine what runs in the cluster. **Ordering rule: build and push the image FIRST, then
-pin the tag.** Pinning a tag that was never built is exactly what took the fleet down once
-already — see the `verify-fleet-tags` note below. To roll out a new build:
+1. Build and push an explicit version: `make fleet-image VERSION=<version> FLEET_TAG=<version>`
+   and `make merger-image VERSION=<version> FLEET_TAG=<version>`.
+2. Verify the published registry manifests and architectures before proposing image pins.
+3. Open the rollout PR in `boldfield/manifests`, including the image digest and validation.
+4. After review and merge, observe the ArgoCD fleet applications and deployment rollouts.
 
-```sh
-make fleet-image                       # 1. build + push the new tag to the registry
-# 2. Bump the pinned tag in deploy/fleet/worker-deployment.yaml and
-#    deploy/fleet/reviewer-deployment.yaml (all `image:` lines) to the tag just pushed.
-make diff-fleet                        # 3. preview what the apply would change on the cluster
-make fleet-deploy                      # 4. apply the manifests and wait for the rollout
-```
-
-**Never use `kubectl set image` to roll the fleet.** It patches the live Deployment directly, but
-the manifest in the repo is unchanged — the next `make fleet-deploy` (or anyone else applying the
-manifest) silently reverts the cluster back to the old tag. The pinned tag in the manifest is the
-single source of truth for what's running; always change it there.
-
-### `verify-fleet-tags`: fail fast if a pinned tag was never pushed
-
-`fleet-deploy` depends on `verify-fleet-tags`, which runs before either `kubectl apply` and fails
-loudly if any image tag pinned in `worker-deployment.yaml` or `reviewer-deployment.yaml` (there
-are three `image:` lines across the two files — the `codex-auth-setup` init container and the
-reviewer container both pin the fleet image too) is missing from the registry. It parses the tags
-actually in the manifests — not `$(VERSION)` — since the whole point is to check what will be
-*applied*, which can differ from what would be freshly built, then queries
-`http://$(FLEET_REGISTRY)/v2/<repo>/tags/list` for each distinct image (plain HTTP — the internal
-registry has no TLS on port 32050). It uses only `curl` plus POSIX `sh`/`grep` (no `jq`).
-
-If a tag is missing it names the image and tag and points at the fix (`make fleet-image` /
-`make merger-image` to build and push, or correct the pin); if the registry is unreachable it
-fails with a distinct message rather than passing an unverifiable deploy. This is the guard that
-would have caught the incident that motivated it: a tag was pinned in the manifests before any
-image had ever been pushed under it, so applying it took down every worker and reviewer pod with
-`ImagePullBackOff`, and the failure only surfaced as a rollout timeout minutes later. Run it
-standalone with `make verify-fleet-tags` any time you want to sanity check the current pins
-without deploying.
-
-**`fleet-deploy` no longer rebuilds the image.** It previously depended on `fleet-image`, which
-rebuilt and pushed a tag derived from the current HEAD — generally *not* the tag the manifests
-pin, so that build was wasted and misleading. Deploy now depends only on `verify-fleet-tags`,
-which checks the exact pinned tags before applying. Build explicitly with `make fleet-image`
-(step 1 above) when you actually want a new image.
+Do not reuse an existing release tag or use `:latest` for deployed workloads. If image construction
+uses an existing runtime base, record its digest and the replacement CLI/harness source revision
+in the rollout PR. A rollback is another reviewed change to the manifest pins.
