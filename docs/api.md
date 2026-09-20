@@ -1019,6 +1019,42 @@ the PATCH response does not include the dependency list. Errors include `400 SEL
 empty replacement list. Invalid dependency IDs, duplicates, or other storage failures currently
 return `500 UPDATE_ERROR`.
 
+#### `PATCH /tasks/{id}/escalation`
+
+Update the task's automatic escalation policy. This endpoint controls whether the task **may** be
+escalated to a higher-capacity model if needed, independent of the task's initial model assignment.
+
+**Model assignment and escalation are separate concerns:**
+- **Initial model**: The model chosen when the task is created (e.g., Haiku, Sonnet). This sizing
+  decision is based on task complexity and is immutable.
+- **Escalation permission** (the `escalate` field): A boolean policy flag controlling whether the
+  task may be automatically promoted to a higher-capacity model if the assigned model runs out of
+  capacity or if review feedback indicates that additional capability is needed. Enabled by default.
+- **Task resumption/escalation** (a separate action): The act of actually promoting a task to a
+  higher model occurs via `/tasks/{id}/promote` or through automated circuit-breaker escalation.
+  Changing the `escalate` setting here does NOT immediately resume or escalate a task.
+
+```bash
+curl -X PATCH -H "Authorization: Bearer token" -H 'Content-Type: application/json' \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/escalation \
+  -d '{"escalate":true}'
+```
+
+The request requires exactly one field, `escalate`, and it must be a boolean (`true` or `false`).
+Missing, null, non-boolean, or unknown fields are rejected with `400 BAD_REQUEST`. Omitting the
+field, setting it to `null`, or sending an unrecognized field all fail validation without
+mutating the task.
+
+**Response:** `200 OK` with the task object showing the new escalation policy. The field `escalate`
+in the response indicates the current policy. Repeating the same value is idempotent. Errors
+include `400 MISSING_FIELD`, `400 NULL_FIELD`, `400 INVALID_FIELD_TYPE`, `400 UNKNOWN_FIELD`,
+`400 JSON_DECODE_ERROR`, `409 CONFLICT` for a task in a disallowed terminal state (e.g., `done`,
+`failed`, `abandoned`), and `404 NOT_FOUND` for a missing task.
+
+Changing the escalation policy does not change the task's initial model, current state, lease,
+review round, dependencies, history, or PR links. A blocked task may still update its escalation
+policy.
+
 #### `POST /tasks/{id}/supersede`
 
 Create a replacement task and atomically repoint dependents to it. The old task becomes
