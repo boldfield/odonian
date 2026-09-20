@@ -1757,6 +1757,27 @@ func TestListUnaddressedFeedback_WorkerNoteWithoutFixingCommitDoesNotAck(t *test
 	}
 }
 
+// TestListUnaddressedFeedback_NegatedStatusDoesNotAck: a worker status that merely contains
+// "addressed in <sha> (see comment <id>)" as a substring — e.g. "not addressed in ..." — is not
+// the acknowledgment writer format and must not clear the feedback. The acknowledgment message
+// must BEGIN with "addressed in ", not embed it after other words.
+func TestListUnaddressedFeedback_NegatedStatusDoesNotAck(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-a", 1, "human", "2024-01-01T10:00:00Z", "Issue A: needs fixing"),
+		globalComment("comment-neg", 2, "human", "2024-01-01T10:10:00Z",
+			"haiku-worker: not addressed in abc123 (see comment comment-a)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (negated worker status must not acknowledge): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-a" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-a")
+	}
+}
+
 // TestListUnaddressedFeedback_NonWorkerAckDoesNotClear: only a worker acknowledgment clears
 // global feedback; a reviewer/merger comment in the ack format must not.
 func TestListUnaddressedFeedback_NonWorkerAckDoesNotClear(t *testing.T) {

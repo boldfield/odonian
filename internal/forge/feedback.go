@@ -380,23 +380,32 @@ func parseCommentTime(s string) (time.Time, bool) {
 	return t, true
 }
 
-// bodyAcknowledgesComment reports whether body matches the acknowledgment writer
-// format "addressed in <sha> (see comment <targetNodeID>)" — it must reference the
-// exact target comment ID and claim a non-empty fixing commit.
+// bodyAcknowledgesComment reports whether body is the acknowledgment writer's exact
+// format "addressed in <sha> (see comment <targetNodeID>)". The marker-stripped
+// message must BEGIN with "addressed in " (a mere substring elsewhere — e.g. a worker
+// status "not addressed in <sha> (see comment <id>)" — does not qualify), carry a
+// single non-empty fixing-commit token, and then reference the exact target comment ID.
 func bodyAcknowledgesComment(body, targetNodeID string) bool {
-	marker := "(see comment " + targetNodeID + ")"
-	idx := strings.Index(body, marker)
+	// Strip the leading agent marker so the check anchors on the writer format itself
+	// rather than the "<model>-worker: " prefix.
+	msg := AgentCommentMessage(body)
+	const prefix = "addressed in "
+	if !strings.HasPrefix(msg, prefix) {
+		return false
+	}
+	rest := msg[len(prefix):]
+	marker := " (see comment " + targetNodeID + ")"
+	idx := strings.Index(rest, marker)
 	if idx < 0 {
 		return false
 	}
-	prefix := body[:idx]
-	ai := strings.LastIndex(prefix, "addressed in ")
-	if ai < 0 {
+	// The fixing commit is the single token between "addressed in " and the marker;
+	// it must be non-empty and contain no whitespace (the writer emits a bare sha).
+	sha := rest[:idx]
+	if sha == "" || strings.ContainsAny(sha, " \t\r\n") {
 		return false
 	}
-	// Require a non-empty fixing-commit token between "addressed in " and the marker.
-	sha := strings.TrimSpace(prefix[ai+len("addressed in "):])
-	return sha != ""
+	return true
 }
 
 // fetchGlobalCommentsPageRaw fetches a single page of global PR comments from the GraphQL API.
