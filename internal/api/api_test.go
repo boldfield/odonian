@@ -5506,6 +5506,79 @@ func TestUpdateEscalationRequiresAuth(t *testing.T) {
 	}
 }
 
+// escalationBaseline captures the pre-request state of a task so a rejected escalation PATCH can
+// be proven to have mutated nothing.
+type escalationBaseline struct {
+	escalate bool
+	state    string
+	events   []store.Event
+}
+
+// captureEscalationBaseline records a task's current escalate flag, state, and full event history
+// through the API so it can be compared after an invalid request.
+func captureEscalationBaseline(t *testing.T, server *Server, authHeader, taskID string) escalationBaseline {
+	t.Helper()
+	getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+	var task store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(getW.Body).Decode(&task); err != nil {
+		t.Fatalf("failed to decode baseline task: %v", err)
+	}
+
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+taskID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+	var events []store.Event
+	if err := json.NewDecoder(eventsW.Body).Decode(&events); err != nil {
+		t.Fatalf("failed to decode baseline events: %v", err)
+	}
+
+	return escalationBaseline{escalate: task.Escalate, state: task.State, events: events}
+}
+
+// assertEscalationUnchanged verifies that a rejected escalation PATCH did not mutate the task:
+// the escalate flag, state, and prior event history must all be identical to the captured baseline.
+func assertEscalationUnchanged(t *testing.T, server *Server, authHeader, taskID string, baseline escalationBaseline) {
+	t.Helper()
+	getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+	var after store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(getW.Body).Decode(&after); err != nil {
+		t.Fatalf("failed to decode task after rejected request: %v", err)
+	}
+	if after.Escalate != baseline.escalate {
+		t.Errorf("escalate mutated by rejected request: want %v, got %v", baseline.escalate, after.Escalate)
+	}
+	if after.State != baseline.state {
+		t.Errorf("state mutated by rejected request: want %q, got %q", baseline.state, after.State)
+	}
+
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+taskID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+	var eventsAfter []store.Event
+	if err := json.NewDecoder(eventsW.Body).Decode(&eventsAfter); err != nil {
+		t.Fatalf("failed to decode events after rejected request: %v", err)
+	}
+	if len(eventsAfter) != len(baseline.events) {
+		t.Errorf("event history changed by rejected request: want %d events, got %d", len(baseline.events), len(eventsAfter))
+	}
+	for i, want := range baseline.events {
+		if i >= len(eventsAfter) {
+			break
+		}
+		if got := eventsAfter[i]; got.ID != want.ID || got.Kind != want.Kind || got.Actor != want.Actor {
+			t.Errorf("prior event %d changed by rejected request: want %+v, got %+v", i, want, got)
+		}
+	}
+}
+
 // TestUpdateEscalationMissingFieldReturns400 verifies that missing escalate field returns 400.
 func TestUpdateEscalationMissingFieldReturns400(t *testing.T) {
 	server := setupTestServer(t, "test-token")
@@ -5530,6 +5603,8 @@ func TestUpdateEscalationMissingFieldReturns400(t *testing.T) {
 	json.NewDecoder(createW.Body).Decode(&createdTasks)
 	taskID := createdTasks[0].ID
 
+	baseline := captureEscalationBaseline(t, server, authHeader, taskID)
+
 	// Try to update with empty payload
 	updatePayload := map[string]interface{}{}
 	updateBody, _ := json.Marshal(updatePayload)
@@ -5552,6 +5627,9 @@ func TestUpdateEscalationMissingFieldReturns400(t *testing.T) {
 	if code, ok := errObj["code"]; !ok || code != "MISSING_FIELD" {
 		t.Errorf("expected error code MISSING_FIELD, got %v", code)
 	}
+
+	// The rejected request must not have mutated the task.
+	assertEscalationUnchanged(t, server, authHeader, taskID, baseline)
 }
 
 // TestUpdateEscalationNullFieldReturns400 verifies that null escalate field returns 400.
@@ -5578,6 +5656,8 @@ func TestUpdateEscalationNullFieldReturns400(t *testing.T) {
 	json.NewDecoder(createW.Body).Decode(&createdTasks)
 	taskID := createdTasks[0].ID
 
+	baseline := captureEscalationBaseline(t, server, authHeader, taskID)
+
 	// Try to update with null escalate
 	updatePayload := map[string]interface{}{
 		"escalate": nil,
@@ -5602,6 +5682,9 @@ func TestUpdateEscalationNullFieldReturns400(t *testing.T) {
 	if code, ok := errObj["code"]; !ok || code != "NULL_FIELD" {
 		t.Errorf("expected error code NULL_FIELD, got %v", code)
 	}
+
+	// The rejected request must not have mutated the task.
+	assertEscalationUnchanged(t, server, authHeader, taskID, baseline)
 }
 
 // TestUpdateEscalationStringFieldReturns400 verifies that string escalate field returns 400.
@@ -5628,6 +5711,8 @@ func TestUpdateEscalationStringFieldReturns400(t *testing.T) {
 	json.NewDecoder(createW.Body).Decode(&createdTasks)
 	taskID := createdTasks[0].ID
 
+	baseline := captureEscalationBaseline(t, server, authHeader, taskID)
+
 	// Try to update with string escalate
 	updateBody := []byte(`{"escalate": "true"}`)
 	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
@@ -5649,6 +5734,9 @@ func TestUpdateEscalationStringFieldReturns400(t *testing.T) {
 	if code, ok := errObj["code"]; !ok || code != "INVALID_FIELD_TYPE" {
 		t.Errorf("expected error code INVALID_FIELD_TYPE, got %v", code)
 	}
+
+	// The rejected request must not have mutated the task.
+	assertEscalationUnchanged(t, server, authHeader, taskID, baseline)
 }
 
 // TestUpdateEscalationUnknownFieldReturns400 verifies that unknown fields return 400.
@@ -5675,6 +5763,8 @@ func TestUpdateEscalationUnknownFieldReturns400(t *testing.T) {
 	json.NewDecoder(createW.Body).Decode(&createdTasks)
 	taskID := createdTasks[0].ID
 
+	baseline := captureEscalationBaseline(t, server, authHeader, taskID)
+
 	// Try to update with unknown field
 	updateBody := []byte(`{"escalate": true, "unknown_field": "value"}`)
 	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
@@ -5696,6 +5786,9 @@ func TestUpdateEscalationUnknownFieldReturns400(t *testing.T) {
 	if code, ok := errObj["code"]; !ok || code != "UNKNOWN_FIELD" {
 		t.Errorf("expected error code UNKNOWN_FIELD, got %v", code)
 	}
+
+	// The rejected request must not have mutated the task.
+	assertEscalationUnchanged(t, server, authHeader, taskID, baseline)
 }
 
 // TestUpdateEscalationMissingTaskReturns404 verifies that missing task returns 404.
