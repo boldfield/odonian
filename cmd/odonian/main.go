@@ -1452,11 +1452,18 @@ func extractReviewFindings(events []tuiclient.Event, currentReviewRound int) []R
 						Verdict: *event.Verdict,
 					})
 				}
-				// Extract findings from the note field of review events
+				// Extract findings from the note field of review events. Only reject
+				// verdicts are labeled as rejection findings the worker must address;
+				// approve verdicts that also carry a note are labeled distinctly so
+				// they are not presented as unresolved work.
 				if event.Note != nil {
+					kind := "approval"
+					if event.Verdict != nil && *event.Verdict == "reject" {
+						kind = "rejection"
+					}
 					roundMap[activeRound].Findings = append(roundMap[activeRound].Findings, ReviewFindingInfo{
 						Reviewer: event.Actor,
-						Kind:     "rejection",
+						Kind:     kind,
 						Text:     *event.Note,
 					})
 				}

@@ -4186,6 +4186,124 @@ func TestExecuteShowMultipleReviewers(t *testing.T) {
 	}
 }
 
+// TestExecuteShowApprovalNoteNotLabeledRejection tests that a note on an approve
+// verdict is not presented to the worker as a rejection finding to address.
+func TestExecuteShowApprovalNoteNotLabeledRejection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-approve-note":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-approve-note",
+				Title:       "Mixed Verdict With Approval Note",
+				Spec:        "Address feedback",
+				State:       "ready",
+				ReviewRound: 1,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-approve-note/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:     "event-0",
+					TaskID: "task-approve-note",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\",\"gpt-5.5\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
+					ID:     "event-1",
+					TaskID: "task-approve-note",
+					Actor:  "opus-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "reject"
+						return &s
+					}(),
+					Note: func() *string {
+						s := "Missing input validation"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:01Z",
+				},
+				{
+					ID:     "event-2",
+					TaskID: "task-approve-note",
+					Actor:  "gpt-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "approve"
+						return &s
+					}(),
+					Note: func() *string {
+						s := "LGTM, nicely scoped"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:02Z",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-approve-note"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "opus-reviewer] rejection: Missing input validation") {
+		t.Errorf("expected the reject verdict's note labeled as rejection, got: %s", output)
+	}
+	if strings.Contains(output, "gpt-reviewer] rejection") {
+		t.Errorf("expected approve verdict's note NOT labeled as rejection, got: %s", output)
+	}
+	if !strings.Contains(output, "gpt-reviewer] approval: LGTM") {
+		t.Errorf("expected approve verdict's note labeled as approval, got: %s", output)
+	}
+
+	jsonBuf := &bytes.Buffer{}
+	if err := executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "task-approve-note"}, jsonBuf); err != nil {
+		t.Fatalf("executeShow --json failed: %v", err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(jsonBuf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+	findings, ok := result["review_findings"].([]interface{})
+	if !ok || len(findings) == 0 {
+		t.Fatalf("expected review_findings array in JSON, got: %v", result["review_findings"])
+	}
+	round := findings[0].(map[string]interface{})
+	roundFindings, ok := round["findings"].([]interface{})
+	if !ok || len(roundFindings) != 2 {
+		t.Fatalf("expected 2 findings in round, got: %v", round["findings"])
+	}
+	for _, rf := range roundFindings {
+		f := rf.(map[string]interface{})
+		switch f["reviewer"] {
+		case "opus-reviewer":
+			if f["kind"] != "rejection" {
+				t.Errorf("expected opus-reviewer finding kind rejection, got: %v", f["kind"])
+			}
+		case "gpt-reviewer":
+			if f["kind"] != "approval" {
+				t.Errorf("expected gpt-reviewer finding kind approval, got: %v", f["kind"])
+			}
+		default:
+			t.Errorf("unexpected reviewer in findings: %v", f["reviewer"])
+		}
+	}
+}
+
 // TestExecuteShowMultipleRounds tests showing findings from multiple review rounds with history
 func TestExecuteShowMultipleRounds(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

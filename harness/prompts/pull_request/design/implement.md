@@ -143,7 +143,22 @@ on sensing elapsed time.
    FRESH first attempt there is no PR yet and no feedback to address, so this step is a **no-op**;
    skip straight to step 8.
 
-   On a rework you MUST clear the reviewer's feedback before you may submit:
+   On a rework you MUST clear the reviewer's feedback before you may submit. Start by reading the
+   full review context: run `odonian show <task-id>` to see the recorded review round, verdicts, and
+   findings from previous review rounds. These recorded findings explain the rework requirements
+   alongside the current PR feedback. You MUST reconcile all four sources:
+   1. **Recorded review findings** — the task's stored review verdicts and rejection findings from
+      previous rounds (displayed by `odonian show`). These are the authoritative rejection reasons
+      that prompted the rework.
+   2. **Current PR feedback** — outstanding comments on the PR (listed by `odonian pr-feedback list`).
+   3. **Task specification and acceptance criteria** — what the task requires.
+   4. **Your current `DESIGN.md` diff** — what you've changed in this rework.
+
+   An empty `odonian pr-feedback list` alone does NOT establish completion — you MUST ensure your
+   `DESIGN.md` addresses the recorded review findings. If a reviewer's earlier finding is not
+   repeated in current PR comments, it still applies unless you've resolved it in this rework.
+
+   Then address all feedback:
    - Run `odonian pr-feedback list <pr-url>` to enumerate EVERY unaddressed item — both inline
      review threads AND global comments. (`<pr-url>` is the same PR you resolve in the find-or-create
      step 8; on a rework it already exists.)
@@ -156,7 +171,9 @@ on sensing elapsed time.
    **GATE — mirrors the `make check` / self-check gate:** Do NOT submit a rework while
    `odonian pr-feedback list <pr-url>` still returns unaddressed items. A rework submit that leaves
    listed items unaddressed and unacked is INVALID — the reviewer will reject it. Do NOT proceed to
-   the submit step until `pr-feedback list` returns nothing outstanding.
+   the submit step until `pr-feedback list` returns nothing outstanding. Empty GitHub feedback alone
+   is not sufficient — ensure your `DESIGN.md` addresses the recorded review findings shown by
+   `odonian show`.
 8. Commit, push, PR. End the commit message with a blank line then
    `Co-Authored-By: Claude (<value of $AGENT_MODEL>) <noreply@anthropic.com>`. Push your (detached)
    HEAD to the deterministic branch: `git push origin HEAD:mr/<TASKID8>`. Then **FIND-OR-CREATE the
