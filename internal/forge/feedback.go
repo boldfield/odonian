@@ -221,17 +221,15 @@ func fetchReviewThreadsPage(ctx context.Context, owner, repo string, prNumber in
 
 	var items []FeedbackItem
 	for _, thread := range result.Data.Repository.PullRequest.ReviewThreads.Nodes {
-		// A thread is addressed iff it is resolved or its last reply is agent-authored,
-		// identified by marker prefix (not login, which is indistinguishable from the
-		// human's when they share one GitHub identity).
+		// A thread is addressed iff it is resolved. Resolution is the sole
+		// completion signal: `pr-feedback ack` both posts a fixing-commit reply
+		// AND resolves the exact thread, so a marked reviewer comment or a worker
+		// reply that failed to resolve the thread must NOT silently clear it.
+		// Agent authorship of any reply is not proof the thread is addressed.
 		if thread.IsResolved {
 			continue
 		}
 		if len(thread.FirstComments.Nodes) == 0 || len(thread.LastComments.Nodes) == 0 {
-			continue
-		}
-		lastComment := thread.LastComments.Nodes[0]
-		if IsAgentAuthoredComment(lastComment.Body) {
 			continue
 		}
 
@@ -274,55 +272,106 @@ func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, p
 		after = nextCursor
 	}
 
-	// Filter comments: exclude agent-authored (by marker), exclude acknowledged (bot reaction or marker reply)
+	// Classify each comment by author role (from its marker), then check whether it
+	// has an explicit worker acknowledgment. An agent marker signals authorship/role;
+	// it is never by itself proof that the comment is addressed.
 	var items []FeedbackItem
 	for _, comment := range allComments {
-		// Skip comments authored by the fleet, identified by marker prefix (not login,
-		// which is indistinguishable from the human's when they share one GitHub identity)
-		if IsAgentAuthoredComment(comment.Body) {
+		// Keep only actionable feedback: unmarked human comments, reviewer
+		// requests, and unknown reviewer messages. Drop worker acknowledgment/
+		// status, merger/reconciler status, and canonical reviewer approvals.
+		if !isActionableGlobalComment(comment.Body) {
 			continue
 		}
 
-		// Check if comment has been acknowledged
-		acknowledged := false
-
-		// Check for bot reactions (retained by login: reactions cannot carry markers)
-		for _, reactionGroup := range comment.ReactionGroups {
-			for _, user := range reactionGroup.Users.Nodes {
-				if user.Login == botLogin {
-					acknowledged = true
-					break
-				}
-			}
-			if acknowledged {
-				break
-			}
+		// A global comment is addressed only by an explicit worker acknowledgment
+		// that names the exact original comment ID and a fixing commit (the writer
+		// format "addressed in <sha> (see comment <id>)"). Reactions, unrelated
+		// replies, later approvals, and acknowledgments of other comments do not
+		// clear it.
+		if isGlobalCommentAcknowledged(comment.ID, allComments) {
+			continue
 		}
 
-		// Check for a later marker-prefixed reply
-		if !acknowledged {
-			for _, other := range allComments {
-				if IsAgentAuthoredComment(other.Body) && other.CreatedAt > comment.CreatedAt {
-					acknowledged = true
-					break
-				}
-			}
-		}
-
-		// Only include unacknowledged comments
-		if !acknowledged {
-			items = append(items, FeedbackItem{
-				Kind:       "global",
-				ID:         comment.ID,
-				DatabaseID: comment.DatabaseID,
-				PRID:       prNodeID,
-				Author:     comment.Author.Login,
-				Body:       comment.Body,
-			})
-		}
+		items = append(items, FeedbackItem{
+			Kind:       "global",
+			ID:         comment.ID,
+			DatabaseID: comment.DatabaseID,
+			PRID:       prNodeID,
+			Author:     comment.Author.Login,
+			Body:       comment.Body,
+		})
 	}
 
 	return items, nil
+}
+
+// isActionableGlobalComment reports whether a global PR comment is actionable
+// reviewer/human feedback that must be surfaced. Marker roles are used only to
+// classify authorship:
+//   - unmarked comments are human feedback and are always actionable;
+//   - reviewer comments are actionable unless they are a canonical approval status
+//     (an approval must never clear another reviewer's outstanding request), so
+//     reviewer CHANGES REQUESTED and unknown reviewer messages remain visible;
+//   - worker acknowledgment/status and merger/reconciler status are not new
+//     reviewer requests and are not surfaced.
+func isActionableGlobalComment(body string) bool {
+	role, ok := AgentCommentRole(body)
+	if !ok {
+		// Unmarked: human feedback.
+		return true
+	}
+	if role == "reviewer" {
+		return !isReviewerApproval(body)
+	}
+	// worker, merger, reconciler: fleet status/acknowledgment, not new feedback.
+	return false
+}
+
+// isReviewerApproval reports whether a reviewer-marked comment is a canonical
+// approval summary (non-actionable status). Only recognized approvals are treated
+// as status; any other reviewer message (including unknown ones) stays visible.
+func isReviewerApproval(body string) bool {
+	msg := strings.ToUpper(AgentCommentMessage(body))
+	return strings.HasPrefix(msg, "APPROVED")
+}
+
+// isGlobalCommentAcknowledged reports whether targetNodeID has an explicit worker
+// acknowledgment among the given comments. A valid acknowledgment is a worker-marked
+// comment whose body carries the writer format "addressed in <sha> (see comment
+// <targetNodeID>)" with a non-empty fixing commit. An acknowledgment naming a
+// different comment, a reviewer/merger/reconciler comment, a bare reaction, or a
+// worker note without a fixing commit does NOT acknowledge the target.
+func isGlobalCommentAcknowledged(targetNodeID string, all []comment) bool {
+	for _, other := range all {
+		role, ok := AgentCommentRole(other.Body)
+		if !ok || role != "worker" {
+			continue
+		}
+		if bodyAcknowledgesComment(other.Body, targetNodeID) {
+			return true
+		}
+	}
+	return false
+}
+
+// bodyAcknowledgesComment reports whether body matches the acknowledgment writer
+// format "addressed in <sha> (see comment <targetNodeID>)" — it must reference the
+// exact target comment ID and claim a non-empty fixing commit.
+func bodyAcknowledgesComment(body, targetNodeID string) bool {
+	marker := "(see comment " + targetNodeID + ")"
+	idx := strings.Index(body, marker)
+	if idx < 0 {
+		return false
+	}
+	prefix := body[:idx]
+	ai := strings.LastIndex(prefix, "addressed in ")
+	if ai < 0 {
+		return false
+	}
+	// Require a non-empty fixing-commit token between "addressed in " and the marker.
+	sha := strings.TrimSpace(prefix[ai+len("addressed in "):])
+	return sha != ""
 }
 
 // fetchGlobalCommentsPageRaw fetches a single page of global PR comments from the GraphQL API.
