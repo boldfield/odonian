@@ -2,6 +2,8 @@
 
 **Status:** approved · **Date:** 2026-08-18 · **Supersedes behavior from:** `2026-06-26-pr-feedback-ack.md` (detection logic only; the CLI surface and prompt contract are unchanged)
 
+> The detection and acknowledgment rules below are superseded by the approved [reviewer feedback repair](2026-09-19-reviewer-feedback-repair.md). Agent authorship alone does not make feedback addressed. This document retains the historical problem statement and original design for context.
+
 ## Problem
 
 The rework-feedback loop (`odonian pr-feedback list|ack`) is partially blind in production.
