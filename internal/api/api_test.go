@@ -5356,3 +5356,670 @@ func TestListTasksFieldsSummaryComposesWithFilters(t *testing.T) {
 		}
 	}
 }
+
+// TestUpdateEscalationSucceedsWithTrue verifies that updating escalate to true succeeds.
+func TestUpdateEscalationSucceedsWithTrue(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task with escalate=false
+	escalateFalse := false
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+			Model:      "haiku",
+			Escalate:   &escalateFalse,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Update escalate to true
+	updatePayload := map[string]interface{}{
+		"escalate": true,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+
+	var updatedTask store.Task
+	if err := json.NewDecoder(updateW.Body).Decode(&updatedTask); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if updatedTask.ID != taskID {
+		t.Errorf("expected task id %q, got %q", taskID, updatedTask.ID)
+	}
+	if updatedTask.Escalate != true {
+		t.Errorf("expected escalate=true, got %v", updatedTask.Escalate)
+	}
+}
+
+// TestUpdateEscalationSucceedsWithFalse verifies that updating escalate to false succeeds.
+func TestUpdateEscalationSucceedsWithFalse(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task with escalate=true (default)
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+			Model:      "haiku",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Update escalate to false
+	updatePayload := map[string]interface{}{
+		"escalate": false,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+
+	var updatedTask store.Task
+	if err := json.NewDecoder(updateW.Body).Decode(&updatedTask); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if updatedTask.ID != taskID {
+		t.Errorf("expected task id %q, got %q", taskID, updatedTask.ID)
+	}
+	if updatedTask.Escalate != false {
+		t.Errorf("expected escalate=false, got %v", updatedTask.Escalate)
+	}
+}
+
+// TestUpdateEscalationRequiresAuth verifies that the escalation endpoint requires auth.
+func TestUpdateEscalationRequiresAuth(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Try to update without auth
+	updatePayload := map[string]interface{}{
+		"escalate": true,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d", updateW.Code)
+	}
+}
+
+// TestUpdateEscalationMissingFieldReturns400 verifies that missing escalate field returns 400.
+func TestUpdateEscalationMissingFieldReturns400(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Try to update with empty payload
+	updatePayload := map[string]interface{}{}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(updateW.Body).Decode(&errResp)
+	errObj, ok := errResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error field is not a map: %v", errResp)
+	}
+	if code, ok := errObj["code"]; !ok || code != "MISSING_FIELD" {
+		t.Errorf("expected error code MISSING_FIELD, got %v", code)
+	}
+}
+
+// TestUpdateEscalationNullFieldReturns400 verifies that null escalate field returns 400.
+func TestUpdateEscalationNullFieldReturns400(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Try to update with null escalate
+	updatePayload := map[string]interface{}{
+		"escalate": nil,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(updateW.Body).Decode(&errResp)
+	errObj, ok := errResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error field is not a map: %v", errResp)
+	}
+	if code, ok := errObj["code"]; !ok || code != "NULL_FIELD" {
+		t.Errorf("expected error code NULL_FIELD, got %v", code)
+	}
+}
+
+// TestUpdateEscalationStringFieldReturns400 verifies that string escalate field returns 400.
+func TestUpdateEscalationStringFieldReturns400(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Try to update with string escalate
+	updateBody := []byte(`{"escalate": "true"}`)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(updateW.Body).Decode(&errResp)
+	errObj, ok := errResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error field is not a map: %v", errResp)
+	}
+	if code, ok := errObj["code"]; !ok || code != "INVALID_FIELD_TYPE" {
+		t.Errorf("expected error code INVALID_FIELD_TYPE, got %v", code)
+	}
+}
+
+// TestUpdateEscalationUnknownFieldReturns400 verifies that unknown fields return 400.
+func TestUpdateEscalationUnknownFieldReturns400(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Try to update with unknown field
+	updateBody := []byte(`{"escalate": true, "unknown_field": "value"}`)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(updateW.Body).Decode(&errResp)
+	errObj, ok := errResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error field is not a map: %v", errResp)
+	}
+	if code, ok := errObj["code"]; !ok || code != "UNKNOWN_FIELD" {
+		t.Errorf("expected error code UNKNOWN_FIELD, got %v", code)
+	}
+}
+
+// TestUpdateEscalationMissingTaskReturns404 verifies that missing task returns 404.
+func TestUpdateEscalationMissingTaskReturns404(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	updatePayload := map[string]interface{}{
+		"escalate": true,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/non-existent-id/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", updateW.Code)
+	}
+}
+
+// TestUpdateEscalationTerminalTaskReturns409 verifies that terminal tasks cannot be updated.
+func TestUpdateEscalationTerminalTaskReturns409(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Manually set task to a terminal state (done) to test rejection
+	_, err := server.store.Conn().ExecContext(context.Background(),
+		"UPDATE task SET state = ? WHERE id = ?", "done", taskID)
+	if err != nil {
+		t.Fatalf("failed to set task to done: %v", err)
+	}
+
+	// Try to update escalate on terminal task
+	updatePayload := map[string]interface{}{
+		"escalate": false,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+}
+
+// TestUpdateEscalationBlockedTaskSucceeds verifies that escalate can be changed on a blocked task.
+func TestUpdateEscalationBlockedTaskSucceeds(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Hold (block) the task
+	holdReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/hold", nil)
+	holdReq.Header.Set("Authorization", authHeader)
+	holdW := httptest.NewRecorder()
+	server.mux.ServeHTTP(holdW, holdReq)
+
+	// Update escalate on blocked task
+	updatePayload := map[string]interface{}{
+		"escalate": false,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+}
+
+// TestUpdateEscalationPreservesOtherFields verifies that state, dependencies, and history remain intact.
+func TestUpdateEscalationPreservesOtherFields(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Task 1",
+			Spec:       "Task 1 spec",
+			DocumentID: docID,
+		},
+		{
+			Title:      "Task 2",
+			Spec:       "Task 2 spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	task1ID := createdTasks[0].ID
+	task2ID := createdTasks[1].ID
+
+	// Set task2 to depend on task1
+	depPayload := map[string]interface{}{
+		"depends_on": []string{task1ID},
+	}
+	depBody, _ := json.Marshal(depPayload)
+	depReq := httptest.NewRequest("PATCH", "/tasks/"+task2ID, bytes.NewReader(depBody))
+	depReq.Header.Set("Authorization", authHeader)
+	depReq.Header.Set("Content-Type", "application/json")
+	depW := httptest.NewRecorder()
+	server.mux.ServeHTTP(depW, depReq)
+
+	// Get the original task to compare
+	getReq := httptest.NewRequest("GET", "/tasks/"+task2ID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+
+	var originalTask store.Task
+	json.NewDecoder(getW.Body).Decode(&originalTask)
+
+	// Update escalate
+	updatePayload := map[string]interface{}{
+		"escalate": false,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+task2ID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	var updatedTask store.Task
+	json.NewDecoder(updateW.Body).Decode(&updatedTask)
+
+	// Verify state, model, and review round are preserved
+	if updatedTask.State != originalTask.State {
+		t.Errorf("expected state %q, got %q", originalTask.State, updatedTask.State)
+	}
+	if updatedTask.Model != originalTask.Model {
+		t.Errorf("expected model %q, got %q", originalTask.Model, updatedTask.Model)
+	}
+	if updatedTask.ReviewRound != originalTask.ReviewRound {
+		t.Errorf("expected review_round %d, got %d", originalTask.ReviewRound, updatedTask.ReviewRound)
+	}
+	if updatedTask.Title != originalTask.Title {
+		t.Errorf("expected title %q, got %q", originalTask.Title, updatedTask.Title)
+	}
+}
+
+// TestUpdateEscalationIdempotent verifies that repeating the same value is idempotent.
+func TestUpdateEscalationIdempotent(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	escalateFalse := false
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+			Escalate:   &escalateFalse,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Update escalate to false (same value)
+	updatePayload := map[string]interface{}{
+		"escalate": false,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d; body: %s", updateW.Code, updateW.Body.String())
+	}
+
+	var updatedTask store.Task
+	if err := json.NewDecoder(updateW.Body).Decode(&updatedTask); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if updatedTask.Escalate != false {
+		t.Errorf("expected escalate=false, got %v", updatedTask.Escalate)
+	}
+}
+
+// TestUpdateEscalationFullIDResolution verifies that full task ID works.
+func TestUpdateEscalationFullIDResolution(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Update using full ID
+	updatePayload := map[string]interface{}{
+		"escalate": true,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskID+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", updateW.Code)
+	}
+}
+
+// TestUpdateEscalationPrefixIDResolution verifies that unique prefix ID resolution works.
+func TestUpdateEscalationPrefixIDResolution(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Get the first 8 characters as a unique prefix
+	taskIDPrefix := taskID[:8]
+
+	// Update using prefix ID
+	updatePayload := map[string]interface{}{
+		"escalate": true,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PATCH", "/tasks/"+taskIDPrefix+"/escalation", bytes.NewReader(updateBody))
+	updateReq.Header.Set("Authorization", authHeader)
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateW := httptest.NewRecorder()
+	server.mux.ServeHTTP(updateW, updateReq)
+
+	if updateW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", updateW.Code)
+	}
+}
