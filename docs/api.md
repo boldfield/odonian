@@ -1031,7 +1031,10 @@ escalated to a higher-capacity model if needed, independent of the task's initia
   task may be automatically promoted to a higher-capacity model if the assigned model runs out of
   capacity or if review feedback indicates that additional capability is needed. Enabled by default.
 - **Task resumption/escalation** (a separate action): The act of actually promoting a task to a
-  higher model occurs via `/tasks/{id}/promote` or through automated circuit-breaker escalation.
+  higher model occurs exclusively through the automated circuit breaker: when a rejected task's
+  review round exceeds the threshold and `escalate` is true, the task is superseded onto the next
+  model tier. There is no manual endpoint to escalate a task's model tier; `/tasks/{id}/promote`
+  is unrelated — it moves a task from `backlog` to `ready` and does not change its model.
   Changing the `escalate` setting here does NOT immediately resume or escalate a task.
 
 ```bash
