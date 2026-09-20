@@ -39,6 +39,27 @@ correctly if distinct bot identities arrive later).
 
 **Detection rules** (in `internal/forge/feedback.go` and the inline-thread path):
 
+> ⚠️ **Superseded — do not implement these rules.** Every rule in this subsection is replaced
+> by [reviewer feedback repair](2026-09-19-reviewer-feedback-repair.md). They are retained only
+> as the historical record of the faulty behavior that caused the Run03 Referee lost-feedback
+> incident. The marker grammar itself is still used, but *only as an authorship/role parser* —
+> never as a completion/acknowledgment rule. Under the corrected contract:
+>
+> - *Skip-own* is replaced by **role-aware classification**: a marker identifies the author's
+>   role, not that the comment is addressed. Reviewer requests (e.g. `gpt-5.5-reviewer: CHANGES
+>   REQUESTED`) and unknown reviewer messages remain visible under shared and separate logins;
+>   only worker acknowledgment/status, merger/reconciler status, and canonical reviewer
+>   approvals are non-actionable.
+> - *Reply-ack* is replaced by **exact-ID worker acknowledgment**: a global comment is addressed
+>   only by a later worker comment naming the exact original comment ID and a fixing commit
+>   (`addressed in <sha> (see comment <id>)`). An acknowledgment of B cannot clear A, and one
+>   reviewer's approval cannot clear another's request.
+> - *Thread-ack* is replaced by **resolution-only**: an inline thread is addressed iff it is
+>   resolved. A marked reviewer comment or a worker reply that did not resolve the thread does
+>   not clear it.
+> - *Reaction-ack* is **removed**: a 👍 reaction no longer acknowledges anything. Items
+>   previously cleared only by a reaction can reappear; that is an intentional correction.
+
 - *Skip-own*: a comment is skipped as the fleet's own iff it matches the marker grammar.
 - *Reply-ack*: a global comment counts as addressed iff a LATER reply in the conversation
   matches the marker grammar.

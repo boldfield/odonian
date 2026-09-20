@@ -2,9 +2,11 @@ package forge
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -303,8 +305,18 @@ func TestListUnaddressedFeedback_AcknowledgedCommentExcluded(t *testing.T) {
             {
               "id": "comment-2",
               "databaseId": 2,
-              "body": "Feedback with bot reaction",
-              "createdAt": "2024-01-01T10:00:00Z",
+              "body": "haiku-worker: addressed in abc123 (see comment comment-1)",
+              "createdAt": "2024-01-01T10:05:00Z",
+              "author": {
+                "login": "human"
+              },
+              "reactionGroups": []
+            },
+            {
+              "id": "comment-3",
+              "databaseId": 3,
+              "body": "Feedback with only a bot reaction",
+              "createdAt": "2024-01-01T10:10:00Z",
               "author": {
                 "login": "human"
               },
@@ -347,12 +359,15 @@ func TestListUnaddressedFeedback_AcknowledgedCommentExcluded(t *testing.T) {
 		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
 	}
 
+	// comment-1 is cleared by the exact-ID worker acknowledgment (comment-2), which
+	// is itself worker status and not surfaced. comment-3 carries only a bot reaction,
+	// which no longer acknowledges anything, so it remains outstanding.
 	if len(items) != 1 {
-		t.Errorf("ListUnaddressedFeedback() returned %d items, want 1", len(items))
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 1: %+v", len(items), items)
 	}
 
-	if items[0].ID != "comment-1" {
-		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-1")
+	if items[0].ID != "comment-3" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-3")
 	}
 }
 
@@ -1089,13 +1104,19 @@ func TestListUnaddressedFeedback_AcknowledgedByBotReply(t *testing.T) {
 		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
 	}
 
-	// Should return 1 item: comment-3 (comment-1 is acknowledged by the marker-prefixed reply comment-2)
-	if len(items) != 1 {
-		t.Errorf("ListUnaddressedFeedback() returned %d items, want 1", len(items))
+	// comment-2 is a worker note WITHOUT the exact-ID/fixing-commit acknowledgment
+	// format, so it neither surfaces as feedback (worker status) nor clears comment-1.
+	// Both unmarked human comments therefore remain outstanding.
+	if len(items) != 2 {
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 2: %+v", len(items), items)
 	}
 
-	if items[0].ID != "comment-3" {
-		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-3")
+	ids := map[string]bool{}
+	for _, it := range items {
+		ids[it.ID] = true
+	}
+	if !ids["comment-1"] || !ids["comment-3"] {
+		t.Errorf("expected comment-1 and comment-3 outstanding, got %+v", items)
 	}
 }
 
@@ -1153,7 +1174,7 @@ func TestListUnaddressedFeedback_SingleIdentity(t *testing.T) {
             {
               "id": "comment-marker-reply",
               "databaseId": 2,
-              "body": "haiku-worker: addressed in abc123",
+              "body": "haiku-worker: addressed in abc123 (see comment comment-marker-acked)",
               "createdAt": "2024-01-01T10:05:00Z",
               "author": {
                 "login": "human"
@@ -1217,15 +1238,23 @@ func TestListUnaddressedFeedback_SingleIdentity(t *testing.T) {
 		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
 	}
 
-	// Only comment-unmarked should survive: it has no marker and no ack of any kind.
-	// comment-marker-reply is itself agent-authored (skip-own) and also acks comment-marker-acked.
-	// comment-reaction-acked is hidden by the retained thumbs-up-by-botLogin check.
-	if len(items) != 1 {
-		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 1: %+v", len(items), items)
+	// Under the corrected contract two comments survive:
+	//   - comment-marker-acked is cleared by comment-marker-reply, an exact-ID worker
+	//     acknowledgment ("addressed in <sha> (see comment comment-marker-acked)").
+	//   - comment-marker-reply is worker status and is not surfaced.
+	//   - comment-reaction-acked has only a thumbs-up reaction, which NO LONGER
+	//     acknowledges anything, so it remains outstanding.
+	//   - comment-unmarked has no acknowledgment and remains outstanding.
+	if len(items) != 2 {
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 2: %+v", len(items), items)
 	}
 
-	if items[0].ID != "comment-unmarked" {
-		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-unmarked")
+	ids := map[string]bool{}
+	for _, it := range items {
+		ids[it.ID] = true
+	}
+	if !ids["comment-reaction-acked"] || !ids["comment-unmarked"] {
+		t.Errorf("expected comment-reaction-acked and comment-unmarked outstanding, got %+v", items)
 	}
 }
 
@@ -1381,24 +1410,30 @@ func TestListUnaddressedFeedback_SingleIdentityThreads(t *testing.T) {
 		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
 	}
 
-	// Only thread-unresolved-human should survive: thread-marker-acked's last reply is
-	// marker-prefixed, and thread-resolved is resolved. All comments share one login, so
-	// only the marker grammar and isResolved distinguish them.
-	if len(items) != 1 {
-		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 1: %+v", len(items), items)
+	// Under the corrected contract completion is keyed solely on resolution state:
+	//   - thread-unresolved-human survives (unresolved).
+	//   - thread-marker-acked survives too: its last reply is a worker marker, but a
+	//     marked/worker reply does NOT resolve a thread — only resolution does.
+	//   - thread-resolved is excluded (resolved).
+	if len(items) != 2 {
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 2: %+v", len(items), items)
 	}
 
-	if items[0].ID != "thread-unresolved-human" {
-		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "thread-unresolved-human")
+	ids := map[string]bool{}
+	for _, it := range items {
+		ids[it.ID] = true
+	}
+	if !ids["thread-unresolved-human"] || !ids["thread-marker-acked"] {
+		t.Errorf("expected thread-unresolved-human and thread-marker-acked outstanding, got %+v", items)
 	}
 }
 
-// TestListUnaddressedFeedback_ThreadLastReplyBeyondFirstPage guards against the pagination
-// boundary bug: fetching only the first N replies and treating the last of that page as the
-// thread's last reply misclassifies long threads. The thread's earliest reply (what a
-// first-N-only fetch would still see as "last" among the first page) is marker-prefixed, but
-// the actual last reply — reachable only via comments(last: 1) — is an unmarked human reply.
-// Classification must follow the true last reply and report the thread as unaddressed.
+// TestListUnaddressedFeedback_ThreadLastReplyBeyondFirstPage keeps the pagination behavior
+// intact: the reviewThreads query still fetches the thread's true last reply via
+// comments(last: 1). Under the corrected contract completion is keyed solely on resolution
+// state, so an unresolved thread surfaces regardless of who wrote its first or last reply —
+// here the first reply carries a worker marker yet the unresolved thread must still be
+// reported as outstanding.
 func TestListUnaddressedFeedback_ThreadLastReplyBeyondFirstPage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1498,5 +1533,305 @@ func TestListUnaddressedFeedback_ThreadLastReplyBeyondFirstPage(t *testing.T) {
 
 	if items[0].ID != "thread-long" {
 		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "thread-long")
+	}
+}
+
+// listGlobalFeedback runs ListUnaddressedFeedback against a stub GitHub GraphQL
+// server whose review-thread page is empty and whose global-comment page contains
+// exactly the provided comment node JSON. It isolates the global-comment
+// classification/acknowledgment rules for focused regression coverage.
+func listGlobalFeedback(t *testing.T, botLogin, commentNodesJSON string) []FeedbackItem {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodyStr := string(body)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		if strings.Contains(bodyStr, "reviewThreads") {
+			w.Write([]byte(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}`))
+			return
+		}
+
+		w.Write([]byte(`{"data":{"repository":{"pullRequest":{"id":"PR-node-id","comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[` + commentNodesJSON + `]}}}}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	oldBaseURL := GitHubBaseURL
+	GitHubBaseURL = server.URL
+	t.Cleanup(func() { GitHubBaseURL = oldBaseURL })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	items, err := ListUnaddressedFeedback(ctx, "owner", "repo", 42, botLogin, "token")
+	if err != nil {
+		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
+	}
+	return items
+}
+
+func globalComment(id string, dbID int, login, createdAt, body string) string {
+	// body is embedded via %q so JSON string escaping is handled for us.
+	return `{"id":"` + id + `","databaseId":` + itoa(dbID) + `,"body":` + quoteJSON(body) + `,"createdAt":"` + createdAt + `","author":{"login":"` + login + `"},"reactionGroups":[]}`
+}
+
+func quoteJSON(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func itoa(i int) string {
+	return strconv.Itoa(i)
+}
+
+func idSet(items []FeedbackItem) map[string]bool {
+	m := map[string]bool{}
+	for _, it := range items {
+		m[it.ID] = true
+	}
+	return m
+}
+
+// TestListUnaddressedFeedback_ReviewerRequestSharedLogin is the primary Run03 regression:
+// a marked global reviewer rejection under the SHARED fleet/human login must remain visible.
+// An agent marker signals authorship, never that the feedback is addressed.
+func TestListUnaddressedFeedback_ReviewerRequestSharedLogin(t *testing.T) {
+	nodes := globalComment("comment-req", 1, "human", "2024-01-01T10:00:00Z",
+		"gpt-5.5-reviewer: CHANGES REQUESTED - fix the nil deref")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (reviewer rejection preserved): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-req" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-req")
+	}
+}
+
+// TestListUnaddressedFeedback_ReviewerRequestSeparateLogin is the same regression under a
+// SEPARATE reviewer login: a marked reviewer rejection must remain visible regardless of login.
+func TestListUnaddressedFeedback_ReviewerRequestSeparateLogin(t *testing.T) {
+	nodes := globalComment("comment-req", 1, "gpt-reviewer-bot", "2024-01-01T10:00:00Z",
+		"gpt-5.5-reviewer: CHANGES REQUESTED - fix the nil deref")
+
+	// botLogin is the fleet's shared login "human", distinct from the reviewer's login.
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (reviewer rejection preserved): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-req" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-req")
+	}
+}
+
+// TestListUnaddressedFeedback_ApprovalDoesNotClearRejection: a canonical reviewer approval is
+// non-actionable status and must NOT clear another reviewer's outstanding CHANGES REQUESTED.
+func TestListUnaddressedFeedback_ApprovalDoesNotClearRejection(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-req", 1, "human", "2024-01-01T10:00:00Z",
+			"gpt-5.5-reviewer: CHANGES REQUESTED - fix the nil deref"),
+		globalComment("comment-appr", 2, "human", "2024-01-01T11:00:00Z",
+			"opus-reviewer: APPROVED - looks good to me"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (rejection preserved despite later approval): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-req" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-req")
+	}
+}
+
+// TestListUnaddressedFeedback_ReviewerApprovalNonActionable: a standalone canonical reviewer
+// approval carries no outstanding request and must not surface as feedback.
+func TestListUnaddressedFeedback_ReviewerApprovalNonActionable(t *testing.T) {
+	nodes := globalComment("comment-appr", 1, "human", "2024-01-01T10:00:00Z",
+		"opus-reviewer: APPROVED")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 0 {
+		t.Fatalf("returned %d items, want 0 (approval is non-actionable status): %+v", len(items), items)
+	}
+}
+
+// TestListUnaddressedFeedback_UnknownReviewerMessageVisible: an unrecognized reviewer message
+// (not a canonical approval) must remain visible rather than be discarded as fleet chatter.
+func TestListUnaddressedFeedback_UnknownReviewerMessageVisible(t *testing.T) {
+	nodes := globalComment("comment-unknown", 1, "human", "2024-01-01T10:00:00Z",
+		"sonnet-reviewer: deferring on this until the migration lands")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (unknown reviewer message preserved): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-unknown" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-unknown")
+	}
+}
+
+// TestListUnaddressedFeedback_OneAckDoesNotClearOther: two outstanding global comments with a
+// single exact-ID acknowledgment must retain the unacknowledged one; an ack of B cannot clear A.
+func TestListUnaddressedFeedback_OneAckDoesNotClearOther(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-a", 1, "human", "2024-01-01T10:00:00Z", "Issue A: needs fixing"),
+		globalComment("comment-b", 2, "human", "2024-01-01T10:05:00Z", "Issue B: also needs fixing"),
+		globalComment("comment-ack-a", 3, "human", "2024-01-01T10:10:00Z",
+			"haiku-worker: addressed in abc123 (see comment comment-a)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (only comment-a acknowledged): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-b" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-b")
+	}
+}
+
+// TestListUnaddressedFeedback_ExactIDAcknowledgmentClears: the existing writer format
+// "addressed in <sha> (see comment <id>)" from a worker still acknowledges its exact target.
+func TestListUnaddressedFeedback_ExactIDAcknowledgmentClears(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-a", 1, "human", "2024-01-01T10:00:00Z", "Issue A: needs fixing"),
+		globalComment("comment-ack-a", 2, "human", "2024-01-01T10:10:00Z",
+			"haiku-worker: addressed in abc123 (see comment comment-a)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 0 {
+		t.Fatalf("returned %d items, want 0 (exact-ID acknowledgment clears comment-a): %+v", len(items), items)
+	}
+}
+
+// TestListUnaddressedFeedback_EarlierAckDoesNotClearLaterFeedback: an acknowledgment must be
+// posted strictly LATER than the request it clears. A worker "addressed in <sha> (see comment
+// <id>)" comment created BEFORE the feedback it names cannot have fixed it, so the feedback
+// must remain outstanding.
+func TestListUnaddressedFeedback_EarlierAckDoesNotClearLaterFeedback(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-ack-a", 1, "human", "2024-01-01T09:00:00Z",
+			"haiku-worker: addressed in abc123 (see comment comment-a)"),
+		globalComment("comment-a", 2, "human", "2024-01-01T10:00:00Z", "Issue A: needs fixing"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (earlier ack cannot clear later feedback): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-a" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-a")
+	}
+}
+
+// TestListUnaddressedFeedback_WorkerNoteWithoutFixingCommitDoesNotAck: a worker reply that
+// references the exact comment ID but claims NO fixing commit must not clear the feedback.
+func TestListUnaddressedFeedback_WorkerNoteWithoutFixingCommitDoesNotAck(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-a", 1, "human", "2024-01-01T10:00:00Z", "Issue A: needs fixing"),
+		globalComment("comment-note", 2, "human", "2024-01-01T10:10:00Z",
+			"haiku-worker: noted for follow-up (see comment comment-a)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (note without fixing commit does not ack): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-a" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-a")
+	}
+}
+
+// TestListUnaddressedFeedback_NegatedStatusDoesNotAck: a worker status that merely contains
+// "addressed in <sha> (see comment <id>)" as a substring — e.g. "not addressed in ..." — is not
+// the acknowledgment writer format and must not clear the feedback. The acknowledgment message
+// must BEGIN with "addressed in ", not embed it after other words.
+func TestListUnaddressedFeedback_NegatedStatusDoesNotAck(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-a", 1, "human", "2024-01-01T10:00:00Z", "Issue A: needs fixing"),
+		globalComment("comment-neg", 2, "human", "2024-01-01T10:10:00Z",
+			"haiku-worker: not addressed in abc123 (see comment comment-a)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (negated worker status must not acknowledge): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-a" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-a")
+	}
+}
+
+// TestListUnaddressedFeedback_NonWorkerAckDoesNotClear: only a worker acknowledgment clears
+// global feedback; a reviewer/merger comment in the ack format must not.
+func TestListUnaddressedFeedback_NonWorkerAckDoesNotClear(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-a", 1, "human", "2024-01-01T10:00:00Z", "Issue A: needs fixing"),
+		globalComment("comment-rev", 2, "human", "2024-01-01T10:10:00Z",
+			"opus-reviewer: addressed in abc123 (see comment comment-a)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	// The reviewer's ack-format comment does NOT clear comment-a (only worker
+	// acknowledgments do), so comment-a stays outstanding. The reviewer comment is
+	// itself not a canonical approval, so it also remains visible as a reviewer
+	// message — two items total.
+	if len(items) != 2 {
+		t.Fatalf("returned %d items, want 2: %+v", len(items), items)
+	}
+	ids := idSet(items)
+	if !ids["comment-a"] {
+		t.Errorf("comment-a must remain outstanding (reviewer comment must not acknowledge it), got %+v", items)
+	}
+}
+
+// TestListUnaddressedFeedback_BareReactionDoesNotClear: a thumbs-up reaction by the fleet
+// login no longer acknowledges a comment under the corrected contract.
+func TestListUnaddressedFeedback_BareReactionDoesNotClear(t *testing.T) {
+	nodes := `{"id":"comment-a","databaseId":1,"body":"Issue A: needs fixing","createdAt":"2024-01-01T10:00:00Z","author":{"login":"human"},"reactionGroups":[{"content":"THUMBS_UP","users":{"nodes":[{"login":"human"}]}}]}`
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (bare reaction does not acknowledge): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-a" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-a")
+	}
+}
+
+// TestListUnaddressedFeedback_WorkerAndReconcilerStatusNotFeedback: worker/merger/reconciler
+// status messages are not new reviewer requests and must not surface as feedback.
+func TestListUnaddressedFeedback_WorkerAndReconcilerStatusNotFeedback(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-worker", 1, "human", "2024-01-01T10:00:00Z",
+			"haiku-worker: pushed a rework, taking another look"),
+		globalComment("comment-merger", 2, "human", "2024-01-01T10:05:00Z",
+			"fable-merger: merged to main"),
+		globalComment("comment-reconciler", 3, "human", "2024-01-01T10:10:00Z",
+			"odonian-reconciler: bounced back to ready"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 0 {
+		t.Fatalf("returned %d items, want 0 (fleet status is not feedback): %+v", len(items), items)
 	}
 }
