@@ -50,6 +50,7 @@ type Store interface {
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
+	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
 	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int) (Task, error)
 	ArchiveTask(ctx context.Context, taskID string) (Task, error)
@@ -2564,6 +2565,72 @@ func (s *sqliteStore) SupersedeTask(ctx context.Context, taskID string, modelOve
 	}
 
 	return newTask, nil
+}
+
+// UpdateTaskEscalate sets a task's escalate flag and appends a "policy-change"
+// audit event recording the old and new values. It is permitted on any
+// nonterminal task (including blocked) and rejected on terminal states
+// (done, failed, abandoned, superseded). Setting the flag to its current
+// value is a no-op: the task is returned unchanged and no event is appended,
+// so repeated calls with the same value never accumulate duplicate history.
+// It never resumes or otherwise transitions the task, and never touches
+// dependencies, links, or review history.
+func (s *sqliteStore) UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var t Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, ErrNotFound
+	}
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch task: %w", err)
+	}
+
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	switch t.State {
+	case "done", "failed", "abandoned", "superseded":
+		return Task{}, conflict("TERMINAL_STATE", fmt.Sprintf("cannot update escalate on task in terminal state %q", t.State))
+	}
+
+	if t.Escalate == escalate {
+		if err := tx.Commit(); err != nil {
+			return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return t, nil
+	}
+
+	now := nowTimestamp()
+	if _, err := tx.ExecContext(ctx, `UPDATE task SET escalate = ?, updated_at = ? WHERE id = ?`, escalate, now, taskID); err != nil {
+		return Task{}, fmt.Errorf("failed to update task escalate flag: %w", err)
+	}
+
+	note := fmt.Sprintf("escalate policy changed: %v → %v", t.Escalate, escalate)
+	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "policy-change", nil, &note); err != nil {
+		return Task{}, fmt.Errorf("failed to append policy-change event: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	t.Escalate = escalate
+	t.UpdatedAt = now
+	return t, nil
 }
 
 // closeSupersededPR closes the old task's recorded pull request (if any and still
