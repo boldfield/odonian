@@ -37,19 +37,35 @@ Nothing else — login equality is removed from authorship classification entire
 distinguish anything in a single-identity deployment, and a marker-only rule still behaves
 correctly if distinct bot identities arrive later).
 
-**Detection rules** (in `internal/forge/feedback.go` and the inline-thread path):
+**Detection rules — SUPERSEDED, kept for historical context only.** The rules below shipped
+with this spec and are the ones that caused the Run03 Referee incident: they treat marker
+authorship itself as proof a comment is addressed, which silently drops actionable marked
+reviewer feedback (e.g. `gpt-5.5-reviewer: CHANGES REQUESTED`). Do not implement these; see
+[the corrected rules](2026-09-19-reviewer-feedback-repair.md#required-behavior) instead, which
+use the marker grammar above only as an authorship/role parser, not a completion rule.
 
-- *Skip-own*: a comment is skipped as the fleet's own iff it matches the marker grammar.
-- *Reply-ack*: a global comment counts as addressed iff a LATER reply in the conversation
-  matches the marker grammar.
-- *Thread-ack*: an inline review thread counts as addressed iff it is resolved OR its last
-  reply matches the marker grammar.
-- *Reaction-ack* (👍 by `botLogin`) is retained as-is: reactions cannot carry markers, and a
-  human 👍-ing their own comment is an acceptable false-ack. Documented limitation.
+- ~~*Skip-own*: a comment is skipped as the fleet's own iff it matches the marker grammar.~~
+  Wrong: this also skips actionable marker-prefixed reviewer requests. The corrected rule
+  classifies by *role*: worker/merger/reconciler markers are always non-actionable, but a
+  reviewer marker is non-actionable only if it is a canonical approval; every other reviewer
+  message (including unrecognized ones) remains visible feedback.
+- ~~*Reply-ack*: a global comment counts as addressed iff a LATER reply in the conversation
+  matches the marker grammar.~~ Wrong: any later marked comment, regardless of content, could
+  clear every earlier comment — including a different reviewer's unrelated request. The
+  corrected rule requires a later *worker* reply naming the *exact original comment ID* and a
+  fixing commit, in the existing writer's `addressed in <sha> (see comment <id>)` format.
+- ~~*Thread-ack*: an inline review thread counts as addressed iff it is resolved OR its last
+  reply matches the marker grammar.~~ Wrong: a marked reviewer comment or worker reply left in
+  an unresolved thread does not resolve it. The corrected rule relies solely on GitHub's
+  `isResolved` state, which `pr-feedback ack` sets via `resolveReviewThread`.
+- ~~*Reaction-ack* (👍 by `botLogin`) is retained as-is.~~ Wrong: a bare reaction is not an
+  explicit acknowledgment. The corrected rule requires the exact-ID worker reply described
+  above; reactions no longer acknowledge anything.
 
 **Ack stamping.** `odonian pr-feedback ack` must emit reply bodies that begin with a worker
 marker so its own acks are recognized on the next `list`. Default prefix:
-`${ODONIAN_MODEL:-fleet}-worker: ` with an optional `--marker` flag override.
+`${ODONIAN_MODEL:-fleet}-worker: ` with an optional `--marker` flag override. This part is
+unchanged by the repair; only the exact-ID requirement above is new.
 
 ## Non-goals
 

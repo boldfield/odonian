@@ -99,6 +99,54 @@ func TestIsAgentAuthoredComment(t *testing.T) {
 	}
 }
 
+func TestCommentRole(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		wantRole string
+		wantOK   bool
+	}{
+		{name: "worker", body: "haiku-worker: addressed in abc123", wantRole: "worker", wantOK: true},
+		{name: "reviewer", body: "gpt-5.5-reviewer: CHANGES REQUESTED", wantRole: "reviewer", wantOK: true},
+		{name: "merger", body: "fable-merger: Merging now", wantRole: "merger", wantOK: true},
+		{name: "reconciler", body: "odonian-reconciler: bouncing back", wantRole: "reconciler", wantOK: true},
+		{name: "leading whitespace", body: "  \n haiku-worker: Comment", wantRole: "worker", wantOK: true},
+		{name: "unmarked human comment", body: "Please fix this", wantRole: "", wantOK: false},
+		{name: "marker mid-body is not a prefix", body: "Some text haiku-worker: More", wantRole: "", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			role, ok := CommentRole(tt.body)
+			if role != tt.wantRole || ok != tt.wantOK {
+				t.Errorf("CommentRole(%q) = (%q, %v), want (%q, %v)", tt.body, role, ok, tt.wantRole, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestStripCommentMarker(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		wantRest string
+		wantOK   bool
+	}{
+		{name: "worker", body: "haiku-worker: addressed in abc123", wantRest: "addressed in abc123", wantOK: true},
+		{name: "reviewer approval", body: "gpt-5.5-reviewer:   APPROVED", wantRest: "APPROVED", wantOK: true},
+		{name: "unmarked comment", body: "Please fix this", wantRest: "", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rest, ok := StripCommentMarker(tt.body)
+			if rest != tt.wantRest || ok != tt.wantOK {
+				t.Errorf("StripCommentMarker(%q) = (%q, %v), want (%q, %v)", tt.body, rest, ok, tt.wantRest, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestMarkerPrefix(t *testing.T) {
 	tests := []struct {
 		name  string

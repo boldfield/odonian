@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -51,9 +52,9 @@ type comment struct {
 	}
 }
 
-// ListUnaddressedFeedback returns all unaddressed feedback on a PR.
-// It includes unaddressed inline review threads and global comments not
-// acknowledged (no marker-prefixed reply and no bot reaction).
+// ListUnaddressedFeedback returns all unaddressed feedback on a PR: unresolved inline review
+// threads, and global comments that are actionable feedback and lack an explicit, exact-ID
+// worker acknowledgment. See isNonActionableGlobalComment and isCommentAcknowledged.
 func ListUnaddressedFeedback(ctx context.Context, owner, repo string, prNumber int, botLogin, token string) ([]FeedbackItem, error) {
 	var items []FeedbackItem
 
@@ -221,17 +222,15 @@ func fetchReviewThreadsPage(ctx context.Context, owner, repo string, prNumber in
 
 	var items []FeedbackItem
 	for _, thread := range result.Data.Repository.PullRequest.ReviewThreads.Nodes {
-		// A thread is addressed iff it is resolved or its last reply is agent-authored,
-		// identified by marker prefix (not login, which is indistinguishable from the
-		// human's when they share one GitHub identity).
+		// A thread's completion is determined solely by GitHub's resolution state.
+		// `pr-feedback ack` resolves the exact thread it addresses via resolveReviewThread,
+		// so that is the authoritative signal. A marked reviewer comment or a worker reply
+		// left in an unresolved thread does not itself resolve it — the marker is only an
+		// authorship/role signal, not proof the thread is addressed.
 		if thread.IsResolved {
 			continue
 		}
-		if len(thread.FirstComments.Nodes) == 0 || len(thread.LastComments.Nodes) == 0 {
-			continue
-		}
-		lastComment := thread.LastComments.Nodes[0]
-		if IsAgentAuthoredComment(lastComment.Body) {
+		if len(thread.FirstComments.Nodes) == 0 {
 			continue
 		}
 
@@ -252,8 +251,9 @@ func fetchReviewThreadsPage(ctx context.Context, owner, repo string, prNumber in
 	return items, hasNextPage, endCursor, nil
 }
 
-// listUnacknowledgedGlobalComments fetches global PR comments that are not authored by the bot
-// and not yet acknowledged (no bot reply and no bot reaction).
+// listUnacknowledgedGlobalComments fetches global PR comments that are actionable feedback
+// (see isNonActionableGlobalComment) and not yet acknowledged by an explicit, exact-ID worker
+// reply (see isCommentAcknowledged).
 func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, prNumber int, botLogin, token string) ([]FeedbackItem, error) {
 	var allComments []comment
 	var prNodeID string
@@ -274,55 +274,82 @@ func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, p
 		after = nextCursor
 	}
 
-	// Filter comments: exclude agent-authored (by marker), exclude acknowledged (bot reaction or marker reply)
+	// Classify comments: exclude non-actionable agent status/chatter, then exclude comments
+	// that carry an explicit, exact-ID worker acknowledgment.
 	var items []FeedbackItem
 	for _, comment := range allComments {
-		// Skip comments authored by the fleet, identified by marker prefix (not login,
-		// which is indistinguishable from the human's when they share one GitHub identity)
-		if IsAgentAuthoredComment(comment.Body) {
+		if isNonActionableGlobalComment(comment.Body) {
 			continue
 		}
 
-		// Check if comment has been acknowledged
-		acknowledged := false
-
-		// Check for bot reactions (retained by login: reactions cannot carry markers)
-		for _, reactionGroup := range comment.ReactionGroups {
-			for _, user := range reactionGroup.Users.Nodes {
-				if user.Login == botLogin {
-					acknowledged = true
-					break
-				}
-			}
-			if acknowledged {
-				break
-			}
+		if isCommentAcknowledged(comment, allComments) {
+			continue
 		}
 
-		// Check for a later marker-prefixed reply
-		if !acknowledged {
-			for _, other := range allComments {
-				if IsAgentAuthoredComment(other.Body) && other.CreatedAt > comment.CreatedAt {
-					acknowledged = true
-					break
-				}
-			}
-		}
-
-		// Only include unacknowledged comments
-		if !acknowledged {
-			items = append(items, FeedbackItem{
-				Kind:       "global",
-				ID:         comment.ID,
-				DatabaseID: comment.DatabaseID,
-				PRID:       prNodeID,
-				Author:     comment.Author.Login,
-				Body:       comment.Body,
-			})
-		}
+		items = append(items, FeedbackItem{
+			Kind:       "global",
+			ID:         comment.ID,
+			DatabaseID: comment.DatabaseID,
+			PRID:       prNodeID,
+			Author:     comment.Author.Login,
+			Body:       comment.Body,
+		})
 	}
 
 	return items, nil
+}
+
+// reviewerApprovalRegex matches a canonical reviewer approval verdict: the literal word
+// "APPROVED" (case-insensitive), optionally followed by more text.
+var reviewerApprovalRegex = regexp.MustCompile(`(?i)^approved\b`)
+
+// isNonActionableGlobalComment reports whether a global PR comment must never be treated as
+// outstanding feedback, regardless of acknowledgment: worker acknowledgment/status messages
+// and merger/reconciler status messages are not reviewer requests, and a canonical reviewer
+// approval is non-actionable status rather than a request.
+//
+// Everything else remains potential feedback, including unmarked (human) comments and every
+// other marker-authored reviewer message — an unrecognized reviewer message is preserved
+// rather than discarded, and a marker alone is never treated as proof a comment is addressed
+// (CommentRole/IsAgentAuthoredComment are authorship/role parsers, not completion rules).
+func isNonActionableGlobalComment(body string) bool {
+	role, ok := CommentRole(body)
+	if !ok {
+		return false
+	}
+	switch role {
+	case "worker", "merger", "reconciler":
+		return true
+	case "reviewer":
+		rest, _ := StripCommentMarker(body)
+		return reviewerApprovalRegex.MatchString(rest)
+	default:
+		return false
+	}
+}
+
+// isCommentAcknowledged reports whether target has a later, explicit worker acknowledgment
+// naming its exact GraphQL node ID, in the format the existing writer (postCommentReply)
+// emits: "<marker>addressed in <sha> (see comment <id>)". Only an exact-ID worker
+// acknowledgment counts as clearing target — bare reactions, unrelated replies, other
+// reviewers' verdicts, and acknowledgments naming a different comment's ID never clear it. An
+// acknowledgment records the worker's claim of a fix; it does not itself establish that the
+// fix is sufficient.
+func isCommentAcknowledged(target comment, allComments []comment) bool {
+	needle := "(see comment " + target.ID + ")"
+	for _, other := range allComments {
+		if other.CreatedAt <= target.CreatedAt {
+			continue
+		}
+		role, ok := CommentRole(other.Body)
+		if !ok || role != "worker" {
+			continue
+		}
+		if strings.Contains(other.Body, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchGlobalCommentsPageRaw fetches a single page of global PR comments from the GraphQL API.
