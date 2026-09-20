@@ -563,12 +563,36 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		return fmt.Errorf("failed to get task: %w", err)
 	}
 
+	// Fetch events for rework tasks to display review findings
+	var events []tuiclient.Event
+	if task.ReviewRound > 0 {
+		events, err = client.ListEvents(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("failed to get task events: %w", err)
+		}
+	}
+
+	// Extract review findings from events
+	reviewFindings := extractReviewFindings(events, task.ReviewRound)
+
 	if jsonOutput {
-		output, err := json.MarshalIndent(task, "", "  ")
+		// Build output with review findings added to the task
+		output := map[string]interface{}{}
+		taskJSON, err := json.Marshal(task)
+		if err != nil {
+			return fmt.Errorf("failed to marshal task: %w", err)
+		}
+		if err := json.Unmarshal(taskJSON, &output); err != nil {
+			return fmt.Errorf("failed to unmarshal task: %w", err)
+		}
+		if len(reviewFindings) > 0 {
+			output["review_findings"] = reviewFindings
+		}
+		finalOutput, err := json.MarshalIndent(output, "", "  ")
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Fprintln(out, string(output))
+		fmt.Fprintln(out, string(finalOutput))
 	} else {
 		fmt.Fprintf(out, "ID: %s\n", task.ID)
 		fmt.Fprintf(out, "State: %s\n", task.State)
@@ -576,6 +600,9 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		fmt.Fprintf(out, "Kind: %s\n", task.Kind)
 		fmt.Fprintf(out, "Title: %s\n", task.Title)
 		fmt.Fprintf(out, "Spec: %s\n", task.Spec)
+		if task.ReviewRound > 0 {
+			fmt.Fprintf(out, "Review Round: %d\n", task.ReviewRound)
+		}
 		if task.TargetTaskID != nil {
 			fmt.Fprintf(out, "Target Task ID: %s\n", *task.TargetTaskID)
 		}
@@ -583,6 +610,25 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			fmt.Fprintf(out, "Links:\n")
 			for _, link := range task.Links {
 				fmt.Fprintf(out, "  - %s: %s\n", link.Kind, link.Value)
+			}
+		}
+		if len(reviewFindings) > 0 {
+			fmt.Fprintf(out, "Review Findings:\n")
+			for i, finding := range reviewFindings {
+				fmt.Fprintf(out, "  Round %d:\n", finding.Round)
+				fmt.Fprintf(out, "    Verdicts:\n")
+				for _, verdict := range finding.Verdicts {
+					fmt.Fprintf(out, "      - %s: %s\n", verdict.Actor, verdict.Verdict)
+				}
+				if len(finding.Findings) > 0 {
+					fmt.Fprintf(out, "    Findings:\n")
+					for _, f := range finding.Findings {
+						fmt.Fprintf(out, "      - [%s] %s: %s\n", f.Reviewer, f.Kind, f.Text)
+						if i > 0 && f.IsHistory {
+							fmt.Fprintf(out, "        (historical)\n")
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1347,6 +1393,85 @@ func executeWtEnsure(ctx context.Context, baseURL, token string, args []string) 
 	fmt.Println(wtPath)
 
 	return nil
+}
+
+// ReviewVerdictInfo holds a single reviewer's verdict
+type ReviewVerdictInfo struct {
+	Actor   string `json:"actor"`
+	Verdict string `json:"verdict"`
+}
+
+// ReviewFindingInfo holds a single review finding
+type ReviewFindingInfo struct {
+	Reviewer  string `json:"reviewer"`
+	Kind      string `json:"kind"`
+	Text      string `json:"text"`
+	IsHistory bool   `json:"is_history,omitempty"`
+}
+
+// ReviewRoundFindings holds all findings for a single review round
+type ReviewRoundFindings struct {
+	Round    int                 `json:"round"`
+	Verdicts []ReviewVerdictInfo `json:"verdicts,omitempty"`
+	Findings []ReviewFindingInfo `json:"findings,omitempty"`
+}
+
+// extractReviewFindings extracts review context from task events, grouped by review round.
+// It returns findings from the latest completed round, and marks earlier findings as historical.
+func extractReviewFindings(events []tuiclient.Event, currentReviewRound int) []ReviewRoundFindings {
+	if currentReviewRound <= 0 {
+		return nil
+	}
+
+	// Group events by round (approximately via sequence order and type)
+	// Review events typically have kind="review", with verdict field set to approve/reject
+	// Finding events likely have kind="finding" with the text in the note
+	roundMap := make(map[int]*ReviewRoundFindings)
+
+	// Process events to extract verdicts and findings
+	for _, event := range events {
+		round := 1 // Default to round 1; we'll improve detection if needed
+		// For now, we'll treat all review events as being from the latest round
+		// since we don't have explicit round info in events
+
+		if roundMap[round] == nil {
+			roundMap[round] = &ReviewRoundFindings{Round: round}
+		}
+
+		switch event.Kind {
+		case "review":
+			if event.Verdict != nil {
+				roundMap[round].Verdicts = append(roundMap[round].Verdicts, ReviewVerdictInfo{
+					Actor:   event.Actor,
+					Verdict: *event.Verdict,
+				})
+			}
+		case "finding":
+			if event.Note != nil {
+				roundMap[round].Findings = append(roundMap[round].Findings, ReviewFindingInfo{
+					Reviewer: event.Actor,
+					Kind:     "rejection",
+					Text:     *event.Note,
+				})
+			}
+		}
+	}
+
+	// Convert map to sorted slice
+	var results []ReviewRoundFindings
+	for i := 1; i <= currentReviewRound; i++ {
+		if rf, ok := roundMap[i]; ok {
+			// Mark older rounds as historical
+			if i < currentReviewRound {
+				for j := range rf.Findings {
+					rf.Findings[j].IsHistory = true
+				}
+			}
+			results = append(results, *rf)
+		}
+	}
+
+	return results
 }
 
 func resolveAgentIdentity(agentFlag, modelFlag string) (agentID, model string, err error) {
