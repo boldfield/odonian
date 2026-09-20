@@ -1717,6 +1717,27 @@ func TestListUnaddressedFeedback_ExactIDAcknowledgmentClears(t *testing.T) {
 	}
 }
 
+// TestListUnaddressedFeedback_EarlierAckDoesNotClearLaterFeedback: an acknowledgment must be
+// posted strictly LATER than the request it clears. A worker "addressed in <sha> (see comment
+// <id>)" comment created BEFORE the feedback it names cannot have fixed it, so the feedback
+// must remain outstanding.
+func TestListUnaddressedFeedback_EarlierAckDoesNotClearLaterFeedback(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-ack-a", 1, "human", "2024-01-01T09:00:00Z",
+			"haiku-worker: addressed in abc123 (see comment comment-a)"),
+		globalComment("comment-a", 2, "human", "2024-01-01T10:00:00Z", "Issue A: needs fixing"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (earlier ack cannot clear later feedback): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-a" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-a")
+	}
+}
+
 // TestListUnaddressedFeedback_WorkerNoteWithoutFixingCommitDoesNotAck: a worker reply that
 // references the exact comment ID but claims NO fixing commit must not clear the feedback.
 func TestListUnaddressedFeedback_WorkerNoteWithoutFixingCommitDoesNotAck(t *testing.T) {

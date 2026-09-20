@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // FeedbackItem represents an unaddressed piece of PR feedback.
@@ -285,11 +286,11 @@ func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, p
 		}
 
 		// A global comment is addressed only by an explicit worker acknowledgment
-		// that names the exact original comment ID and a fixing commit (the writer
-		// format "addressed in <sha> (see comment <id>)"). Reactions, unrelated
-		// replies, later approvals, and acknowledgments of other comments do not
-		// clear it.
-		if isGlobalCommentAcknowledged(comment.ID, allComments) {
+		// that is posted LATER than the comment and names the exact original comment
+		// ID and a fixing commit (the writer format "addressed in <sha> (see comment
+		// <id>)"). Reactions, unrelated replies, later approvals, acknowledgments of
+		// other comments, and earlier worker comments do not clear it.
+		if isGlobalCommentAcknowledged(comment, allComments) {
 			continue
 		}
 
@@ -336,23 +337,47 @@ func isReviewerApproval(body string) bool {
 	return strings.HasPrefix(msg, "APPROVED")
 }
 
-// isGlobalCommentAcknowledged reports whether targetNodeID has an explicit worker
+// isGlobalCommentAcknowledged reports whether target has an explicit worker
 // acknowledgment among the given comments. A valid acknowledgment is a worker-marked
-// comment whose body carries the writer format "addressed in <sha> (see comment
-// <targetNodeID>)" with a non-empty fixing commit. An acknowledgment naming a
-// different comment, a reviewer/merger/reconciler comment, a bare reaction, or a
-// worker note without a fixing commit does NOT acknowledge the target.
-func isGlobalCommentAcknowledged(targetNodeID string, all []comment) bool {
+// comment that was created strictly LATER than target and whose body carries the
+// writer format "addressed in <sha> (see comment <target.ID>)" with a non-empty
+// fixing commit. An acknowledgment naming a different comment, a reviewer/merger/
+// reconciler comment, a bare reaction, a worker note without a fixing commit, or an
+// earlier worker comment does NOT acknowledge the target: a fix cannot be recorded
+// before the request it addresses.
+func isGlobalCommentAcknowledged(target comment, all []comment) bool {
+	targetTime, ok := parseCommentTime(target.CreatedAt)
+	if !ok {
+		// Without a parseable target timestamp we cannot establish that any
+		// acknowledgment is later, so we keep the feedback outstanding rather
+		// than risk clearing it out of order.
+		return false
+	}
 	for _, other := range all {
 		role, ok := AgentCommentRole(other.Body)
 		if !ok || role != "worker" {
 			continue
 		}
-		if bodyAcknowledgesComment(other.Body, targetNodeID) {
-			return true
+		if !bodyAcknowledgesComment(other.Body, target.ID) {
+			continue
 		}
+		ackTime, ok := parseCommentTime(other.CreatedAt)
+		if !ok || !ackTime.After(targetTime) {
+			continue
+		}
+		return true
 	}
 	return false
+}
+
+// parseCommentTime parses a GitHub RFC3339 comment timestamp. It reports ok=false
+// when the timestamp is missing or malformed so callers can fail safe.
+func parseCommentTime(s string) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // bodyAcknowledgesComment reports whether body matches the acknowledgment writer
