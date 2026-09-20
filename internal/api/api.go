@@ -87,6 +87,7 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("POST /tasks/{id}/transition", server.authMiddleware(server.handleTransition))
 	mux.HandleFunc("POST /tasks/{id}/supersede", server.authMiddleware(server.handleSupersede))
 	mux.HandleFunc("PATCH /tasks/{id}", server.authMiddleware(server.handleUpdateTask))
+	mux.HandleFunc("PATCH /tasks/{id}/escalation", server.authMiddleware(server.handleUpdateEscalation))
 	mux.HandleFunc("POST /tasks/{id}/hold", server.authMiddleware(server.handleHold))
 	mux.HandleFunc("POST /tasks/{id}/release", server.authMiddleware(server.handleRelease))
 	mux.HandleFunc("POST /tasks/{id}/archive", server.authMiddleware(server.handleArchiveTask))
@@ -833,6 +834,90 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, store.ErrConflict) {
 			s.errorResponse(w, http.StatusConflict, "CONFLICT", "Failed to update dependencies")
+			return
+		}
+		s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, task)
+}
+
+// handleUpdateEscalation handles PATCH /tasks/{id}/escalation to update a task's escalation policy.
+func (s *Server) handleUpdateEscalation(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
+
+	// Decode the JSON payload with strict validation
+	if r.Body == nil {
+		s.errorResponse(w, http.StatusBadRequest, "READ_ERROR", "Failed to read request body")
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "READ_ERROR", "Failed to read request body")
+		return
+	}
+
+	// Parse as a map to check for unknown fields and validate structure
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Invalid JSON in request body")
+		return
+	}
+
+	// Check for unknown fields
+	for key := range payload {
+		if key != "escalate" {
+			s.errorResponse(w, http.StatusBadRequest, "UNKNOWN_FIELD", "Unknown field: "+key)
+			return
+		}
+	}
+
+	// Check that escalate field exists
+	escalateValue, ok := payload["escalate"]
+	if !ok {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_FIELD", "Required field 'escalate' is missing")
+		return
+	}
+
+	// Check that escalate is not null
+	if escalateValue == nil {
+		s.errorResponse(w, http.StatusBadRequest, "NULL_FIELD", "Field 'escalate' cannot be null")
+		return
+	}
+
+	// Check that escalate is a boolean
+	escalate, ok := escalateValue.(bool)
+	if !ok {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_FIELD_TYPE", "Field 'escalate' must be a boolean")
+		return
+	}
+
+	// Update the task's escalation policy
+	task, err := s.store.UpdateTaskEscalate(r.Context(), taskID, escalate)
+	if err != nil {
+		// Check if it's a ValidationError
+		var validationErr *store.ValidationError
+		if errors.As(err, &validationErr) {
+			s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
+			return
+		}
+		// Check for ConflictError with specific code
+		var conflictErr *store.ConflictError
+		if errors.As(err, &conflictErr) {
+			s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+			return
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+			return
+		}
+		if errors.Is(err, store.ErrConflict) {
+			s.errorResponse(w, http.StatusConflict, "CONFLICT", "Failed to update escalation")
 			return
 		}
 		s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
