@@ -347,12 +347,21 @@ func TestListUnaddressedFeedback_AcknowledgedCommentExcluded(t *testing.T) {
 		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
 	}
 
-	if len(items) != 1 {
-		t.Errorf("ListUnaddressedFeedback() returned %d items, want 1", len(items))
+	// Both comments should be returned. Reactions no longer count as acknowledgment;
+	// only explicit worker acknowledgments with exact comment ID count.
+	if len(items) != 2 {
+		t.Errorf("ListUnaddressedFeedback() returned %d items, want 2", len(items))
 	}
 
-	if items[0].ID != "comment-1" {
-		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-1")
+	ids := map[string]bool{}
+	for _, item := range items {
+		ids[item.ID] = true
+	}
+	if !ids["comment-1"] {
+		t.Errorf("Expected comment-1 in results")
+	}
+	if !ids["comment-2"] {
+		t.Errorf("Expected comment-2 in results (reactions no longer acknowledge)")
 	}
 }
 
@@ -1089,13 +1098,21 @@ func TestListUnaddressedFeedback_AcknowledgedByBotReply(t *testing.T) {
 		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
 	}
 
-	// Should return 1 item: comment-3 (comment-1 is acknowledged by the marker-prefixed reply comment-2)
-	if len(items) != 1 {
-		t.Errorf("ListUnaddressedFeedback() returned %d items, want 1", len(items))
+	// Should return 2 items: comment-1 and comment-3. comment-2 is agent-authored and skipped.
+	// comment-1 is NOT acknowledged because there's no explicit acknowledgment with its exact ID.
+	if len(items) != 2 {
+		t.Errorf("ListUnaddressedFeedback() returned %d items, want 2", len(items))
 	}
 
-	if items[0].ID != "comment-3" {
-		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-3")
+	ids := map[string]bool{}
+	for _, item := range items {
+		ids[item.ID] = true
+	}
+	if !ids["comment-1"] {
+		t.Errorf("Expected comment-1 in results")
+	}
+	if !ids["comment-3"] {
+		t.Errorf("Expected comment-3 in results")
 	}
 }
 
@@ -1217,15 +1234,27 @@ func TestListUnaddressedFeedback_SingleIdentity(t *testing.T) {
 		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
 	}
 
-	// Only comment-unmarked should survive: it has no marker and no ack of any kind.
-	// comment-marker-reply is itself agent-authored (skip-own) and also acks comment-marker-acked.
-	// comment-reaction-acked is hidden by the retained thumbs-up-by-botLogin check.
-	if len(items) != 1 {
-		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 1: %+v", len(items), items)
+	// Should return 3 items: comment-marker-acked, comment-reaction-acked, and comment-unmarked.
+	// comment-marker-reply is agent-authored (skip-own).
+	// comment-marker-acked is NOT acknowledged without explicit comment ID in the reply.
+	// comment-reaction-acked is NOT acknowledged (reactions no longer count as acknowledgment).
+	// comment-unmarked has no acknowledgment.
+	if len(items) != 3 {
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 3: %+v", len(items), items)
 	}
 
-	if items[0].ID != "comment-unmarked" {
-		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-unmarked")
+	ids := map[string]bool{}
+	for _, item := range items {
+		ids[item.ID] = true
+	}
+	if !ids["comment-marker-acked"] {
+		t.Errorf("Expected comment-marker-acked in results")
+	}
+	if !ids["comment-reaction-acked"] {
+		t.Errorf("Expected comment-reaction-acked in results")
+	}
+	if !ids["comment-unmarked"] {
+		t.Errorf("Expected comment-unmarked in results")
 	}
 }
 
@@ -1381,15 +1410,23 @@ func TestListUnaddressedFeedback_SingleIdentityThreads(t *testing.T) {
 		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
 	}
 
-	// Only thread-unresolved-human should survive: thread-marker-acked's last reply is
-	// marker-prefixed, and thread-resolved is resolved. All comments share one login, so
-	// only the marker grammar and isResolved distinguish them.
-	if len(items) != 1 {
-		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 1: %+v", len(items), items)
+	// Should return 2 items: thread-unresolved-human and thread-marker-acked.
+	// thread-resolved is resolved and should be excluded.
+	// thread-marker-acked remains unaddressed even though its last reply is marker-prefixed;
+	// the presence of a marker does not itself resolve a thread.
+	if len(items) != 2 {
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 2: %+v", len(items), items)
 	}
 
-	if items[0].ID != "thread-unresolved-human" {
-		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "thread-unresolved-human")
+	ids := map[string]bool{}
+	for _, item := range items {
+		ids[item.ID] = true
+	}
+	if !ids["thread-unresolved-human"] {
+		t.Errorf("Expected thread-unresolved-human in results")
+	}
+	if !ids["thread-marker-acked"] {
+		t.Errorf("Expected thread-marker-acked in results")
 	}
 }
 
@@ -1498,5 +1535,341 @@ func TestListUnaddressedFeedback_ThreadLastReplyBeyondFirstPage(t *testing.T) {
 
 	if items[0].ID != "thread-long" {
 		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "thread-long")
+	}
+}
+
+// TestListUnaddressedFeedback_ExplicitAcknowledgmentWithCommentID verifies that only
+// explicit acknowledgments with the exact comment ID clear a comment.
+// Acknowledgment format: "addressed in <sha> (see comment <id>)"
+func TestListUnaddressedFeedback_ExplicitAcknowledgmentWithCommentID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodyStr := string(body)
+
+		if strings.Contains(bodyStr, "reviewThreads") {
+			graphqlResp := `{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}`
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(graphqlResp))
+		} else if strings.Contains(bodyStr, "comments") {
+			graphqlResp := `{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "id": "PR-explicit-ack",
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "comment-a",
+              "databaseId": 1,
+              "body": "Issue A: needs fixing",
+              "createdAt": "2024-01-01T10:00:00Z",
+              "author": {
+                "login": "reviewer"
+              },
+              "reactionGroups": []
+            },
+            {
+              "id": "comment-b",
+              "databaseId": 2,
+              "body": "Issue B: also needs fixing",
+              "createdAt": "2024-01-01T10:01:00Z",
+              "author": {
+                "login": "reviewer"
+              },
+              "reactionGroups": []
+            },
+            {
+              "id": "comment-ack-b",
+              "databaseId": 3,
+              "body": "haiku-worker: addressed in abc123 (see comment comment-b)",
+              "createdAt": "2024-01-01T10:05:00Z",
+              "author": {
+                "login": "reviewer"
+              },
+              "reactionGroups": []
+            },
+            {
+              "id": "comment-approval",
+              "databaseId": 4,
+              "body": "Looks good to me!",
+              "createdAt": "2024-01-01T10:10:00Z",
+              "author": {
+                "login": "reviewer"
+              },
+              "reactionGroups": []
+            }
+          ]
+        }
+      }
+    }
+  }
+}`
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(graphqlResp))
+		}
+	}))
+	defer server.Close()
+
+	oldBaseURL := GitHubBaseURL
+	GitHubBaseURL = server.URL
+	defer func() { GitHubBaseURL = oldBaseURL }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	items, err := ListUnaddressedFeedback(ctx, "owner", "repo", 42, "reviewer", "token")
+
+	if err != nil {
+		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
+	}
+
+	// Should return 2 items: comment-a and comment-approval
+	// comment-b is acknowledged with explicit comment ID in comment-ack-b (excluded)
+	// comment-ack-b is agent-authored (skipped as agent reply)
+	// comment-approval is neutral feedback (should still be returned)
+	if len(items) != 2 {
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 2: %+v", len(items), items)
+	}
+
+	ids := map[string]bool{}
+	for _, item := range items {
+		ids[item.ID] = true
+	}
+	if !ids["comment-a"] {
+		t.Errorf("Expected comment-a (unacknowledged) in results")
+	}
+	if ids["comment-b"] {
+		t.Errorf("Expected comment-b to be acknowledged and excluded from results")
+	}
+	if !ids["comment-approval"] {
+		t.Errorf("Expected comment-approval in results")
+	}
+}
+
+// TestListUnaddressedFeedback_AcknowledgmentNotClearingOthers verifies that an acknowledgment
+// of comment B does not clear comment A.
+func TestListUnaddressedFeedback_AcknowledgmentNotClearingOthers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodyStr := string(body)
+
+		if strings.Contains(bodyStr, "reviewThreads") {
+			graphqlResp := `{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}`
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(graphqlResp))
+		} else if strings.Contains(bodyStr, "comments") {
+			graphqlResp := `{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "id": "PR-separate-ack",
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "comment-1",
+              "databaseId": 1,
+              "body": "First issue",
+              "createdAt": "2024-01-01T10:00:00Z",
+              "author": {
+                "login": "reviewer"
+              },
+              "reactionGroups": []
+            },
+            {
+              "id": "comment-2",
+              "databaseId": 2,
+              "body": "Second issue",
+              "createdAt": "2024-01-01T10:01:00Z",
+              "author": {
+                "login": "reviewer"
+              },
+              "reactionGroups": []
+            },
+            {
+              "id": "comment-ack-2",
+              "databaseId": 3,
+              "body": "haiku-worker: addressed in def456 (see comment comment-2)",
+              "createdAt": "2024-01-01T10:05:00Z",
+              "author": {
+                "login": "reviewer"
+              },
+              "reactionGroups": []
+            }
+          ]
+        }
+      }
+    }
+  }
+}`
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(graphqlResp))
+		}
+	}))
+	defer server.Close()
+
+	oldBaseURL := GitHubBaseURL
+	GitHubBaseURL = server.URL
+	defer func() { GitHubBaseURL = oldBaseURL }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	items, err := ListUnaddressedFeedback(ctx, "owner", "repo", 42, "reviewer", "token")
+
+	if err != nil {
+		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
+	}
+
+	// Should return 1 item: comment-1
+	// Only comment-2 is acknowledged (explicit ID in comment-ack-2)
+	if len(items) != 1 {
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 1: %+v", len(items), items)
+	}
+
+	if items[0].ID != "comment-1" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-1")
+	}
+}
+
+// TestListUnaddressedFeedback_UnresolvedThreadWithMarkedReply verifies that a marked
+// (agent-authored) reply does not resolve an inline thread.
+func TestListUnaddressedFeedback_UnresolvedThreadWithMarkedReply(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodyStr := string(body)
+
+		if strings.Contains(bodyStr, "reviewThreads") {
+			graphqlResp := `{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": [
+            {
+              "id": "thread-1",
+              "isResolved": false,
+              "path": "main.go",
+              "line": 100,
+              "firstComments": {
+                "nodes": [
+                  {
+                    "id": "comment-first",
+                    "body": "This needs a nil check",
+                    "author": {
+                      "login": "reviewer"
+                    }
+                  }
+                ]
+              },
+              "lastComments": {
+                "nodes": [
+                  {
+                    "id": "comment-last-marked",
+                    "body": "gpt-5.5-reviewer: addressed in ghi789",
+                    "author": {
+                      "login": "reviewer"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}`
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(graphqlResp))
+		} else if strings.Contains(bodyStr, "comments") {
+			graphqlResp := `{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "id": "PR-marked-reply",
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        }
+      }
+    }
+  }
+}`
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(graphqlResp))
+		}
+	}))
+	defer server.Close()
+
+	oldBaseURL := GitHubBaseURL
+	GitHubBaseURL = server.URL
+	defer func() { GitHubBaseURL = oldBaseURL }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	items, err := ListUnaddressedFeedback(ctx, "owner", "repo", 42, "reviewer", "token")
+
+	if err != nil {
+		t.Fatalf("ListUnaddressedFeedback() error = %v, want nil", err)
+	}
+
+	// Should return 1 item: thread-1
+	// The thread is unresolved; a marked reply does not resolve it.
+	if len(items) != 1 {
+		t.Fatalf("ListUnaddressedFeedback() returned %d items, want 1: %+v", len(items), items)
+	}
+
+	if items[0].ID != "thread-1" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "thread-1")
 	}
 }

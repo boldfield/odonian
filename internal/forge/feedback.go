@@ -221,17 +221,12 @@ func fetchReviewThreadsPage(ctx context.Context, owner, repo string, prNumber in
 
 	var items []FeedbackItem
 	for _, thread := range result.Data.Repository.PullRequest.ReviewThreads.Nodes {
-		// A thread is addressed iff it is resolved or its last reply is agent-authored,
-		// identified by marker prefix (not login, which is indistinguishable from the
-		// human's when they share one GitHub identity).
+		// An unresolved thread is addressed iff it is resolved. The presence of a marker
+		// or any reply does not itself resolve it. Use thread.IsResolved to determine completion.
 		if thread.IsResolved {
 			continue
 		}
-		if len(thread.FirstComments.Nodes) == 0 || len(thread.LastComments.Nodes) == 0 {
-			continue
-		}
-		lastComment := thread.LastComments.Nodes[0]
-		if IsAgentAuthoredComment(lastComment.Body) {
+		if len(thread.FirstComments.Nodes) == 0 {
 			continue
 		}
 
@@ -253,7 +248,7 @@ func fetchReviewThreadsPage(ctx context.Context, owner, repo string, prNumber in
 }
 
 // listUnacknowledgedGlobalComments fetches global PR comments that are not authored by the bot
-// and not yet acknowledged (no bot reply and no bot reaction).
+// and not yet acknowledged (no explicit acknowledgment with exact comment ID).
 func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, prNumber int, botLogin, token string) ([]FeedbackItem, error) {
 	var allComments []comment
 	var prNodeID string
@@ -274,7 +269,7 @@ func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, p
 		after = nextCursor
 	}
 
-	// Filter comments: exclude agent-authored (by marker), exclude acknowledged (bot reaction or marker reply)
+	// Filter comments: exclude agent-authored (by marker), exclude acknowledged (explicit acknowledgment with exact ID)
 	var items []FeedbackItem
 	for _, comment := range allComments {
 		// Skip comments authored by the fleet, identified by marker prefix (not login,
@@ -283,31 +278,9 @@ func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, p
 			continue
 		}
 
-		// Check if comment has been acknowledged
-		acknowledged := false
-
-		// Check for bot reactions (retained by login: reactions cannot carry markers)
-		for _, reactionGroup := range comment.ReactionGroups {
-			for _, user := range reactionGroup.Users.Nodes {
-				if user.Login == botLogin {
-					acknowledged = true
-					break
-				}
-			}
-			if acknowledged {
-				break
-			}
-		}
-
-		// Check for a later marker-prefixed reply
-		if !acknowledged {
-			for _, other := range allComments {
-				if IsAgentAuthoredComment(other.Body) && other.CreatedAt > comment.CreatedAt {
-					acknowledged = true
-					break
-				}
-			}
-		}
+		// Check if comment has been acknowledged: look for explicit acknowledgment with exact comment ID
+		// Format: "addressed in <sha> (see comment <id>)"
+		acknowledged := isCommentAcknowledged(comment.ID, allComments)
 
 		// Only include unacknowledged comments
 		if !acknowledged {
@@ -323,6 +296,24 @@ func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, p
 	}
 
 	return items, nil
+}
+
+// isCommentAcknowledged checks if a comment has an explicit acknowledgment from the fleet.
+// An acknowledgment must be a later agent-authored reply that names the exact comment ID
+// in the format: "addressed in <sha> (see comment <id>)"
+func isCommentAcknowledged(commentID string, allComments []comment) bool {
+	for _, other := range allComments {
+		// Look for agent-authored replies
+		if !IsAgentAuthoredComment(other.Body) {
+			continue
+		}
+		// Check if this reply acknowledges the specific comment
+		// The format is: "<marker>addressed in <sha> (see comment <id>)"
+		if strings.Contains(other.Body, "(see comment "+commentID+")") {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchGlobalCommentsPageRaw fetches a single page of global PR comments from the GraphQL API.
