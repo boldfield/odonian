@@ -3975,6 +3975,17 @@ func TestExecuteShowReworkTaskWithFindings(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode([]tuiclient.Event{
 				{
+					ID:     "event-0",
+					TaskID: "task-rework",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
 					ID:     "event-1",
 					TaskID: "task-rework",
 					Actor:  "opus-reviewer",
@@ -3983,13 +3994,6 @@ func TestExecuteShowReworkTaskWithFindings(t *testing.T) {
 						s := "reject"
 						return &s
 					}(),
-					CreatedAt: "2026-01-01T00:00:00Z",
-				},
-				{
-					ID:     "event-2",
-					TaskID: "task-rework",
-					Actor:  "opus-reviewer",
-					Kind:   "finding",
 					Note: func() *string {
 						s := "The error handling is missing in the main path"
 						return &s
@@ -4046,6 +4050,17 @@ func TestExecuteShowReworkTaskJSON(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode([]tuiclient.Event{
 				{
+					ID:     "event-0",
+					TaskID: "task-json",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"haiku\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
 					ID:     "event-1",
 					TaskID: "task-json",
 					Actor:  "reviewer",
@@ -4054,7 +4069,7 @@ func TestExecuteShowReworkTaskJSON(t *testing.T) {
 						s := "approve"
 						return &s
 					}(),
-					CreatedAt: "2026-01-01T00:00:00Z",
+					CreatedAt: "2026-01-01T00:00:01Z",
 				},
 			})
 		default:
@@ -4104,6 +4119,17 @@ func TestExecuteShowMultipleReviewers(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode([]tuiclient.Event{
 				{
+					ID:     "event-0",
+					TaskID: "task-multi",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\",\"gpt-5.5\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
 					ID:     "event-1",
 					TaskID: "task-multi",
 					Actor:  "opus-reviewer",
@@ -4112,7 +4138,11 @@ func TestExecuteShowMultipleReviewers(t *testing.T) {
 						s := "reject"
 						return &s
 					}(),
-					CreatedAt: "2026-01-01T00:00:00Z",
+					Note: func() *string {
+						s := "Performance issue in loop"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:01Z",
 				},
 				{
 					ID:     "event-2",
@@ -4121,17 +4151,6 @@ func TestExecuteShowMultipleReviewers(t *testing.T) {
 					Kind:   "review",
 					Verdict: func() *string {
 						s := "approve"
-						return &s
-					}(),
-					CreatedAt: "2026-01-01T00:00:01Z",
-				},
-				{
-					ID:     "event-3",
-					TaskID: "task-multi",
-					Actor:  "opus-reviewer",
-					Kind:   "finding",
-					Note: func() *string {
-						s := "Performance issue in loop"
 						return &s
 					}(),
 					CreatedAt: "2026-01-01T00:00:02Z",
@@ -4164,6 +4183,109 @@ func TestExecuteShowMultipleReviewers(t *testing.T) {
 	}
 	if !strings.Contains(output, "Performance issue") {
 		t.Errorf("expected finding text, got: %s", output)
+	}
+}
+
+// TestExecuteShowMultipleRounds tests showing findings from multiple review rounds with history
+func TestExecuteShowMultipleRounds(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-rounds":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-rounds",
+				Title:       "Multi-Round Task",
+				Spec:        "Address feedback over multiple rounds",
+				State:       "ready",
+				ReviewRound: 2,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-rounds/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:     "event-0",
+					TaskID: "task-rounds",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
+					ID:     "event-1",
+					TaskID: "task-rounds",
+					Actor:  "opus-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "reject"
+						return &s
+					}(),
+					Note: func() *string {
+						s := "Missing error handling in retry logic"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:01Z",
+				},
+				{
+					ID:     "event-2",
+					TaskID: "task-rounds",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 2 with models: [\"gpt-5.5\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T01:00:00Z",
+				},
+				{
+					ID:     "event-3",
+					TaskID: "task-rounds",
+					Actor:  "gpt-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "approve"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T01:00:01Z",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-rounds"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Round 1") {
+		t.Errorf("expected Round 1 in output, got: %s", output)
+	}
+	if !strings.Contains(output, "Round 2") {
+		t.Errorf("expected Round 2 in output, got: %s", output)
+	}
+	if !strings.Contains(output, "(historical)") {
+		t.Errorf("expected (historical) marker for round 1 findings, got: %s", output)
+	}
+	if !strings.Contains(output, "Missing error handling") {
+		t.Errorf("expected historical finding text from round 1, got: %s", output)
+	}
+	if !strings.Contains(output, "opus-reviewer") {
+		t.Errorf("expected opus-reviewer in output, got: %s", output)
+	}
+	if !strings.Contains(output, "gpt-reviewer") {
+		t.Errorf("expected gpt-reviewer in output, got: %s", output)
+	}
+	if !strings.Contains(output, "approve") {
+		t.Errorf("expected approve verdict from round 2, got: %s", output)
 	}
 }
 

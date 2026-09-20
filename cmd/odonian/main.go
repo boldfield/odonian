@@ -614,7 +614,7 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		}
 		if len(reviewFindings) > 0 {
 			fmt.Fprintf(out, "Review Findings:\n")
-			for i, finding := range reviewFindings {
+			for _, finding := range reviewFindings {
 				fmt.Fprintf(out, "  Round %d:\n", finding.Round)
 				fmt.Fprintf(out, "    Verdicts:\n")
 				for _, verdict := range finding.Verdicts {
@@ -624,7 +624,7 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 					fmt.Fprintf(out, "    Findings:\n")
 					for _, f := range finding.Findings {
 						fmt.Fprintf(out, "      - [%s] %s: %s\n", f.Reviewer, f.Kind, f.Text)
-						if i > 0 && f.IsHistory {
+						if f.IsHistory {
 							fmt.Fprintf(out, "        (historical)\n")
 						}
 					}
@@ -1423,45 +1423,51 @@ func extractReviewFindings(events []tuiclient.Event, currentReviewRound int) []R
 		return nil
 	}
 
-	// Group events by round (approximately via sequence order and type)
-	// Review events typically have kind="review", with verdict field set to approve/reject
-	// Finding events likely have kind="finding" with the text in the note
+	// Track round boundaries via spawn_review events, which carry "Round N with models: ..."
 	roundMap := make(map[int]*ReviewRoundFindings)
 
-	// Process events to extract verdicts and findings
+	// Initialize all rounds up to currentReviewRound
+	for i := 1; i <= currentReviewRound; i++ {
+		roundMap[i] = &ReviewRoundFindings{Round: i}
+	}
+
+	// Single pass: assign events to rounds and extract verdicts/findings
+	activeRound := 1
 	for _, event := range events {
-		round := 1 // Default to round 1; we'll improve detection if needed
-		// For now, we'll treat all review events as being from the latest round
-		// since we don't have explicit round info in events
-
-		if roundMap[round] == nil {
-			roundMap[round] = &ReviewRoundFindings{Round: round}
-		}
-
 		switch event.Kind {
-		case "review":
-			if event.Verdict != nil {
-				roundMap[round].Verdicts = append(roundMap[round].Verdicts, ReviewVerdictInfo{
-					Actor:   event.Actor,
-					Verdict: *event.Verdict,
-				})
-			}
-		case "finding":
+		case "spawn_review":
+			// Update active round based on spawn_review events
 			if event.Note != nil {
-				roundMap[round].Findings = append(roundMap[round].Findings, ReviewFindingInfo{
-					Reviewer: event.Actor,
-					Kind:     "rejection",
-					Text:     *event.Note,
-				})
+				roundNum := parseRoundFromSpawnReview(*event.Note)
+				if roundNum > 0 {
+					activeRound = roundNum
+				}
+			}
+		case "review":
+			// Review events belong to the current active round
+			if activeRound <= currentReviewRound {
+				if event.Verdict != nil {
+					roundMap[activeRound].Verdicts = append(roundMap[activeRound].Verdicts, ReviewVerdictInfo{
+						Actor:   event.Actor,
+						Verdict: *event.Verdict,
+					})
+				}
+				// Extract findings from the note field of review events
+				if event.Note != nil {
+					roundMap[activeRound].Findings = append(roundMap[activeRound].Findings, ReviewFindingInfo{
+						Reviewer: event.Actor,
+						Kind:     "rejection",
+						Text:     *event.Note,
+					})
+				}
 			}
 		}
 	}
 
-	// Convert map to sorted slice
+	// Mark older rounds as historical
 	var results []ReviewRoundFindings
 	for i := 1; i <= currentReviewRound; i++ {
-		if rf, ok := roundMap[i]; ok {
-			// Mark older rounds as historical
+		if rf := roundMap[i]; len(rf.Verdicts) > 0 || len(rf.Findings) > 0 {
 			if i < currentReviewRound {
 				for j := range rf.Findings {
 					rf.Findings[j].IsHistory = true
@@ -1472,6 +1478,18 @@ func extractReviewFindings(events []tuiclient.Event, currentReviewRound int) []R
 	}
 
 	return results
+}
+
+// parseRoundFromSpawnReview extracts the round number from a spawn_review event note.
+// The format is "Round N with models: [...]"
+func parseRoundFromSpawnReview(note string) int {
+	parts := strings.Fields(note)
+	if len(parts) >= 2 && parts[0] == "Round" {
+		if round, err := strconv.Atoi(parts[1]); err == nil {
+			return round
+		}
+	}
+	return -1
 }
 
 func resolveAgentIdentity(agentFlag, modelFlag string) (agentID, model string, err error) {
