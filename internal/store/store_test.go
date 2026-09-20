@@ -9645,3 +9645,481 @@ func TestReadsNotBlockedByWrites(t *testing.T) {
 		t.Errorf("unexpected task from GetTask: %+v", fullTask)
 	}
 }
+
+// TestUpdateTaskEscalateTrueToFalse tests updating escalate flag from true (default) to false
+func TestUpdateTaskEscalateTrueToFalseDefault(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project, document, and task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test Task", Spec: "Test spec", DocumentID: doc.ID},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Verify initial escalate is true (default)
+	if !tasks[0].Escalate {
+		t.Errorf("expected initial escalate=true, got false")
+	}
+
+	// Update escalate to false (the opposite of the default)
+	updated, err := store.UpdateTaskEscalate(ctx, taskID, false)
+	if err != nil {
+		t.Fatalf("failed to update escalate: %v", err)
+	}
+
+	// Verify escalate is now false
+	if updated.Escalate {
+		t.Errorf("expected escalate=false after update, got true")
+	}
+
+	// Verify audit event was appended
+	events, err := store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	if len(events) == 0 {
+		t.Errorf("expected at least one event, got none")
+	}
+
+	lastEvent := events[len(events)-1]
+	if lastEvent.Kind != "policy-change" {
+		t.Errorf("expected last event kind='policy-change', got '%s'", lastEvent.Kind)
+	}
+	if lastEvent.Note == nil || *lastEvent.Note != "escalate policy changed: true → false" {
+		t.Errorf("expected note 'escalate policy changed: true → false', got %v", lastEvent.Note)
+	}
+}
+
+// TestUpdateTaskEscalateFalseToTrue tests updating escalate flag from false to true
+func TestUpdateTaskEscalateFalseToTrue(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project, document, and task with escalate=false
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	escalateFalse := false
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test Task", Spec: "Test spec", DocumentID: doc.ID, Escalate: &escalateFalse},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Verify initial escalate is false
+	if tasks[0].Escalate {
+		t.Errorf("expected initial escalate=false, got true")
+	}
+
+	// Now update to true
+	updated, err := store.UpdateTaskEscalate(ctx, taskID, true)
+	if err != nil {
+		t.Fatalf("failed to update escalate to true: %v", err)
+	}
+
+	// Verify escalate is now true
+	if !updated.Escalate {
+		t.Errorf("expected escalate=true after update, got false")
+	}
+
+	// Verify audit event was appended
+	events, err := store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	if len(events) == 0 {
+		t.Errorf("expected at least one event, got none")
+	}
+
+	lastEvent := events[len(events)-1]
+	if lastEvent.Kind != "policy-change" {
+		t.Errorf("expected last event kind='policy-change', got '%s'", lastEvent.Kind)
+	}
+	if lastEvent.Note == nil || *lastEvent.Note != "escalate policy changed: false → true" {
+		t.Errorf("expected note 'escalate policy changed: false → true', got %v", lastEvent.Note)
+	}
+}
+
+// TestUpdateTaskEscalateNoop tests that setting escalate to its current value is idempotent
+func TestUpdateTaskEscalateNoop(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project, document, and task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test Task", Spec: "Test spec", DocumentID: doc.ID},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Set escalate to true
+	_, err = store.UpdateTaskEscalate(ctx, taskID, true)
+	if err != nil {
+		t.Fatalf("failed to set escalate to true: %v", err)
+	}
+
+	// Get event count after first update
+	events, err := store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	initialEventCount := len(events)
+
+	// Update to same value (true)
+	_, err = store.UpdateTaskEscalate(ctx, taskID, true)
+	if err != nil {
+		t.Fatalf("failed to update escalate (noop): %v", err)
+	}
+
+	// Verify no new event was added
+	events, err = store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	if len(events) != initialEventCount {
+		t.Errorf("expected %d events (no new event for noop), got %d", initialEventCount, len(events))
+	}
+}
+
+// TestUpdateTaskEscalateBlockedState tests that escalate can be updated on blocked tasks
+func TestUpdateTaskEscalateBlockedState(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project, document, and task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test Task", Spec: "Test spec", DocumentID: doc.ID},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Transition task to blocked state
+	_, err = store.TransitionTask(ctx, taskID, "blocked", nil)
+	if err != nil {
+		t.Fatalf("failed to transition task to blocked: %v", err)
+	}
+
+	// Update escalate on blocked task should succeed
+	updated, err := store.UpdateTaskEscalate(ctx, taskID, true)
+	if err != nil {
+		t.Fatalf("failed to update escalate on blocked task: %v", err)
+	}
+
+	if !updated.Escalate {
+		t.Errorf("expected escalate=true, got false")
+	}
+}
+
+// TestUpdateTaskEscalateTerminalStateFails tests that updating escalate on terminal tasks fails
+func TestUpdateTaskEscalateTerminalStateFails(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	terminalStates := []string{"done", "failed", "abandoned", "superseded"}
+
+	for _, state := range terminalStates {
+		// Create a project, document, and task
+		proj, err := store.CreateProject(ctx, fmt.Sprintf("test-project-%s", state), "https://github.com/example/repo")
+		if err != nil {
+			t.Fatalf("failed to create project: %v", err)
+		}
+
+		doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+		if err != nil {
+			t.Fatalf("failed to create document: %v", err)
+		}
+
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{Title: fmt.Sprintf("Test Task %s", state), Spec: "Test spec", DocumentID: doc.ID},
+		})
+		if err != nil {
+			t.Fatalf("failed to create task: %v", err)
+		}
+		taskID := tasks[0].ID
+
+		// Manually set the task to the terminal state
+		now := nowTimestamp()
+		_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = ?, updated_at = ? WHERE id = ?", state, now, taskID)
+		if err != nil {
+			t.Fatalf("failed to set task to state %s: %v", state, err)
+		}
+
+		// Try to update escalate on terminal task - should fail
+		_, err = store.UpdateTaskEscalate(ctx, taskID, true)
+		if err == nil {
+			t.Errorf("expected error when updating escalate on %s task, got nil", state)
+		}
+
+		var conflictErr *ConflictError
+		if !errors.As(err, &conflictErr) {
+			t.Errorf("expected ConflictError, got %T: %v", err, err)
+		} else if conflictErr.Code != "TERMINAL_STATE" {
+			t.Errorf("expected TERMINAL_STATE error code, got %s", conflictErr.Code)
+		}
+	}
+}
+
+// TestUpdateTaskEscalateMissingTask tests that updating escalate on non-existent task fails
+func TestUpdateTaskEscalateMissingTask(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Try to update escalate on non-existent task
+	_, err = store.UpdateTaskEscalate(ctx, "non-existent-task-id", true)
+	if err == nil {
+		t.Errorf("expected error when updating escalate on non-existent task, got nil")
+	}
+
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got %T: %v", err, err)
+	}
+}
+
+// TestUpdateTaskEscalatePreservesFields tests that update preserves all other task fields
+func TestUpdateTaskEscalatePreservesFields(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project, document, and task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test Task", Spec: "Test spec", DocumentID: doc.ID},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	originalTask := tasks[0]
+
+	// Promote task to ready state (required before claiming)
+	now := nowTimestamp()
+	_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = ?, updated_at = ? WHERE id = ?", "ready", now, originalTask.ID)
+	if err != nil {
+		t.Fatalf("failed to promote task to ready: %v", err)
+	}
+
+	// Claim the task to set assignee and lease
+	agentID := "test-agent"
+	leaseTTL := 5 * time.Minute
+	_, err = store.ClaimTask(ctx, originalTask.ID, agentID, "haiku", leaseTTL)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Update escalate
+	updated, err := store.UpdateTaskEscalate(ctx, originalTask.ID, true)
+	if err != nil {
+		t.Fatalf("failed to update escalate: %v", err)
+	}
+
+	// Verify all fields are preserved
+	if updated.ID != originalTask.ID {
+		t.Errorf("ID changed: %s vs %s", updated.ID, originalTask.ID)
+	}
+	if updated.ProjectID != originalTask.ProjectID {
+		t.Errorf("ProjectID changed: %s vs %s", updated.ProjectID, originalTask.ProjectID)
+	}
+	if updated.DocumentID != originalTask.DocumentID {
+		t.Errorf("DocumentID changed: %s vs %s", updated.DocumentID, originalTask.DocumentID)
+	}
+	if updated.Title != originalTask.Title {
+		t.Errorf("Title changed: %s vs %s", updated.Title, originalTask.Title)
+	}
+	if updated.Spec != originalTask.Spec {
+		t.Errorf("Spec changed: %s vs %s", updated.Spec, originalTask.Spec)
+	}
+	if updated.Model != originalTask.Model {
+		t.Errorf("Model changed: %s vs %s", updated.Model, originalTask.Model)
+	}
+	if updated.Kind != originalTask.Kind {
+		t.Errorf("Kind changed: %s vs %s", updated.Kind, originalTask.Kind)
+	}
+	if updated.ReviewRound != originalTask.ReviewRound {
+		t.Errorf("ReviewRound changed: %d vs %d", updated.ReviewRound, originalTask.ReviewRound)
+	}
+
+	// Verify assignee and lease are preserved
+	if updated.Assignee == nil || *updated.Assignee != agentID {
+		t.Errorf("Assignee not preserved: expected %s, got %v", agentID, updated.Assignee)
+	}
+	if updated.LeaseExpiresAt == nil {
+		t.Errorf("LeaseExpiresAt not preserved: expected set, got nil")
+	}
+}
+
+// TestUpdateTaskEscalateReviewAggregation tests that escalate flag is preserved through task operations
+func TestUpdateTaskEscalateReviewAggregation(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(), WithEscalationLadder([]string{"haiku", "sonnet", "opus"}))
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a haiku implementation task with escalate=false
+	escalateFalse := false
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:      "Implementation Task",
+			Spec:       "Test spec",
+			DocumentID: doc.ID,
+			Escalate:   &escalateFalse,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	taskID := tasks[0].ID
+	if tasks[0].Model != "haiku" {
+		t.Fatalf("expected task model haiku, got %s", tasks[0].Model)
+	}
+
+	// Verify initial escalate is false
+	if tasks[0].Escalate {
+		t.Errorf("expected initial escalate=false, got true")
+	}
+
+	// Update escalate to true
+	updated, err := store.UpdateTaskEscalate(ctx, taskID, true)
+	if err != nil {
+		t.Fatalf("failed to set escalate to true: %v", err)
+	}
+
+	if !updated.Escalate {
+		t.Errorf("expected escalate=true after update, got false")
+	}
+
+	// Verify that review history and dependencies are preserved
+	events, err := store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	// Should have the policy-change event
+	hasPolicyChangeEvent := false
+	for _, e := range events {
+		if e.Kind == "policy-change" {
+			hasPolicyChangeEvent = true
+		}
+	}
+
+	if !hasPolicyChangeEvent {
+		t.Errorf("expected policy-change event in task history")
+	}
+
+	// Verify the escalate flag is correctly persisted
+	taskWithDeps, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+
+	if !taskWithDeps.Escalate {
+		t.Errorf("expected escalate=true to be persisted, got false")
+	}
+}

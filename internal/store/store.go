@@ -50,6 +50,7 @@ type Store interface {
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
+	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
 	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int) (Task, error)
 	ArchiveTask(ctx context.Context, taskID string) (Task, error)
@@ -2564,6 +2565,83 @@ func (s *sqliteStore) SupersedeTask(ctx context.Context, taskID string, modelOve
 	}
 
 	return newTask, nil
+}
+
+// UpdateTaskEscalate updates the escalate flag for an existing task and appends an audit event.
+// Only allows updates on nonterminal tasks (not done, failed, abandoned, superseded).
+// If the escalate value doesn't change, no event is appended (idempotent).
+// Returns the updated task.
+func (s *sqliteStore) UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error) {
+	// Start transaction
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Load current task state
+	var currentTask Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&currentTask.ID, &currentTask.ProjectID, &currentTask.DocumentID, &currentTask.Title, &currentTask.Spec, &currentTask.State, &currentTask.Assignee, &currentTask.LeaseExpiresAt, &currentTask.Result, &currentTask.Model, &currentTask.Kind, &reviewModelsJSON, &currentTask.ReviewRound, &currentTask.TargetTaskID, &currentTask.Verdict, &currentTask.AgentMerge, &currentTask.Held, &currentTask.Escalate, &currentTask.Track, &currentTask.CreatedAt, &currentTask.UpdatedAt, &currentTask.ArchivedAt, &currentTask.SupersededBy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, ErrNotFound
+	}
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch task: %w", err)
+	}
+
+	// Unmarshal review_models
+	currentTask.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &currentTask.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	// Check if task is in a terminal state
+	switch currentTask.State {
+	case "done", "failed", "abandoned", "superseded":
+		return Task{}, conflict("TERMINAL_STATE", fmt.Sprintf("cannot update escalate on task in terminal state %q", currentTask.State))
+	}
+
+	// If escalate value doesn't change, return task without appending event (idempotent)
+	if currentTask.Escalate == escalate {
+		if err := tx.Commit(); err != nil {
+			return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return currentTask, nil
+	}
+
+	// Update escalate flag and updated_at
+	now := nowTimestamp()
+	_, err = tx.ExecContext(ctx, `
+		UPDATE task SET escalate = ?, updated_at = ? WHERE id = ?
+	`, escalate, now, taskID)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to update task escalate flag: %w", err)
+	}
+
+	// Append audit event recording the policy change
+	oldValue := fmt.Sprintf("%v", currentTask.Escalate)
+	newValue := fmt.Sprintf("%v", escalate)
+	eventNote := fmt.Sprintf("escalate policy changed: %s → %s", oldValue, newValue)
+	_, err = s.AppendEvent(ctx, tx, taskID, "system", "policy-change", nil, &eventNote)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to append policy-change event: %w", err)
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Return updated task
+	currentTask.Escalate = escalate
+	currentTask.UpdatedAt = now
+	return currentTask, nil
 }
 
 // closeSupersededPR closes the old task's recorded pull request (if any and still
