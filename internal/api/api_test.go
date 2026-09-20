@@ -5765,7 +5765,9 @@ func TestUpdateEscalationTerminalTaskReturns409(t *testing.T) {
 	}
 }
 
-// TestUpdateEscalationBlockedTaskSucceeds verifies that escalate can be changed on a blocked task.
+// TestUpdateEscalationBlockedTaskSucceeds verifies that escalate can be changed on a task in
+// state=blocked (reached via /transition, not the unrelated held flag set by /hold) and that the
+// update does not unblock or otherwise resume the task.
 func TestUpdateEscalationBlockedTaskSucceeds(t *testing.T) {
 	server := setupTestServer(t, "test-token")
 	authHeader := "Bearer test-token"
@@ -5789,13 +5791,41 @@ func TestUpdateEscalationBlockedTaskSucceeds(t *testing.T) {
 	json.NewDecoder(createW.Body).Decode(&createdTasks)
 	taskID := createdTasks[0].ID
 
-	// Hold (block) the task
-	holdReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/hold", nil)
-	holdReq.Header.Set("Authorization", authHeader)
-	holdW := httptest.NewRecorder()
-	server.mux.ServeHTTP(holdW, holdReq)
+	// Promote and claim so the task is in an active state that can transition to blocked.
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
 
-	// Update escalate on blocked task
+	claimPayload := map[string]string{"agent_id": "test-agent", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	// Transition to state=blocked via the transition API.
+	transitionPayload := map[string]interface{}{
+		"to":   "blocked",
+		"note": "Blocked on external dependency",
+	}
+	transitionBody, _ := json.Marshal(transitionPayload)
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader(transitionBody))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	var blockedTask store.Task
+	if err := json.NewDecoder(transitionW.Body).Decode(&blockedTask); err != nil {
+		t.Fatalf("failed to decode transition response: %v", err)
+	}
+	if blockedTask.State != "blocked" {
+		t.Fatalf("precondition failed: expected state 'blocked', got %q", blockedTask.State)
+	}
+
+	// Update escalate on the now-blocked task.
 	updatePayload := map[string]interface{}{
 		"escalate": false,
 	}
@@ -5809,9 +5839,21 @@ func TestUpdateEscalationBlockedTaskSucceeds(t *testing.T) {
 	if updateW.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d; body: %s", updateW.Code, updateW.Body.String())
 	}
+
+	var updatedTask store.Task
+	if err := json.NewDecoder(updateW.Body).Decode(&updatedTask); err != nil {
+		t.Fatalf("failed to decode update response: %v", err)
+	}
+	if updatedTask.State != "blocked" {
+		t.Errorf("expected state to remain 'blocked', got %q", updatedTask.State)
+	}
+	if updatedTask.Escalate != false {
+		t.Errorf("expected escalate to be false, got %v", updatedTask.Escalate)
+	}
 }
 
-// TestUpdateEscalationPreservesOtherFields verifies that state, dependencies, and history remain intact.
+// TestUpdateEscalationPreservesOtherFields verifies through the API that state, dependencies, and
+// prior event history remain intact after changing the escalation policy.
 func TestUpdateEscalationPreservesOtherFields(t *testing.T) {
 	server := setupTestServer(t, "test-token")
 	authHeader := "Bearer test-token"
@@ -5852,14 +5894,46 @@ func TestUpdateEscalationPreservesOtherFields(t *testing.T) {
 	depW := httptest.NewRecorder()
 	server.mux.ServeHTTP(depW, depReq)
 
-	// Get the original task to compare
+	// Record prior history on task2 by promoting and claiming it, which appends a "claim" event.
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+task2ID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "test-agent", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+task2ID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	// Get the original task (with deps) and its event history to compare against.
 	getReq := httptest.NewRequest("GET", "/tasks/"+task2ID, nil)
 	getReq.Header.Set("Authorization", authHeader)
 	getW := httptest.NewRecorder()
 	server.mux.ServeHTTP(getW, getReq)
 
-	var originalTask store.Task
-	json.NewDecoder(getW.Body).Decode(&originalTask)
+	var originalTask store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(getW.Body).Decode(&originalTask); err != nil {
+		t.Fatalf("failed to decode original task: %v", err)
+	}
+	if len(originalTask.DependsOn) != 1 || originalTask.DependsOn[0] != task1ID {
+		t.Fatalf("precondition failed: expected task2 to depend on task1, got %v", originalTask.DependsOn)
+	}
+
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+task2ID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+
+	var originalEvents []store.Event
+	if err := json.NewDecoder(eventsW.Body).Decode(&originalEvents); err != nil {
+		t.Fatalf("failed to decode original events: %v", err)
+	}
+	if len(originalEvents) == 0 {
+		t.Fatalf("precondition failed: expected at least one prior event")
+	}
 
 	// Update escalate
 	updatePayload := map[string]interface{}{
@@ -5887,6 +5961,41 @@ func TestUpdateEscalationPreservesOtherFields(t *testing.T) {
 	}
 	if updatedTask.Title != originalTask.Title {
 		t.Errorf("expected title %q, got %q", originalTask.Title, updatedTask.Title)
+	}
+
+	// Verify dependencies remain intact through the API.
+	getAfterReq := httptest.NewRequest("GET", "/tasks/"+task2ID, nil)
+	getAfterReq.Header.Set("Authorization", authHeader)
+	getAfterW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getAfterW, getAfterReq)
+
+	var taskAfter store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(getAfterW.Body).Decode(&taskAfter); err != nil {
+		t.Fatalf("failed to decode task after update: %v", err)
+	}
+	if len(taskAfter.DependsOn) != 1 || taskAfter.DependsOn[0] != task1ID {
+		t.Errorf("expected depends_on to remain [%q], got %v", task1ID, taskAfter.DependsOn)
+	}
+
+	// Verify prior event history remains intact (the escalation update may append its own
+	// policy-change event, but every event that existed before it must still be present).
+	eventsAfterReq := httptest.NewRequest("GET", "/tasks/"+task2ID+"/events", nil)
+	eventsAfterReq.Header.Set("Authorization", authHeader)
+	eventsAfterW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsAfterW, eventsAfterReq)
+
+	var eventsAfter []store.Event
+	if err := json.NewDecoder(eventsAfterW.Body).Decode(&eventsAfter); err != nil {
+		t.Fatalf("failed to decode events after update: %v", err)
+	}
+	if len(eventsAfter) < len(originalEvents) {
+		t.Fatalf("expected at least %d events after update, got %d", len(originalEvents), len(eventsAfter))
+	}
+	for i, want := range originalEvents {
+		got := eventsAfter[i]
+		if got.ID != want.ID || got.Kind != want.Kind || got.Actor != want.Actor {
+			t.Errorf("prior event %d changed: want %+v, got %+v", i, want, got)
+		}
 	}
 }
 
