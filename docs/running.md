@@ -40,6 +40,13 @@ directly runs as a separate pod that mounts the same volume.
 complete spec, result, dependencies, and links; `pending --json` does not contain their full
 contents. JSON list commands return `[]` when empty. `tasks` supports server-side filtering:
 
+For a rework task (`review_round > 0`), `show` also fetches recorded review events and displays
+the latest completed round's reviewer verdicts and full findings, plus earlier rounds retained as
+clearly labeled history (`(historical)` in text output, `is_history` in JSON). Notes on approving
+verdicts are labeled `approval`, not `rejection`, so they aren't mistaken for outstanding work.
+Initial tasks with no review history omit this section entirely. If the review events cannot be
+retrieved, `show` fails explicitly rather than printing an apparently complete task.
+
 ```bash
 ./bin/odonian tasks --project <project-id> --state ready --model haiku
 ./bin/odonian pending --project <project-id>

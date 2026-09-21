@@ -3916,3 +3916,533 @@ func getGitSHA(t *testing.T, repoPath, ref string) string {
 	}
 	return strings.TrimSpace(string(output))
 }
+
+// TestExecuteShowInitialTask tests showing an initial task with no review
+func TestExecuteShowInitialTask(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-initial":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-initial",
+				Title:       "Initial Task",
+				Spec:        "Do something",
+				State:       "ready",
+				ReviewRound: 0,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-initial"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Initial Task") {
+		t.Errorf("expected output to contain title, got: %s", output)
+	}
+	if strings.Contains(output, "Review Round") {
+		t.Errorf("expected no Review Round for initial task, got: %s", output)
+	}
+	if strings.Contains(output, "Review Findings") {
+		t.Errorf("expected no Review Findings for initial task, got: %s", output)
+	}
+}
+
+// TestExecuteShowReworkTaskWithFindings tests showing a rework task with review findings
+func TestExecuteShowReworkTaskWithFindings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-rework":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-rework",
+				Title:       "Rework Task",
+				Spec:        "Fix the code",
+				State:       "ready",
+				ReviewRound: 1,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-rework/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:     "event-0",
+					TaskID: "task-rework",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
+					ID:     "event-1",
+					TaskID: "task-rework",
+					Actor:  "opus-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "reject"
+						return &s
+					}(),
+					Note: func() *string {
+						s := "The error handling is missing in the main path"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:01Z",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-rework"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Review Round: 1") {
+		t.Errorf("expected Review Round in output, got: %s", output)
+	}
+	if !strings.Contains(output, "Review Findings") {
+		t.Errorf("expected Review Findings in output, got: %s", output)
+	}
+	if !strings.Contains(output, "opus-reviewer") {
+		t.Errorf("expected reviewer name in output, got: %s", output)
+	}
+	if !strings.Contains(output, "reject") {
+		t.Errorf("expected reject verdict in output, got: %s", output)
+	}
+	if !strings.Contains(output, "error handling") {
+		t.Errorf("expected finding text in output, got: %s", output)
+	}
+}
+
+// TestExecuteShowReworkTaskJSON tests showing a rework task with JSON output
+func TestExecuteShowReworkTaskJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-json":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-json",
+				Title:       "JSON Task",
+				Spec:        "Test JSON output",
+				State:       "ready",
+				ReviewRound: 1,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-json/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:     "event-0",
+					TaskID: "task-json",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"haiku\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
+					ID:     "event-1",
+					TaskID: "task-json",
+					Actor:  "reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "approve"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:01Z",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "task-json"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow with --json failed: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+
+	if result["title"] != "JSON Task" {
+		t.Errorf("expected title in JSON, got: %v", result["title"])
+	}
+	if result["review_round"] != float64(1) {
+		t.Errorf("expected review_round in JSON, got: %v", result["review_round"])
+	}
+	if _, ok := result["review_findings"]; !ok {
+		t.Errorf("expected review_findings in JSON output")
+	}
+}
+
+// TestExecuteShowMultipleReviewers tests showing findings from multiple reviewers
+func TestExecuteShowMultipleReviewers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-multi":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-multi",
+				Title:       "Multi-Reviewer Task",
+				Spec:        "Address feedback",
+				State:       "ready",
+				ReviewRound: 1,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-multi/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:     "event-0",
+					TaskID: "task-multi",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\",\"gpt-5.5\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
+					ID:     "event-1",
+					TaskID: "task-multi",
+					Actor:  "opus-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "reject"
+						return &s
+					}(),
+					Note: func() *string {
+						s := "Performance issue in loop"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:01Z",
+				},
+				{
+					ID:     "event-2",
+					TaskID: "task-multi",
+					Actor:  "gpt-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "approve"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:02Z",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-multi"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "opus-reviewer") {
+		t.Errorf("expected opus-reviewer in output, got: %s", output)
+	}
+	if !strings.Contains(output, "gpt-reviewer") {
+		t.Errorf("expected gpt-reviewer in output, got: %s", output)
+	}
+	if !strings.Contains(output, "reject") {
+		t.Errorf("expected reject verdict, got: %s", output)
+	}
+	if !strings.Contains(output, "approve") {
+		t.Errorf("expected approve verdict, got: %s", output)
+	}
+	if !strings.Contains(output, "Performance issue") {
+		t.Errorf("expected finding text, got: %s", output)
+	}
+}
+
+// TestExecuteShowApprovalNoteNotLabeledRejection tests that a note on an approve
+// verdict is not presented to the worker as a rejection finding to address.
+func TestExecuteShowApprovalNoteNotLabeledRejection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-approve-note":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-approve-note",
+				Title:       "Mixed Verdict With Approval Note",
+				Spec:        "Address feedback",
+				State:       "ready",
+				ReviewRound: 1,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-approve-note/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:     "event-0",
+					TaskID: "task-approve-note",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\",\"gpt-5.5\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
+					ID:     "event-1",
+					TaskID: "task-approve-note",
+					Actor:  "opus-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "reject"
+						return &s
+					}(),
+					Note: func() *string {
+						s := "Missing input validation"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:01Z",
+				},
+				{
+					ID:     "event-2",
+					TaskID: "task-approve-note",
+					Actor:  "gpt-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "approve"
+						return &s
+					}(),
+					Note: func() *string {
+						s := "LGTM, nicely scoped"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:02Z",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-approve-note"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "opus-reviewer] rejection: Missing input validation") {
+		t.Errorf("expected the reject verdict's note labeled as rejection, got: %s", output)
+	}
+	if strings.Contains(output, "gpt-reviewer] rejection") {
+		t.Errorf("expected approve verdict's note NOT labeled as rejection, got: %s", output)
+	}
+	if !strings.Contains(output, "gpt-reviewer] approval: LGTM") {
+		t.Errorf("expected approve verdict's note labeled as approval, got: %s", output)
+	}
+
+	jsonBuf := &bytes.Buffer{}
+	if err := executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "task-approve-note"}, jsonBuf); err != nil {
+		t.Fatalf("executeShow --json failed: %v", err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(jsonBuf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+	findings, ok := result["review_findings"].([]interface{})
+	if !ok || len(findings) == 0 {
+		t.Fatalf("expected review_findings array in JSON, got: %v", result["review_findings"])
+	}
+	round := findings[0].(map[string]interface{})
+	roundFindings, ok := round["findings"].([]interface{})
+	if !ok || len(roundFindings) != 2 {
+		t.Fatalf("expected 2 findings in round, got: %v", round["findings"])
+	}
+	for _, rf := range roundFindings {
+		f := rf.(map[string]interface{})
+		switch f["reviewer"] {
+		case "opus-reviewer":
+			if f["kind"] != "rejection" {
+				t.Errorf("expected opus-reviewer finding kind rejection, got: %v", f["kind"])
+			}
+		case "gpt-reviewer":
+			if f["kind"] != "approval" {
+				t.Errorf("expected gpt-reviewer finding kind approval, got: %v", f["kind"])
+			}
+		default:
+			t.Errorf("unexpected reviewer in findings: %v", f["reviewer"])
+		}
+	}
+}
+
+// TestExecuteShowMultipleRounds tests showing findings from multiple review rounds with history
+func TestExecuteShowMultipleRounds(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-rounds":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-rounds",
+				Title:       "Multi-Round Task",
+				Spec:        "Address feedback over multiple rounds",
+				State:       "ready",
+				ReviewRound: 2,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-rounds/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:     "event-0",
+					TaskID: "task-rounds",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
+					ID:     "event-1",
+					TaskID: "task-rounds",
+					Actor:  "opus-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "reject"
+						return &s
+					}(),
+					Note: func() *string {
+						s := "Missing error handling in retry logic"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:01Z",
+				},
+				{
+					ID:     "event-2",
+					TaskID: "task-rounds",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 2 with models: [\"gpt-5.5\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T01:00:00Z",
+				},
+				{
+					ID:     "event-3",
+					TaskID: "task-rounds",
+					Actor:  "gpt-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "approve"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T01:00:01Z",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-rounds"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Round 1") {
+		t.Errorf("expected Round 1 in output, got: %s", output)
+	}
+	if !strings.Contains(output, "Round 2") {
+		t.Errorf("expected Round 2 in output, got: %s", output)
+	}
+	if !strings.Contains(output, "(historical)") {
+		t.Errorf("expected (historical) marker for round 1 findings, got: %s", output)
+	}
+	if !strings.Contains(output, "Missing error handling") {
+		t.Errorf("expected historical finding text from round 1, got: %s", output)
+	}
+	if !strings.Contains(output, "opus-reviewer") {
+		t.Errorf("expected opus-reviewer in output, got: %s", output)
+	}
+	if !strings.Contains(output, "gpt-reviewer") {
+		t.Errorf("expected gpt-reviewer in output, got: %s", output)
+	}
+	if !strings.Contains(output, "approve") {
+		t.Errorf("expected approve verdict from round 2, got: %s", output)
+	}
+}
+
+// TestExecuteShowEventRetrievalFailure tests handling of event retrieval failures
+func TestExecuteShowEventRetrievalFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-fail":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-fail",
+				Title:       "Failing Task",
+				Spec:        "Test failure",
+				State:       "ready",
+				ReviewRound: 1,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-fail/events":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{
+					"code":    "internal_error",
+					"message": "failed to retrieve events",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-fail"}, buf)
+	if err == nil {
+		t.Errorf("expected error when events cannot be retrieved, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to get task events") {
+		t.Errorf("expected error message about event retrieval, got: %v", err)
+	}
+}

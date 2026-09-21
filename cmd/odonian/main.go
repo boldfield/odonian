@@ -563,12 +563,36 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		return fmt.Errorf("failed to get task: %w", err)
 	}
 
+	// Fetch events for rework tasks to display review findings
+	var events []tuiclient.Event
+	if task.ReviewRound > 0 {
+		events, err = client.ListEvents(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("failed to get task events: %w", err)
+		}
+	}
+
+	// Extract review findings from events
+	reviewFindings := extractReviewFindings(events, task.ReviewRound)
+
 	if jsonOutput {
-		output, err := json.MarshalIndent(task, "", "  ")
+		// Build output with review findings added to the task
+		output := map[string]interface{}{}
+		taskJSON, err := json.Marshal(task)
+		if err != nil {
+			return fmt.Errorf("failed to marshal task: %w", err)
+		}
+		if err := json.Unmarshal(taskJSON, &output); err != nil {
+			return fmt.Errorf("failed to unmarshal task: %w", err)
+		}
+		if len(reviewFindings) > 0 {
+			output["review_findings"] = reviewFindings
+		}
+		finalOutput, err := json.MarshalIndent(output, "", "  ")
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
-		fmt.Fprintln(out, string(output))
+		fmt.Fprintln(out, string(finalOutput))
 	} else {
 		fmt.Fprintf(out, "ID: %s\n", task.ID)
 		fmt.Fprintf(out, "State: %s\n", task.State)
@@ -576,6 +600,9 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		fmt.Fprintf(out, "Kind: %s\n", task.Kind)
 		fmt.Fprintf(out, "Title: %s\n", task.Title)
 		fmt.Fprintf(out, "Spec: %s\n", task.Spec)
+		if task.ReviewRound > 0 {
+			fmt.Fprintf(out, "Review Round: %d\n", task.ReviewRound)
+		}
 		if task.TargetTaskID != nil {
 			fmt.Fprintf(out, "Target Task ID: %s\n", *task.TargetTaskID)
 		}
@@ -583,6 +610,25 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			fmt.Fprintf(out, "Links:\n")
 			for _, link := range task.Links {
 				fmt.Fprintf(out, "  - %s: %s\n", link.Kind, link.Value)
+			}
+		}
+		if len(reviewFindings) > 0 {
+			fmt.Fprintf(out, "Review Findings:\n")
+			for _, finding := range reviewFindings {
+				fmt.Fprintf(out, "  Round %d:\n", finding.Round)
+				fmt.Fprintf(out, "    Verdicts:\n")
+				for _, verdict := range finding.Verdicts {
+					fmt.Fprintf(out, "      - %s: %s\n", verdict.Actor, verdict.Verdict)
+				}
+				if len(finding.Findings) > 0 {
+					fmt.Fprintf(out, "    Findings:\n")
+					for _, f := range finding.Findings {
+						fmt.Fprintf(out, "      - [%s] %s: %s\n", f.Reviewer, f.Kind, f.Text)
+						if f.IsHistory {
+							fmt.Fprintf(out, "        (historical)\n")
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1347,6 +1393,110 @@ func executeWtEnsure(ctx context.Context, baseURL, token string, args []string) 
 	fmt.Println(wtPath)
 
 	return nil
+}
+
+// ReviewVerdictInfo holds a single reviewer's verdict
+type ReviewVerdictInfo struct {
+	Actor   string `json:"actor"`
+	Verdict string `json:"verdict"`
+}
+
+// ReviewFindingInfo holds a single review finding
+type ReviewFindingInfo struct {
+	Reviewer  string `json:"reviewer"`
+	Kind      string `json:"kind"`
+	Text      string `json:"text"`
+	IsHistory bool   `json:"is_history,omitempty"`
+}
+
+// ReviewRoundFindings holds all findings for a single review round
+type ReviewRoundFindings struct {
+	Round    int                 `json:"round"`
+	Verdicts []ReviewVerdictInfo `json:"verdicts,omitempty"`
+	Findings []ReviewFindingInfo `json:"findings,omitempty"`
+}
+
+// extractReviewFindings extracts review context from task events, grouped by review round.
+// It returns findings from the latest completed round, and marks earlier findings as historical.
+func extractReviewFindings(events []tuiclient.Event, currentReviewRound int) []ReviewRoundFindings {
+	if currentReviewRound <= 0 {
+		return nil
+	}
+
+	// Track round boundaries via spawn_review events, which carry "Round N with models: ..."
+	roundMap := make(map[int]*ReviewRoundFindings)
+
+	// Initialize all rounds up to currentReviewRound
+	for i := 1; i <= currentReviewRound; i++ {
+		roundMap[i] = &ReviewRoundFindings{Round: i}
+	}
+
+	// Single pass: assign events to rounds and extract verdicts/findings
+	activeRound := 1
+	for _, event := range events {
+		switch event.Kind {
+		case "spawn_review":
+			// Update active round based on spawn_review events
+			if event.Note != nil {
+				roundNum := parseRoundFromSpawnReview(*event.Note)
+				if roundNum > 0 {
+					activeRound = roundNum
+				}
+			}
+		case "review":
+			// Review events belong to the current active round
+			if activeRound <= currentReviewRound {
+				if event.Verdict != nil {
+					roundMap[activeRound].Verdicts = append(roundMap[activeRound].Verdicts, ReviewVerdictInfo{
+						Actor:   event.Actor,
+						Verdict: *event.Verdict,
+					})
+				}
+				// Extract findings from the note field of review events. Only reject
+				// verdicts are labeled as rejection findings the worker must address;
+				// approve verdicts that also carry a note are labeled distinctly so
+				// they are not presented as unresolved work.
+				if event.Note != nil {
+					kind := "approval"
+					if event.Verdict != nil && *event.Verdict == "reject" {
+						kind = "rejection"
+					}
+					roundMap[activeRound].Findings = append(roundMap[activeRound].Findings, ReviewFindingInfo{
+						Reviewer: event.Actor,
+						Kind:     kind,
+						Text:     *event.Note,
+					})
+				}
+			}
+		}
+	}
+
+	// Mark older rounds as historical
+	var results []ReviewRoundFindings
+	for i := 1; i <= currentReviewRound; i++ {
+		if rf := roundMap[i]; len(rf.Verdicts) > 0 || len(rf.Findings) > 0 {
+			if i < currentReviewRound {
+				for j := range rf.Findings {
+					rf.Findings[j].IsHistory = true
+				}
+			}
+			results = append(results, *rf)
+		}
+	}
+
+	return results
+}
+
+// parseRoundFromSpawnReview extracts the round number from a spawn_review event note.
+// The format is "Round N with models: [...]"
+func parseRoundFromSpawnReview(note string) int {
+	parts := strings.Fields(note)
+	if len(parts) >= 2 && parts[0] == "Round" {
+		if round, err := strconv.Atoi(parts[1]); err == nil {
+			return round
+		}
+	}
+	return -1
 }
 
 func resolveAgentIdentity(agentFlag, modelFlag string) (agentID, model string, err error) {

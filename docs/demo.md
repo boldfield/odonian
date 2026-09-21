@@ -195,6 +195,9 @@ odonian pending --project <project-id> --json | jq -r '.[] | [.id, .state, .titl
 
 ```bash
 odonian show <task-id>          # spec, state, model, links, result
+                                 # rework tasks (review_round > 0) also show the
+                                 # latest round's verdicts/findings, with earlier
+                                 # rounds retained as clearly labeled history
 odonian diff <task-id>          # the diff of the worker's commit (add --full for the whole commit)
 ```
 

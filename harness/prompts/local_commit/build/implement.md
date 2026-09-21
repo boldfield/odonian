@@ -56,17 +56,19 @@ rely on sensing elapsed time.
    `docs/features/model-and-review.md` for design context. The spec gives intent, constraints,
    pattern pointers (file:line) and acceptance criteria — and deliberately NO code. You write the
    implementation.
-4. Enter your worktree. Run `odonian wt-ensure <id>`. The CLI resolves the right base (the MR
-   branch `wi/<slug>` if a prior attempt exists, else `origin/main`), creates (or idempotently
-   re-attaches) a per-item `wip/<iid>` worktree under `$ODONIAN_WORKTREE_HOME`, and **prints the
-   worktree path** on stdout. `cd` into exactly that printed path and do all your work there. Do NOT
+4. Enter your worktree. Run `odonian show <id>` first to see the full task context, including any
+   recorded review findings and the review round if this is a rework. Then run `odonian wt-ensure <id>`. 
+   The CLI resolves the right base (the MR branch `wi/<slug>` if a prior attempt exists, else `origin/main`), 
+   creates (or idempotently re-attaches) a per-item `wip/<iid>` worktree under `$ODONIAN_WORKTREE_HOME`, and 
+   **prints the worktree path** on stdout. `cd` into exactly that printed path and do all your work there. Do NOT
    create branches or worktrees yourself — `wt-ensure` is the only way in, and it is safe to run
    again (idempotent) if you are unsure whether your worktree exists.
    - **FRESH** (first attempt): the worktree is based on `origin/main`. Implement from a clean tree.
    - **REWORK** (the task was bounced back to ready): `wt-ensure` re-attaches the SAME `wip/<iid>`
-     worktree with your prior commit already on `HEAD`. Read ONLY the **most recent** actionable
-     feedback — the reviewer's `CHANGES REQUESTED` note or a human's note (it **supersedes all
-     earlier comments**) — and address every point by editing files in that worktree.
+     worktree with your prior commit already on `HEAD`. Read the full review context from `odonian show <id>`,
+     which includes recorded review findings from previous rounds and the current review round. You MUST 
+     reconcile these recorded findings against the task specification and current diff. Address every point 
+     in the review findings by editing files in that worktree.
 5. Implement exactly what the spec requires — nothing more, nothing less. Keep the diff scoped to
    this one task. Follow its constraints and the pattern pointers it names. **Edit files only** —
    do not commit (see the Hard rule).
