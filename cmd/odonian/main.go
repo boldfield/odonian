@@ -799,9 +799,16 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		return fmt.Errorf("failed to get task: %w", taskErr)
 	}
 	if taskErr != nil {
-		// The gate is best-effort outside local_commit mode: a task-fetch failure here
-		// warns and falls through rather than blocking the submit (see enforceFeedbackGate).
-		fmt.Fprintf(os.Stderr, "warning: could not load task for pr-feedback gate check (%v); proceeding\n", taskErr)
+		// Task metadata (review round, pr link) is what tells the gate whether this is a
+		// rework that must be checked. A fetch failure means that is unknown, not that it
+		// is safe to skip — an unavailable lookup must never be read as "this is an initial
+		// submission" or "there is no outstanding feedback". Stop with a retryable error;
+		// --skip-feedback-gate remains the explicit human/emergency override.
+		if *skipFeedbackGateFlag {
+			fmt.Fprintf(os.Stderr, "WARNING: --skip-feedback-gate set; bypassing the PR feedback gate check (task lookup failed: %v)\n", taskErr)
+		} else {
+			return fmt.Errorf("could not load task for pr-feedback gate check (%w); this is retryable — retry the submit once the lookup succeeds, or pass --skip-feedback-gate to bypass (humans/emergencies only)", taskErr)
+		}
 	} else if err := enforceFeedbackGate(ctx, task, *skipFeedbackGateFlag, os.Stderr); err != nil {
 		return err
 	}
