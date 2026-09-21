@@ -1,6 +1,7 @@
 ---
 name: odonian-breakdown
-description: Use to turn a design into an executable Odonian board — decompose it into model-pinned, bite-size tasks and register the project/document/tasks via the Odonian API. The human brings the work: ALWAYS ask what to break down — never propose topics, ideas, or features to build. Works from an existing design/feature-spec document when the human has one (the common case — go straight to decomposing it); only brainstorms a design collaboratively when they don't. Proposes and takes positions on design choices and task boundaries but STOPS for the human's decision; never finalizes alone. Triggers on "break this down for the board", "decompose this doc into Odonian tasks", "put this feature on the board", "scaffold a project from this design".
+description: >-
+  Use to turn a design into an executable Odonian board — decompose it into model-pinned, bite-size tasks and register the project/document/tasks via the Odonian API. The human brings the work: ALWAYS ask what to break down — never propose topics, ideas, or features to build. Works from an existing design/feature-spec document when the human has one (the common case — go straight to decomposing it); only brainstorms a design collaboratively when they don't. Proposes and takes positions on design choices and task boundaries but STOPS for the human's decision; never finalizes alone. Triggers on "break this down for the board", "decompose this doc into Odonian tasks", "put this feature on the board", "scaffold a project from this design".
 ---
 
 # Odonian design + breakdown
@@ -104,8 +105,11 @@ Non-negotiable decomposition rules:
 - **NO code in a spec.** The spec says *what* and *why*; the implementer writes the *how*. A spec
   that contains code reduces the implementer to a paste buffer — that is contrary to the job.
 - **Decompose-to-executor: every coding task is Haiku-sized — landable in one pass.** If a task is
-  too big for Haiku, decompose it **finer**. NEVER escalate to a bigger model. Coding is Haiku;
-  Opus reviews and gates, it does not implement.
+  too big for Haiku, decompose it **finer**. Use Haiku as the initial implementation model and
+  allow Odonian's configured escalation policy to move a stalled task to a stronger model.
+  Set `escalate=true` when creating tasks unless the user explicitly disables escalation.
+  Task sizing and initial model choice do not prohibit escalation. Keep review and merge gates
+  independent of the implementation model.
 - **Dependency-order to serialize file overlap.** Two tasks that touch the same file must be
   ordered by a dependency, never left concurrent — that is the merge-conflict trap. Tasks can have
   multiple dependencies, but the graph must be a **DAG**: a cycle (A→B, B→A) leaves both tasks
@@ -136,4 +140,4 @@ board (`ODONIAN_PROJECT=<id>` + the worker/reviewer loops).
 - The human owns the **merge gate** — tasks default `agent_merge=false`; review workers approve but
   never merge.
 - You never finalize a design choice, a task boundary, or a task's spec alone.
-- Coding is Haiku; specs carry no code; same-file tasks are dependency-ordered.
+- Tasks are Haiku-sized and start on Haiku; escalation is allowed. Specs carry no code; same-file tasks are dependency-ordered.
