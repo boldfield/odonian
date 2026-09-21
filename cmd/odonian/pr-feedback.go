@@ -237,8 +237,9 @@ func getBotLogin(ctx context.Context, token string) (string, error) {
 // rather than trusting the agent to have run it, since a half-followed prompt (ack one of
 // two items, submit anyway) was observed in production on PR #314.
 //
-// A check that cannot run (network/token error) warns and lets the submit proceed — a
-// GitHub outage must not wedge the fleet.
+// A check that cannot run (network/token error) on a rework returns a retryable error;
+// the gate requires confirmation that feedback data is available. On initial submissions
+// (review_round <= 0), lookup failures warn and allow the submit to proceed.
 func enforceFeedbackGate(ctx context.Context, task tuiclient.TaskDetail, skip bool, errOut io.Writer) error {
 	if skip {
 		fmt.Fprintln(errOut, "WARNING: --skip-feedback-gate set; bypassing the PR feedback gate check")
@@ -262,8 +263,7 @@ func enforceFeedbackGate(ctx context.Context, task tuiclient.TaskDetail, skip bo
 
 	items, err := fetchUnaddressedFeedback(ctx, prURL)
 	if err != nil {
-		fmt.Fprintf(errOut, "warning: could not check pr-feedback gate (%v); proceeding without it\n", err)
-		return nil
+		return fmt.Errorf("could not retrieve pr-feedback for rework (review_round=%d): %w; retry submission after verifying feedback data is available", task.ReviewRound, err)
 	}
 
 	if len(items) == 0 {

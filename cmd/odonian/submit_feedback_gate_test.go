@@ -105,6 +105,104 @@ func githubFeedbackServer(t *testing.T, itemBody string) *httptest.Server {
 	}))
 }
 
+// githubIncidentReplayServer models PR#34 with:
+// - one resolved/acknowledged inline thread
+// - an outstanding marked global rejection
+// - another reviewer's approval (non-actionable)
+func githubIncidentReplayServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"login": "test-bot"})
+		case "/graphql":
+			w.Header().Set("Content-Type", "application/json")
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			query := body["query"]
+			switch {
+			case strings.Contains(query, "reviewThreads"):
+				// One resolved inline thread (acknowledged)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"repository": map[string]interface{}{
+							"pullRequest": map[string]interface{}{
+								"reviewThreads": map[string]interface{}{
+									"pageInfo": map[string]interface{}{"hasNextPage": false},
+									"nodes": []map[string]interface{}{
+										{
+											"id":         "thread-1",
+											"isResolved": true,
+											"path":       "file.go",
+											"line":       42,
+											"firstComments": map[string]interface{}{
+												"nodes": []map[string]interface{}{
+													{
+														"id":     "comment-1",
+														"body":   "please fix this",
+														"author": map[string]string{"login": "reviewer"},
+													},
+												},
+											},
+											"lastComments": map[string]interface{}{
+												"nodes": []map[string]interface{}{
+													{
+														"id":     "comment-1-reply",
+														"body":   "haiku-worker: addressed in abc123 (see comment thread-1)",
+														"author": map[string]string{"login": "test-bot"},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+			case strings.Contains(query, "comments(first:"):
+				// Outstanding marked global rejection + approval
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"repository": map[string]interface{}{
+							"pullRequest": map[string]interface{}{
+								"id": "pr-node-1",
+								"comments": map[string]interface{}{
+									"pageInfo": map[string]interface{}{"hasNextPage": false},
+									"nodes": []map[string]interface{}{
+										{
+											"id":             "global-rejection-1",
+											"databaseId":     123,
+											"body":           "gpt-5.5-reviewer: CHANGES REQUESTED\n\nThis needs work.",
+											"createdAt":      "2026-01-01T10:00:00Z",
+											"author":         map[string]string{"login": "gpt-reviewer"},
+											"reactionGroups": []interface{}{},
+										},
+										{
+											"id":             "global-approval-1",
+											"databaseId":     124,
+											"body":           "opus-reviewer: APPROVED",
+											"createdAt":      "2026-01-01T11:00:00Z",
+											"author":         map[string]string{"login": "opus-reviewer"},
+											"reactionGroups": []interface{}{},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
 func TestExecuteSubmitFeedbackGateBlocksWithRemainingItems(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/42"
 
@@ -211,14 +309,15 @@ func TestExecuteSubmitFeedbackGateBypassFlag(t *testing.T) {
 	}
 }
 
-func TestExecuteSubmitFeedbackGateCheckErrorProceeds(t *testing.T) {
+func TestExecuteSubmitFeedbackGateLookupFailureBlocks(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/42"
 
 	odonianServer := odonianTaskServer(t, "task123", 1, prURL)
 	defer odonianServer.Close()
 
 	// No GH token available anywhere, so the feedback check itself fails (not a "found
-	// items" result) — this must warn and let the submit through, not block it.
+	// items" result) — for a rework with review_round > 0, this must block the submit
+	// with an explicit error, not warn and proceed.
 	oldToken := os.Getenv("GH_TOKEN")
 	os.Unsetenv("GH_TOKEN")
 	defer func() {
@@ -234,7 +333,69 @@ func TestExecuteSubmitFeedbackGateCheckErrorProceeds(t *testing.T) {
 		"--branch", "mr/a1b2c3d4",
 		"task123",
 	})
+	if err == nil {
+		t.Fatal("expected executeSubmit to be blocked by lookup failure on a rework, got nil error")
+	}
+	if !strings.Contains(err.Error(), "could not retrieve") && !strings.Contains(err.Error(), "retry") {
+		t.Errorf("expected error to indicate retrieval failure requiring retry, got: %v", err)
+	}
+}
+
+func TestExecuteSubmitIncidentReplayOutstandingRejectionBlocks(t *testing.T) {
+	prURL := "https://github.com/owner/repo/pull/42"
+
+	odonianServer := odonianTaskServer(t, "task123", 1, prURL)
+	defer odonianServer.Close()
+
+	ghServer := githubIncidentReplayServer(t)
+	defer ghServer.Close()
+
+	oldBase := forge.GitHubBaseURL
+	forge.GitHubBaseURL = ghServer.URL
+	defer func() { forge.GitHubBaseURL = oldBase }()
+
+	t.Setenv("GH_TOKEN", "test-token")
+	t.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), odonianServer.URL, "test-token", []string{
+		"--result", "reworked",
+		"--pr", prURL,
+		"--branch", "mr/a1b2c3d4",
+		"task123",
+	})
+	if err == nil {
+		t.Fatal("expected executeSubmit to be blocked by the unacknowledged rejection")
+	}
+	// The error message should contain the pr-feedback ack instruction
+	if !strings.Contains(err.Error(), "pr-feedback ack") {
+		t.Errorf("expected error to mention pr-feedback ack, got: %v", err)
+	}
+}
+
+func TestExecuteSubmitLookupFailureAllowsInitialSubmission(t *testing.T) {
+	prURL := "https://github.com/owner/repo/pull/42"
+
+	odonianServer := odonianTaskServer(t, "task123", 0, prURL) // review_round = 0 (initial)
+	defer odonianServer.Close()
+
+	// No GH token available, so lookup fails — but review_round = 0, so it's an initial
+	// submission and the gate should not apply. Submit should proceed.
+	oldToken := os.Getenv("GH_TOKEN")
+	os.Unsetenv("GH_TOKEN")
+	defer func() {
+		if oldToken != "" {
+			os.Setenv("GH_TOKEN", oldToken)
+		}
+	}()
+	t.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), odonianServer.URL, "test-token", []string{
+		"--result", "implemented",
+		"--pr", prURL,
+		"--branch", "mr/a1b2c3d4",
+		"task123",
+	})
 	if err != nil {
-		t.Fatalf("expected a check failure to warn and proceed, got blocking error: %v", err)
+		t.Fatalf("expected executeSubmit to allow initial submission (review_round=0) despite lookup failure, got: %v", err)
 	}
 }

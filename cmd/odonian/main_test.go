@@ -702,7 +702,17 @@ func TestExecuteClaimServerError(t *testing.T) {
 
 func TestExecuteSubmitSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" && r.URL.Path == "/tasks/task123/submit" {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/tasks/task123":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":           "task123",
+				"kind":         "implement",
+				"title":        "test task",
+				"review_round": 0,
+				"links":        []map[string]string{},
+			})
+		case r.Method == "POST" && r.URL.Path == "/tasks/task123/submit":
 			var req struct {
 				AgentID string
 				Result  string
@@ -746,7 +756,17 @@ func TestExecuteSubmitSuccess(t *testing.T) {
 
 func TestExecuteSubmitNoOp(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" && r.URL.Path == "/tasks/task123/submit" {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/tasks/task123":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":           "task123",
+				"kind":         "implement",
+				"title":        "test task",
+				"review_round": 0,
+				"links":        []map[string]string{},
+			})
+		case r.Method == "POST" && r.URL.Path == "/tasks/task123/submit":
 			var req struct {
 				AgentID string
 				Result  string
@@ -784,7 +804,17 @@ func TestExecuteSubmitNoOp(t *testing.T) {
 
 func TestExecuteSubmitVerdict(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" && r.URL.Path == "/tasks/task123/submit" {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/tasks/task123":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":           "task123",
+				"kind":         "review",
+				"title":        "test task",
+				"review_round": 0,
+				"links":        []map[string]string{},
+			})
+		case r.Method == "POST" && r.URL.Path == "/tasks/task123/submit":
 			var req struct {
 				Verdict *string
 			}

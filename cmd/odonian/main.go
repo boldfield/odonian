@@ -792,17 +792,27 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		return fmt.Errorf("--no-op cannot be combined with --pr or --branch")
 	}
 
+	if !localcommit.IsLocalCommit() && *prFlag != "" && *branchFlag == "" {
+		return fmt.Errorf("--pr and --branch must be provided together")
+	}
+	if !localcommit.IsLocalCommit() && *branchFlag != "" && *prFlag == "" {
+		return fmt.Errorf("--pr and --branch must be provided together")
+	}
+
+	if *verdictFlag != "" {
+		if *verdictFlag != "approve" && *verdictFlag != "reject" {
+			return fmt.Errorf("verdict must be 'approve' or 'reject', got %q", *verdictFlag)
+		}
+	}
+
 	client := tuiclient.NewHTTPClient(baseURL, token)
 
 	task, taskErr := client.GetTask(ctx, taskID)
-	if taskErr != nil && localcommit.IsLocalCommit() {
-		return fmt.Errorf("failed to get task: %w", taskErr)
-	}
 	if taskErr != nil {
-		// The gate is best-effort outside local_commit mode: a task-fetch failure here
-		// warns and falls through rather than blocking the submit (see enforceFeedbackGate).
-		fmt.Fprintf(os.Stderr, "warning: could not load task for pr-feedback gate check (%v); proceeding\n", taskErr)
-	} else if err := enforceFeedbackGate(ctx, task, *skipFeedbackGateFlag, os.Stderr); err != nil {
+		return fmt.Errorf("failed to get task (required for rework gate and task metadata): %w; retry submission", taskErr)
+	}
+
+	if err := enforceFeedbackGate(ctx, task, *skipFeedbackGateFlag, os.Stderr); err != nil {
 		return err
 	}
 
@@ -881,23 +891,16 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 			links = []tuiclient.LinkInput{
 				{Kind: "no_op", Value: "already-satisfied"},
 			}
-		} else {
-			if *prFlag != "" && *branchFlag != "" {
-				links = []tuiclient.LinkInput{
-					{Kind: "pr", Value: *prFlag},
-					{Kind: "branch", Value: *branchFlag},
-				}
-			} else if *prFlag != "" || *branchFlag != "" {
-				return fmt.Errorf("--pr and --branch must be provided together")
+		} else if *prFlag != "" && *branchFlag != "" {
+			links = []tuiclient.LinkInput{
+				{Kind: "pr", Value: *prFlag},
+				{Kind: "branch", Value: *branchFlag},
 			}
 		}
 	}
 
 	var verdict *string
 	if *verdictFlag != "" {
-		if *verdictFlag != "approve" && *verdictFlag != "reject" {
-			return fmt.Errorf("verdict must be 'approve' or 'reject', got %q", *verdictFlag)
-		}
 		verdict = verdictFlag
 	}
 
