@@ -141,8 +141,12 @@ whitelist in `TransitionTask` ([`internal/store/store.go`](./internal/store/stor
 Review is unanimous: one reject returns the parent to `ready` with its review round incremented.
 On rework, the worker must address every unaddressed review item on the PR, inline threads and
 top-level comments alike: enumerate them with `odonian pr-feedback list`, acknowledge each with
-`odonian pr-feedback ack` (a marker-stamped reply plus thread resolution or a 👍 reaction), and
-only then can `odonian submit` succeed. It refuses while any item remains. That gate is mechanical,
+`odonian pr-feedback ack` (a marker-stamped reply naming the exact comment/thread and a fixing
+commit, plus thread resolution for inline items — a reaction alone never acknowledges a global
+comment), and only then can `odonian submit` succeed. It refuses while any item remains, and it
+refuses if the task or feedback lookup itself fails rather than treating an unsuccessful lookup as
+zero outstanding items — that failure is retryable, so retry the submit once the lookup succeeds,
+or pass `--skip-feedback-gate` for an explicit human/emergency bypass. That gate is mechanical,
 in the CLI, not an instruction in a prompt. Past a per-model round threshold the **circuit breaker** fires: if
 escalation is enabled for the task and a higher tier exists, the task is superseded by a copy pinned
 to the next model up (`haiku → sonnet → opus` by default) and promoted straight to `ready`;
