@@ -15,10 +15,12 @@ import (
 )
 
 // odonianTaskServer returns a mock odonian server serving GET /tasks/{id} with the given
-// review round and pr link, and accepting POST /tasks/{id}/submit unconditionally.
-func odonianTaskServer(t *testing.T, taskID string, reviewRound int, prLink string) *httptest.Server {
+// review round and pr link. It tracks POST /tasks/{id}/submit calls; use taskSubmitCalled
+// to check whether POST was sent.
+func odonianTaskServer(t *testing.T, taskID string, reviewRound int, prLink string) (*httptest.Server, *bool) {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var submitCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/tasks/"+taskID:
 			links := []map[string]string{}
@@ -34,11 +36,13 @@ func odonianTaskServer(t *testing.T, taskID string, reviewRound int, prLink stri
 				"links":        links,
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/tasks/"+taskID+"/submit":
+			submitCalled = true
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
+	return server, &submitCalled
 }
 
 // githubFeedbackServer returns a mock GitHub API serving /user and /graphql. If item is
@@ -206,7 +210,7 @@ func githubIncidentReplayServer(t *testing.T) *httptest.Server {
 func TestExecuteSubmitFeedbackGateBlocksWithRemainingItems(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/42"
 
-	odonianServer := odonianTaskServer(t, "task123", 1, prURL)
+	odonianServer, submitCalled := odonianTaskServer(t, "task123", 1, prURL)
 	defer odonianServer.Close()
 
 	ghServer := githubFeedbackServer(t, "please fix this")
@@ -231,12 +235,15 @@ func TestExecuteSubmitFeedbackGateBlocksWithRemainingItems(t *testing.T) {
 	if !strings.Contains(err.Error(), "pr-feedback ack") {
 		t.Errorf("expected error to point at pr-feedback ack, got: %v", err)
 	}
+	if *submitCalled {
+		t.Error("expected POST /submit to NOT be called when blocked by feedback gate")
+	}
 }
 
 func TestExecuteSubmitFeedbackGateCleanPass(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/42"
 
-	odonianServer := odonianTaskServer(t, "task123", 1, prURL)
+	odonianServer, submitCalled := odonianTaskServer(t, "task123", 1, prURL)
 	defer odonianServer.Close()
 
 	ghServer := githubFeedbackServer(t, "")
@@ -258,12 +265,15 @@ func TestExecuteSubmitFeedbackGateCleanPass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected executeSubmit to pass with no unaddressed feedback, got: %v", err)
 	}
+	if !*submitCalled {
+		t.Error("expected POST /submit to be called when feedback gate passes")
+	}
 }
 
 func TestExecuteSubmitFeedbackGateBypassFlag(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/42"
 
-	odonianServer := odonianTaskServer(t, "task123", 1, prURL)
+	odonianServer, submitCalled := odonianTaskServer(t, "task123", 1, prURL)
 	defer odonianServer.Close()
 
 	// A real GitHub mock with an outstanding item, and a working token: without
@@ -307,12 +317,15 @@ func TestExecuteSubmitFeedbackGateBypassFlag(t *testing.T) {
 	if !strings.Contains(stderr.String(), "WARNING") {
 		t.Errorf("expected a loud warning on bypass, got stderr: %q", stderr.String())
 	}
+	if !*submitCalled {
+		t.Error("expected POST /submit to be called when bypass flag is used")
+	}
 }
 
 func TestExecuteSubmitFeedbackGateLookupFailureBlocks(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/42"
 
-	odonianServer := odonianTaskServer(t, "task123", 1, prURL)
+	odonianServer, submitCalled := odonianTaskServer(t, "task123", 1, prURL)
 	defer odonianServer.Close()
 
 	// No GH token available anywhere, so the feedback check itself fails (not a "found
@@ -339,12 +352,15 @@ func TestExecuteSubmitFeedbackGateLookupFailureBlocks(t *testing.T) {
 	if !strings.Contains(err.Error(), "could not retrieve") && !strings.Contains(err.Error(), "retry") {
 		t.Errorf("expected error to indicate retrieval failure requiring retry, got: %v", err)
 	}
+	if *submitCalled {
+		t.Error("expected POST /submit to NOT be called when feedback lookup fails on a rework")
+	}
 }
 
 func TestExecuteSubmitIncidentReplayOutstandingRejectionBlocks(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/42"
 
-	odonianServer := odonianTaskServer(t, "task123", 1, prURL)
+	odonianServer, submitCalled := odonianTaskServer(t, "task123", 1, prURL)
 	defer odonianServer.Close()
 
 	ghServer := githubIncidentReplayServer(t)
@@ -370,12 +386,15 @@ func TestExecuteSubmitIncidentReplayOutstandingRejectionBlocks(t *testing.T) {
 	if !strings.Contains(err.Error(), "pr-feedback ack") {
 		t.Errorf("expected error to mention pr-feedback ack, got: %v", err)
 	}
+	if *submitCalled {
+		t.Error("expected POST /submit to NOT be called when incident replay has outstanding rejection")
+	}
 }
 
 func TestExecuteSubmitLookupFailureAllowsInitialSubmission(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/42"
 
-	odonianServer := odonianTaskServer(t, "task123", 0, prURL) // review_round = 0 (initial)
+	odonianServer, submitCalled := odonianTaskServer(t, "task123", 0, prURL) // review_round = 0 (initial)
 	defer odonianServer.Close()
 
 	// No GH token available, so lookup fails — but review_round = 0, so it's an initial
@@ -397,5 +416,174 @@ func TestExecuteSubmitLookupFailureAllowsInitialSubmission(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("expected executeSubmit to allow initial submission (review_round=0) despite lookup failure, got: %v", err)
+	}
+	if !*submitCalled {
+		t.Error("expected POST /submit to be called for initial submission")
+	}
+}
+
+func TestExecuteSubmitTaskFetchFailureBlocks(t *testing.T) {
+	prURL := "https://github.com/owner/repo/pull/42"
+
+	// odonianTaskServer that errors on GetTask (always returns 500)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/tasks/") {
+			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+		"--result", "reworked",
+		"--pr", prURL,
+		"--branch", "mr/a1b2c3d4",
+		"task123",
+	})
+	if err == nil {
+		t.Fatal("expected executeSubmit to be blocked when GetTask fails, got nil error")
+	}
+	if !strings.Contains(err.Error(), "failed to get task") {
+		t.Errorf("expected error to mention failed GetTask, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "retry") {
+		t.Errorf("expected error to indicate retry needed, got: %v", err)
+	}
+}
+
+// githubIncidentReplayServerWithAcknowledgment models PR#34 but with the outstanding
+// rejection already acknowledged, so submission should be permitted.
+func githubIncidentReplayServerWithAcknowledgment(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"login": "test-bot"})
+		case "/graphql":
+			w.Header().Set("Content-Type", "application/json")
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			query := body["query"]
+			switch {
+			case strings.Contains(query, "reviewThreads"):
+				// One resolved inline thread (acknowledged)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"repository": map[string]interface{}{
+							"pullRequest": map[string]interface{}{
+								"reviewThreads": map[string]interface{}{
+									"pageInfo": map[string]interface{}{"hasNextPage": false},
+									"nodes": []map[string]interface{}{
+										{
+											"id":         "thread-1",
+											"isResolved": true,
+											"path":       "file.go",
+											"line":       42,
+											"firstComments": map[string]interface{}{
+												"nodes": []map[string]interface{}{
+													{
+														"id":     "comment-1",
+														"body":   "please fix this",
+														"author": map[string]string{"login": "reviewer"},
+													},
+												},
+											},
+											"lastComments": map[string]interface{}{
+												"nodes": []map[string]interface{}{
+													{
+														"id":     "comment-1-reply",
+														"body":   "haiku-worker: addressed in abc123 (see comment thread-1)",
+														"author": map[string]string{"login": "test-bot"},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+			case strings.Contains(query, "comments(first:"):
+				// Previously-outstanding rejection, now acknowledged + approval (non-actionable)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"repository": map[string]interface{}{
+							"pullRequest": map[string]interface{}{
+								"id": "pr-node-1",
+								"comments": map[string]interface{}{
+									"pageInfo": map[string]interface{}{"hasNextPage": false},
+									"nodes": []map[string]interface{}{
+										{
+											"id":             "global-rejection-1",
+											"databaseId":     123,
+											"body":           "gpt-5.5-reviewer: CHANGES REQUESTED\n\nThis needs work.",
+											"createdAt":      "2026-01-01T10:00:00Z",
+											"author":         map[string]string{"login": "gpt-reviewer"},
+											"reactionGroups": []interface{}{},
+										},
+										{
+											"id":             "rejection-ack-1",
+											"databaseId":     123,
+											"body":           "haiku-worker: addressed in def456 (see comment global-rejection-1)",
+											"createdAt":      "2026-01-01T12:00:00Z",
+											"author":         map[string]string{"login": "test-bot"},
+											"reactionGroups": []interface{}{},
+										},
+										{
+											"id":             "global-approval-1",
+											"databaseId":     124,
+											"body":           "opus-reviewer: APPROVED",
+											"createdAt":      "2026-01-01T11:00:00Z",
+											"author":         map[string]string{"login": "opus-reviewer"},
+											"reactionGroups": []interface{}{},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+func TestExecuteSubmitIncidentReplaySpecificAcknowledgmentPermits(t *testing.T) {
+	prURL := "https://github.com/owner/repo/pull/42"
+
+	odonianServer, submitCalled := odonianTaskServer(t, "task123", 1, prURL)
+	defer odonianServer.Close()
+
+	ghServer := githubIncidentReplayServerWithAcknowledgment(t)
+	defer ghServer.Close()
+
+	oldBase := forge.GitHubBaseURL
+	forge.GitHubBaseURL = ghServer.URL
+	defer func() { forge.GitHubBaseURL = oldBase }()
+
+	t.Setenv("GH_TOKEN", "test-token")
+	t.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), odonianServer.URL, "test-token", []string{
+		"--result", "reworked",
+		"--pr", prURL,
+		"--branch", "mr/a1b2c3d4",
+		"task123",
+	})
+	if err != nil {
+		t.Fatalf("expected executeSubmit to permit when the specific outstanding rejection is acknowledged, got: %v", err)
+	}
+	if !*submitCalled {
+		t.Error("expected POST /submit to be called when the rejection is properly acknowledged")
 	}
 }
