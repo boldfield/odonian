@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags "-X main.version=${VERSION}" -o /out/odonian ./cmd/odonian
 
 # --- Runtime: Node base (for claude) + toolchains ---
-FROM node:20-slim
+FROM node:22-slim
 
 # System deps + C/C++ toolchain (covers cgo, native builds, and most "build-essential" tools).
 # libgc-dev = Boehm GC: Sigil-compiled programs + the sigil runtime/e2e tests link `-lgc`, so
@@ -46,10 +46,14 @@ RUN set -eux; \
 COPY --from=golang:1.25-bookworm /usr/local/go /usr/local/go
 
 # claude CLI (subscription auth comes at runtime via CLAUDE_CODE_OAUTH_TOKEN env).
-RUN npm install -g @anthropic-ai/claude-code
+# Pinned to 2.1.281: supports claude-opus-5-5 model (requires >= 2.1.280).
+# See: https://www.npmjs.com/package/@anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code@2.1.281
 
 # Codex CLI (OpenAI Codex tool).
-RUN npm install -g @openai/codex
+# Pinned to 0.156.1: supports gpt-6-astra model (0.149.0 rejected it).
+# See: https://www.npmjs.com/package/@openai/codex
+RUN npm install -g @openai/codex@0.156.1
 
 # odonian CLI + harness + the shared fleet entrypoint.
 COPY --from=odonian-builder /out/odonian /usr/local/bin/odonian
