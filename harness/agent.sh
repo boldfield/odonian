@@ -303,13 +303,94 @@ ensure_worktree() {
   echo "$wt"
 }
 
-# Run one claude task, shielded from Ctrl-C, waiting until it truly finishes.
-# Captures claude's exit code and backs off on failure: a non-zero exit means claude
-# could not run (out of credits, auth, missing binary) — NOT that the task is bad. With
-# no backoff the loop would re-dispatch into a failing claude instantly and spin. The
-# backoff escalates with consecutive failures (capped) and self-heals when claude works
-# again (credits returned), so an overnight credit lapse pauses rather than hammers.
-CLAUDE_FAILS=0
+# --- per-model backend availability (bash 3.2: parallel indexed arrays, no assoc arrays) ---
+# A dispatch failure (claude/codex exits non-zero — out of credits, auth, spend limit) is a
+# property of the MODEL's backend, not of this pod or the task it was trying. Tracking it per
+# model (instead of one pod-wide failure counter) means a failing Claude backend never delays
+# codex-routed (or any other model's) work: only that model's tasks are skipped, for an
+# escalating-but-capped window, until it is retried.
+FAIL_MODEL_NAMES=()
+FAIL_MODEL_UNTIL=()   # epoch seconds when the matching model's backoff window ends
+FAIL_MODEL_COUNTS=()  # consecutive failures for that model, for escalating backoff
+
+# Echo the index of $1 in FAIL_MODEL_NAMES, or nothing (rc=1) if not tracked.
+_fail_model_index() {
+  local i
+  for i in "${!FAIL_MODEL_NAMES[@]}"; do
+    [ "${FAIL_MODEL_NAMES[$i]}" = "$1" ] && { echo "$i"; return 0; }
+  done
+  return 1
+}
+
+_fail_model_drop() {
+  local i="$1"
+  unset 'FAIL_MODEL_NAMES[i]' 'FAIL_MODEL_UNTIL[i]' 'FAIL_MODEL_COUNTS[i]'
+  FAIL_MODEL_NAMES=("${FAIL_MODEL_NAMES[@]}")
+  FAIL_MODEL_UNTIL=("${FAIL_MODEL_UNTIL[@]}")
+  FAIL_MODEL_COUNTS=("${FAIL_MODEL_COUNTS[@]}")
+}
+
+# True (rc=0) if model $1 is currently within a failure backoff window — the caller should skip
+# claimable tasks pinned to it. Clears the record and logs a retry line once the window elapses,
+# so the model becomes a normal candidate again on the very next check.
+model_unavailable() {
+  local m="$1" i now
+  i="$(_fail_model_index "$m")" || return 1
+  now=$(date +%s)
+  if [ "$now" -lt "${FAIL_MODEL_UNTIL[$i]}" ]; then
+    return 0
+  fi
+  echo "[$AGENT_ID] $(date '+%H:%M:%S') model $m backoff window elapsed; retrying" >&2
+  _fail_model_drop "$i"
+  return 1
+}
+
+# Record a dispatch failure attributable to model $1's backend; escalating capped backoff,
+# mirroring the previous pod-wide CLAUDE_FAILS scheme but scoped to just this model.
+mark_model_unavailable() {
+  local m="$1" i count backoff now
+  i="$(_fail_model_index "$m")"
+  count=1
+  [ -n "$i" ] && count=$((${FAIL_MODEL_COUNTS[$i]} + 1))
+  backoff=$((count * 30)); [ "$backoff" -gt 300 ] && backoff=300
+  now=$(date +%s)
+  if [ -n "$i" ]; then
+    FAIL_MODEL_UNTIL[$i]=$((now + backoff)); FAIL_MODEL_COUNTS[$i]=$count
+  else
+    FAIL_MODEL_NAMES+=("$m"); FAIL_MODEL_UNTIL+=("$((now + backoff))"); FAIL_MODEL_COUNTS+=("$count")
+  fi
+  echo "[$AGENT_ID] $(date '+%H:%M:%S') model $m backend unavailable (consecutive failures=$count); skipping its tasks for ${backoff}s" >&2
+}
+
+# Self-heal on a successful dispatch: this model's backend works again.
+clear_model_failures() {
+  local i
+  i="$(_fail_model_index "$1")" || return 0
+  _fail_model_drop "$i"
+}
+
+# Select the highest-priority claimable task of kind $2 in project $1 whose model is not
+# currently in a failure backoff window, skipping past any head task(s) pinned to an unavailable
+# model. Echoes "id<TAB>model" of the chosen task, or nothing if the project has no claimable
+# task of this kind, or every claimable task's model is unavailable (the caller then falls back
+# to its normal "nothing claimable" nap — the agent only backs off entirely in that case).
+pick_claimable_task() {
+  local project="$1" kind="$2" json id model
+  json=$(odonian tasks --project "$project" --claimable --kind "$kind" --json 2>/dev/null) || return 0
+  while IFS=$'\t' read -r id model; do
+    [ -n "$id" ] || continue
+    model_unavailable "$model" && continue
+    printf '%s\t%s\n' "$id" "$model"
+    return 0
+  done < <(printf '%s' "$json" | jq -r '.[]? | "\(.id)\t\(.model)"' 2>/dev/null)
+  return 0
+}
+
+# Run one claude task, shielded from Ctrl-C, waiting until it truly finishes. Captures claude's
+# exit code: a non-zero exit means claude could not run (out of credits, auth, missing binary) —
+# NOT that the task is bad. On failure this marks $AGENT_MODEL's backend unavailable (see above)
+# rather than sleeping the whole pod, so a pass immediately following a failure can still
+# dispatch a different, healthy model's claimable work instead of idling out the backoff.
 dispatch() {
   # Substitute the __AGENT_MODEL__ placeholder with this dispatch's actual model so the agent
   # self-identifies correctly (e.g. review prompts sign PR comments "<model>-reviewer:" instead of
@@ -348,12 +429,10 @@ dispatch() {
   # failure and don't back off; just unwind so the loop can exit promptly.
   [ "$STOP" -eq 1 ] && return "$rc"
   if [ "$rc" -ne 0 ]; then
-    CLAUDE_FAILS=$((CLAUDE_FAILS + 1))
-    local backoff=$((CLAUDE_FAILS * 30)); [ "$backoff" -gt 300 ] && backoff=300
-    echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatch exited rc=$rc (likely out of credits/auth); consecutive failures=$CLAUDE_FAILS, backing off ${backoff}s" >&2
-    nap "$backoff"
+    echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatch exited rc=$rc (likely out of credits/auth) for model $AGENT_MODEL" >&2
+    mark_model_unavailable "$AGENT_MODEL"
   else
-    CLAUDE_FAILS=0
+    clear_model_failures "$AGENT_MODEL"
   fi
   return "$rc"
 }
@@ -416,18 +495,15 @@ if [ "$MULTI" = 0 ]; then
   while true; do
     [ "$STOP" -eq 1 ] && break
     if has_claimable_work "$ODONIAN_PROJECT"; then
-      # Find the next claimable task (any model) and get its model
-      task_id=$(odonian next --project "$ODONIAN_PROJECT" --kind "$KIND" 2>/dev/null)
-      if [ -z "$task_id" ]; then
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND); sleeping 30s"; nap 30; continue
+      # Pick the highest-priority claimable task whose model isn't in a failure backoff window
+      # (skipping past any head task pinned to an unavailable model — see pick_claimable_task).
+      sel=$(pick_claimable_task "$ODONIAN_PROJECT" "$KIND")
+      if [ -z "$sel" ]; then
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND) with an available model; sleeping 30s"; nap 30; continue
       fi
-      task_json=$(odonian show "$task_id" --json 2>/dev/null)
-      task_model=$(echo "$task_json" | jq -r '.model // ""')
-      if [ -z "$task_model" ]; then
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') failed to read task model for $task_id; sleeping 30s"; nap 30; continue
-      fi
+      task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
       # Read track from task, default to 'build' if absent
-      task_track=$(echo "$task_json" | jq -r '.track // "build"')
+      task_track=$(odonian show "$task_id" --json 2>/dev/null | jq -r '.track // "build"')
       PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
       if [ ! -f "$PROMPT_FILE" ]; then
         odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
@@ -479,24 +555,23 @@ while true; do
     in_allow "$pid" || continue
     # Re-check claimable (the listing can race another worker); skip if it emptied out.
     has_claimable_work "$pid" || continue
+    # Pick the highest-priority claimable task whose model isn't in a failure backoff window
+    # (skipping past any head task pinned to an unavailable model — see pick_claimable_task).
+    # Done before cloning so a project whose only claimable work is on a down backend doesn't
+    # cost a clone/worktree setup — try the next project instead.
+    sel=$(pick_claimable_task "$pid" "$KIND")
+    if [ -z "$sel" ]; then
+      continue   # raced away, or every claimable task's model is unavailable — try next project
+    fi
+    task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
     apply_owner_token "$(norm_repo "$prepo" | cut -d/ -f1)"   # auth as the repo's owner (default auth if unmapped)
     prune_repos_cache "$REPOS_DIR/$(repo_slug "$prepo")"
     clone="$(ensure_clone "$prepo")" || continue
     wt="$(ensure_worktree "$clone")" || continue
     export ODONIAN_PROJECT="$pid" ODONIAN_REPO="$wt"
     cd "$wt" || continue
-    # Find the next claimable task (any model) and get its model
-    task_id=$(odonian next --project "$pid" --kind "$KIND" 2>/dev/null)
-    if [ -z "$task_id" ]; then
-      continue   # task raced away, try next project
-    fi
-    task_json=$(odonian show "$task_id" --json 2>/dev/null)
-    task_model=$(echo "$task_json" | jq -r '.model // ""')
-    if [ -z "$task_model" ]; then
-      continue   # couldn't read task model, try next project
-    fi
     # Read track from task, default to 'build' if absent
-    task_track=$(echo "$task_json" | jq -r '.track // "build"')
+    task_track=$(odonian show "$task_id" --json 2>/dev/null | jq -r '.track // "build"')
     PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
     if [ ! -f "$PROMPT_FILE" ]; then
       odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
