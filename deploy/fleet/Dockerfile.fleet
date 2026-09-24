@@ -24,9 +24,11 @@ FROM node:22-slim
 # libgc-dev = Boehm GC: Sigil-compiled programs + the sigil runtime/e2e tests link `-lgc`, so
 # without it any sigil `make check`/`make test` fails at link with "unable to find library -lgc",
 # which auto-rejects every sigil review round and escalates the task to the top tier.
+# poppler-utils = PDF rendering (pdfinfo, pdftoppm, pdftotext) for the history.rehab research pilot.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates jq build-essential pkg-config cmake clang lld \
       libgc-dev \
+      poppler-utils \
       python3 python3-pip python3-venv python3-yaml \
  && rm -rf /var/lib/apt/lists/*
 
