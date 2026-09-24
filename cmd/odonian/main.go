@@ -491,6 +491,8 @@ func executeTasks(ctx context.Context, baseURL, token string, jsonOutput bool, a
 	projectFlag := fs.String("project", "", "project ID")
 	stateFlag := fs.String("state", "", "filter by state")
 	modelFlag := fs.String("model", "", "filter by model")
+	kindFlag := fs.String("kind", "", "filter by kind")
+	claimableFlag := fs.Bool("claimable", false, "filter by claimable status")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
@@ -506,6 +508,12 @@ func executeTasks(ctx context.Context, baseURL, token string, jsonOutput bool, a
 	}
 	if *modelFlag != "" {
 		opts = append(opts, tuiclient.WithModel(*modelFlag))
+	}
+	if *kindFlag != "" {
+		opts = append(opts, tuiclient.WithKind(*kindFlag))
+	}
+	if *claimableFlag {
+		opts = append(opts, tuiclient.WithClaimable(true))
 	}
 	tasks, err := client.ListTasks(ctx, *projectFlag, opts...)
 	if err != nil {
