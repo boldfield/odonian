@@ -146,6 +146,30 @@ room, not as a substitute for this bound), leaving headroom for worktrees and to
 also live under `$ODONIAN_HOME` but are not touched by this prune — only `$ODONIAN_HOME/repos`
 is in scope.
 
+### PDF rendering and source inspection
+
+The fleet image includes Poppler utilities (`pdfinfo`, `pdftoppm`, `pdftotext`) for PDF rendering
+and text extraction, used in research workflows like the history.rehab pilot.
+
+**Source-inspection procedure:**
+
+To render or inspect a PDF file within a worker/reviewer pod:
+
+1. **Get PDF metadata:** `pdfinfo /path/to/file.pdf` — lists page count, dimensions, encryption
+   status, and other document properties. Redacted PDFs report `text "cannot" be extracted`.
+2. **Render a page to image:** `pdftoppm -png -singlefile -f 2 -l 2 /path/to/file.pdf /tmp/page` —
+   renders page 2 of the PDF to a PNG image at `/tmp/page.png`. Use `-f` and `-l` to specify the
+   page range; `-png` sets the output format.
+3. **Extract text from a page:** `pdftotext -f 2 -l 2 /path/to/file.pdf -` — extracts text from
+   pages 2 through 2, writing to stdout. If the PDF is redacted or malformed, extraction may fail
+   silently (producing empty output), which is NOT treated as proof of redaction without visual
+   verification.
+
+**Performance note:** Large PDFs or full-document operations (extracting all pages) can be
+memory-intensive. Extract specific page ranges when possible. Rendering outputs (images and
+extracted text) are ephemeral — store them in temporary directories (`/tmp` or pod-local
+`emptyDir` volumes) and clean them up to avoid filling the pod's home volume.
+
 ### Releasing a new fleet image
 
 1. Build and push an explicit version: `make fleet-image VERSION=<version> FLEET_TAG=<version>`
