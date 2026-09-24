@@ -61,7 +61,8 @@ RUN npm install -g @openai/codex@0.156.1
 COPY --from=odonian-builder /out/odonian /usr/local/bin/odonian
 COPY harness/ /harness/
 COPY deploy/fleet/fleet-entrypoint.sh /usr/local/bin/fleet-entrypoint.sh
-RUN chmod +x /usr/local/bin/fleet-entrypoint.sh /harness/agent.sh
+COPY deploy/fleet/pdf-smoke-check.sh /usr/local/bin/pdf-smoke-check.sh
+RUN chmod +x /usr/local/bin/fleet-entrypoint.sh /harness/agent.sh /usr/local/bin/pdf-smoke-check.sh
 
 # Symlink Go binaries to /usr/local/bin so Codex reviewer can find them.
 # Codex rebuilds PATH and doesn't inherit Docker ENV additions, so Go must be in /usr/local/bin.
@@ -74,6 +75,10 @@ USER 1000
 ENV HOME=/home/agent \
     ODONIAN_HOME=/home/agent/.odonian \
     PATH="/usr/local/go/bin:/home/agent/.cargo/bin:${PATH}"
+
+# Verify PDF rendering capabilities: run smoke check as non-root user.
+# This ensures the worker/reviewer runtime can render PDFs as required by the history.rehab pilot.
+RUN /usr/local/bin/pdf-smoke-check.sh
 
 # Rust toolchain (per-user via rustup) — many faictory tools are Rust crates.
 # rustfmt + clippy are required for sigil's `make check` (and the CI rustfmt gate): the minimal
