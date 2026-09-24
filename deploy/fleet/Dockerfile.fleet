@@ -78,7 +78,8 @@ ENV HOME=/home/agent \
 
 # Verify PDF rendering capabilities: run smoke check as non-root user.
 # This ensures the worker/reviewer runtime can render PDFs as required by the history.rehab pilot.
-RUN /usr/local/bin/pdf-smoke-check.sh
+# Test with the NIC PDF (page 2) as specified by the history.rehab research-review pilot.
+RUN PDF_URL=https://cdn.factcheck.org/UploadedFiles/SOCM-2025-11374_Redacted.pdf /usr/local/bin/pdf-smoke-check.sh
 
 # Rust toolchain (per-user via rustup) — many faictory tools are Rust crates.
 # rustfmt + clippy are required for sigil's `make check` (and the CI rustfmt gate): the minimal
