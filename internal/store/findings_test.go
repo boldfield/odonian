@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -79,6 +80,8 @@ func TestFindingsValidation_ValidSubmission(t *testing.T) {
 	}
 
 	priorID := "finding-0"
+	inChangedTrue := true
+	inChangedFalse := false
 	findings := []Finding{
 		{
 			ID:            "finding-1",
@@ -86,7 +89,7 @@ func TestFindingsValidation_ValidSubmission(t *testing.T) {
 			File:          "src/main.go",
 			Line:          42,
 			Summary:       "Missing error handling",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "new",
 		},
 		{
@@ -95,7 +98,7 @@ func TestFindingsValidation_ValidSubmission(t *testing.T) {
 			File:          "src/main.go",
 			Line:          50,
 			Summary:       "Typo in variable name",
-			InChangedText: false,
+			InChangedText: &inChangedFalse,
 			Status:        "still_open",
 			PriorID:       &priorID,
 		},
@@ -155,6 +158,7 @@ func TestFindingsValidation_InvalidID(t *testing.T) {
 	ctx := context.Background()
 	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
 
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "", // Empty ID should fail
@@ -162,7 +166,7 @@ func TestFindingsValidation_InvalidID(t *testing.T) {
 			File:          "src/main.go",
 			Line:          42,
 			Summary:       "Some issue",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "new",
 		},
 	}
@@ -193,6 +197,7 @@ func TestFindingsValidation_InvalidSeverity(t *testing.T) {
 	ctx := context.Background()
 	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
 
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "f1",
@@ -200,7 +205,7 @@ func TestFindingsValidation_InvalidSeverity(t *testing.T) {
 			File:          "src/main.go",
 			Line:          42,
 			Summary:       "Some issue",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "new",
 		},
 	}
@@ -231,6 +236,7 @@ func TestFindingsValidation_EmptyFile(t *testing.T) {
 	ctx := context.Background()
 	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
 
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "f1",
@@ -238,7 +244,7 @@ func TestFindingsValidation_EmptyFile(t *testing.T) {
 			File:          "", // Empty file
 			Line:          42,
 			Summary:       "Some issue",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "new",
 		},
 	}
@@ -269,6 +275,7 @@ func TestFindingsValidation_NonPositiveLine(t *testing.T) {
 	ctx := context.Background()
 	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
 
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "f1",
@@ -276,7 +283,7 @@ func TestFindingsValidation_NonPositiveLine(t *testing.T) {
 			File:          "src/main.go",
 			Line:          0, // Non-positive
 			Summary:       "Some issue",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "new",
 		},
 	}
@@ -307,6 +314,7 @@ func TestFindingsValidation_EmptySummary(t *testing.T) {
 	ctx := context.Background()
 	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
 
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "f1",
@@ -314,7 +322,7 @@ func TestFindingsValidation_EmptySummary(t *testing.T) {
 			File:          "src/main.go",
 			Line:          42,
 			Summary:       "", // Empty summary
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "new",
 		},
 	}
@@ -345,6 +353,7 @@ func TestFindingsValidation_InvalidStatus(t *testing.T) {
 	ctx := context.Background()
 	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
 
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "f1",
@@ -352,7 +361,7 @@ func TestFindingsValidation_InvalidStatus(t *testing.T) {
 			File:          "src/main.go",
 			Line:          42,
 			Summary:       "Some issue",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "invalid", // Invalid status
 		},
 	}
@@ -383,6 +392,7 @@ func TestFindingsValidation_MissingPriorID(t *testing.T) {
 	ctx := context.Background()
 	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
 
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "f1",
@@ -390,7 +400,7 @@ func TestFindingsValidation_MissingPriorID(t *testing.T) {
 			File:          "src/main.go",
 			Line:          42,
 			Summary:       "Some issue",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "still_open", // Requires prior_id
 			PriorID:       nil,          // Missing
 		},
@@ -423,6 +433,7 @@ func TestFindingsValidation_UnexpectedPriorID(t *testing.T) {
 	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
 
 	priorID := "f0"
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "f1",
@@ -430,7 +441,7 @@ func TestFindingsValidation_UnexpectedPriorID(t *testing.T) {
 			File:          "src/main.go",
 			Line:          42,
 			Summary:       "Some issue",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "new",    // Doesn't allow prior_id
 			PriorID:       &priorID, // But provided anyway
 		},
@@ -494,6 +505,7 @@ func TestFindingsValidation_FindingsNotAllowedOnImplement(t *testing.T) {
 		t.Fatalf("failed to claim task: %v", err)
 	}
 
+	inChangedTrue := true
 	findings := []Finding{
 		{
 			ID:            "f1",
@@ -501,7 +513,7 @@ func TestFindingsValidation_FindingsNotAllowedOnImplement(t *testing.T) {
 			File:          "src/main.go",
 			Line:          42,
 			Summary:       "Some issue",
-			InChangedText: true,
+			InChangedText: &inChangedTrue,
 			Status:        "new",
 		},
 	}
@@ -615,6 +627,96 @@ func TestFindingsValidation_UnchangedSubmissionWithoutFindings(t *testing.T) {
 
 	if reviewEvent.Findings != nil {
 		t.Errorf("expected no findings, got %v", reviewEvent.Findings)
+	}
+}
+
+// TestFindingsValidation_MissingInChangedText tests rejection when in_changed_text is missing.
+func TestFindingsValidation_MissingInChangedText(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
+
+	findings := []Finding{
+		{
+			ID:            "f1",
+			Severity:      "P2",
+			File:          "src/main.go",
+			Line:          42,
+			Summary:       "Some issue",
+			InChangedText: nil, // Missing required field
+			Status:        "new",
+		},
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Review", &approve, []LinkInput{}, &findings, 5, nil)
+	if err == nil {
+		t.Fatalf("expected error for missing in_changed_text, got nil")
+	}
+
+	var valErr *ValidationError
+	if !errors.As(err, &valErr) {
+		t.Fatalf("expected ValidationError, got %T: %v", err, err)
+	}
+	if valErr.Code != "INVALID_FINDINGS" {
+		t.Errorf("expected code INVALID_FINDINGS, got %s", valErr.Code)
+	}
+}
+
+// TestFindingsValidation_DuplicateID tests rejection for duplicate finding IDs.
+func TestFindingsValidation_DuplicateID(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_, _, reviewTaskID := setupFindingsTest(t, store, ctx)
+
+	inChangedTrue := true
+	findings := []Finding{
+		{
+			ID:            "f1",
+			Severity:      "P2",
+			File:          "src/main.go",
+			Line:          42,
+			Summary:       "Issue 1",
+			InChangedText: &inChangedTrue,
+			Status:        "new",
+		},
+		{
+			ID:            "f1", // Duplicate ID
+			Severity:      "P2",
+			File:          "src/main.go",
+			Line:          50,
+			Summary:       "Issue 2",
+			InChangedText: &inChangedTrue,
+			Status:        "new",
+		},
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Review", &approve, []LinkInput{}, &findings, 5, nil)
+	if err == nil {
+		t.Fatalf("expected error for duplicate ID, got nil")
+	}
+
+	var valErr *ValidationError
+	if !errors.As(err, &valErr) {
+		t.Fatalf("expected ValidationError, got %T: %v", err, err)
+	}
+	if valErr.Code != "INVALID_FINDINGS" {
+		t.Errorf("expected code INVALID_FINDINGS, got %s", valErr.Code)
+	}
+	// Verify the error message contains the index
+	if !strings.Contains(valErr.Message, "findings[1]") {
+		t.Errorf("expected error message to contain findings[1], got: %s", valErr.Message)
 	}
 }
 

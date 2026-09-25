@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -631,6 +632,49 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// First pass: decode with lenient handling to catch findings type errors
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "READ_ERROR", "Failed to read request body")
+		return
+	}
+
+	var rawPayload map[string]interface{}
+	if err := json.Unmarshal(body, &rawPayload); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Invalid JSON in request body")
+		return
+	}
+
+	// Validate findings structure if present
+	if rawFindingsIface, ok := rawPayload["findings"]; ok && rawFindingsIface != nil {
+		rawFindings, ok := rawFindingsIface.([]interface{})
+		if !ok {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", "findings: must be an array")
+			return
+		}
+		// Check each finding for type errors
+		for i, rawFinding := range rawFindings {
+			findingMap, ok := rawFinding.(map[string]interface{})
+			if !ok {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d]: must be an object", i))
+				return
+			}
+			// Validate critical fields for type correctness
+			if val, ok := findingMap["line"]; ok {
+				if _, isNum := val.(float64); !isNum {
+					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+					return
+				}
+			}
+			if val, ok := findingMap["in_changed_text"]; ok {
+				if _, isBool := val.(bool); !isBool {
+					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].in_changed_text: must be a boolean", i))
+					return
+				}
+			}
+		}
+	}
+
 	var payload struct {
 		AgentID  string            `json:"agent_id"`
 		Result   string            `json:"result"`
@@ -639,8 +683,9 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		Findings *[]store.Finding  `json:"findings"`
 	}
 
-	if err := s.decodeJSON(w, r, &payload); err != nil {
-		return // decodeJSON already wrote error response
+	if err := json.Unmarshal(body, &payload); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Invalid JSON in request body")
+		return
 	}
 
 	// Validate agent_id is non-empty

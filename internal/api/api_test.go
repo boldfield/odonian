@@ -6285,3 +6285,397 @@ func TestUpdateEscalationPrefixIDResolution(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", updateW.Code)
 	}
 }
+
+// TestFindingsAPISubmission tests valid findings submission and retrieval through the HTTP API.
+func TestFindingsAPISubmission(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create implement task
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Implement feature",
+			Spec:         "Do the thing",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	implementTaskID := createdTasks[0].ID
+
+	// Promote and claim
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "haiku-impl", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	// Submit implement task to spawn review task
+	submitPayload := map[string]interface{}{
+		"agent_id": "haiku-impl",
+		"result":   "Implementation complete",
+		"links":    []map[string]string{{"kind": "pr", "value": "#100"}},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	// Get review task
+	taskListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	taskListReq.Header.Set("Authorization", authHeader)
+	taskListW := httptest.NewRecorder()
+	server.mux.ServeHTTP(taskListW, taskListReq)
+
+	var tasks []store.Task
+	json.NewDecoder(taskListW.Body).Decode(&tasks)
+
+	var reviewTaskID string
+	for _, task := range tasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == implementTaskID {
+			reviewTaskID = task.ID
+			break
+		}
+	}
+
+	if reviewTaskID == "" {
+		t.Fatalf("review task not found")
+	}
+
+	// Claim review task
+	reviewClaimPayload := map[string]string{"agent_id": "opus-reviewer", "model": "opus"}
+	reviewClaimBody, _ := json.Marshal(reviewClaimPayload)
+	reviewClaimReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/claim", bytes.NewReader(reviewClaimBody))
+	reviewClaimReq.Header.Set("Authorization", authHeader)
+	reviewClaimReq.Header.Set("Content-Type", "application/json")
+	reviewClaimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(reviewClaimW, reviewClaimReq)
+
+	// Submit review with findings
+	inChangedTrue := true
+	inChangedFalse := false
+	findings := []map[string]interface{}{
+		{
+			"id":              "finding-1",
+			"severity":        "P2",
+			"file":            "src/main.go",
+			"line":            float64(42),
+			"summary":         "Missing error handling",
+			"in_changed_text": inChangedTrue,
+			"status":          "new",
+		},
+		{
+			"id":              "finding-2",
+			"severity":        "P3",
+			"file":            "src/main.go",
+			"line":            float64(50),
+			"summary":         "Typo in variable name",
+			"in_changed_text": inChangedFalse,
+			"status":          "still_open",
+			"prior_id":        "finding-0",
+		},
+	}
+
+	reviewSubmitPayload := map[string]interface{}{
+		"agent_id": "opus-reviewer",
+		"result":   "Review with findings",
+		"verdict":  "approve",
+		"links":    []map[string]string{},
+		"findings": findings,
+	}
+	reviewSubmitBody, _ := json.Marshal(reviewSubmitPayload)
+	reviewSubmitReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(reviewSubmitBody))
+	reviewSubmitReq.Header.Set("Authorization", authHeader)
+	reviewSubmitReq.Header.Set("Content-Type", "application/json")
+	reviewSubmitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(reviewSubmitW, reviewSubmitReq)
+
+	if reviewSubmitW.Code != http.StatusOK {
+		t.Fatalf("failed to submit review with findings: got status %d, body: %s", reviewSubmitW.Code, reviewSubmitW.Body.String())
+	}
+
+	// Read events to verify findings are stored
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+implementTaskID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+
+	var events []store.Event
+	json.NewDecoder(eventsW.Body).Decode(&events)
+
+	// Find review event with findings
+	var reviewEvent *store.Event
+	for i := range events {
+		if events[i].Kind == "review" && events[i].Findings != nil {
+			reviewEvent = &events[i]
+			break
+		}
+	}
+
+	if reviewEvent == nil {
+		t.Fatalf("review event with findings not found")
+	}
+
+	if len(*reviewEvent.Findings) != 2 {
+		t.Fatalf("expected 2 findings, got %d", len(*reviewEvent.Findings))
+	}
+
+	// Verify findings content
+	f1 := (*reviewEvent.Findings)[0]
+	if f1.ID != "finding-1" || *f1.InChangedText != true {
+		t.Errorf("first finding incorrect: id=%s, inChangedText=%v", f1.ID, f1.InChangedText)
+	}
+
+	f2 := (*reviewEvent.Findings)[1]
+	if f2.ID != "finding-2" || *f2.InChangedText != false {
+		t.Errorf("second finding incorrect: id=%s, inChangedText=%v", f2.ID, f2.InChangedText)
+	}
+}
+
+// TestFindingsAPITypeErrors tests that findings with type errors return INVALID_FINDINGS.
+func TestFindingsAPITypeErrors(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create and submit implement task
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Test",
+			Spec:         "Test",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	implementTaskID := createdTasks[0].ID
+
+	// Promote and claim
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "agent1", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	submitPayload := map[string]interface{}{
+		"agent_id": "agent1",
+		"result":   "Done",
+		"links":    []map[string]string{{"kind": "pr", "value": "#100"}},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	// Get review task
+	taskListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	taskListReq.Header.Set("Authorization", authHeader)
+	taskListW := httptest.NewRecorder()
+	server.mux.ServeHTTP(taskListW, taskListReq)
+
+	var tasks []store.Task
+	json.NewDecoder(taskListW.Body).Decode(&tasks)
+
+	var reviewTaskID string
+	for _, task := range tasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == implementTaskID {
+			reviewTaskID = task.ID
+			break
+		}
+	}
+
+	// Claim review task
+	reviewClaimPayload := map[string]string{"agent_id": "reviewer", "model": "opus"}
+	reviewClaimBody, _ := json.Marshal(reviewClaimPayload)
+	reviewClaimReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/claim", bytes.NewReader(reviewClaimBody))
+	reviewClaimReq.Header.Set("Authorization", authHeader)
+	reviewClaimReq.Header.Set("Content-Type", "application/json")
+	reviewClaimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(reviewClaimW, reviewClaimReq)
+
+	// Test: line as string instead of integer
+	badFindingsPayload := map[string]interface{}{
+		"agent_id": "reviewer",
+		"result":   "Review",
+		"verdict":  "approve",
+		"links":    []map[string]string{},
+		"findings": []map[string]interface{}{
+			{
+				"id":              "f1",
+				"severity":        "P2",
+				"file":            "src/main.go",
+				"line":            "42", // Should be integer
+				"summary":         "Issue",
+				"in_changed_text": true,
+				"status":          "new",
+			},
+		},
+	}
+	badBody, _ := json.Marshal(badFindingsPayload)
+	badReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(badBody))
+	badReq.Header.Set("Authorization", authHeader)
+	badReq.Header.Set("Content-Type", "application/json")
+	badW := httptest.NewRecorder()
+	server.mux.ServeHTTP(badW, badReq)
+
+	if badW.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", badW.Code)
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(badW.Body).Decode(&errResp)
+	errObj := errResp["error"].(map[string]interface{})
+	if errObj["code"] != "INVALID_FINDINGS" {
+		t.Errorf("expected INVALID_FINDINGS, got %v", errObj["code"])
+	}
+}
+
+// TestFindingsAPIMissingInChangedText tests that missing in_changed_text is rejected.
+func TestFindingsAPIMissingInChangedText(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create and submit implement task
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Test",
+			Spec:         "Test",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	implementTaskID := createdTasks[0].ID
+
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "agent1", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	submitPayload := map[string]interface{}{
+		"agent_id": "agent1",
+		"result":   "Done",
+		"links":    []map[string]string{{"kind": "pr", "value": "#100"}},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+implementTaskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	taskListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	taskListReq.Header.Set("Authorization", authHeader)
+	taskListW := httptest.NewRecorder()
+	server.mux.ServeHTTP(taskListW, taskListReq)
+
+	var tasks []store.Task
+	json.NewDecoder(taskListW.Body).Decode(&tasks)
+
+	var reviewTaskID string
+	for _, task := range tasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == implementTaskID {
+			reviewTaskID = task.ID
+			break
+		}
+	}
+
+	reviewClaimPayload := map[string]string{"agent_id": "reviewer", "model": "opus"}
+	reviewClaimBody, _ := json.Marshal(reviewClaimPayload)
+	reviewClaimReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/claim", bytes.NewReader(reviewClaimBody))
+	reviewClaimReq.Header.Set("Authorization", authHeader)
+	reviewClaimReq.Header.Set("Content-Type", "application/json")
+	reviewClaimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(reviewClaimW, reviewClaimReq)
+
+	// Submit with missing in_changed_text
+	missingFieldPayload := map[string]interface{}{
+		"agent_id": "reviewer",
+		"result":   "Review",
+		"verdict":  "approve",
+		"links":    []map[string]string{},
+		"findings": []map[string]interface{}{
+			{
+				"id":       "f1",
+				"severity": "P2",
+				"file":     "src/main.go",
+				"line":     float64(42),
+				"summary":  "Issue",
+				// "in_changed_text" is missing
+				"status": "new",
+			},
+		},
+	}
+	missingBody, _ := json.Marshal(missingFieldPayload)
+	missingReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(missingBody))
+	missingReq.Header.Set("Authorization", authHeader)
+	missingReq.Header.Set("Content-Type", "application/json")
+	missingW := httptest.NewRecorder()
+	server.mux.ServeHTTP(missingW, missingReq)
+
+	if missingW.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", missingW.Code)
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(missingW.Body).Decode(&errResp)
+	errObj := errResp["error"].(map[string]interface{})
+	if errObj["code"] != "INVALID_FINDINGS" {
+		t.Errorf("expected INVALID_FINDINGS, got %v", errObj["code"])
+	}
+}

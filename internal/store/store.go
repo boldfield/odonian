@@ -31,7 +31,7 @@ type Finding struct {
 	File          string  `json:"file"`            // non-empty
 	Line          int     `json:"line"`            // positive integer
 	Summary       string  `json:"summary"`         // non-empty
-	InChangedText bool    `json:"in_changed_text"` // boolean
+	InChangedText *bool   `json:"in_changed_text"` // required boolean
 	Status        string  `json:"status"`          // new, still_open, resolved
 	PriorID       *string `json:"prior_id"`        // required for still_open/resolved, absent for new
 }
@@ -1703,7 +1703,7 @@ func validateFindings(findings *[]Finding) error {
 	for i, f := range *findings {
 		// Validate id: non-empty, unique within submission
 		if f.ID == "" {
-			return invalid("INVALID_FINDINGS", "findings[0].id: must be non-empty")
+			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: must be non-empty", i))
 		}
 		if seenIDs[f.ID] {
 			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: duplicate id %q", i, f.ID))
@@ -1728,6 +1728,11 @@ func validateFindings(findings *[]Finding) error {
 		// Validate summary: non-empty
 		if f.Summary == "" {
 			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].summary: must be non-empty", i))
+		}
+
+		// Validate in_changed_text: must be present
+		if f.InChangedText == nil {
+			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].in_changed_text: must be a boolean", i))
 		}
 
 		// Validate status: must be new, still_open, or resolved
