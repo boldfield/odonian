@@ -92,6 +92,30 @@ else
   test_fail "a delivery-mode build prompt is missing"
 fi
 
+# Test 7b: get_prompt_file (extracted verbatim from agent.sh) actually resolves
+# research/implement and research/review to real files under pull_request.
+echo "Test 7b: get_prompt_file resolves research/implement and research/review under pull_request"
+_get_prompt_file_src="$(sed -n '/^get_prompt_file() {/,/^}/p' "$SCRIPT_TO_TEST")"
+_research_missing=0
+if [ -z "$_get_prompt_file_src" ]; then
+  echo "  could not extract get_prompt_file() from $SCRIPT_TO_TEST"
+  _research_missing=1
+else
+  eval "$_get_prompt_file_src"
+  for _kind in implement review; do
+    _resolved="$(HARNESS_DIR="$HARNESS_DIR" DELIVERY_MODE=pull_request get_prompt_file research "$_kind")"
+    if [ "$_resolved" != "$HARNESS_DIR/prompts/pull_request/research/$_kind.md" ] || [ ! -f "$_resolved" ]; then
+      echo "  get_prompt_file research $_kind resolved to missing/unexpected path: $_resolved"
+      _research_missing=1
+    fi
+  done
+fi
+if [ "$_research_missing" -eq 0 ]; then
+  test_pass "get_prompt_file resolves research prompts under pull_request (implement + review)"
+else
+  test_fail "get_prompt_file failed to resolve a pull_request research prompt"
+fi
+
 # Test 8: Check fleet.sh exists and is executable
 echo "Test 8: fleet.sh exists"
 if [ -x "$FLEET_SCRIPT" ]; then
