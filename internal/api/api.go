@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 	"time"
 
@@ -47,10 +48,11 @@ type Server struct {
 	leaseTTL             time.Duration
 	maxReviewRounds      int
 	escalationThresholds map[string]int
+	pprofEnabled         bool
 }
 
-// New creates a new API server with the given store, auth token, lease TTL, max review rounds, and escalation thresholds.
-func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int) *Server {
+// New creates a new API server with the given store, auth token, lease TTL, max review rounds, escalation thresholds, and pprof enablement.
+func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, pprofEnabled bool) *Server {
 	mux := http.NewServeMux()
 	server := &Server{
 		mux:                  mux,
@@ -59,11 +61,25 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 		leaseTTL:             leaseTTL,
 		maxReviewRounds:      maxReviewRounds,
 		escalationThresholds: escalationThresholds,
+		pprofEnabled:         pprofEnabled,
 	}
 
 	// Register handlers
 	// GET /healthz is exempted from auth
 	mux.HandleFunc("GET /healthz", server.handleHealthz)
+
+	// Pprof endpoints (protected) - only if ODONIAN_PPROF is enabled
+	if pprofEnabled {
+		mux.HandleFunc("GET /debug/pprof/", server.authMiddleware(pprof.Index))
+		mux.HandleFunc("GET /debug/pprof/cmdline", server.authMiddleware(pprof.Cmdline))
+		mux.HandleFunc("GET /debug/pprof/profile", server.authMiddleware(pprof.Profile))
+		mux.HandleFunc("GET /debug/pprof/symbol", server.authMiddleware(pprof.Symbol))
+		mux.HandleFunc("GET /debug/pprof/trace", server.authMiddleware(pprof.Trace))
+		mux.HandleFunc("GET /debug/pprof/{profile}", server.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+			profile := r.PathValue("profile")
+			pprof.Handler(profile).ServeHTTP(w, r)
+		}))
+	}
 
 	// Project endpoints (protected)
 	mux.HandleFunc("POST /projects", server.authMiddleware(server.handleCreateProject))

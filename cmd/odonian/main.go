@@ -219,6 +219,8 @@ func runServer() {
 		log.Fatalf("failed to parse PRWATCH_RATE_LIMIT_FLOOR: %v", err)
 	}
 
+	pprofEnabled := strings.EqualFold(os.Getenv("ODONIAN_PPROF"), "true")
+
 	// Open the store
 	s, err := store.Open(dbPath, allowedModels, store.WithEscalationLadder(escalationLadder))
 	if err != nil {
@@ -237,7 +239,7 @@ func runServer() {
 	}
 
 	// Create API server
-	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds)
+	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, pprofEnabled)
 
 	// Set up graceful shutdown with signal handling
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

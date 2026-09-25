@@ -23,7 +23,7 @@ func setupTestServer(t *testing.T, authToken string) *Server {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, false)
 }
 
 func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds map[string]int) *Server {
@@ -32,7 +32,7 @@ func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds ma
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, thresholds)
+	return New(s, authToken, 5*time.Minute, 5, thresholds, false)
 }
 
 // TestHealthzWithoutAuth verifies GET /healthz returns 200 without auth.
@@ -3167,7 +3167,7 @@ func TestListProjectsReturnsEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// List projects without creating any
@@ -3201,7 +3201,7 @@ func TestListProjectsWithClaimableFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create project 1 with a claimable haiku implement task
@@ -3307,7 +3307,7 @@ func TestListProjectsClaimableWithMultipleFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create a project with two tasks: one haiku, one sonnet
@@ -3413,7 +3413,7 @@ func TestListProjectsClaimableUnchangedWithoutFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create two projects
@@ -6223,5 +6223,56 @@ func TestUpdateEscalationPrefixIDResolution(t *testing.T) {
 
 	if updateW.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", updateW.Code)
+	}
+}
+
+func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool) *Server {
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled)
+}
+
+// TestPprofDisabledReturns404 verifies GET /debug/pprof/ returns 404 when pprof is disabled.
+func TestPprofDisabledReturns404(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", false)
+	authHeader := "Bearer test-token"
+
+	req := httptest.NewRequest("GET", "/debug/pprof/", nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d", w.Code)
+	}
+}
+
+// TestPprofEnabledWithoutAuthReturns401 verifies GET /debug/pprof/ returns 401 without auth.
+func TestPprofEnabledWithoutAuthReturns401(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	req := httptest.NewRequest("GET", "/debug/pprof/", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+}
+
+// TestPprofEnabledWithAuthReturns200 verifies GET /debug/pprof/ returns 200 with auth when enabled.
+func TestPprofEnabledWithAuthReturns200(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+	authHeader := "Bearer test-token"
+
+	req := httptest.NewRequest("GET", "/debug/pprof/", nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
 	}
 }
