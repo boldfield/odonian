@@ -228,7 +228,12 @@ func runServer() {
 		log.Fatalf("failed to parse PRWATCH_RATE_LIMIT_FLOOR: %v", err)
 	}
 
+	slowRequestThresholdMs, warnInvalidSlowRequest := parseSlowRequestThreshold(os.Getenv("ODONIAN_SLOW_REQUEST_MS"))
+
 	pprofEnabled := pprofEnabledFromEnv()
+
+	// Set up logger (used by API and reconcilers)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	// Open the store
 	s, err := store.Open(dbPath, allowedModels, store.WithEscalationLadder(escalationLadder))
@@ -248,7 +253,7 @@ func runServer() {
 	}
 
 	// Create API server
-	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, pprofEnabled)
+	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, pprofEnabled, slowRequestThresholdMs, warnInvalidSlowRequest, logger)
 
 	// Set up graceful shutdown with signal handling
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -258,7 +263,6 @@ func runServer() {
 	// belonging to superseded/abandoned tasks, which must happen regardless of whether
 	// change notifications are configured. NOTIFY_URL only controls the separate
 	// notify reconciler (and, when set, lets PR-watch publish notifications too).
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	var notifier notify.Notifier = noopNotifier{}
 	reconcilers := []reconcile.Reconciler{}
@@ -970,6 +974,28 @@ func executeHeartbeat(ctx context.Context, baseURL, token string, args []string)
 	}
 
 	return nil
+}
+
+// parseSlowRequestThreshold parses ODONIAN_SLOW_REQUEST_MS.
+// Returns the threshold in milliseconds and whether to warn about invalid input.
+// Default is 500ms; negative or non-integer values fall back to default with warning.
+func parseSlowRequestThreshold(thresholdStr string) (int, bool) {
+	if thresholdStr == "" {
+		return 500, false
+	}
+
+	threshold, err := strconv.Atoi(thresholdStr)
+	if err != nil {
+		log.Printf("warning: ODONIAN_SLOW_REQUEST_MS is not an integer, using default 500ms")
+		return 500, true
+	}
+
+	if threshold < 0 {
+		log.Printf("warning: ODONIAN_SLOW_REQUEST_MS is negative, using default 500ms")
+		return 500, true
+	}
+
+	return threshold, false
 }
 
 func parseAllowedModels(modelsStr string) []string {

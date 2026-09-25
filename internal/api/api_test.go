@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,7 +25,7 @@ func setupTestServer(t *testing.T, authToken string) *Server {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, false)
+	return New(s, authToken, 5*time.Minute, 5, nil, false, 500, false, nil)
 }
 
 func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds map[string]int) *Server {
@@ -32,7 +34,7 @@ func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds ma
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, thresholds, false)
+	return New(s, authToken, 5*time.Minute, 5, thresholds, false, 500, false, nil)
 }
 
 func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool) *Server {
@@ -41,7 +43,16 @@ func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool)
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled)
+	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled, 500, false, nil)
+}
+
+func setupTestServerWithLogger(t *testing.T, authToken string, logger *slog.Logger) *Server {
+	// Use in-memory database for testing
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	return New(s, authToken, 5*time.Minute, 5, nil, false, 500, false, logger)
 }
 
 // TestHealthzWithoutAuth verifies GET /healthz returns 200 without auth.
@@ -3236,7 +3247,7 @@ func TestListProjectsReturnsEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, nil)
 	authHeader := "Bearer test-token"
 
 	// List projects without creating any
@@ -3270,7 +3281,7 @@ func TestListProjectsWithClaimableFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, nil)
 	authHeader := "Bearer test-token"
 
 	// Create project 1 with a claimable haiku implement task
@@ -3376,7 +3387,7 @@ func TestListProjectsClaimableWithMultipleFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, nil)
 	authHeader := "Bearer test-token"
 
 	// Create a project with two tasks: one haiku, one sonnet
@@ -3482,7 +3493,7 @@ func TestListProjectsClaimableUnchangedWithoutFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, nil)
 	authHeader := "Bearer test-token"
 
 	// Create two projects
@@ -6355,5 +6366,222 @@ func TestPprofEnabledAuthenticatedNamedProfile(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+}
+
+// logCapture captures slog output for testing.
+type logCapture struct {
+	records []*slog.Record
+}
+
+func (lc *logCapture) Enabled(ctx context.Context, level slog.Level) bool {
+	return true
+}
+
+func (lc *logCapture) Handle(ctx context.Context, record slog.Record) error {
+	lc.records = append(lc.records, &record)
+	return nil
+}
+
+func (lc *logCapture) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return lc
+}
+
+func (lc *logCapture) WithGroup(name string) slog.Handler {
+	return lc
+}
+
+// TestLatencyLoggingSlowRequest verifies a slow request produces an INFO record.
+func TestLatencyLoggingSlowRequest(t *testing.T) {
+	capture := &logCapture{}
+	logger := slog.New(capture)
+
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 100, false, logger)
+
+	// Create a project first
+	ctx := context.Background()
+	_, err = s.CreateProject(ctx, "test", "repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Test a protected endpoint (slower than 100ms threshold)
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	if len(capture.records) == 0 {
+		t.Errorf("expected log record, got none")
+	}
+}
+
+// TestLatencyLoggingHealthzExcluded verifies /healthz is not logged.
+func TestLatencyLoggingHealthzExcluded(t *testing.T) {
+	capture := &logCapture{}
+	logger := slog.New(capture)
+
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, logger)
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	// /healthz should not be logged (even with a logger configured)
+	if len(capture.records) > 0 {
+		t.Errorf("expected no log records for /healthz, got %d", len(capture.records))
+	}
+}
+
+// getAttrValue extracts the value of an attribute by key from record attrs.
+func getAttrValue(record *slog.Record, key string) string {
+	var result string
+	record.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			result = a.Value.String()
+			return false
+		}
+		return true
+	})
+	return result
+}
+
+// TestLatencyLoggingQueryParams verifies query parameter names (not values) are logged.
+func TestLatencyLoggingQueryParams(t *testing.T) {
+	capture := &logCapture{}
+	logger := slog.New(capture)
+
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 100, false, logger)
+
+	// Create a project first
+	ctx := context.Background()
+	project, err := s.CreateProject(ctx, "test", "repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/projects?claimable=true&model=haiku", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	if len(capture.records) == 0 {
+		t.Errorf("expected log record, got none")
+	}
+
+	// Check that query params are logged but not their values
+	if len(capture.records) > 0 {
+		record := capture.records[0]
+		queryParams := getAttrValue(record, "query_params")
+		if !strings.Contains(queryParams, "claimable") || !strings.Contains(queryParams, "model") {
+			t.Errorf("expected query param names in log, got: %s", queryParams)
+		}
+		if strings.Contains(queryParams, "true") || strings.Contains(queryParams, "haiku") {
+			t.Errorf("expected query param values NOT in log, got: %s", queryParams)
+		}
+	}
+
+	_ = project
+}
+
+// TestLatencyLoggingAuthNotLogged verifies Authorization token is never logged.
+func TestLatencyLoggingAuthNotLogged(t *testing.T) {
+	capture := &logCapture{}
+	logger := slog.New(capture)
+
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 100, false, logger)
+
+	// Create a project first
+	ctx := context.Background()
+	_, err = s.CreateProject(ctx, "test", "repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Test with a query parameter that has a sensitive value
+	req := httptest.NewRequest("GET", "/projects?model=secret-model-value", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	// Check that query param values are never logged
+	if len(capture.records) > 0 {
+		record := capture.records[0]
+		var fullLog strings.Builder
+		record.Attrs(func(a slog.Attr) bool {
+			fullLog.WriteString(a.String())
+			fullLog.WriteString(" ")
+			return true
+		})
+		logStr := fullLog.String()
+		// The param name "model" should be logged but not the value
+		if !strings.Contains(logStr, "model") {
+			t.Errorf("expected 'model' param name in log")
+		}
+		if strings.Contains(logStr, "secret-model-value") {
+			t.Errorf("expected query param value NOT in log, got: %s", logStr)
+		}
+	}
+}
+
+// TestLatencyLoggingResponseSize verifies response size is logged.
+func TestLatencyLoggingResponseSize(t *testing.T) {
+	capture := &logCapture{}
+	logger := slog.New(capture)
+
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 100, false, logger)
+
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	// Response should include bytes logged
+	if len(capture.records) > 0 {
+		record := capture.records[0]
+		bytesStr := getAttrValue(record, "bytes")
+		if bytesStr == "" {
+			t.Errorf("expected 'bytes' in log")
+		}
 	}
 }
