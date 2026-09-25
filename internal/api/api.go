@@ -647,10 +647,11 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload struct {
-		AgentID string            `json:"agent_id"`
-		Result  string            `json:"result"`
-		Verdict *string           `json:"verdict"`
-		Links   []store.LinkInput `json:"links"`
+		AgentID  string            `json:"agent_id"`
+		Result   string            `json:"result"`
+		Verdict  *string           `json:"verdict"`
+		Links    []store.LinkInput `json:"links"`
+		Findings json.RawMessage   `json:"findings"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
@@ -664,7 +665,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Submit the task
-	task, err := s.store.SubmitTask(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds)
+	task, err := s.store.SubmitTask(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, payload.Findings)
 	if err != nil {
 		// Check if it's a ValidationError (invalid link kind)
 		var validationErr *store.ValidationError
