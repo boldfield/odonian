@@ -100,15 +100,17 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
    - **Reject if any P1 or P2 finding exists** (including a still-open finding from an earlier
      round, or an unreachable source behind a `confirmed` claim). **Otherwise approve**, and list any
      P3 findings in your writeup — P3s never block a round.
-   - **Always end your writeup with a fenced JSON block titled `Findings`**, in addition to your
-     prose, listing every finding you raised or re-evaluated this round (empty array if none). Each
-     entry has: `id` (unique within the task, assigned by you), `severity` (`P1`/`P2`/`P3`), `file`,
-     `line`, `summary` (one or two sentences), `in_changed_text` (bool; always `true` in round 1),
-     `status` (`new`, `still_open` or `resolved`), and `prior_id` (the earlier finding's id, for
-     `still_open`/`resolved`; omit or null for `new`). For example:
+   - **Always end your writeup with a `Findings` heading followed by a fenced `json` block**, in
+     addition to your prose, listing every finding you raised or re-evaluated this round (empty array
+     if none). The fence must hold **only the JSON array** — no title or other text inside it — so
+     the next milestone can parse it directly. Each entry has: `id` (unique within the task, assigned
+     by you), `severity` (`P1`/`P2`/`P3`), `file`, `line`, `summary` (one or two sentences),
+     `in_changed_text` (bool; always `true` in round 1), `status` (`new`, `still_open` or `resolved`),
+     and `prior_id` (the earlier finding's id, for `still_open`/`resolved`; omit or null for `new`).
+     For example:
 
-     ```
      Findings
+     ```json
      [
        {"id": "f1", "severity": "P2", "file": "claims.md", "line": 42,
         "summary": "Claim overstates the source, which only supports a weaker statement.",
@@ -147,8 +149,9 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
   difference from the worker's included output as a P1 finding.
 - **Reject on any P1 or P2 finding; otherwise approve and list P3s.** This is a full review every
   round — check the whole file plus every earlier finding's status, not just the diff.
-- **Every verdict ends with a fenced `Findings` JSON block** (id, severity, file, line, summary,
-  in_changed_text, status, prior_id), in addition to prose, even when the list is empty.
+- **Every verdict ends with a `Findings` heading followed by a fenced `json` block containing only
+  the JSON array** (id, severity, file, line, summary, in_changed_text, status, prior_id), in
+  addition to prose, even when the list is empty. No title or prose inside the fence.
 - Your verdict goes on the **review task you claimed** (via `submit` with `verdict`), not on the
   parent.
 - **NEVER merge a PR and NEVER transition a parent task** — merging is the merger's job (the server
