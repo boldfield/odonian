@@ -8510,7 +8510,7 @@ func TestCreateTasksWithTrack(t *testing.T) {
 }
 
 // TestCreateTasksWithUnknownTrack verifies that track field is validated.
-// Tracks not in {build, design} are rejected with UNKNOWN_TRACK.
+// Tracks not in {build, design, research} are rejected with UNKNOWN_TRACK.
 func TestCreateTasksWithUnknownTrack(t *testing.T) {
 	ctx := context.Background()
 
@@ -8544,8 +8544,8 @@ func TestCreateTasksWithUnknownTrack(t *testing.T) {
 		t.Errorf("expected error code UNKNOWN_TRACK, got %s", valErr.Code)
 	}
 
-	// Verify that build and design are accepted
-	for _, track := range []string{"build", "design"} {
+	// Verify that build, design, and research are accepted
+	for _, track := range []string{"build", "design", "research"} {
 		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
 			{Title: "Track Task " + track, Spec: "Spec", DocumentID: doc.ID, Track: track},
 		})

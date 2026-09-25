@@ -1685,6 +1685,46 @@ func TestCreateTasksAcceptsDesignTrack(t *testing.T) {
 	}
 }
 
+// TestCreateTasksAcceptsResearchTrack verifies CreateTasks accepts research track.
+func TestCreateTasksAcceptsResearchTrack(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Research Track Task",
+			Spec:       "Spec",
+			DocumentID: docID,
+			Track:      "research",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", w.Code)
+	}
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(createdTasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(createdTasks))
+	}
+
+	if createdTasks[0].Track != "research" {
+		t.Errorf("expected track 'research', got %q", createdTasks[0].Track)
+	}
+}
+
 // TestCreateTasksDefaultsTrackToBuild verifies CreateTasks defaults track to build when empty.
 func TestCreateTasksDefaultsTrackToBuild(t *testing.T) {
 	server := setupTestServer(t, "test-token")

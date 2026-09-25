@@ -332,11 +332,11 @@ Bulk-create tasks for a project.
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
 - `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
 - `escalate` (optional, default `true`): Allow replacement by a higher model tier after the review threshold is exceeded.
-- `track` (optional, default `build`): `build` or `design`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
+- `track` (optional, default `build`): `build`, `design`, or `research`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
 
 | Delivery mode | Supported tracks |
 |---|---|
-| `pull_request` | `build`, `design` |
+| `pull_request` | `build`, `design`, `research` |
 | `local_commit` | `build` |
 
 These combinations have worker and reviewer prompts in the bundled harness. The API validates
@@ -392,7 +392,7 @@ superseding the task will not resolve a missing prompt.
 - `201 Created`: Tasks successfully created
 - `400 INVALID_DOCUMENT_ID`: One or more document IDs do not exist
 - `400 UNKNOWN_MODEL`: The `model` or a `review_models` entry is not in the deployment allowlist
-- `400 UNKNOWN_TRACK`: The `track` field is not one of `"build"` or `"design"`
+- `400 UNKNOWN_TRACK`: The `track` field is not one of `"build"`, `"design"`, or `"research"`
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `400 <other validation errors>`: Client input validation errors
 - `500 CREATE_ERROR`: Server error creating tasks

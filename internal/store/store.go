@@ -1012,7 +1012,7 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 
 		track := "build"
 		if input.Track != "" {
-			if input.Track != "build" && input.Track != "design" {
+			if input.Track != "build" && input.Track != "design" && input.Track != "research" {
 				return nil, invalid("UNKNOWN_TRACK", fmt.Sprintf("unknown track: %s", input.Track))
 			}
 			track = input.Track
