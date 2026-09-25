@@ -17,6 +17,7 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_LEASE_TTL` | `5m` | Lease granted on claim and extended by each heartbeat. A task whose lease has lapsed is claimable again, so a session that outlives its lease loses the task to another worker. Kept generous in production because renewal is agent-driven. |
 | `ODONIAN_EVENT_TERMINAL_RETENTION_DAYS` | `1` | At startup, audit events for tasks in terminal states older than this are pruned. Events for live tasks are never pruned. |
 | `ODONIAN_PPROF` | unset | Enable Go runtime profiling on `/debug/pprof/` when set to exactly `true`. All pprof endpoints require the same bearer-token auth as every other protected route. When unset or any other value, `/debug/pprof/` returns 404. See [Runtime profiling with pprof](#runtime-profiling-with-pprof). |
+| `ODONIAN_SLOW_REQUEST_MS` | `500` | Per-request latency logging threshold in milliseconds. Requests at or above this threshold log at INFO level; below it log at DEBUG. `/healthz` is never logged. A non-integer or negative value logs one warning at startup and falls back to the default. |
 | `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by PR-watch, supersession PR cleanup, and `odonian merge`. See [Forge tokens](#forge-tokens). |
 
 ### Runtime profiling with pprof
