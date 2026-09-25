@@ -6276,3 +6276,44 @@ func TestPprofEnabledWithAuthReturns200(t *testing.T) {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
 }
+
+// TestPprofHeapWithoutAuthReturns401 verifies GET /debug/pprof/heap returns 401 without auth.
+func TestPprofHeapWithoutAuthReturns401(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	req := httptest.NewRequest("GET", "/debug/pprof/heap", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+}
+
+// TestPprofHeapWithAuthReturns200 verifies GET /debug/pprof/heap returns 200 with auth when enabled.
+func TestPprofHeapWithAuthReturns200(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+	authHeader := "Bearer test-token"
+
+	req := httptest.NewRequest("GET", "/debug/pprof/heap", nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+}
+
+// TestPprofProfileWithoutAuthReturns401 verifies GET /debug/pprof/profile returns 401 without auth.
+func TestPprofProfileWithoutAuthReturns401(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	req := httptest.NewRequest("GET", "/debug/pprof/profile", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+}

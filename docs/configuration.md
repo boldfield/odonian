@@ -24,9 +24,10 @@ the process that reads them. Defaults are what the code does when the variable i
 When `ODONIAN_PPROF=true`, the server exposes Go's standard pprof endpoints at `/debug/pprof/`. All endpoints require bearer token authentication. Example: capture a 30-second CPU profile:
 
 ```bash
-go tool pprof -http=:8081 \
-  "http://localhost:8080/debug/pprof/profile?seconds=30" \
-  -H "Authorization: Bearer $ODONIAN_TOKEN"
+curl -sf -H "Authorization: Bearer $ODONIAN_TOKEN" \
+  -o cpu.pprof \
+  "http://localhost:8080/debug/pprof/profile?seconds=30"
+go tool pprof -http=:8081 cpu.pprof
 ```
 
 Available profiles: `profile` (CPU), `heap` (memory), `goroutine`, `block`, `mutex`, `trace`, and others.
