@@ -6317,3 +6317,23 @@ func TestPprofProfileWithoutAuthReturns401(t *testing.T) {
 		t.Errorf("expected status 401, got %d", w.Code)
 	}
 }
+
+// TestPprofDisabledForNonLiteralValues regression test: ODONIAN_PPROF must match exactly "true",
+// not case variations like "TRUE" or "True". This test verifies that when pprof is disabled,
+// all endpoints return 404 even with authentication.
+func TestPprofDisabledForNonLiteralValues(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", false)
+	authHeader := "Bearer test-token"
+
+	paths := []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/profile", "/debug/pprof/goroutine"}
+	for _, path := range paths {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("expected 404 for %s with pprof disabled, got %d", path, w.Code)
+		}
+	}
+}

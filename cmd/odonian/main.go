@@ -219,7 +219,7 @@ func runServer() {
 		log.Fatalf("failed to parse PRWATCH_RATE_LIMIT_FLOOR: %v", err)
 	}
 
-	pprofEnabled := strings.EqualFold(os.Getenv("ODONIAN_PPROF"), "true")
+	pprofEnabled := os.Getenv("ODONIAN_PPROF") == "true"
 
 	// Open the store
 	s, err := store.Open(dbPath, allowedModels, store.WithEscalationLadder(escalationLadder))
