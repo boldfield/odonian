@@ -4472,12 +4472,14 @@ func TestExecuteShowEventRetrievalFailure(t *testing.T) {
 	}
 }
 
-// TestPprofEnabledFromEnv verifies that only the exact literal "true" enables pprof;
+// TestPprofEnabledFromEnv verifies runServer's actual production wiring: pprofEnabledFromEnv
+// reads ODONIAN_PPROF from the environment itself, so this exercises the same call the server
+// makes, not a value the test re-derives. Only the exact literal "true" must enable pprof;
 // case variants, other truthy-looking values, and whitespace must all disable it.
 func TestPprofEnabledFromEnv(t *testing.T) {
 	tests := []struct {
-		value string
-		want  bool
+		envValue string
+		want     bool
 	}{
 		{"true", true},
 		{"", false},
@@ -4489,31 +4491,9 @@ func TestPprofEnabledFromEnv(t *testing.T) {
 		{"true ", false},
 	}
 	for _, tt := range tests {
-		if got := pprofEnabledFromEnv(tt.value); got != tt.want {
-			t.Errorf("pprofEnabledFromEnv(%q) = %v, want %v", tt.value, got, tt.want)
-		}
-	}
-}
-
-// TestPprofEnabledFromEnvReadsODONIANPPROF verifies runServer's actual production wiring:
-// os.Getenv("ODONIAN_PPROF") is fed into pprofEnabledFromEnv, not a value the test
-// re-derives itself. A regression that changes what runServer reads or how it interprets
-// it must fail this test.
-func TestPprofEnabledFromEnvReadsODONIANPPROF(t *testing.T) {
-	tests := []struct {
-		envValue string
-		want     bool
-	}{
-		{"true", true},
-		{"", false},
-		{"TRUE", false},
-		{"1", false},
-	}
-	for _, tt := range tests {
 		t.Setenv("ODONIAN_PPROF", tt.envValue)
-		got := pprofEnabledFromEnv(os.Getenv("ODONIAN_PPROF"))
-		if got != tt.want {
-			t.Errorf("ODONIAN_PPROF=%q: pprofEnabledFromEnv(os.Getenv(...)) = %v, want %v", tt.envValue, got, tt.want)
+		if got := pprofEnabledFromEnv(); got != tt.want {
+			t.Errorf("ODONIAN_PPROF=%q: pprofEnabledFromEnv() = %v, want %v", tt.envValue, got, tt.want)
 		}
 	}
 }

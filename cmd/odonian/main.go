@@ -129,12 +129,13 @@ Commands:
 `, version)
 }
 
-// pprofEnabledFromEnv reports whether the pprof debug endpoints should be registered.
+// pprofEnabledFromEnv reports whether the pprof debug endpoints should be registered,
+// reading ODONIAN_PPROF directly so this function reflects runServer's actual wiring.
 // Only the exact literal "true" enables them; any other value (including case variants
 // like "TRUE" or values like "1") leaves them disabled, matching /debug/pprof/ returning
 // 404 as if the feature didn't exist.
-func pprofEnabledFromEnv(v string) bool {
-	return v == "true"
+func pprofEnabledFromEnv() bool {
+	return os.Getenv("ODONIAN_PPROF") == "true"
 }
 
 func runServer() {
@@ -227,7 +228,7 @@ func runServer() {
 		log.Fatalf("failed to parse PRWATCH_RATE_LIMIT_FLOOR: %v", err)
 	}
 
-	pprofEnabled := pprofEnabledFromEnv(os.Getenv("ODONIAN_PPROF"))
+	pprofEnabled := pprofEnabledFromEnv()
 
 	// Open the store
 	s, err := store.Open(dbPath, allowedModels, store.WithEscalationLadder(escalationLadder))
