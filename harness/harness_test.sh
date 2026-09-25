@@ -92,6 +92,19 @@ else
   test_fail "a delivery-mode build prompt is missing"
 fi
 
+# Test 7b: research track prompts resolve under pull_request via the same
+# get_prompt_file("$track", "$kind") => prompts/<delivery_mode>/<track>/<kind>.md path rule.
+echo "Test 7b: get_prompt_file resolves research/implement and research/review under pull_request"
+_research_missing=0
+for _f in prompts/pull_request/research/implement.md prompts/pull_request/research/review.md; do
+  [ -f "$HARNESS_DIR/$_f" ] || { echo "  missing: $_f"; _research_missing=1; }
+done
+if [ "$_research_missing" -eq 0 ]; then
+  test_pass "research prompts present under pull_request (implement + review)"
+else
+  test_fail "a pull_request research prompt is missing"
+fi
+
 # Test 8: Check fleet.sh exists and is executable
 echo "Test 8: fleet.sh exists"
 if [ -x "$FLEET_SCRIPT" ]; then
