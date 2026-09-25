@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,70 +45,81 @@ func taskToSummary(task store.Task) map[string]interface{} {
 
 // Server wraps the HTTP server with its dependencies: store, auth token, and lease TTL.
 type Server struct {
-	mux                  *http.ServeMux
-	store                store.Store
-	authToken            string
-	leaseTTL             time.Duration
-	maxReviewRounds      int
-	escalationThresholds map[string]int
+	mux                    *http.ServeMux
+	store                  store.Store
+	authToken              string
+	leaseTTL               time.Duration
+	maxReviewRounds        int
+	escalationThresholds   map[string]int
+	slowRequestThresholdMs int
+	logger                 *slog.Logger
 }
 
 // New creates a new API server with the given store, auth token, lease TTL, max review rounds,
-// escalation thresholds, and whether pprof debug endpoints should be registered.
-func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, pprofEnabled bool) *Server {
+// escalation thresholds, whether pprof debug endpoints should be registered, slow request threshold,
+// and logger.
+func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, pprofEnabled bool, slowRequestThresholdMs int, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
+
 	server := &Server{
-		mux:                  mux,
-		store:                s,
-		authToken:            authToken,
-		leaseTTL:             leaseTTL,
-		maxReviewRounds:      maxReviewRounds,
-		escalationThresholds: escalationThresholds,
+		mux:                    mux,
+		store:                  s,
+		authToken:              authToken,
+		leaseTTL:               leaseTTL,
+		maxReviewRounds:        maxReviewRounds,
+		escalationThresholds:   escalationThresholds,
+		slowRequestThresholdMs: slowRequestThresholdMs,
+		logger:                 logger,
+	}
+
+	// Helper to compose auth middleware and latency logging
+	wrapProtected := func(pattern string, handler http.HandlerFunc) http.HandlerFunc {
+		return server.latencyLoggingWrapper(pattern, server.authMiddleware(handler))
 	}
 
 	// Register handlers
-	// GET /healthz is exempted from auth
+	// GET /healthz is exempted from auth and latency logging
 	mux.HandleFunc("GET /healthz", server.handleHealthz)
 
 	// Project endpoints (protected)
-	mux.HandleFunc("POST /projects", server.authMiddleware(server.handleCreateProject))
-	mux.HandleFunc("GET /projects", server.authMiddleware(server.handleListProjects))
-	mux.HandleFunc("GET /projects/{id}", server.authMiddleware(server.handleGetProject))
+	mux.HandleFunc("POST /projects", wrapProtected("POST /projects", server.handleCreateProject))
+	mux.HandleFunc("GET /projects", wrapProtected("GET /projects", server.handleListProjects))
+	mux.HandleFunc("GET /projects/{id}", wrapProtected("GET /projects/{id}", server.handleGetProject))
 
 	// Document endpoints (protected)
-	mux.HandleFunc("POST /projects/{id}/documents", server.authMiddleware(server.handleCreateDocument))
-	mux.HandleFunc("GET /projects/{id}/documents", server.authMiddleware(server.handleListDocuments))
+	mux.HandleFunc("POST /projects/{id}/documents", wrapProtected("POST /projects/{id}/documents", server.handleCreateDocument))
+	mux.HandleFunc("GET /projects/{id}/documents", wrapProtected("GET /projects/{id}/documents", server.handleListDocuments))
 
 	// Task endpoints (protected)
-	mux.HandleFunc("POST /projects/{id}/tasks", server.authMiddleware(server.handleCreateTasks))
-	mux.HandleFunc("GET /projects/{id}/tasks", server.authMiddleware(server.handleListTasks))
-	mux.HandleFunc("GET /tasks/{id}", server.authMiddleware(server.handleGetTask))
-	mux.HandleFunc("GET /tasks/{id}/events", server.authMiddleware(server.handleGetTaskEvents))
-	mux.HandleFunc("POST /tasks/{id}/claim", server.authMiddleware(server.handleClaimTask))
-	mux.HandleFunc("POST /tasks/{id}/heartbeat", server.authMiddleware(server.handleHeartbeat))
-	mux.HandleFunc("POST /tasks/{id}/promote", server.authMiddleware(server.handlePromoteTask))
-	mux.HandleFunc("POST /tasks/{id}/submit", server.authMiddleware(server.handleSubmit))
-	mux.HandleFunc("POST /tasks/{id}/review", server.authMiddleware(server.handleReview))
-	mux.HandleFunc("POST /tasks/{id}/transition", server.authMiddleware(server.handleTransition))
-	mux.HandleFunc("POST /tasks/{id}/supersede", server.authMiddleware(server.handleSupersede))
-	mux.HandleFunc("PATCH /tasks/{id}", server.authMiddleware(server.handleUpdateTask))
-	mux.HandleFunc("PATCH /tasks/{id}/escalation", server.authMiddleware(server.handleUpdateEscalation))
-	mux.HandleFunc("POST /tasks/{id}/hold", server.authMiddleware(server.handleHold))
-	mux.HandleFunc("POST /tasks/{id}/release", server.authMiddleware(server.handleRelease))
-	mux.HandleFunc("POST /tasks/{id}/archive", server.authMiddleware(server.handleArchiveTask))
-	mux.HandleFunc("POST /tasks/{id}/unarchive", server.authMiddleware(server.handleUnarchiveTask))
-	mux.HandleFunc("POST /projects/{id}/archive", server.authMiddleware(server.handleArchiveProject))
-	mux.HandleFunc("POST /projects/{id}/unarchive", server.authMiddleware(server.handleUnarchiveProject))
+	mux.HandleFunc("POST /projects/{id}/tasks", wrapProtected("POST /projects/{id}/tasks", server.handleCreateTasks))
+	mux.HandleFunc("GET /projects/{id}/tasks", wrapProtected("GET /projects/{id}/tasks", server.handleListTasks))
+	mux.HandleFunc("GET /tasks/{id}", wrapProtected("GET /tasks/{id}", server.handleGetTask))
+	mux.HandleFunc("GET /tasks/{id}/events", wrapProtected("GET /tasks/{id}/events", server.handleGetTaskEvents))
+	mux.HandleFunc("POST /tasks/{id}/claim", wrapProtected("POST /tasks/{id}/claim", server.handleClaimTask))
+	mux.HandleFunc("POST /tasks/{id}/heartbeat", wrapProtected("POST /tasks/{id}/heartbeat", server.handleHeartbeat))
+	mux.HandleFunc("POST /tasks/{id}/promote", wrapProtected("POST /tasks/{id}/promote", server.handlePromoteTask))
+	mux.HandleFunc("POST /tasks/{id}/submit", wrapProtected("POST /tasks/{id}/submit", server.handleSubmit))
+	mux.HandleFunc("POST /tasks/{id}/review", wrapProtected("POST /tasks/{id}/review", server.handleReview))
+	mux.HandleFunc("POST /tasks/{id}/transition", wrapProtected("POST /tasks/{id}/transition", server.handleTransition))
+	mux.HandleFunc("POST /tasks/{id}/supersede", wrapProtected("POST /tasks/{id}/supersede", server.handleSupersede))
+	mux.HandleFunc("PATCH /tasks/{id}", wrapProtected("PATCH /tasks/{id}", server.handleUpdateTask))
+	mux.HandleFunc("PATCH /tasks/{id}/escalation", wrapProtected("PATCH /tasks/{id}/escalation", server.handleUpdateEscalation))
+	mux.HandleFunc("POST /tasks/{id}/hold", wrapProtected("POST /tasks/{id}/hold", server.handleHold))
+	mux.HandleFunc("POST /tasks/{id}/release", wrapProtected("POST /tasks/{id}/release", server.handleRelease))
+	mux.HandleFunc("POST /tasks/{id}/archive", wrapProtected("POST /tasks/{id}/archive", server.handleArchiveTask))
+	mux.HandleFunc("POST /tasks/{id}/unarchive", wrapProtected("POST /tasks/{id}/unarchive", server.handleUnarchiveTask))
+	mux.HandleFunc("POST /projects/{id}/archive", wrapProtected("POST /projects/{id}/archive", server.handleArchiveProject))
+	mux.HandleFunc("POST /projects/{id}/unarchive", wrapProtected("POST /projects/{id}/unarchive", server.handleUnarchiveProject))
 
 	// Pprof endpoints (protected), registered only when ODONIAN_PPROF=true.
 	if pprofEnabled {
-		mux.HandleFunc("GET /debug/pprof/", server.authMiddleware(pprof.Index))
-		mux.HandleFunc("GET /debug/pprof/cmdline", server.authMiddleware(pprof.Cmdline))
-		mux.HandleFunc("GET /debug/pprof/profile", server.authMiddleware(pprof.Profile))
-		mux.HandleFunc("GET /debug/pprof/symbol", server.authMiddleware(pprof.Symbol))
-		mux.HandleFunc("POST /debug/pprof/symbol", server.authMiddleware(pprof.Symbol))
-		mux.HandleFunc("GET /debug/pprof/trace", server.authMiddleware(pprof.Trace))
-		mux.HandleFunc("GET /debug/pprof/{profile}", server.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("GET /debug/pprof/", wrapProtected("GET /debug/pprof/", pprof.Index))
+		mux.HandleFunc("GET /debug/pprof/cmdline", wrapProtected("GET /debug/pprof/cmdline", pprof.Cmdline))
+		mux.HandleFunc("GET /debug/pprof/profile", wrapProtected("GET /debug/pprof/profile", pprof.Profile))
+		mux.HandleFunc("GET /debug/pprof/symbol", wrapProtected("GET /debug/pprof/symbol", pprof.Symbol))
+		mux.HandleFunc("POST /debug/pprof/symbol", wrapProtected("POST /debug/pprof/symbol", pprof.Symbol))
+		mux.HandleFunc("GET /debug/pprof/trace", wrapProtected("GET /debug/pprof/trace", pprof.Trace))
+		mux.HandleFunc("GET /debug/pprof/{profile}", wrapProtected("GET /debug/pprof/{profile}", func(w http.ResponseWriter, r *http.Request) {
 			pprof.Handler(r.PathValue("profile")).ServeHTTP(w, r)
 		}))
 	}
@@ -155,6 +169,83 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		next(w, r)
 	}
+}
+
+// latencyLoggingWrapper wraps an HTTP handler to log per-request latency.
+// Logs method, pattern, query param names (not values), status, response size, and duration.
+// Requests at or above the slow threshold log at INFO; below log at DEBUG.
+// Only logs when a logger is configured.
+func (s *Server) latencyLoggingWrapper(pattern string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// If no logger, just call the handler
+		if s.logger == nil {
+			next(w, r)
+			return
+		}
+
+		start := time.Now()
+
+		// Wrap response writer to capture status and size
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		// Call the handler
+		next(wrapped, r)
+
+		// Log the request
+		duration := time.Since(start)
+		durationMs := int(duration.Milliseconds())
+		queryParams := extractQueryParamNames(r.URL.Query())
+
+		attrs := []slog.Attr{
+			slog.String("method", r.Method),
+			slog.String("pattern", pattern),
+			slog.String("query_params", queryParams),
+			slog.Int("status", wrapped.statusCode),
+			slog.Int("bytes", wrapped.size),
+			slog.Int("duration_ms", durationMs),
+		}
+
+		level := slog.LevelDebug
+		if durationMs >= s.slowRequestThresholdMs {
+			level = slog.LevelInfo
+		}
+
+		s.logger.LogAttrs(r.Context(), level, "http_request", attrs...)
+	}
+}
+
+// responseWriter wraps http.ResponseWriter to capture status and size.
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	size       int
+}
+
+func (w *responseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *responseWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	w.size += n
+	return n, err
+}
+
+// extractQueryParamNames extracts query parameter names (not values) from a URL query.
+// Returns a comma-separated string of unique parameter names, sorted.
+func extractQueryParamNames(q url.Values) string {
+	if len(q) == 0 {
+		return ""
+	}
+
+	names := make([]string, 0, len(q))
+	for name := range q {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 // decodeJSON decodes a JSON body and handles errors with appropriate responses.
