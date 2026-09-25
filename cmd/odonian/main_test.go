@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -4503,22 +4504,45 @@ func TestPprofEnabledFromEnv(t *testing.T) {
 // default 500ms and log one warning via log.Printf.
 func TestParseSlowRequestThreshold(t *testing.T) {
 	tests := []struct {
-		name     string
-		envValue string
-		want     int
+		name        string
+		envValue    string
+		want        int
+		wantWarning bool
 	}{
-		{"empty string defaults to 500", "", 500},
-		{"valid positive integer", "250", 250},
-		{"zero is valid", "0", 0},
-		{"negative value uses default", "-5", 500},
-		{"non-integer string uses default", "abc", 500},
-		{"decimal string uses default", "1.5", 500},
+		{"empty string defaults to 500", "", 500, false},
+		{"valid positive integer", "250", 250, false},
+		{"zero is valid", "0", 0, false},
+		{"negative value uses default", "-5", 500, true},
+		{"non-integer string uses default", "abc", 500, true},
+		{"decimal string uses default", "1.5", 500, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			logBuf := &bytes.Buffer{}
+			logWriter := log.Writer()
+			log.SetOutput(logBuf)
+			t.Cleanup(func() {
+				log.SetOutput(logWriter)
+			})
+
 			got := parseSlowRequestThreshold(tt.envValue)
 			if got != tt.want {
 				t.Errorf("parseSlowRequestThreshold(%q) = %d, want %d", tt.envValue, got, tt.want)
+			}
+
+			logOutput := logBuf.String()
+			if tt.wantWarning {
+				if !strings.Contains(logOutput, "ODONIAN_SLOW_REQUEST_MS") {
+					t.Errorf("expected warning containing 'ODONIAN_SLOW_REQUEST_MS', got: %s", logOutput)
+				}
+				warningCount := strings.Count(logOutput, "ODONIAN_SLOW_REQUEST_MS")
+				if warningCount != 1 {
+					t.Errorf("expected exactly 1 warning, got %d warnings", warningCount)
+				}
+			} else {
+				if strings.Contains(logOutput, "ODONIAN_SLOW_REQUEST_MS") {
+					t.Errorf("expected no warning, got: %s", logOutput)
+				}
 			}
 		})
 	}

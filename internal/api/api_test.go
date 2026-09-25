@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,15 +45,6 @@ func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool)
 		t.Fatalf("failed to open test store: %v", err)
 	}
 	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled, 500, nil)
-}
-
-func setupTestServerWithLogger(t *testing.T, authToken string, logger *slog.Logger) *Server {
-	// Use in-memory database for testing
-	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
-	if err != nil {
-		t.Fatalf("failed to open test store: %v", err)
-	}
-	return New(s, authToken, 5*time.Minute, 5, nil, false, 500, logger)
 }
 
 // TestHealthzWithoutAuth verifies GET /healthz returns 200 without auth.
@@ -6445,14 +6437,29 @@ func TestLatencyLoggingSlowRequest(t *testing.T) {
 		t.Errorf("expected status '200', got %q", status)
 	}
 
-	bytes := getAttrValue(record, "bytes")
-	if bytes == "" {
+	bytesStr := getAttrValue(record, "bytes")
+	if bytesStr == "" {
 		t.Errorf("expected bytes field to be present")
 	}
+	bytesVal, err := strconv.Atoi(bytesStr)
+	if err != nil {
+		t.Errorf("expected bytes to be an integer, got: %q", bytesStr)
+	}
+	expectedBytes := w.Body.Len()
+	if bytesVal != expectedBytes {
+		t.Errorf("expected bytes %d, got %d", expectedBytes, bytesVal)
+	}
 
-	durationMs := getAttrValue(record, "duration_ms")
-	if durationMs == "" {
+	durationMsStr := getAttrValue(record, "duration_ms")
+	if durationMsStr == "" {
 		t.Errorf("expected duration_ms field to be present")
+	}
+	durationMsVal, err := strconv.Atoi(durationMsStr)
+	if err != nil {
+		t.Errorf("expected duration_ms to be an integer, got: %q", durationMsStr)
+	}
+	if durationMsVal < 0 {
+		t.Errorf("expected duration_ms to be >= 0, got %d", durationMsVal)
 	}
 }
 
@@ -6665,5 +6672,13 @@ func TestLatencyLoggingResponseSize(t *testing.T) {
 	bytesStr := getAttrValue(record, "bytes")
 	if bytesStr == "" {
 		t.Errorf("expected 'bytes' in log")
+	}
+	bytesVal, err := strconv.Atoi(bytesStr)
+	if err != nil {
+		t.Errorf("expected bytes to be an integer, got: %q", bytesStr)
+	}
+	expectedBytes := w.Body.Len()
+	if bytesVal != expectedBytes {
+		t.Errorf("expected bytes %d, got %d", expectedBytes, bytesVal)
 	}
 }
