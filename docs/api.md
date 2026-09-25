@@ -792,7 +792,18 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
 {
   "agent_id": "opus-reviewer-1",
   "verdict": "approve",
-  "result": "Code review passed. Well-structured and thoroughly tested. One minor comment on error handling."
+  "result": "Code review passed. Well-structured and thoroughly tested. One minor comment on error handling.",
+  "findings": [
+    {
+      "id": "f1",
+      "severity": "P2",
+      "file": "internal/api/api.go",
+      "line": 42,
+      "summary": "Missing nil check before dereference.",
+      "in_changed_text": true,
+      "status": "new"
+    }
+  ]
 }
 ```
 
@@ -800,6 +811,19 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
 - `agent_id` (required): The ID of the reviewing agent (must match the task's assignee)
 - `verdict` (required): Either `"approve"` or `"reject"`
 - `result` (optional): Review writeup or detailed feedback
+- `findings` (optional): Array of structured findings, only accepted on review-kind tasks. Omitting
+  the field, or sending an explicit `null`, behaves exactly as before. Each finding:
+  - `id` (required): Non-empty string, unique within the submission.
+  - `severity` (required): One of `P1`, `P2`, `P3`.
+  - `file` (required): Non-empty string.
+  - `line` (required): A positive integer.
+  - `summary` (required): Non-empty string.
+  - `in_changed_text` (required): Boolean.
+  - `status` (required): One of `new`, `still_open`, `resolved`.
+  - `prior_id`: The id of an earlier finding. Required when `status` is `still_open` or
+    `resolved`, and must be absent (not even `null`) when `status` is `new`.
+
+  Findings are stored on the review event and returned by `GET /tasks/{id}/events`.
 
 **Response (200 OK):**
 ```json
@@ -836,12 +860,15 @@ The response includes the review task's own `id` and the parent implement task's
 - `400 INVALID_VERDICT`: verdict must be "approve" or "reject" (review only)
 - `400 FORBIDDEN_VERDICT`: verdict must not be present for implement tasks
 - `400 MISSING_VERDICT`: verdict is required for review tasks
+- `400 INVALID_FINDINGS`: A findings array is malformed; the message names the first invalid field
+- `400 FINDINGS_NOT_ALLOWED`: findings were provided on a non-review-kind task
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `404 NOT_FOUND`: Task not found
 - `409 CONFLICT`: Task is not in_progress or is not assigned to the provided agent_id
 - `500 SUBMIT_ERROR`: Server error submitting task
 
-**Note:** Links are indexed on `(kind, value)` to enable reverse lookup. Review verdicts are recorded as events on the parent implement task for audit purposes.
+**Note:** Links are indexed on `(kind, value)` to enable reverse lookup. Review verdicts, including
+any findings, are recorded as events on the parent implement task for audit purposes.
 
 ---
 
@@ -986,10 +1013,14 @@ curl -H "Authorization: Bearer token" \
     "kind": "claim",
     "verdict": null,
     "note": null,
+    "findings": null,
     "created_at": "2026-06-05T21:00:00.000000000Z"
   }
 ]
 ```
+
+`findings` is non-null only on `review` events for which the reviewer submitted structured
+findings (see `POST /tasks/{id}/submit` above); it is `null` on every other event.
 
 Returns `[]` when there are no retained events, including for an unknown full-length task UUID.
 An unmatched or too-short prefix returns `404 NOT_FOUND`; an ambiguous prefix returns

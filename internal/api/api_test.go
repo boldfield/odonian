@@ -2119,6 +2119,100 @@ func setupClaimedTask(t *testing.T, server *Server, authHeader string) (string, 
 	return taskID, claimedTask.LeaseExpiresAt
 }
 
+// setupClaimedReviewTask creates and submits an implement task (spawning a review
+// task), then claims that review task. It returns the claimed review task's id and
+// the parent implement task's id.
+func setupClaimedReviewTask(t *testing.T, server *Server, authHeader string) (string, string) {
+	t.Helper()
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Implement feature",
+			Spec:         "Do the thing",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "agent-1", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+	if claimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim implement task: got status %d", claimW.Code)
+	}
+
+	submitPayload := map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Implemented",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+	if submitW.Code != http.StatusOK {
+		t.Fatalf("failed to submit implement task: got status %d; body: %s", submitW.Code, submitW.Body.String())
+	}
+
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var allTasks []store.Task
+	if err := json.NewDecoder(listW.Body).Decode(&allTasks); err != nil {
+		t.Fatalf("failed to decode task list: %v", err)
+	}
+
+	var reviewTaskID string
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == taskID {
+			reviewTaskID = task.ID
+			break
+		}
+	}
+	if reviewTaskID == "" {
+		t.Fatalf("review task not found")
+	}
+
+	reviewClaimPayload := map[string]string{"agent_id": "opus-reviewer", "model": "opus"}
+	reviewClaimBody, _ := json.Marshal(reviewClaimPayload)
+	reviewClaimReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/claim", bytes.NewReader(reviewClaimBody))
+	reviewClaimReq.Header.Set("Authorization", authHeader)
+	reviewClaimReq.Header.Set("Content-Type", "application/json")
+	reviewClaimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(reviewClaimW, reviewClaimReq)
+	if reviewClaimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim review task: got status %d", reviewClaimW.Code)
+	}
+
+	return reviewTaskID, taskID
+}
+
 // TestHeartbeatExtendsLease verifies that heartbeat by the assignee extends the lease.
 func TestHeartbeatExtendsLease(t *testing.T) {
 	server := setupTestServer(t, "test-token")
@@ -2695,6 +2789,314 @@ func TestSubmitEmptyAgentIDReturns400(t *testing.T) {
 	errObj := errResp["error"].(map[string]interface{})
 	if errObj["code"] != "EMPTY_AGENT_ID" {
 		t.Errorf("expected error code 'EMPTY_AGENT_ID', got %v", errObj["code"])
+	}
+}
+
+// TestSubmitReviewFindingsRoundTripThroughEvents verifies that a valid findings
+// array submitted on a review task is stored on the parent's review event and is
+// retrievable via GET /tasks/{id}/events.
+func TestSubmitReviewFindingsRoundTripThroughEvents(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	reviewTaskID, parentTaskID := setupClaimedReviewTask(t, server, authHeader)
+
+	submitPayload := map[string]interface{}{
+		"agent_id": "opus-reviewer",
+		"result":   "Mostly good, a couple of issues",
+		"verdict":  "approve",
+		"findings": []map[string]interface{}{
+			{
+				"id": "f1", "severity": "P2", "file": "src/main.go", "line": 42,
+				"summary": "Issue one", "in_changed_text": true, "status": "new",
+			},
+			{
+				"id": "f2", "severity": "P1", "file": "src/other.go", "line": 7,
+				"summary": "Issue two", "in_changed_text": false, "status": "still_open", "prior_id": "old-1",
+			},
+		},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	if submitW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d; body: %s", submitW.Code, submitW.Body.String())
+	}
+
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+parentTaskID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+
+	if eventsW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", eventsW.Code)
+	}
+
+	var events []store.Event
+	if err := json.NewDecoder(eventsW.Body).Decode(&events); err != nil {
+		t.Fatalf("failed to decode events: %v", err)
+	}
+
+	var reviewEvent *store.Event
+	for i := range events {
+		if events[i].Kind == "review" {
+			reviewEvent = &events[i]
+		}
+	}
+	if reviewEvent == nil {
+		t.Fatalf("review event not found")
+	}
+	if reviewEvent.Findings == nil {
+		t.Fatalf("expected findings on review event, got none")
+	}
+
+	var storedFindings []store.Finding
+	if err := json.Unmarshal(*reviewEvent.Findings, &storedFindings); err != nil {
+		t.Fatalf("failed to unmarshal stored findings: %v", err)
+	}
+	if len(storedFindings) != 2 {
+		t.Fatalf("expected 2 findings, got %d", len(storedFindings))
+	}
+	if storedFindings[0].ID != "f1" || storedFindings[0].Line != 42 || !storedFindings[0].InChangedText {
+		t.Errorf("finding 0 round-tripped incorrectly: %+v", storedFindings[0])
+	}
+	if storedFindings[1].ID != "f2" || storedFindings[1].PriorID == nil || *storedFindings[1].PriorID != "old-1" {
+		t.Errorf("finding 1 round-tripped incorrectly: %+v", storedFindings[1])
+	}
+}
+
+// TestSubmitWithoutFindingsUnchanged verifies that a submission with no findings
+// field behaves exactly as before: 200 OK and no findings stored on the event.
+func TestSubmitWithoutFindingsUnchanged(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	reviewTaskID, parentTaskID := setupClaimedReviewTask(t, server, authHeader)
+
+	submitPayload := map[string]interface{}{
+		"agent_id": "opus-reviewer",
+		"result":   "Looks good",
+		"verdict":  "approve",
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	if submitW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d; body: %s", submitW.Code, submitW.Body.String())
+	}
+
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+parentTaskID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+
+	var events []store.Event
+	if err := json.NewDecoder(eventsW.Body).Decode(&events); err != nil {
+		t.Fatalf("failed to decode events: %v", err)
+	}
+	for _, e := range events {
+		if e.Kind == "review" && e.Findings != nil {
+			t.Errorf("expected no findings on review event, got %s", string(*e.Findings))
+		}
+	}
+}
+
+// TestSubmitFindingsTypeMismatchReturnsInvalidFindings verifies that findings with
+// the wrong JSON type for a field return 400 INVALID_FINDINGS naming the field,
+// instead of falling through to a generic JSON_DECODE_ERROR.
+func TestSubmitFindingsTypeMismatchReturnsInvalidFindings(t *testing.T) {
+	validFinding := map[string]interface{}{
+		"id": "f1", "severity": "P2", "file": "src/main.go", "line": 42,
+		"summary": "Issue one", "in_changed_text": true, "status": "new",
+	}
+
+	cases := []struct {
+		name     string
+		mutate   func(f map[string]interface{})
+		wantCode string
+	}{
+		{"fractional line", func(f map[string]interface{}) { f["line"] = 1.5 }, "INVALID_FINDINGS"},
+		{"huge line", func(f map[string]interface{}) { f["line"] = 1e30 }, "INVALID_FINDINGS"},
+		{"non-string id", func(f map[string]interface{}) { f["id"] = 5 }, "INVALID_FINDINGS"},
+		{"non-string severity", func(f map[string]interface{}) { f["severity"] = 2 }, "INVALID_FINDINGS"},
+		{"missing in_changed_text", func(f map[string]interface{}) { delete(f, "in_changed_text") }, "INVALID_FINDINGS"},
+		{"null in_changed_text", func(f map[string]interface{}) { f["in_changed_text"] = nil }, "INVALID_FINDINGS"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := setupTestServer(t, "test-token")
+			authHeader := "Bearer test-token"
+			reviewTaskID, _ := setupClaimedReviewTask(t, server, authHeader)
+
+			finding := map[string]interface{}{}
+			for k, v := range validFinding {
+				finding[k] = v
+			}
+			tc.mutate(finding)
+
+			submitPayload := map[string]interface{}{
+				"agent_id": "opus-reviewer",
+				"result":   "review",
+				"verdict":  "approve",
+				"findings": []map[string]interface{}{finding},
+			}
+			submitBody, _ := json.Marshal(submitPayload)
+			submitReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(submitBody))
+			submitReq.Header.Set("Authorization", authHeader)
+			submitReq.Header.Set("Content-Type", "application/json")
+			submitW := httptest.NewRecorder()
+			server.mux.ServeHTTP(submitW, submitReq)
+
+			if submitW.Code != http.StatusBadRequest {
+				t.Fatalf("expected status 400, got %d; body: %s", submitW.Code, submitW.Body.String())
+			}
+			var errResp map[string]interface{}
+			json.NewDecoder(submitW.Body).Decode(&errResp)
+			errObj := errResp["error"].(map[string]interface{})
+			if errObj["code"] != tc.wantCode {
+				t.Errorf("expected error code %q, got %v (message: %v)", tc.wantCode, errObj["code"], errObj["message"])
+			}
+		})
+	}
+}
+
+// TestSubmitFindingsOrderingNamesFirstInvalidField verifies that when findings[0]
+// has a semantic error and findings[1] has a type error, the response names
+// findings[0], not findings[1] — each finding is validated completely before
+// validation moves to the next one.
+func TestSubmitFindingsOrderingNamesFirstInvalidField(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	reviewTaskID, _ := setupClaimedReviewTask(t, server, authHeader)
+
+	submitPayload := map[string]interface{}{
+		"agent_id": "opus-reviewer",
+		"result":   "review",
+		"verdict":  "approve",
+		"findings": []map[string]interface{}{
+			{
+				"id": "", "severity": "P2", "file": "src/main.go", "line": 1,
+				"summary": "s", "in_changed_text": true, "status": "new",
+			},
+			{
+				"id": "f2", "severity": "P2", "file": "src/main.go", "line": 1.5,
+				"summary": "s", "in_changed_text": true, "status": "new",
+			},
+		},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	if submitW.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", submitW.Code, submitW.Body.String())
+	}
+	var errResp map[string]interface{}
+	json.NewDecoder(submitW.Body).Decode(&errResp)
+	errObj := errResp["error"].(map[string]interface{})
+	if errObj["code"] != "INVALID_FINDINGS" {
+		t.Fatalf("expected error code INVALID_FINDINGS, got %v", errObj["code"])
+	}
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "findings[0]") {
+		t.Errorf("expected message to name findings[0], got %q", msg)
+	}
+}
+
+// TestSubmitFindingsOnNonReviewTaskReturnsFindingsNotAllowed verifies that findings
+// on a non-review task always return FINDINGS_NOT_ALLOWED, even when the findings
+// payload is itself malformed — the kind gate takes precedence over format checks.
+func TestSubmitFindingsOnNonReviewTaskReturnsFindingsNotAllowed(t *testing.T) {
+	cases := []struct {
+		name     string
+		findings interface{}
+	}{
+		{"well-formed findings", []map[string]interface{}{
+			{
+				"id": "f1", "severity": "P2", "file": "src/main.go", "line": 1,
+				"summary": "s", "in_changed_text": true, "status": "new",
+			},
+		}},
+		{"malformed findings", []map[string]interface{}{{"id": ""}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := setupTestServer(t, "test-token")
+			authHeader := "Bearer test-token"
+			taskID, _ := setupClaimedTask(t, server, authHeader)
+
+			submitPayload := map[string]interface{}{
+				"agent_id": "test-agent",
+				"result":   "Implemented",
+				"findings": tc.findings,
+			}
+			submitBody, _ := json.Marshal(submitPayload)
+			submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+			submitReq.Header.Set("Authorization", authHeader)
+			submitReq.Header.Set("Content-Type", "application/json")
+			submitW := httptest.NewRecorder()
+			server.mux.ServeHTTP(submitW, submitReq)
+
+			if submitW.Code != http.StatusBadRequest {
+				t.Fatalf("expected status 400, got %d; body: %s", submitW.Code, submitW.Body.String())
+			}
+			var errResp map[string]interface{}
+			json.NewDecoder(submitW.Body).Decode(&errResp)
+			errObj := errResp["error"].(map[string]interface{})
+			if errObj["code"] != "FINDINGS_NOT_ALLOWED" {
+				t.Errorf("expected error code FINDINGS_NOT_ALLOWED, got %v (message: %v)", errObj["code"], errObj["message"])
+			}
+		})
+	}
+}
+
+// TestSubmitFindingsPriorIdNullOnNewStatusReturnsInvalid verifies that an explicit
+// prior_id:null is rejected the same as a present prior_id when status is "new" —
+// the spec requires prior_id to be absent, not merely falsy, for new findings.
+func TestSubmitFindingsPriorIdNullOnNewStatusReturnsInvalid(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	reviewTaskID, _ := setupClaimedReviewTask(t, server, authHeader)
+
+	submitPayload := map[string]interface{}{
+		"agent_id": "opus-reviewer",
+		"result":   "review",
+		"verdict":  "approve",
+		"findings": []map[string]interface{}{
+			{
+				"id": "f1", "severity": "P2", "file": "src/main.go", "line": 42,
+				"summary": "Issue", "in_changed_text": true, "status": "new", "prior_id": nil,
+			},
+		},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	if submitW.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", submitW.Code, submitW.Body.String())
+	}
+	var errResp map[string]interface{}
+	json.NewDecoder(submitW.Body).Decode(&errResp)
+	errObj := errResp["error"].(map[string]interface{})
+	if errObj["code"] != "INVALID_FINDINGS" {
+		t.Errorf("expected error code INVALID_FINDINGS, got %v (message: %v)", errObj["code"], errObj["message"])
 	}
 }
 

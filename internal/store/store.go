@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net/url"
 	"path/filepath"
 	"sort"
@@ -29,7 +30,7 @@ var migrationsFS embed.FS
 type Store interface {
 	Close() error
 	Conn() *sql.DB
-	AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string) (Event, error)
+	AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string, findings ...json.RawMessage) (Event, error)
 	ListEvents(ctx context.Context, taskID string) ([]Event, error)
 	PruneEvents(ctx context.Context, terminalRetentionDays int) (int64, error)
 	CreateProject(ctx context.Context, name, repo string) (Project, error)
@@ -46,7 +47,7 @@ type Store interface {
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error)
 	PromoteTask(ctx context.Context, taskID string) (Task, error)
-	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int) (TaskWithDepsAndLinks, error)
+	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
@@ -333,14 +334,22 @@ func (s *sqliteStore) Conn() *sql.DB {
 // AppendEvent inserts a new event into the event table within an existing transaction.
 // It must be called within a transaction so that a state change and its event can be
 // committed atomically.
-func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string) (Event, error) {
+func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string, findings ...json.RawMessage) (Event, error) {
 	eventID := GenerateID()
 	now := nowTimestamp()
 
+	var findingsText *string
+	var findingsRaw *json.RawMessage
+	if len(findings) > 0 && findings[0] != nil {
+		text := string(findings[0])
+		findingsText = &text
+		findingsRaw = &findings[0]
+	}
+
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO event (id, task_id, actor, kind, verdict, note, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, eventID, taskID, actor, kind, verdict, note, now)
+		INSERT INTO event (id, task_id, actor, kind, verdict, note, findings, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, eventID, taskID, actor, kind, verdict, note, findingsText, now)
 	if err != nil {
 		return Event{}, fmt.Errorf("failed to append event: %w", err)
 	}
@@ -360,6 +369,7 @@ func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor
 		Kind:      kind,
 		Verdict:   verdict,
 		Note:      note,
+		Findings:  findingsRaw,
 		CreatedAt: now,
 	}, nil
 }
@@ -392,7 +402,7 @@ func (s *sqliteStore) setTaskDepends(ctx context.Context, tx *sql.Tx, taskID str
 // ListEvents retrieves all events for a given task, ordered by created_at and id.
 func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, error) {
 	rows, err := s.readConn.QueryContext(ctx, `
-		SELECT id, task_id, actor, kind, verdict, note, created_at
+		SELECT id, task_id, actor, kind, verdict, note, findings, created_at
 		FROM event
 		WHERE task_id = ?
 		ORDER BY created_at, id
@@ -405,9 +415,14 @@ func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, e
 	var events []Event
 	for rows.Next() {
 		var e Event
-		err := rows.Scan(&e.ID, &e.TaskID, &e.Actor, &e.Kind, &e.Verdict, &e.Note, &e.CreatedAt)
+		var findingsText sql.NullString
+		err := rows.Scan(&e.ID, &e.TaskID, &e.Actor, &e.Kind, &e.Verdict, &e.Note, &findingsText, &e.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
+		}
+		if findingsText.Valid {
+			raw := json.RawMessage(findingsText.String)
+			e.Findings = &raw
 		}
 		events = append(events, e)
 	}
@@ -613,13 +628,170 @@ type ProjectListFilter struct {
 
 // Event represents an audit/event log entry.
 type Event struct {
-	ID        string  `db:"id" json:"id"`
-	TaskID    string  `db:"task_id" json:"task_id"`
-	Actor     string  `db:"actor" json:"actor"`
-	Kind      string  `db:"kind" json:"kind"`
-	Verdict   *string `db:"verdict" json:"verdict"` // nullable
-	Note      *string `db:"note" json:"note"`       // nullable
-	CreatedAt string  `db:"created_at" json:"created_at"`
+	ID        string           `db:"id" json:"id"`
+	TaskID    string           `db:"task_id" json:"task_id"`
+	Actor     string           `db:"actor" json:"actor"`
+	Kind      string           `db:"kind" json:"kind"`
+	Verdict   *string          `db:"verdict" json:"verdict"`   // nullable
+	Note      *string          `db:"note" json:"note"`         // nullable
+	Findings  *json.RawMessage `db:"findings" json:"findings"` // nullable; structured review findings
+	CreatedAt string           `db:"created_at" json:"created_at"`
+}
+
+// Finding is a single structured review finding, as defined by the research track
+// spec (docs/features/research-track.md, section 3). Findings are optional and are
+// only accepted on review-kind task submissions.
+type Finding struct {
+	ID            string  `json:"id"`
+	Severity      string  `json:"severity"`
+	File          string  `json:"file"`
+	Line          int     `json:"line"`
+	Summary       string  `json:"summary"`
+	InChangedText bool    `json:"in_changed_text"`
+	Status        string  `json:"status"`
+	PriorID       *string `json:"prior_id,omitempty"`
+}
+
+// validateFindings parses and validates a raw JSON findings payload against the
+// section 3 format. Each finding is validated completely, field by field, before
+// validation moves to the next finding, so a rejection names the first invalid
+// field in submission order.
+func validateFindings(raw json.RawMessage) ([]Finding, error) {
+	var rawFindings []json.RawMessage
+	if err := json.Unmarshal(raw, &rawFindings); err != nil {
+		return nil, invalid("INVALID_FINDINGS", "findings: must be an array")
+	}
+
+	findings := make([]Finding, 0, len(rawFindings))
+	seenIDs := make(map[string]bool, len(rawFindings))
+
+	for i, rf := range rawFindings {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(rf, &m); err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d]: must be an object", i))
+		}
+
+		var f Finding
+
+		idRaw, ok := m["id"]
+		if !ok {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: must be non-empty", i))
+		}
+		var id string
+		if err := json.Unmarshal(idRaw, &id); err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: must be a string", i))
+		}
+		if id == "" {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: must be non-empty", i))
+		}
+		if seenIDs[id] {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: duplicate id %q", i, id))
+		}
+		seenIDs[id] = true
+		f.ID = id
+
+		sevRaw, ok := m["severity"]
+		if !ok {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].severity: must be one of P1, P2, P3", i))
+		}
+		var severity string
+		if err := json.Unmarshal(sevRaw, &severity); err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].severity: must be a string", i))
+		}
+		if severity != "P1" && severity != "P2" && severity != "P3" {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].severity: must be one of P1, P2, P3", i))
+		}
+		f.Severity = severity
+
+		fileRaw, ok := m["file"]
+		if !ok {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].file: must be non-empty", i))
+		}
+		var file string
+		if err := json.Unmarshal(fileRaw, &file); err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].file: must be a string", i))
+		}
+		if file == "" {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].file: must be non-empty", i))
+		}
+		f.File = file
+
+		lineRaw, ok := m["line"]
+		if !ok || len(lineRaw) == 0 || lineRaw[0] == '"' {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+		}
+		var lineNum json.Number
+		if err := json.Unmarshal(lineRaw, &lineNum); err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+		}
+		lineVal, err := lineNum.Int64()
+		if err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+		}
+		if lineVal <= 0 || lineVal > math.MaxInt32 {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be a positive integer", i))
+		}
+		f.Line = int(lineVal)
+
+		sumRaw, ok := m["summary"]
+		if !ok {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].summary: must be non-empty", i))
+		}
+		var summary string
+		if err := json.Unmarshal(sumRaw, &summary); err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].summary: must be a string", i))
+		}
+		if summary == "" {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].summary: must be non-empty", i))
+		}
+		f.Summary = summary
+
+		ictRaw, ok := m["in_changed_text"]
+		if !ok || string(ictRaw) == "null" {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].in_changed_text: must be a boolean", i))
+		}
+		var inChangedText bool
+		if err := json.Unmarshal(ictRaw, &inChangedText); err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].in_changed_text: must be a boolean", i))
+		}
+		f.InChangedText = inChangedText
+
+		statusRaw, ok := m["status"]
+		if !ok {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].status: must be one of new, still_open, resolved", i))
+		}
+		var status string
+		if err := json.Unmarshal(statusRaw, &status); err != nil {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].status: must be a string", i))
+		}
+		if status != "new" && status != "still_open" && status != "resolved" {
+			return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].status: must be one of new, still_open, resolved", i))
+		}
+		f.Status = status
+
+		priorRaw, priorPresent := m["prior_id"]
+		if status == "new" {
+			if priorPresent {
+				return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: must be absent when status is new", i))
+			}
+		} else {
+			if !priorPresent {
+				return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: required when status is %s", i, status))
+			}
+			var priorID string
+			if err := json.Unmarshal(priorRaw, &priorID); err != nil {
+				return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: must be a string", i))
+			}
+			if priorID == "" {
+				return nil, invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: must be non-empty", i))
+			}
+			f.PriorID = &priorID
+		}
+
+		findings = append(findings, f)
+	}
+
+	return findings, nil
 }
 
 // ErrNotFound is returned when a resource is not found.
@@ -1663,7 +1835,7 @@ func thresholdFor(model string, escalationThresholds map[string]int, maxReviewRo
 // Returns ValidationError if a link kind is invalid or verdict is missing/invalid.
 // Returns ErrNotFound if the task doesn't exist.
 // Returns ErrConflict if the task is not in_progress or not assigned to the given agentID.
-func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int) (TaskWithDepsAndLinks, error) {
+func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error) {
 	// Validate link kinds first (before mutating anything).
 	// "no_op" marks a review-verified no-op resolution: a worker that finds the
 	// acceptance criteria already satisfied on main with no diff submits with a
@@ -1725,6 +1897,25 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 		if verdict != nil {
 			return TaskWithDepsAndLinks{}, invalid("FORBIDDEN_VERDICT", "verdict is not allowed for implement tasks")
 		}
+	}
+
+	// Validate findings based on task kind. A findings payload is optional and
+	// explicit null is treated the same as absent, so submissions without findings
+	// are unaffected. Findings are only accepted on review-kind tasks.
+	var findingsToStore json.RawMessage
+	if len(findings) > 0 && findings[0] != nil && string(findings[0]) != "null" {
+		if taskKind != "review" {
+			return TaskWithDepsAndLinks{}, invalid("FINDINGS_NOT_ALLOWED", "findings are only allowed on review-kind tasks")
+		}
+		parsedFindings, ferr := validateFindings(findings[0])
+		if ferr != nil {
+			return TaskWithDepsAndLinks{}, ferr
+		}
+		marshaled, merr := json.Marshal(parsedFindings)
+		if merr != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to marshal findings: %w", merr)
+		}
+		findingsToStore = marshaled
 	}
 
 	// Determine the next state based on task kind
@@ -1881,7 +2072,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			t.ReviewRound = newReviewRound
 		} else if t.Kind == "review" && targetTaskID != nil {
 			// This is a review task. Append a review event on the parent task.
-			_, err := s.AppendEvent(ctx, tx, *targetTaskID, agentID, "review", verdict, &result)
+			_, err := s.AppendEvent(ctx, tx, *targetTaskID, agentID, "review", verdict, &result, findingsToStore)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append review event on parent: %w", err)
 			}

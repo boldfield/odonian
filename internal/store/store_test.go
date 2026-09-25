@@ -145,8 +145,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 13 {
-		t.Errorf("expected 13 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 14 {
+		t.Errorf("expected 14 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -161,8 +161,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 13 {
-		t.Errorf("expected 13 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 14 {
+		t.Errorf("expected 14 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -258,8 +258,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 13 {
-		t.Errorf("expected 13 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 14 {
+		t.Errorf("expected 14 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -3280,6 +3280,266 @@ func TestSubmitReviewTaskWithoutVerdictRejected(t *testing.T) {
 	var validationErr *ValidationError
 	if !errors.As(err, &validationErr) || validationErr.Code != "MISSING_VERDICT" {
 		t.Errorf("expected MISSING_VERDICT validation error, got: %v", err)
+	}
+}
+
+// newClaimedReviewTaskForFindings sets up a project with an implement task that has
+// been submitted to review, returning the store, context, the claimed review task's
+// id and the parent (implement) task's id, ready for a SubmitTask call carrying
+// findings.
+func newClaimedReviewTaskForFindings(t *testing.T) (Store, context.Context, string, string) {
+	t.Helper()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Implement feature",
+			Spec:         "Do the thing",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	if _, err = store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err = store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 5, nil); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	var reviewTaskID string
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == taskID {
+			reviewTaskID = task.ID
+			break
+		}
+	}
+	if reviewTaskID == "" {
+		t.Fatalf("review task not found")
+	}
+
+	if _, err = store.ClaimTask(ctx, reviewTaskID, "opus-reviewer", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	return store, ctx, reviewTaskID, taskID
+}
+
+// TestSubmitReviewFindingsValidRoundTrip verifies that a valid findings array
+// submitted with a review verdict is stored on the parent's review event and
+// round-trips correctly through ListEvents.
+func TestSubmitReviewFindingsValidRoundTrip(t *testing.T) {
+	store, ctx, reviewTaskID, parentTaskID := newClaimedReviewTaskForFindings(t)
+
+	approve := "approve"
+	findings := json.RawMessage(`[
+		{"id":"f1","severity":"P2","file":"src/main.go","line":42,"summary":"Issue one","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P1","file":"src/other.go","line":7,"summary":"Issue two","in_changed_text":false,"status":"still_open","prior_id":"old-1"}
+	]`)
+
+	if _, err := store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Looks mostly good", &approve, []LinkInput{}, 5, nil, findings); err != nil {
+		t.Fatalf("failed to submit review with findings: %v", err)
+	}
+
+	events, err := store.ListEvents(ctx, parentTaskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	var reviewEvent *Event
+	for i := range events {
+		if events[i].Kind == "review" {
+			reviewEvent = &events[i]
+		}
+	}
+	if reviewEvent == nil {
+		t.Fatalf("review event not found")
+	}
+	if reviewEvent.Findings == nil {
+		t.Fatalf("expected findings to be stored on the review event")
+	}
+
+	var stored []Finding
+	if err := json.Unmarshal(*reviewEvent.Findings, &stored); err != nil {
+		t.Fatalf("failed to unmarshal stored findings: %v", err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("expected 2 findings, got %d", len(stored))
+	}
+	if stored[0].ID != "f1" || stored[0].Severity != "P2" || stored[0].Line != 42 || !stored[0].InChangedText || stored[0].Status != "new" || stored[0].PriorID != nil {
+		t.Errorf("finding 0 round-tripped incorrectly: %+v", stored[0])
+	}
+	if stored[1].ID != "f2" || stored[1].PriorID == nil || *stored[1].PriorID != "old-1" {
+		t.Errorf("finding 1 round-tripped incorrectly: %+v", stored[1])
+	}
+}
+
+// TestSubmitReviewWithoutFindingsUnchanged verifies that a review submission with
+// no findings argument behaves exactly as before: no findings are stored.
+func TestSubmitReviewWithoutFindingsUnchanged(t *testing.T) {
+	store, ctx, reviewTaskID, parentTaskID := newClaimedReviewTaskForFindings(t)
+
+	approve := "approve"
+	if _, err := store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil); err != nil {
+		t.Fatalf("failed to submit review without findings: %v", err)
+	}
+
+	events, err := store.ListEvents(ctx, parentTaskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	for _, e := range events {
+		if e.Kind == "review" && e.Findings != nil {
+			t.Errorf("expected no findings on review event, got %s", string(*e.Findings))
+		}
+	}
+}
+
+// TestSubmitFindingsRejectedOnNonReviewTask verifies that findings on a non-review
+// (implement) task submission are always rejected with FINDINGS_NOT_ALLOWED,
+// regardless of whether the findings payload itself is well-formed.
+func TestSubmitFindingsRejectedOnNonReviewTask(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Implement feature", Spec: "Do the thing", DocumentID: doc.ID, Model: "haiku"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	if _, err = store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		findings json.RawMessage
+	}{
+		{"well-formed findings", json.RawMessage(`[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new"}]`)},
+		{"malformed findings", json.RawMessage(`[{"id":""}]`)},
+		{"findings not an array", json.RawMessage(`"bogus"`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 5, nil, tc.findings)
+			var verr *ValidationError
+			if !errors.As(err, &verr) {
+				t.Fatalf("expected ValidationError, got %v", err)
+			}
+			if verr.Code != "FINDINGS_NOT_ALLOWED" {
+				t.Errorf("expected FINDINGS_NOT_ALLOWED, got %s (%s)", verr.Code, verr.Message)
+			}
+		})
+	}
+}
+
+// TestSubmitReviewFindingsValidationFailures exercises every validation rule from
+// the section 3 finding format, asserting each invalid payload is rejected with
+// INVALID_FINDINGS and a message naming the expected field.
+func TestSubmitReviewFindingsValidationFailures(t *testing.T) {
+	cases := []struct {
+		name       string
+		findings   string
+		wantSubstr string
+	}{
+		{"missing id", `[{"severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].id"},
+		{"empty id", `[{"id":"","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].id"},
+		{"duplicate id", `[
+			{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new"},
+			{"id":"f1","severity":"P2","file":"y.go","line":2,"summary":"s2","in_changed_text":true,"status":"new"}
+		]`, "findings[1].id"},
+		{"non-string id", `[{"id":5,"severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].id"},
+		{"invalid severity", `[{"id":"f1","severity":"P4","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].severity"},
+		{"missing severity", `[{"id":"f1","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].severity"},
+		{"missing file", `[{"id":"f1","severity":"P2","line":1,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].file"},
+		{"empty file", `[{"id":"f1","severity":"P2","file":"","line":1,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].file"},
+		{"missing line", `[{"id":"f1","severity":"P2","file":"x.go","summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].line"},
+		{"zero line", `[{"id":"f1","severity":"P2","file":"x.go","line":0,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].line"},
+		{"negative line", `[{"id":"f1","severity":"P2","file":"x.go","line":-1,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].line"},
+		{"fractional line", `[{"id":"f1","severity":"P2","file":"x.go","line":1.5,"summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].line"},
+		{"string line", `[{"id":"f1","severity":"P2","file":"x.go","line":"1","summary":"s","in_changed_text":true,"status":"new"}]`, "findings[0].line"},
+		{"missing summary", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"in_changed_text":true,"status":"new"}]`, "findings[0].summary"},
+		{"empty summary", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"","in_changed_text":true,"status":"new"}]`, "findings[0].summary"},
+		{"missing in_changed_text", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","status":"new"}]`, "findings[0].in_changed_text"},
+		{"null in_changed_text", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":null,"status":"new"}]`, "findings[0].in_changed_text"},
+		{"string in_changed_text", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":"yes","status":"new"}]`, "findings[0].in_changed_text"},
+		{"invalid status", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"done"}]`, "findings[0].status"},
+		{"missing status", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true}]`, "findings[0].status"},
+		{"prior_id required for still_open", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"still_open"}]`, "findings[0].prior_id"},
+		{"prior_id required for resolved", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"resolved"}]`, "findings[0].prior_id"},
+		{"prior_id present when new", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new","prior_id":"old"}]`, "findings[0].prior_id"},
+		{"prior_id null when new", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new","prior_id":null}]`, "findings[0].prior_id"},
+		{"prior_id empty when still_open", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"still_open","prior_id":""}]`, "findings[0].prior_id"},
+		{"prior_id non-string", `[{"id":"f1","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"still_open","prior_id":7}]`, "findings[0].prior_id"},
+		{"findings not an array", `{"id":"f1"}`, "findings"},
+		{"findings element not an object", `[1]`, "findings[0]"},
+		{"ordering: semantic error in findings[0] beats type error in findings[1]", `[
+			{"id":"","severity":"P2","file":"x.go","line":1,"summary":"s","in_changed_text":true,"status":"new"},
+			{"id":"f2","severity":"P2","file":"x.go","line":1.5,"summary":"s","in_changed_text":true,"status":"new"}
+		]`, "findings[0].id"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, ctx, reviewTaskID, _ := newClaimedReviewTaskForFindings(t)
+
+			approve := "approve"
+			_, err := store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "review", &approve, []LinkInput{}, 5, nil, json.RawMessage(tc.findings))
+
+			var verr *ValidationError
+			if !errors.As(err, &verr) {
+				t.Fatalf("expected ValidationError, got %v", err)
+			}
+			if verr.Code != "INVALID_FINDINGS" {
+				t.Fatalf("expected INVALID_FINDINGS, got %s (%s)", verr.Code, verr.Message)
+			}
+			if !strings.Contains(verr.Message, tc.wantSubstr) {
+				t.Errorf("expected message to contain %q, got %q", tc.wantSubstr, verr.Message)
+			}
+		})
 	}
 }
 
