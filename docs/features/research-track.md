@@ -23,7 +23,7 @@ Between September 23 and 25, 2026, one project ran 59 research assignments on th
 2. Findings carry a severity. Findings that block are separated from findings that are recorded and tracked.
 3. Every non-blocking finding becomes a tracked task. None is dropped.
 4. Disputes about a specific finding are resolved by adjudication, not by majority vote.
-5. Repeated rejection is treated as a sign the task is too big, and it blocks the task for decomposition instead of escalating the model tier.
+5. Repeated rejection is treated as a sign the task is too big, and it blocks the task for decomposition. Research starts on a strong default model and does not escalate unless a research ladder is configured.
 6. Spec compaction on supersede, for research tasks only.
 7. Each reviewer model's record is measured, so the reviewer pair can be chosen on evidence.
 
@@ -97,11 +97,20 @@ A worker may dispute a finding when resubmitting, by listing the finding ID with
 
 The adjudicator model is configured per deployment, for example `ODONIAN_RESEARCH_ADJUDICATOR`, and must be in the allowlist.
 
-### 6. Round budget instead of escalation
+### 6. Default model, escalation and round budget
 
-Research tasks do not change model tier on rejection. The `escalate` flag is ignored for the research track.
+**Default model.** A research task created without a model gets the deployment's research default, `ODONIAN_RESEARCH_DEFAULT_MODEL`. The recommended value is `claude-opus-5-5`. The value must be in the allowlist; the server refuses to start otherwise. A model set explicitly at creation always wins. Without this setting, a task created without a model would fall back to the first allowlisted model, which is today's behavior for every track and is too weak for research.
 
-Each research task has a round budget, configured per deployment, for example `ODONIAN_RESEARCH_ROUND_BUDGET`. When a task reaches the budget without passing, it is blocked with the reason `decompose`. The block event lists the blocking findings from each round, so the owner can see whether they were shrinking or recurring. The expected response is to split the task, not to release it.
+**Escalation is off by default, and can be turned on by configuration.** Research tasks use their own ladder and thresholds, separate from the build ladder:
+
+- `ODONIAN_RESEARCH_ESCALATION_LADDER`: ordered models, for example `claude-opus-5-5,claude-fable-5-1`. Empty or unset means research tasks never change tier on rejection. The default is empty.
+- `ODONIAN_RESEARCH_ESCALATION_THRESHOLDS`: rejected rounds allowed at each tier before moving up, in the same format as the build thresholds.
+
+Build and design tasks keep using the existing ladder and thresholds. A research task's `escalate` flag still applies: false disables escalation for that task even when a research ladder is configured.
+
+**Round budget.** Each research task has a round budget, `ODONIAN_RESEARCH_ROUND_BUDGET`. The budget counts rejected review rounds across the task's entire supersede chain, not per tier, so escalation cannot reset it. When a task reaches the budget without passing, it is blocked with the reason `decompose`, whatever its tier. The block event lists the blocking findings from each round, so the owner can see whether they were shrinking or recurring. The expected response is to split the task, not to release it.
+
+When escalation is enabled, a task escalates at its tier's threshold only if the budget still has rounds left. The budget always takes precedence.
 
 Research tasks also need sizing rules at creation. That belongs in the `odonian-breakdown` skill, not the server: a cap on claim rows and distinct sources per task, and a rule that cross-file mapping is split by the domain the items originate in.
 
@@ -151,9 +160,10 @@ Existing tasks keep their track and behavior. Build and design aggregation, esca
 4. After round 1, a P2 finding in unchanged text doesn't fail the round, and it creates a follow-up task.
 5. A P2 finding in changed text from either reviewer fails the round, even if the other reviewer approves.
 6. A disputed finding that its reviewer maintains spawns one adjudication task on the configured model, and its ruling decides that finding.
-7. A research task that reaches its round budget is blocked with reason `decompose`, and its model tier doesn't change.
-8. A superseded research task's spec contains the original assignment and the last round's unresolved findings only.
-9. Build and design tasks behave exactly as before, by their existing tests.
+7. A research task that reaches its round budget is blocked with reason `decompose`. With no research ladder configured its model tier never changes; with one configured, rounds on every tier count toward the same budget.
+8. A research task created without a model gets `ODONIAN_RESEARCH_DEFAULT_MODEL`; one created with a model keeps it; build and design defaults are unchanged.
+9. A superseded research task's spec contains the original assignment and the last round's unresolved findings only.
+10. Build and design tasks behave exactly as before, by their existing tests.
 
 ## Decisions and defaults
 
@@ -162,7 +172,7 @@ These were open questions. Each now has a recommended default. The owner can ove
 1. **Round budget: 6.** It is a size alarm, not a quality bar. A task that needs more than six rounds is treated as too large and blocked for decomposition. The earlier 13-round correction task would have been flagged at round 6.
 2. **Adjudicator: configured per deployment, required for adjudication.** `ODONIAN_RESEARCH_ADJUDICATOR` names an allowlisted model that differs from both reviewers of the task. If it is unset, or equals either reviewer, a maintained dispute stays blocking and the event says why.
 3. **Follow-up tasks start in `backlog`.** The owner decides when they run.
-4. **No escalation for research, ever.** Research tasks keep their model tier on rejection. A worker that crashes or never submits is already handled by lease expiry and stall detection, so it needs no escalation step either.
+4. **Default model `claude-opus-5-5`; escalation off, but configurable.** The research ladder is empty by default, so research tasks keep their tier. Escalation to Fable can be enabled later by setting the research ladder, with no code change. The round budget counts across the whole supersede chain either way. A worker that crashes or never submits is already handled by lease expiry and stall detection.
 5. **Delivery order** is in the task breakdown below. Until follow-up tasks ship in milestone 2, the research review prompt requires a full review every round.
 
 ## Task breakdown
@@ -176,13 +186,14 @@ Research tasks can run on their own prompts, and reviewers record findings in st
 - **R1. Accept `research` as a track.** Store validation, API documentation, tests. No other behavior change.
 - **R2. Research prompts.** `prompts/pull_request/research/implement.md` and `review.md`, carrying the rules in sections 2 and 9. Full review every round. Findings written in the structured format that R3 defines, and also in prose.
 - **R3a. Structured findings in the store and API.** A migration adding a findings field to review events, validation of the finding format, and acceptance on review submission. Optional, so build and design verdicts are unaffected.
+- **R4. Research default model.** `ODONIAN_RESEARCH_DEFAULT_MODEL`, applied at creation when a research task has no model.
 - **R3b. Structured findings in the CLI.** A way for reviewers to submit findings from a file, and inclusion of structured findings in the review context delivered to the worker on rework, alongside the existing prose findings.
 
-Dependencies: R3a after R1, because both edit the store's task creation and the API documentation. R3b after R3a. R2 is independent.
+Dependencies: R3a after R1, because both edit the store's task creation and the API documentation. R3b after R3a. R4 after R3b, because it edits the store's task creation and the server's configuration in cmd/odonian/main.go, which R1, R3a and R3b also touch. R2 is independent.
 
 ### Milestone 2: research aggregation
 
-Blocking rules from section 3, follow-up tasks from section 4, the round budget from section 6, and compaction from section 7.
+Blocking rules from section 3, follow-up tasks from section 4, the research ladder and round budget from section 6, and compaction from section 7.
 
 ### Milestone 3: disputes
 
