@@ -1345,7 +1345,7 @@ All error responses follow a consistent format:
 - `MODEL_MISMATCH` (409): Task's model doesn't match declared model on claim
 - `AMBIGUOUS_ID` (409): A task id prefix matched more than one task; `error.candidates` lists the matching ids (see [Task ID Conventions](#task-id-conventions))
 - `UNKNOWN_MODEL` (400): Model is not in the deployment allowlist (create time)
-- `UNKNOWN_TRACK` (400): Track is not one of the valid values (`"build"` or `"design"`)
+- `UNKNOWN_TRACK` (400): Track is not one of the valid values (`"build"`, `"design"`, or `"research"`)
 - `JSON_DECODE_ERROR` (400): Invalid JSON in request body
 - `EMPTY_<FIELD>` (400): Required field is empty
 - `INVALID_<FIELD>` (400): Field value is invalid (e.g., verdict not "approve" or "reject")
