@@ -23,7 +23,7 @@ func setupTestServer(t *testing.T, authToken string) *Server {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, false)
 }
 
 func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds map[string]int) *Server {
@@ -32,7 +32,16 @@ func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds ma
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, thresholds)
+	return New(s, authToken, 5*time.Minute, 5, thresholds, false)
+}
+
+func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool) *Server {
+	// Use in-memory database for testing
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled)
 }
 
 // TestHealthzWithoutAuth verifies GET /healthz returns 200 without auth.
@@ -3227,7 +3236,7 @@ func TestListProjectsReturnsEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// List projects without creating any
@@ -3261,7 +3270,7 @@ func TestListProjectsWithClaimableFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create project 1 with a claimable haiku implement task
@@ -3367,7 +3376,7 @@ func TestListProjectsClaimableWithMultipleFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create a project with two tasks: one haiku, one sonnet
@@ -3473,7 +3482,7 @@ func TestListProjectsClaimableUnchangedWithoutFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create two projects
@@ -6283,5 +6292,68 @@ func TestUpdateEscalationPrefixIDResolution(t *testing.T) {
 
 	if updateW.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", updateW.Code)
+	}
+}
+
+// TestPprofDisabledReturns404 verifies that /debug/pprof/ and its sub-routes return 404
+// when pprof is not enabled, exactly as if the feature didn't exist.
+func TestPprofDisabledReturns404(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", false)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/profile", "/debug/pprof/cmdline"} {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("path %s: expected status 404, got %d", path, w.Code)
+		}
+	}
+}
+
+// TestPprofEnabledRequiresAuth verifies that every registered pprof route, including
+// named-profile sub-routes, goes through the bearer-token auth middleware.
+func TestPprofEnabledRequiresAuth(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/goroutine", "/debug/pprof/cmdline"} {
+		req := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("path %s: unauthenticated request: expected status 401, got %d", path, w.Code)
+		}
+	}
+}
+
+// TestPprofEnabledAuthenticatedIndex verifies that an authenticated request to the pprof
+// index succeeds once pprof is enabled.
+func TestPprofEnabledAuthenticatedIndex(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	req := httptest.NewRequest("GET", "/debug/pprof/", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+}
+
+// TestPprofEnabledAuthenticatedNamedProfile verifies that an authenticated request to a
+// named profile sub-route (e.g. heap) succeeds once pprof is enabled.
+func TestPprofEnabledAuthenticatedNamedProfile(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	req := httptest.NewRequest("GET", "/debug/pprof/heap", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
 	}
 }
