@@ -24,7 +24,7 @@ FROM node:22-slim
 # libgc-dev = Boehm GC: Sigil-compiled programs + the sigil runtime/e2e tests link `-lgc`, so
 # without it any sigil `make check`/`make test` fails at link with "unable to find library -lgc",
 # which auto-rejects every sigil review round and escalates the task to the top tier.
-# poppler-utils = PDF rendering (pdfinfo, pdftoppm, pdftotext) for the history.rehab research pilot.
+# poppler-utils = PDF rendering (pdfinfo, pdftoppm, pdftotext) for research tasks that inspect source PDFs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates jq build-essential pkg-config cmake clang lld \
       libgc-dev \
@@ -77,8 +77,8 @@ ENV HOME=/home/agent \
     PATH="/usr/local/go/bin:/home/agent/.cargo/bin:${PATH}"
 
 # Verify PDF rendering capabilities: run smoke check as non-root user.
-# This ensures the worker/reviewer runtime can render PDFs as required by the history.rehab pilot.
-# Test with the NIC PDF (page 2) as specified by the history.rehab research-review pilot.
+# This ensures the worker/reviewer runtime can render PDFs, which research tasks require.
+# Tests against a public multi-page PDF whose page 2 must render.
 RUN PDF_URL=https://cdn.factcheck.org/UploadedFiles/SOCM-2025-11374_Redacted.pdf /usr/local/bin/pdf-smoke-check.sh
 
 # Rust toolchain (per-user via rustup) — many faictory tools are Rust crates.

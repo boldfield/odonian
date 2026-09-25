@@ -149,7 +149,7 @@ is in scope.
 ### PDF rendering and source inspection
 
 The fleet image includes Poppler utilities (`pdfinfo`, `pdftoppm`, `pdftotext`) for PDF rendering
-and text extraction, used in research workflows like the history.rehab pilot.
+and text extraction, used by research workflows that inspect source PDFs.
 
 **Source-inspection procedure:**
 
