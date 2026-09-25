@@ -4471,3 +4471,29 @@ func TestExecuteShowEventRetrievalFailure(t *testing.T) {
 		t.Errorf("expected error message about event retrieval, got: %v", err)
 	}
 }
+
+// TestPprofEnabledFromEnv verifies runServer's actual production wiring: pprofEnabledFromEnv
+// reads ODONIAN_PPROF from the environment itself, so this exercises the same call the server
+// makes, not a value the test re-derives. Only the exact literal "true" must enable pprof;
+// case variants, other truthy-looking values, and whitespace must all disable it.
+func TestPprofEnabledFromEnv(t *testing.T) {
+	tests := []struct {
+		envValue string
+		want     bool
+	}{
+		{"true", true},
+		{"", false},
+		{"TRUE", false},
+		{"True", false},
+		{"1", false},
+		{"yes", false},
+		{" true", false},
+		{"true ", false},
+	}
+	for _, tt := range tests {
+		t.Setenv("ODONIAN_PPROF", tt.envValue)
+		if got := pprofEnabledFromEnv(); got != tt.want {
+			t.Errorf("ODONIAN_PPROF=%q: pprofEnabledFromEnv() = %v, want %v", tt.envValue, got, tt.want)
+		}
+	}
+}
