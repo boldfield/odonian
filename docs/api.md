@@ -332,7 +332,7 @@ Bulk-create tasks for a project.
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
 - `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
 - `escalate` (optional, default `true`): Allow replacement by a higher model tier after the review threshold is exceeded.
-- `track` (optional, default `build`): `build` or `design`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
+- `track` (optional, default `build`): `build`, `design`, or `research`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
 
 | Delivery mode | Supported tracks |
 |---|---|
@@ -392,7 +392,7 @@ superseding the task will not resolve a missing prompt.
 - `201 Created`: Tasks successfully created
 - `400 INVALID_DOCUMENT_ID`: One or more document IDs do not exist
 - `400 UNKNOWN_MODEL`: The `model` or a `review_models` entry is not in the deployment allowlist
-- `400 UNKNOWN_TRACK`: The `track` field is not one of `"build"` or `"design"`
+- `400 UNKNOWN_TRACK`: The `track` field is not one of `"build"`, `"design"`, or `"research"`
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `400 <other validation errors>`: Client input validation errors
 - `500 CREATE_ERROR`: Server error creating tasks
@@ -1345,7 +1345,7 @@ All error responses follow a consistent format:
 - `MODEL_MISMATCH` (409): Task's model doesn't match declared model on claim
 - `AMBIGUOUS_ID` (409): A task id prefix matched more than one task; `error.candidates` lists the matching ids (see [Task ID Conventions](#task-id-conventions))
 - `UNKNOWN_MODEL` (400): Model is not in the deployment allowlist (create time)
-- `UNKNOWN_TRACK` (400): Track is not one of the valid values (`"build"` or `"design"`)
+- `UNKNOWN_TRACK` (400): Track is not one of the valid values (`"build"`, `"design"`, or `"research"`)
 - `JSON_DECODE_ERROR` (400): Invalid JSON in request body
 - `EMPTY_<FIELD>` (400): Required field is empty
 - `INVALID_<FIELD>` (400): Field value is invalid (e.g., verdict not "approve" or "reject")
