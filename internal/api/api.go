@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 	"time"
 
@@ -50,8 +51,9 @@ type Server struct {
 	escalationThresholds map[string]int
 }
 
-// New creates a new API server with the given store, auth token, lease TTL, max review rounds, and escalation thresholds.
-func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int) *Server {
+// New creates a new API server with the given store, auth token, lease TTL, max review rounds,
+// escalation thresholds, and whether pprof debug endpoints should be registered.
+func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, pprofEnabled bool) *Server {
 	mux := http.NewServeMux()
 	server := &Server{
 		mux:                  mux,
@@ -95,6 +97,19 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("POST /tasks/{id}/unarchive", server.authMiddleware(server.handleUnarchiveTask))
 	mux.HandleFunc("POST /projects/{id}/archive", server.authMiddleware(server.handleArchiveProject))
 	mux.HandleFunc("POST /projects/{id}/unarchive", server.authMiddleware(server.handleUnarchiveProject))
+
+	// Pprof endpoints (protected), registered only when ODONIAN_PPROF=true.
+	if pprofEnabled {
+		mux.HandleFunc("GET /debug/pprof/", server.authMiddleware(pprof.Index))
+		mux.HandleFunc("GET /debug/pprof/cmdline", server.authMiddleware(pprof.Cmdline))
+		mux.HandleFunc("GET /debug/pprof/profile", server.authMiddleware(pprof.Profile))
+		mux.HandleFunc("GET /debug/pprof/symbol", server.authMiddleware(pprof.Symbol))
+		mux.HandleFunc("POST /debug/pprof/symbol", server.authMiddleware(pprof.Symbol))
+		mux.HandleFunc("GET /debug/pprof/trace", server.authMiddleware(pprof.Trace))
+		mux.HandleFunc("GET /debug/pprof/{profile}", server.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+			pprof.Handler(r.PathValue("profile")).ServeHTTP(w, r)
+		}))
+	}
 
 	return server
 }

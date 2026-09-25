@@ -6782,3 +6782,65 @@ func TestFindingsAPIMissingInChangedText(t *testing.T) {
 		t.Errorf("expected INVALID_FINDINGS, got %v", errObj["code"])
 	}
 }
+// TestPprofDisabledReturns404 verifies that /debug/pprof/ and its sub-routes return 404
+// when pprof is not enabled, exactly as if the feature didn't exist.
+func TestPprofDisabledReturns404(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", false)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/profile", "/debug/pprof/cmdline"} {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("path %s: expected status 404, got %d", path, w.Code)
+		}
+	}
+}
+
+// TestPprofEnabledRequiresAuth verifies that every registered pprof route, including
+// named-profile sub-routes, goes through the bearer-token auth middleware.
+func TestPprofEnabledRequiresAuth(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/goroutine", "/debug/pprof/cmdline"} {
+		req := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("path %s: unauthenticated request: expected status 401, got %d", path, w.Code)
+		}
+	}
+}
+
+// TestPprofEnabledAuthenticatedIndex verifies that an authenticated request to the pprof
+// index succeeds once pprof is enabled.
+func TestPprofEnabledAuthenticatedIndex(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	req := httptest.NewRequest("GET", "/debug/pprof/", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+}
+
+// TestPprofEnabledAuthenticatedNamedProfile verifies that an authenticated request to a
+// named profile sub-route (e.g. heap) succeeds once pprof is enabled.
+func TestPprofEnabledAuthenticatedNamedProfile(t *testing.T) {
+	server := setupTestServerWithPprof(t, "test-token", true)
+
+	req := httptest.NewRequest("GET", "/debug/pprof/heap", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+}
