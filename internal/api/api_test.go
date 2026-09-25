@@ -25,7 +25,7 @@ func setupTestServer(t *testing.T, authToken string) *Server {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, false, 500, false, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, false, 500, nil)
 }
 
 func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds map[string]int) *Server {
@@ -34,7 +34,7 @@ func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds ma
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, thresholds, false, 500, false, nil)
+	return New(s, authToken, 5*time.Minute, 5, thresholds, false, 500, nil)
 }
 
 func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool) *Server {
@@ -43,7 +43,7 @@ func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool)
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled, 500, false, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled, 500, nil)
 }
 
 func setupTestServerWithLogger(t *testing.T, authToken string, logger *slog.Logger) *Server {
@@ -52,7 +52,7 @@ func setupTestServerWithLogger(t *testing.T, authToken string, logger *slog.Logg
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, false, 500, false, logger)
+	return New(s, authToken, 5*time.Minute, 5, nil, false, 500, logger)
 }
 
 // TestHealthzWithoutAuth verifies GET /healthz returns 200 without auth.
@@ -3247,7 +3247,7 @@ func TestListProjectsReturnsEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, nil)
 	authHeader := "Bearer test-token"
 
 	// List projects without creating any
@@ -3281,7 +3281,7 @@ func TestListProjectsWithClaimableFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, nil)
 	authHeader := "Bearer test-token"
 
 	// Create project 1 with a claimable haiku implement task
@@ -3387,7 +3387,7 @@ func TestListProjectsClaimableWithMultipleFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, nil)
 	authHeader := "Bearer test-token"
 
 	// Create a project with two tasks: one haiku, one sonnet
@@ -3493,7 +3493,7 @@ func TestListProjectsClaimableUnchangedWithoutFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, nil)
 	authHeader := "Bearer test-token"
 
 	// Create two projects
@@ -6391,7 +6391,7 @@ func (lc *logCapture) WithGroup(name string) slog.Handler {
 	return lc
 }
 
-// TestLatencyLoggingSlowRequest verifies a slow request produces an INFO record.
+// TestLatencyLoggingSlowRequest verifies a slow request produces an INFO record with correct fields.
 func TestLatencyLoggingSlowRequest(t *testing.T) {
 	capture := &logCapture{}
 	logger := slog.New(capture)
@@ -6400,7 +6400,8 @@ func TestLatencyLoggingSlowRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 100, false, logger)
+	// Use threshold 0ms so all requests are considered slow
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 0, logger)
 
 	// Create a project first
 	ctx := context.Background()
@@ -6409,7 +6410,7 @@ func TestLatencyLoggingSlowRequest(t *testing.T) {
 		t.Fatalf("failed to create project: %v", err)
 	}
 
-	// Test a protected endpoint (slower than 100ms threshold)
+	// Test a protected endpoint (all requests are slow with 0ms threshold)
 	req := httptest.NewRequest("GET", "/projects", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	w := httptest.NewRecorder()
@@ -6419,8 +6420,78 @@ func TestLatencyLoggingSlowRequest(t *testing.T) {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
 
-	if len(capture.records) == 0 {
-		t.Errorf("expected log record, got none")
+	if len(capture.records) != 1 {
+		t.Fatalf("expected exactly one log record, got %d", len(capture.records))
+	}
+
+	record := capture.records[0]
+	if record.Level != slog.LevelInfo {
+		t.Errorf("expected INFO level, got %v", record.Level)
+	}
+
+	// Check all required fields
+	method := getAttrValue(record, "method")
+	if method != "GET" {
+		t.Errorf("expected method 'GET', got %q", method)
+	}
+
+	pattern := getAttrValue(record, "pattern")
+	if pattern != "GET /projects" {
+		t.Errorf("expected pattern 'GET /projects', got %q", pattern)
+	}
+
+	status := getAttrValue(record, "status")
+	if status != "200" {
+		t.Errorf("expected status '200', got %q", status)
+	}
+
+	bytes := getAttrValue(record, "bytes")
+	if bytes == "" {
+		t.Errorf("expected bytes field to be present")
+	}
+
+	durationMs := getAttrValue(record, "duration_ms")
+	if durationMs == "" {
+		t.Errorf("expected duration_ms field to be present")
+	}
+}
+
+// TestLatencyLoggingFastRequest verifies a fast request produces a DEBUG record, not INFO.
+func TestLatencyLoggingFastRequest(t *testing.T) {
+	capture := &logCapture{}
+	logger := slog.New(capture)
+
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	// Use very high threshold (10 seconds) so normal requests are fast
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 10000, logger)
+
+	// Create a project first
+	ctx := context.Background()
+	_, err = s.CreateProject(ctx, "test", "repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Test a protected endpoint (fast relative to high threshold)
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	if len(capture.records) != 1 {
+		t.Fatalf("expected exactly one log record, got %d", len(capture.records))
+	}
+
+	record := capture.records[0]
+	if record.Level != slog.LevelDebug {
+		t.Errorf("expected DEBUG level for fast request, got %v", record.Level)
 	}
 }
 
@@ -6433,7 +6504,7 @@ func TestLatencyLoggingHealthzExcluded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, false, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, logger)
 
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -6471,7 +6542,7 @@ func TestLatencyLoggingQueryParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 100, false, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 0, logger)
 
 	// Create a project first
 	ctx := context.Background()
@@ -6508,7 +6579,7 @@ func TestLatencyLoggingQueryParams(t *testing.T) {
 	_ = project
 }
 
-// TestLatencyLoggingAuthNotLogged verifies Authorization token is never logged.
+// TestLatencyLoggingAuthNotLogged verifies Authorization token and query values are never logged.
 func TestLatencyLoggingAuthNotLogged(t *testing.T) {
 	capture := &logCapture{}
 	logger := slog.New(capture)
@@ -6517,7 +6588,7 @@ func TestLatencyLoggingAuthNotLogged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 100, false, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 0, logger)
 
 	// Create a project first
 	ctx := context.Background()
@@ -6536,23 +6607,33 @@ func TestLatencyLoggingAuthNotLogged(t *testing.T) {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
 
-	// Check that query param values are never logged
-	if len(capture.records) > 0 {
-		record := capture.records[0]
-		var fullLog strings.Builder
-		record.Attrs(func(a slog.Attr) bool {
-			fullLog.WriteString(a.String())
-			fullLog.WriteString(" ")
-			return true
-		})
-		logStr := fullLog.String()
-		// The param name "model" should be logged but not the value
-		if !strings.Contains(logStr, "model") {
-			t.Errorf("expected 'model' param name in log")
-		}
-		if strings.Contains(logStr, "secret-model-value") {
-			t.Errorf("expected query param value NOT in log, got: %s", logStr)
-		}
+	if len(capture.records) != 1 {
+		t.Fatalf("expected exactly one log record, got %d", len(capture.records))
+	}
+
+	record := capture.records[0]
+	var fullLog strings.Builder
+	record.Attrs(func(a slog.Attr) bool {
+		fullLog.WriteString(a.String())
+		fullLog.WriteString(" ")
+		return true
+	})
+	logStr := fullLog.String()
+
+	// The param name "model" should be logged but not the value
+	if !strings.Contains(logStr, "model") {
+		t.Errorf("expected 'model' param name in log")
+	}
+	if strings.Contains(logStr, "secret-model-value") {
+		t.Errorf("expected query param value NOT in log, got: %s", logStr)
+	}
+
+	// The Authorization header and token should never be logged
+	if strings.Contains(logStr, "test-token") {
+		t.Errorf("expected Authorization token NOT in log, got: %s", logStr)
+	}
+	if strings.Contains(logStr, "Bearer") {
+		t.Errorf("expected Authorization header NOT in log, got: %s", logStr)
 	}
 }
 
@@ -6565,7 +6646,7 @@ func TestLatencyLoggingResponseSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 100, false, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 0, logger)
 
 	req := httptest.NewRequest("GET", "/projects", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
@@ -6576,12 +6657,13 @@ func TestLatencyLoggingResponseSize(t *testing.T) {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
 
-	// Response should include bytes logged
-	if len(capture.records) > 0 {
-		record := capture.records[0]
-		bytesStr := getAttrValue(record, "bytes")
-		if bytesStr == "" {
-			t.Errorf("expected 'bytes' in log")
-		}
+	if len(capture.records) != 1 {
+		t.Fatalf("expected exactly one log record, got %d", len(capture.records))
+	}
+
+	record := capture.records[0]
+	bytesStr := getAttrValue(record, "bytes")
+	if bytesStr == "" {
+		t.Errorf("expected 'bytes' in log")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -57,12 +58,8 @@ type Server struct {
 // New creates a new API server with the given store, auth token, lease TTL, max review rounds,
 // escalation thresholds, whether pprof debug endpoints should be registered, slow request threshold,
 // and logger.
-func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, pprofEnabled bool, slowRequestThresholdMs int, warnInvalidSlowRequest bool, logger *slog.Logger) *Server {
+func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, pprofEnabled bool, slowRequestThresholdMs int, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
-
-	if warnInvalidSlowRequest && logger != nil {
-		logger.Warn("invalid ODONIAN_SLOW_REQUEST_MS value, using default 500ms")
-	}
 
 	server := &Server{
 		mux:                    mux,
@@ -82,7 +79,7 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 
 	// Register handlers
 	// GET /healthz is exempted from auth and latency logging
-	mux.HandleFunc("GET /healthz", server.latencyLoggingWrapper("GET /healthz", server.handleHealthz))
+	mux.HandleFunc("GET /healthz", server.handleHealthz)
 
 	// Project endpoints (protected)
 	mux.HandleFunc("POST /projects", wrapProtected("POST /projects", server.handleCreateProject))
@@ -177,15 +174,9 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // latencyLoggingWrapper wraps an HTTP handler to log per-request latency.
 // Logs method, pattern, query param names (not values), status, response size, and duration.
 // Requests at or above the slow threshold log at INFO; below log at DEBUG.
-// Skips /healthz and only logs when a logger is configured.
+// Only logs when a logger is configured.
 func (s *Server) latencyLoggingWrapper(pattern string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Skip logging for /healthz
-		if pattern == "GET /healthz" {
-			next(w, r)
-			return
-		}
-
 		// If no logger, just call the handler
 		if s.logger == nil {
 			next(w, r)
@@ -253,14 +244,7 @@ func extractQueryParamNames(q url.Values) string {
 		names = append(names, name)
 	}
 
-	// Sort for consistent output
-	// Simple insertion sort for small slices
-	for i := 1; i < len(names); i++ {
-		for j := i; j > 0 && names[j] < names[j-1]; j-- {
-			names[j], names[j-1] = names[j-1], names[j]
-		}
-	}
-
+	sort.Strings(names)
 	return strings.Join(names, ",")
 }
 

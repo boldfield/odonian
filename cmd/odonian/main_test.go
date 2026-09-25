@@ -4497,3 +4497,29 @@ func TestPprofEnabledFromEnv(t *testing.T) {
 		}
 	}
 }
+
+// TestParseSlowRequestThreshold verifies parseSlowRequestThreshold correctly parses
+// ODONIAN_SLOW_REQUEST_MS and validates the threshold value. Invalid values return the
+// default 500ms and log one warning via log.Printf.
+func TestParseSlowRequestThreshold(t *testing.T) {
+	tests := []struct {
+		name     string
+		envValue string
+		want     int
+	}{
+		{"empty string defaults to 500", "", 500},
+		{"valid positive integer", "250", 250},
+		{"zero is valid", "0", 0},
+		{"negative value uses default", "-5", 500},
+		{"non-integer string uses default", "abc", 500},
+		{"decimal string uses default", "1.5", 500},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseSlowRequestThreshold(tt.envValue)
+			if got != tt.want {
+				t.Errorf("parseSlowRequestThreshold(%q) = %d, want %d", tt.envValue, got, tt.want)
+			}
+		})
+	}
+}

@@ -228,7 +228,7 @@ func runServer() {
 		log.Fatalf("failed to parse PRWATCH_RATE_LIMIT_FLOOR: %v", err)
 	}
 
-	slowRequestThresholdMs, warnInvalidSlowRequest := parseSlowRequestThreshold(os.Getenv("ODONIAN_SLOW_REQUEST_MS"))
+	slowRequestThresholdMs := parseSlowRequestThreshold(os.Getenv("ODONIAN_SLOW_REQUEST_MS"))
 
 	pprofEnabled := pprofEnabledFromEnv()
 
@@ -253,7 +253,7 @@ func runServer() {
 	}
 
 	// Create API server
-	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, pprofEnabled, slowRequestThresholdMs, warnInvalidSlowRequest, logger)
+	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, pprofEnabled, slowRequestThresholdMs, logger)
 
 	// Set up graceful shutdown with signal handling
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -977,25 +977,25 @@ func executeHeartbeat(ctx context.Context, baseURL, token string, args []string)
 }
 
 // parseSlowRequestThreshold parses ODONIAN_SLOW_REQUEST_MS.
-// Returns the threshold in milliseconds and whether to warn about invalid input.
-// Default is 500ms; negative or non-integer values fall back to default with warning.
-func parseSlowRequestThreshold(thresholdStr string) (int, bool) {
+// Returns the threshold in milliseconds. Default is 500ms;
+// negative or non-integer values fall back to default with warning.
+func parseSlowRequestThreshold(thresholdStr string) int {
 	if thresholdStr == "" {
-		return 500, false
+		return 500
 	}
 
 	threshold, err := strconv.Atoi(thresholdStr)
 	if err != nil {
 		log.Printf("warning: ODONIAN_SLOW_REQUEST_MS is not an integer, using default 500ms")
-		return 500, true
+		return 500
 	}
 
 	if threshold < 0 {
 		log.Printf("warning: ODONIAN_SLOW_REQUEST_MS is negative, using default 500ms")
-		return 500, true
+		return 500
 	}
 
-	return threshold, false
+	return threshold
 }
 
 func parseAllowedModels(modelsStr string) []string {
