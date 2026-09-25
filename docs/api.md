@@ -336,7 +336,7 @@ Bulk-create tasks for a project.
 
 | Delivery mode | Supported tracks |
 |---|---|
-| `pull_request` | `build`, `design`, `research` |
+| `pull_request` | `build`, `design` |
 | `local_commit` | `build` |
 
 These combinations have worker and reviewer prompts in the bundled harness. The API validates

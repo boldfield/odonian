@@ -1723,6 +1723,26 @@ func TestCreateTasksAcceptsResearchTrack(t *testing.T) {
 	if createdTasks[0].Track != "research" {
 		t.Errorf("expected track 'research', got %q", createdTasks[0].Track)
 	}
+
+	// Verify research track persists when retrieved via GET
+	taskID := createdTasks[0].ID
+	req = httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	req.Header.Set("Authorization", authHeader)
+	w = httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	var retrievedTask store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(w.Body).Decode(&retrievedTask); err != nil {
+		t.Fatalf("failed to decode retrieved task: %v", err)
+	}
+
+	if retrievedTask.Track != "research" {
+		t.Errorf("expected track 'research' after retrieval, got %q", retrievedTask.Track)
+	}
 }
 
 // TestCreateTasksDefaultsTrackToBuild verifies CreateTasks defaults track to build when empty.

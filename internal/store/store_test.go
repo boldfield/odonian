@@ -8507,6 +8507,32 @@ func TestCreateTasksWithTrack(t *testing.T) {
 	if retrievedDefault.Track != "build" {
 		t.Errorf("expected track='build' (default) after retrieval, got '%s'", retrievedDefault.Track)
 	}
+
+	// Test 3: Create task with track=research
+	tasksResearch, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Research Task", Spec: "Research spec", DocumentID: doc.ID, Track: "research"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task with research track: %v", err)
+	}
+
+	if len(tasksResearch) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasksResearch))
+	}
+
+	if tasksResearch[0].Track != "research" {
+		t.Errorf("expected track='research', got '%s'", tasksResearch[0].Track)
+	}
+
+	// Verify research track persists when retrieved
+	retrievedResearch, err := store.GetTask(ctx, tasksResearch[0].ID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+
+	if retrievedResearch.Track != "research" {
+		t.Errorf("expected track='research' after retrieval, got '%s'", retrievedResearch.Track)
+	}
 }
 
 // TestCreateTasksWithUnknownTrack verifies that track field is validated.
@@ -8552,7 +8578,10 @@ func TestCreateTasksWithUnknownTrack(t *testing.T) {
 		if err != nil {
 			t.Errorf("failed to create task with track=%s: %v", track, err)
 		}
-		if len(tasks) != 1 || tasks[0].Track != track {
+		if len(tasks) != 1 {
+			t.Fatalf("expected 1 task with track=%s, got %d", track, len(tasks))
+		}
+		if tasks[0].Track != track {
 			t.Errorf("expected track=%s, got %s", track, tasks[0].Track)
 		}
 	}
