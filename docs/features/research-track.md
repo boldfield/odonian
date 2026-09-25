@@ -1,6 +1,6 @@
 # Feature: research track
 
-Status: draft for owner review · September 25, 2026
+Status: ready for owner review · September 25, 2026. Open questions have recommended defaults, marked below; the owner can override any of them before the milestone they affect.
 
 ## What this is
 
@@ -58,11 +58,19 @@ The research review prompt carries these rules. The project's own contract adds 
 
 ### 3. Structured verdicts and aggregation
 
-A research review verdict stays `approve` or `reject`. It also carries a list of findings. Each finding has an ID, a severity, a file and line, a summary, and whether it is in text changed during this round.
+A research review verdict stays `approve` or `reject`. It also carries a list of findings. Each finding has:
+
+- **id**: unique within the task, assigned by the reviewer.
+- **severity**: P1, P2 or P3.
+- **file** and **line**: where the defect is.
+- **summary**: one or two sentences.
+- **in_changed_text**: whether the defect is in text changed since this reviewer's last review. Always true in round 1.
+- **status**: `new`, `still_open` or `resolved`. From round 2 on, a reviewer reports every one of its own earlier findings as `still_open` or `resolved`.
+- **prior_id**: for `still_open` and `resolved`, the id of the earlier finding.
 
 Aggregation for research tasks:
 
-- **A finding blocks** if it is P1 or P2 and in changed text, if it is P1 or P2 in any text during round 1, or if it is any finding from an earlier round that is still unresolved.
+- **A finding blocks** if it is P1 or P2 and in changed text, if it is P1 or P2 in any text during round 1, or if its status is `still_open`.
 - **The round passes** only if no reviewer raised a blocking finding. Any valid blocking finding from any reviewer fails the round. That keeps the value of two reviewers, since each is there to catch what the other misses.
 - **Non-blocking findings** are P3 findings, and P1 or P2 findings in unchanged text after round 1. They don't fail the round. They become follow-up tasks.
 
@@ -111,6 +119,18 @@ For each reviewer model on the research track, record:
 
 This goes through a read-only API endpoint and a view in the TUI. It is the basis for choosing the reviewer pair, which today is chosen on anecdote.
 
+### 9. Evidence tooling
+
+Anything mechanical in a research task should come from a tool, not be written by hand. Examples: listing every gap bullet and pending row in a set of files, or running a set of search terms across files and reporting the hits with line numbers. On one project, the most frequent review findings on cross-file inventory tasks were wrong line locators, missed items in an enumeration, and search results the worker reported but that did not exist. All three are mechanical.
+
+The research prompts support project-provided tools without making Odonian responsible for them:
+
+- A project's task contract may name tools, such as scripts in its repository, and the inputs to run them with.
+- The research implement prompt requires the worker to run each named tool and include its output verbatim, with the exact command, in the deliverable or the PR.
+- The research review prompt requires the reviewer to re-run each named tool on the merged result and treat any difference from the included output as a P1 finding.
+
+Judgment stays with the worker: which hits are real links, and what disposition each item gets.
+
 ## Data model changes
 
 - `research` added to the allowed `track` values.
@@ -135,10 +155,39 @@ Existing tasks keep their track and behavior. Build and design aggregation, esca
 8. A superseded research task's spec contains the original assignment and the last round's unresolved findings only.
 9. Build and design tasks behave exactly as before, by their existing tests.
 
-## Open questions for the owner
+## Decisions and defaults
 
-1. **Round budget.** The 13-round correction task above was productive throughout. If the budget is meant as a size alarm, 6 would have flagged it for splitting. Is that the intent?
-2. **Adjudicator model.** It must differ from both reviewers. Which model?
-3. **Follow-up tasks.** Should they start in `backlog` as proposed, or promote automatically?
-4. **Escalation.** Should research keep one escalation step, for a worker that crashes or produces nothing, or never escalate at all?
-5. **Order of delivery.** Proposed order: the track and prompts, then structured findings with follow-up tasks, then adjudication, then the round budget, then compaction, then scorecards. The round-scope rule in section 2 depends on follow-up tasks. Until those ship, the research prompt should require full review every round.
+These were open questions. Each now has a recommended default. The owner can override any of them before the milestone it affects.
+
+1. **Round budget: 6.** It is a size alarm, not a quality bar. A task that needs more than six rounds is treated as too large and blocked for decomposition. The earlier 13-round correction task would have been flagged at round 6.
+2. **Adjudicator: configured per deployment, required for adjudication.** `ODONIAN_RESEARCH_ADJUDICATOR` names an allowlisted model that differs from both reviewers of the task. If it is unset, or equals either reviewer, a maintained dispute stays blocking and the event says why.
+3. **Follow-up tasks start in `backlog`.** The owner decides when they run.
+4. **No escalation for research, ever.** Research tasks keep their model tier on rejection. A worker that crashes or never submits is already handled by lease expiry and stall detection, so it needs no escalation step either.
+5. **Delivery order** is in the task breakdown below. Until follow-up tasks ship in milestone 2, the research review prompt requires a full review every round.
+
+## Task breakdown
+
+Only milestone 1 is registered on the board now. Later milestones are registered after the owner reviews the previous one.
+
+### Milestone 1: the track, prompts and structured findings
+
+Research tasks can run on their own prompts, and reviewers record findings in structured form. Aggregation, escalation and supersede behavior are unchanged in this milestone, so the structured findings can be observed before they drive decisions.
+
+- **R1. Accept `research` as a track.** Store validation, API documentation, tests. No other behavior change.
+- **R2. Research prompts.** `prompts/pull_request/research/implement.md` and `review.md`, carrying the rules in sections 2 and 9. Full review every round. Findings written in the structured format that R3 defines, and also in prose.
+- **R3a. Structured findings in the store and API.** A migration adding a findings field to review events, validation of the finding format, and acceptance on review submission. Optional, so build and design verdicts are unaffected.
+- **R3b. Structured findings in the CLI.** A way for reviewers to submit findings from a file, and inclusion of structured findings in the review context delivered to the worker on rework, alongside the existing prose findings.
+
+Dependencies: R3a after R1, because both edit the store's task creation and the API documentation. R3b after R3a. R2 is independent.
+
+### Milestone 2: research aggregation
+
+Blocking rules from section 3, follow-up tasks from section 4, the round budget from section 6, and compaction from section 7.
+
+### Milestone 3: disputes
+
+Dispute submission, adjudication tasks and binding rulings from section 5. The review prompt switches to scoped re-review once follow-up tasks exist.
+
+### Milestone 4: scorecards and sizing
+
+The scorecard endpoint and TUI view from section 8, and sizing guidance in the `odonian-breakdown` skill.
