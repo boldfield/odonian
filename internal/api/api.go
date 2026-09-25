@@ -659,13 +659,34 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d]: must be an object", i))
 				return
 			}
-			// Validate critical fields for type correctness
+			// Validate string fields
+			for _, field := range []string{"id", "severity", "file", "summary", "status", "prior_id"} {
+				if val, ok := findingMap[field]; ok && val != nil {
+					if _, isStr := val.(string); !isStr {
+						s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].%s: must be a string", i, field))
+						return
+					}
+				}
+			}
+			// Validate line: must be a number and an integer in valid range
 			if val, ok := findingMap["line"]; ok {
-				if _, isNum := val.(float64); !isNum {
+				num, isNum := val.(float64)
+				if !isNum {
+					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+					return
+				}
+				// Check if it's an integer (not fractional)
+				if num != float64(int(num)) {
+					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+					return
+				}
+				// Check if it's in valid int range
+				if num < 0 || num > float64(int(^uint(0)>>1)) {
 					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
 					return
 				}
 			}
+			// Validate in_changed_text: must be a boolean
 			if val, ok := findingMap["in_changed_text"]; ok {
 				if _, isBool := val.(bool); !isBool {
 					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].in_changed_text: must be a boolean", i))

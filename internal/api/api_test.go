@@ -6565,6 +6565,109 @@ func TestFindingsAPITypeErrors(t *testing.T) {
 	if errObj["code"] != "INVALID_FINDINGS" {
 		t.Errorf("expected INVALID_FINDINGS, got %v", errObj["code"])
 	}
+
+	// Test: line as fractional number (1.5)
+	fractionalLinePayload := map[string]interface{}{
+		"agent_id": "reviewer",
+		"result":   "Review",
+		"verdict":  "approve",
+		"links":    []map[string]string{},
+		"findings": []map[string]interface{}{
+			{
+				"id":              "f1",
+				"severity":        "P2",
+				"file":            "src/main.go",
+				"line":            1.5, // Fractional
+				"summary":         "Issue",
+				"in_changed_text": true,
+				"status":          "new",
+			},
+		},
+	}
+	fracBody, _ := json.Marshal(fractionalLinePayload)
+	fracReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(fracBody))
+	fracReq.Header.Set("Authorization", authHeader)
+	fracReq.Header.Set("Content-Type", "application/json")
+	fracW := httptest.NewRecorder()
+	server.mux.ServeHTTP(fracW, fracReq)
+
+	if fracW.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for fractional line, got %d", fracW.Code)
+	}
+	json.NewDecoder(fracW.Body).Decode(&errResp)
+	errObj = errResp["error"].(map[string]interface{})
+	if errObj["code"] != "INVALID_FINDINGS" {
+		t.Errorf("expected INVALID_FINDINGS for fractional line, got %v", errObj["code"])
+	}
+
+	// Test: id as non-string (integer)
+	nonStringIDPayload := map[string]interface{}{
+		"agent_id": "reviewer",
+		"result":   "Review",
+		"verdict":  "approve",
+		"links":    []map[string]string{},
+		"findings": []map[string]interface{}{
+			{
+				"id":              5, // Non-string
+				"severity":        "P2",
+				"file":            "src/main.go",
+				"line":            42,
+				"summary":         "Issue",
+				"in_changed_text": true,
+				"status":          "new",
+			},
+		},
+	}
+	idBody, _ := json.Marshal(nonStringIDPayload)
+	idReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(idBody))
+	idReq.Header.Set("Authorization", authHeader)
+	idReq.Header.Set("Content-Type", "application/json")
+	idW := httptest.NewRecorder()
+	server.mux.ServeHTTP(idW, idReq)
+
+	if idW.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-string id, got %d", idW.Code)
+	}
+	json.NewDecoder(idW.Body).Decode(&errResp)
+	errObj = errResp["error"].(map[string]interface{})
+	if errObj["code"] != "INVALID_FINDINGS" {
+		t.Errorf("expected INVALID_FINDINGS for non-string id, got %v", errObj["code"])
+	}
+
+	// Test: prior_id as non-string (integer)
+	nonStringPriorIDPayload := map[string]interface{}{
+		"agent_id": "reviewer",
+		"result":   "Review",
+		"verdict":  "approve",
+		"links":    []map[string]string{},
+		"findings": []map[string]interface{}{
+			{
+				"id":              "f1",
+				"severity":        "P2",
+				"file":            "src/main.go",
+				"line":            42,
+				"summary":         "Issue",
+				"in_changed_text": true,
+				"status":          "still_open",
+				"prior_id":        7, // Non-string
+			},
+		},
+	}
+	priorBody, _ := json.Marshal(nonStringPriorIDPayload)
+	priorReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(priorBody))
+	priorReq.Header.Set("Authorization", authHeader)
+	priorReq.Header.Set("Content-Type", "application/json")
+	priorW := httptest.NewRecorder()
+	server.mux.ServeHTTP(priorW, priorReq)
+
+	if priorW.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-string prior_id, got %d", priorW.Code)
+	}
+	json.NewDecoder(priorW.Body).Decode(&errResp)
+	errObj = errResp["error"].(map[string]interface{})
+	if errObj["code"] != "INVALID_FINDINGS" {
+		t.Errorf("expected INVALID_FINDINGS for non-string prior_id, got %v", errObj["code"])
+	}
 }
 
 // TestFindingsAPIMissingInChangedText tests that missing in_changed_text is rejected.

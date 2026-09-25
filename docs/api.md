@@ -811,9 +811,9 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
 - `agent_id` (required): The ID of the reviewing agent (must match the task's assignee)
 - `verdict` (required): Either `"approve"` or `"reject"`
 - `result` (optional): Review writeup or detailed feedback
-- `findings` (optional): Array of structured review findings (research track only)
+- `findings` (optional): Array of structured review findings (review-kind tasks only)
 
-**Finding Object (research track only):**
+**Finding Object (review-kind tasks only):**
 - `id` (required): Unique identifier within this submission (non-empty string)
 - `severity` (required): `P1`, `P2`, or `P3`
 - `file` (required): Repository path where the finding is located (non-empty string)
