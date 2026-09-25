@@ -23,7 +23,7 @@ func setupTestServer(t *testing.T, authToken string) *Server {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, false)
 }
 
 func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds map[string]int) *Server {
@@ -32,7 +32,16 @@ func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds ma
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, thresholds)
+	return New(s, authToken, 5*time.Minute, 5, thresholds, false)
+}
+
+func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool) *Server {
+	// Use in-memory database for testing
+	s, err := store.Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test store: %v", err)
+	}
+	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled)
 }
 
 // TestHealthzWithoutAuth verifies GET /healthz returns 200 without auth.
@@ -3227,7 +3236,7 @@ func TestListProjectsReturnsEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// List projects without creating any
@@ -3261,7 +3270,7 @@ func TestListProjectsWithClaimableFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create project 1 with a claimable haiku implement task
@@ -3367,7 +3376,7 @@ func TestListProjectsClaimableWithMultipleFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create a project with two tasks: one haiku, one sonnet
@@ -3473,7 +3482,7 @@ func TestListProjectsClaimableUnchangedWithoutFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, false)
 	authHeader := "Bearer test-token"
 
 	// Create two projects
@@ -6782,6 +6791,7 @@ func TestFindingsAPIMissingInChangedText(t *testing.T) {
 		t.Errorf("expected INVALID_FINDINGS, got %v", errObj["code"])
 	}
 }
+
 // TestPprofDisabledReturns404 verifies that /debug/pprof/ and its sub-routes return 404
 // when pprof is not enabled, exactly as if the feature didn't exist.
 func TestPprofDisabledReturns404(t *testing.T) {

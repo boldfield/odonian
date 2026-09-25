@@ -667,46 +667,153 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", "findings: must be an array")
 			return
 		}
-		// Check each finding for type errors
+		// Validate each finding completely (type + semantic) before moving to the next
+		seenIDs := make(map[string]bool)
 		for i, rawFinding := range rawFindings {
 			findingMap, ok := rawFinding.(map[string]interface{})
 			if !ok {
 				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d]: must be an object", i))
 				return
 			}
-			// Validate string fields
-			for _, field := range []string{"id", "severity", "file", "summary", "status", "prior_id"} {
-				if val, ok := findingMap[field]; ok && val != nil {
-					if _, isStr := val.(string); !isStr {
-						s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].%s: must be a string", i, field))
-						return
-					}
-				}
+
+			// Extract and validate each field, reporting the first error found
+			// Order: type checks first, then semantic checks (as JSON would be processed)
+
+			// id: must be a string, non-empty, unique
+			idVal, hasID := findingMap["id"]
+			if !hasID {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: must be a string", i))
+				return
 			}
-			// Validate line: must be a number and an integer in valid range
-			if val, ok := findingMap["line"]; ok {
-				num, isNum := val.(float64)
-				if !isNum {
-					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
-					return
-				}
-				// Check if it's an integer (not fractional)
-				if num != float64(int(num)) {
-					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
-					return
-				}
-				// Check if it's in valid int range
-				if num < 0 || num > float64(int(^uint(0)>>1)) {
-					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
-					return
-				}
+			id, isStr := idVal.(string)
+			if !isStr {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: must be a string", i))
+				return
 			}
-			// Validate in_changed_text: must be a boolean
-			if val, ok := findingMap["in_changed_text"]; ok {
-				if _, isBool := val.(bool); !isBool {
-					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].in_changed_text: must be a boolean", i))
+			if id == "" {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: must be non-empty", i))
+				return
+			}
+			if seenIDs[id] {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: duplicate id %q", i, id))
+				return
+			}
+			seenIDs[id] = true
+
+			// severity: must be a string, P1/P2/P3
+			severityVal, hasSeverity := findingMap["severity"]
+			if !hasSeverity {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].severity: must be a string", i))
+				return
+			}
+			severity, isStr := severityVal.(string)
+			if !isStr {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].severity: must be a string", i))
+				return
+			}
+			if severity != "P1" && severity != "P2" && severity != "P3" {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].severity: must be P1, P2, or P3", i))
+				return
+			}
+
+			// file: must be a string, non-empty
+			fileVal, hasFile := findingMap["file"]
+			if !hasFile {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].file: must be a string", i))
+				return
+			}
+			file, isStr := fileVal.(string)
+			if !isStr {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].file: must be a string", i))
+				return
+			}
+			if file == "" {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].file: must be non-empty", i))
+				return
+			}
+
+			// line: must be a number, positive integer
+			lineVal, hasLine := findingMap["line"]
+			if !hasLine {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+				return
+			}
+			num, isNum := lineVal.(float64)
+			if !isNum {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+				return
+			}
+			if num != float64(int(num)) {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be an integer", i))
+				return
+			}
+			if num <= 0 || num > float64(int(^uint(0)>>1)) {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be positive integer", i))
+				return
+			}
+
+			// summary: must be a string, non-empty
+			summaryVal, hasSummary := findingMap["summary"]
+			if !hasSummary {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].summary: must be a string", i))
+				return
+			}
+			summary, isStr := summaryVal.(string)
+			if !isStr {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].summary: must be a string", i))
+				return
+			}
+			if summary == "" {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].summary: must be non-empty", i))
+				return
+			}
+
+			// in_changed_text: must be a boolean (required)
+			inChangedVal, hasInChanged := findingMap["in_changed_text"]
+			if !hasInChanged {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].in_changed_text: must be a boolean", i))
+				return
+			}
+			if _, isBool := inChangedVal.(bool); !isBool {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].in_changed_text: must be a boolean", i))
+				return
+			}
+
+			// status: must be a string, new/still_open/resolved
+			statusVal, hasStatus := findingMap["status"]
+			if !hasStatus {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].status: must be a string", i))
+				return
+			}
+			status, isStr := statusVal.(string)
+			if !isStr {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].status: must be a string", i))
+				return
+			}
+			if status != "new" && status != "still_open" && status != "resolved" {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].status: must be new, still_open, or resolved", i))
+				return
+			}
+
+			// prior_id: optional string, required for still_open/resolved, must be absent for new
+			priorIDVal, hasPriorID := findingMap["prior_id"]
+			if hasPriorID && priorIDVal != nil {
+				priorID, isStr := priorIDVal.(string)
+				if !isStr {
+					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: must be a string", i))
 					return
 				}
+				if status == "new" {
+					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: must be absent for status=new", i))
+					return
+				}
+				if priorID == "" {
+					s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: must be non-empty", i))
+					return
+				}
+			} else if status == "still_open" || status == "resolved" {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: required for status=%s", i, status))
+				return
 			}
 		}
 	}
