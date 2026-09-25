@@ -671,7 +671,7 @@ func createTerminalTaskWithPRLink(t *testing.T, ctx context.Context, st store.St
 		t.Fatalf("failed to claim task: %v", err)
 	}
 	links := []store.LinkInput{{Kind: "pr", Value: prURL}}
-	if _, err := st.SubmitTask(ctx, task.ID, "agent-1", "Implementation complete", nil, links, 5, nil); err != nil {
+	if _, err := st.SubmitTask(ctx, task.ID, "agent-1", "Implementation complete", nil, links, nil, 5, nil); err != nil {
 		t.Fatalf("failed to submit task: %v", err)
 	}
 

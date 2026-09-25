@@ -24,12 +24,24 @@ import (
 //go:embed migrations
 var migrationsFS embed.FS
 
+// Finding represents a structured review finding.
+type Finding struct {
+	ID            string  `json:"id"`              // unique within task
+	Severity      string  `json:"severity"`        // P1, P2, P3
+	File          string  `json:"file"`            // non-empty
+	Line          int     `json:"line"`            // positive integer
+	Summary       string  `json:"summary"`         // non-empty
+	InChangedText bool    `json:"in_changed_text"` // boolean
+	Status        string  `json:"status"`          // new, still_open, resolved
+	PriorID       *string `json:"prior_id"`        // required for still_open/resolved, absent for new
+}
+
 // Store is the interface for database operations.
 // Concrete implementations (sqliteStore) satisfy this interface.
 type Store interface {
 	Close() error
 	Conn() *sql.DB
-	AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string) (Event, error)
+	AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string, findings *[]Finding) (Event, error)
 	ListEvents(ctx context.Context, taskID string) ([]Event, error)
 	PruneEvents(ctx context.Context, terminalRetentionDays int) (int64, error)
 	CreateProject(ctx context.Context, name, repo string) (Project, error)
@@ -46,7 +58,7 @@ type Store interface {
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error)
 	PromoteTask(ctx context.Context, taskID string) (Task, error)
-	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int) (TaskWithDepsAndLinks, error)
+	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, findings *[]Finding, maxReviewRounds int, escalationThresholds map[string]int) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
@@ -333,14 +345,24 @@ func (s *sqliteStore) Conn() *sql.DB {
 // AppendEvent inserts a new event into the event table within an existing transaction.
 // It must be called within a transaction so that a state change and its event can be
 // committed atomically.
-func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string) (Event, error) {
+func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string, findings *[]Finding) (Event, error) {
 	eventID := GenerateID()
 	now := nowTimestamp()
 
+	var findingsJSON *string
+	if findings != nil {
+		data, err := json.Marshal(findings)
+		if err != nil {
+			return Event{}, fmt.Errorf("failed to marshal findings: %w", err)
+		}
+		s := string(data)
+		findingsJSON = &s
+	}
+
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO event (id, task_id, actor, kind, verdict, note, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, eventID, taskID, actor, kind, verdict, note, now)
+		INSERT INTO event (id, task_id, actor, kind, verdict, note, findings, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, eventID, taskID, actor, kind, verdict, note, findingsJSON, now)
 	if err != nil {
 		return Event{}, fmt.Errorf("failed to append event: %w", err)
 	}
@@ -360,6 +382,7 @@ func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor
 		Kind:      kind,
 		Verdict:   verdict,
 		Note:      note,
+		Findings:  findings,
 		CreatedAt: now,
 	}, nil
 }
@@ -392,7 +415,7 @@ func (s *sqliteStore) setTaskDepends(ctx context.Context, tx *sql.Tx, taskID str
 // ListEvents retrieves all events for a given task, ordered by created_at and id.
 func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, error) {
 	rows, err := s.readConn.QueryContext(ctx, `
-		SELECT id, task_id, actor, kind, verdict, note, created_at
+		SELECT id, task_id, actor, kind, verdict, note, findings, created_at
 		FROM event
 		WHERE task_id = ?
 		ORDER BY created_at, id
@@ -405,10 +428,21 @@ func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, e
 	var events []Event
 	for rows.Next() {
 		var e Event
-		err := rows.Scan(&e.ID, &e.TaskID, &e.Actor, &e.Kind, &e.Verdict, &e.Note, &e.CreatedAt)
+		var findingsJSON *string
+		err := rows.Scan(&e.ID, &e.TaskID, &e.Actor, &e.Kind, &e.Verdict, &e.Note, &findingsJSON, &e.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
 		}
+
+		// Unmarshal findings if present
+		if findingsJSON != nil {
+			var findings []Finding
+			if err := json.Unmarshal([]byte(*findingsJSON), &findings); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal findings: %w", err)
+			}
+			e.Findings = &findings
+		}
+
 		events = append(events, e)
 	}
 
@@ -613,13 +647,14 @@ type ProjectListFilter struct {
 
 // Event represents an audit/event log entry.
 type Event struct {
-	ID        string  `db:"id" json:"id"`
-	TaskID    string  `db:"task_id" json:"task_id"`
-	Actor     string  `db:"actor" json:"actor"`
-	Kind      string  `db:"kind" json:"kind"`
-	Verdict   *string `db:"verdict" json:"verdict"` // nullable
-	Note      *string `db:"note" json:"note"`       // nullable
-	CreatedAt string  `db:"created_at" json:"created_at"`
+	ID        string     `db:"id" json:"id"`
+	TaskID    string     `db:"task_id" json:"task_id"`
+	Actor     string     `db:"actor" json:"actor"`
+	Kind      string     `db:"kind" json:"kind"`
+	Verdict   *string    `db:"verdict" json:"verdict"`   // nullable
+	Note      *string    `db:"note" json:"note"`         // nullable
+	Findings  *[]Finding `db:"findings" json:"findings"` // nullable, JSON array
+	CreatedAt string     `db:"created_at" json:"created_at"`
 }
 
 // ErrNotFound is returned when a resource is not found.
@@ -1418,7 +1453,7 @@ func (s *sqliteStore) ClaimTask(ctx context.Context, taskID, agentID, model stri
 
 	if rowsAffected == 1 {
 		// Claim succeeded. Append event in the same transaction.
-		_, err := s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil)
+		_, err := s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil, nil)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to append claim event: %w", err)
 		}
@@ -1587,7 +1622,7 @@ func (s *sqliteStore) PromoteTask(ctx context.Context, taskID string) (Task, err
 	if rowsAffected == 1 {
 		// Promotion succeeded. Append transition event in the same transaction.
 		note := "backlog->ready"
-		_, err := s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, &note)
+		_, err := s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, &note, nil)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to append transition event: %w", err)
 		}
@@ -1657,13 +1692,71 @@ func thresholdFor(model string, escalationThresholds map[string]int, maxReviewRo
 	return maxReviewRounds
 }
 
+// validateFindings checks a findings array against the required format.
+// Returns error with code INVALID_FINDINGS if any finding is invalid.
+func validateFindings(findings *[]Finding) error {
+	if findings == nil {
+		return nil
+	}
+
+	seenIDs := make(map[string]bool)
+	for i, f := range *findings {
+		// Validate id: non-empty, unique within submission
+		if f.ID == "" {
+			return invalid("INVALID_FINDINGS", "findings[0].id: must be non-empty")
+		}
+		if seenIDs[f.ID] {
+			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].id: duplicate id %q", i, f.ID))
+		}
+		seenIDs[f.ID] = true
+
+		// Validate severity: must be P1, P2, or P3
+		if f.Severity != "P1" && f.Severity != "P2" && f.Severity != "P3" {
+			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].severity: must be P1, P2, or P3", i))
+		}
+
+		// Validate file: non-empty
+		if f.File == "" {
+			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].file: must be non-empty", i))
+		}
+
+		// Validate line: positive integer
+		if f.Line <= 0 {
+			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].line: must be positive integer", i))
+		}
+
+		// Validate summary: non-empty
+		if f.Summary == "" {
+			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].summary: must be non-empty", i))
+		}
+
+		// Validate status: must be new, still_open, or resolved
+		if f.Status != "new" && f.Status != "still_open" && f.Status != "resolved" {
+			return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].status: must be new, still_open, or resolved", i))
+		}
+
+		// Validate prior_id requirements
+		if f.Status == "new" {
+			if f.PriorID != nil {
+				return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: must be absent for status=new", i))
+			}
+		} else if f.Status == "still_open" || f.Status == "resolved" {
+			if f.PriorID == nil || *f.PriorID == "" {
+				return invalid("INVALID_FINDINGS", fmt.Sprintf("findings[%d].prior_id: required for status=%s", i, f.Status))
+			}
+		}
+	}
+
+	return nil
+}
+
 // When all reviews are done and at least one rejected, the parent transitions to ready if review_round <= threshold,
 // or to blocked if review_round > threshold (circuit breaker).
 // Returns the updated TaskWithDepsAndLinks on success.
-// Returns ValidationError if a link kind is invalid or verdict is missing/invalid.
+// Returns ValidationError if a link kind is invalid or verdict is missing/invalid or findings is invalid.
 // Returns ErrNotFound if the task doesn't exist.
 // Returns ErrConflict if the task is not in_progress or not assigned to the given agentID.
-func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int) (TaskWithDepsAndLinks, error) {
+func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, findings *[]Finding, maxReviewRounds int, escalationThresholds map[string]int) (TaskWithDepsAndLinks, error) {
 	// Validate link kinds first (before mutating anything).
 	// "no_op" marks a review-verified no-op resolution: a worker that finds the
 	// acceptance criteria already satisfied on main with no diff submits with a
@@ -1727,6 +1820,16 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 		}
 	}
 
+	// Validate findings: only allowed for review tasks
+	if findings != nil && taskKind != "review" {
+		return TaskWithDepsAndLinks{}, invalid("FINDINGS_NOT_ALLOWED", "findings are only allowed for review tasks")
+	}
+
+	// Validate findings format
+	if err := validateFindings(findings); err != nil {
+		return TaskWithDepsAndLinks{}, err
+	}
+
 	// Determine the next state based on task kind
 	var nextState string
 	if taskKind == "review" {
@@ -1777,7 +1880,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 		}
 
 		// Append submit event in the same transaction
-		_, err := s.AppendEvent(ctx, tx, taskID, agentID, "submit", nil, nil)
+		_, err := s.AppendEvent(ctx, tx, taskID, agentID, "submit", nil, nil, nil)
 		if err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append submit event: %w", err)
 		}
@@ -1872,7 +1975,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			// Append spawn_review event on the parent task
 			reviewersList, _ := json.Marshal(reviewers)
 			eventNote := "Round " + fmt.Sprintf("%d", newReviewRound) + " with models: " + string(reviewersList)
-			_, err = s.AppendEvent(ctx, tx, taskID, "system", "spawn_review", nil, &eventNote)
+			_, err = s.AppendEvent(ctx, tx, taskID, "system", "spawn_review", nil, &eventNote, nil)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append spawn_review event: %w", err)
 			}
@@ -1881,7 +1984,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			t.ReviewRound = newReviewRound
 		} else if t.Kind == "review" && targetTaskID != nil {
 			// This is a review task. Append a review event on the parent task.
-			_, err := s.AppendEvent(ctx, tx, *targetTaskID, agentID, "review", verdict, &result)
+			_, err := s.AppendEvent(ctx, tx, *targetTaskID, agentID, "review", verdict, &result, findings)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append review event on parent: %w", err)
 			}
@@ -2107,13 +2210,13 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 						}
 						// Append transition event for the escalated task
 						escalationNote := "backlog->ready (auto-promoted via escalation)"
-						_, err = s.AppendEvent(ctx, tx, escalatedTaskID, "system", "transition", nil, &escalationNote)
+						_, err = s.AppendEvent(ctx, tx, escalatedTaskID, "system", "transition", nil, &escalationNote, nil)
 						if err != nil {
 							return "", fmt.Errorf("failed to append escalation transition event: %w", err)
 						}
 						// Emit escalation event on the old (now superseded) task
 						eventNote := fmt.Sprintf("%s→%s round %d, superseded by %s", parentModel, nextModel, parentReviewRound, escalatedTaskID)
-						_, err = s.AppendEvent(ctx, tx, parentID, "system", "escalation", nil, &eventNote)
+						_, err = s.AppendEvent(ctx, tx, parentID, "system", "escalation", nil, &eventNote, nil)
 						if err != nil {
 							return "", fmt.Errorf("failed to append escalation event: %w", err)
 						}
@@ -2153,7 +2256,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		} else if newParentState == "blocked" {
 			eventNote = fmt.Sprintf("auto-blocked: %d consecutive review rounds without approval — needs human attention", parentReviewRound)
 		}
-		_, err = s.AppendEvent(ctx, tx, parentID, "system", "transition", nil, &eventNote)
+		_, err = s.AppendEvent(ctx, tx, parentID, "system", "transition", nil, &eventNote, nil)
 		if err != nil {
 			return "", fmt.Errorf("failed to append transition event: %w", err)
 		}
@@ -2203,7 +2306,7 @@ func (s *sqliteStore) AddReview(ctx context.Context, taskID, actor, verdict stri
 
 	// Append the review event
 	verdictPtr := &verdict
-	event, err := s.AppendEvent(ctx, tx, taskID, actor, "review", verdictPtr, note)
+	event, err := s.AppendEvent(ctx, tx, taskID, actor, "review", verdictPtr, note, nil)
 	if err != nil {
 		return Event{}, err
 	}
@@ -2334,7 +2437,7 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 	}
 
 	// Append transition event (actor="system", verdict=nil)
-	_, err = s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, note)
+	_, err = s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, note, nil)
 	if err != nil {
 		return Task{}, err
 	}
@@ -2500,7 +2603,7 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 
 	// 6. Emit event
 	note := fmt.Sprintf("Superseded by %s", newTaskID)
-	_, err = s.AppendEvent(ctx, tx, taskID, "system", "task_superseded", nil, &note)
+	_, err = s.AppendEvent(ctx, tx, taskID, "system", "task_superseded", nil, &note, nil)
 	if err != nil {
 		return "", err
 	}
@@ -2620,7 +2723,7 @@ func (s *sqliteStore) UpdateTaskEscalate(ctx context.Context, taskID string, esc
 	}
 
 	note := fmt.Sprintf("escalate policy changed: %v → %v", t.Escalate, escalate)
-	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "policy-change", nil, &note); err != nil {
+	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "policy-change", nil, &note, nil); err != nil {
 		return Task{}, fmt.Errorf("failed to append policy-change event: %w", err)
 	}
 

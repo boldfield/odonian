@@ -792,7 +792,18 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
 {
   "agent_id": "opus-reviewer-1",
   "verdict": "approve",
-  "result": "Code review passed. Well-structured and thoroughly tested. One minor comment on error handling."
+  "result": "Code review passed. Well-structured and thoroughly tested. One minor comment on error handling.",
+  "findings": [
+    {
+      "id": "finding-1",
+      "severity": "P2",
+      "file": "src/auth.go",
+      "line": 42,
+      "summary": "Missing input validation on user ID parameter",
+      "in_changed_text": true,
+      "status": "new"
+    }
+  ]
 }
 ```
 
@@ -800,6 +811,20 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
 - `agent_id` (required): The ID of the reviewing agent (must match the task's assignee)
 - `verdict` (required): Either `"approve"` or `"reject"`
 - `result` (optional): Review writeup or detailed feedback
+- `findings` (optional): Array of structured review findings (research track only)
+
+**Finding Object (research track only):**
+- `id` (required): Unique identifier within this submission (non-empty string)
+- `severity` (required): `P1`, `P2`, or `P3`
+- `file` (required): Repository path where the finding is located (non-empty string)
+- `line` (required): Line number in the file (positive integer)
+- `summary` (required): One or two sentences describing the finding (non-empty string)
+- `in_changed_text` (required): Boolean indicating if the finding is in text changed since the last review
+- `status` (required): `new`, `still_open`, or `resolved`
+  - `new`: First time this finding is being raised
+  - `still_open`: Previously raised finding that remains unresolved
+  - `resolved`: Previously raised finding that has been fixed
+- `prior_id` (optional): ID of the previous finding this one refers to. Required for `still_open` and `resolved` status, must be absent for `new` status
 
 **Response (200 OK):**
 ```json
@@ -836,6 +861,8 @@ The response includes the review task's own `id` and the parent implement task's
 - `400 INVALID_VERDICT`: verdict must be "approve" or "reject" (review only)
 - `400 FORBIDDEN_VERDICT`: verdict must not be present for implement tasks
 - `400 MISSING_VERDICT`: verdict is required for review tasks
+- `400 INVALID_FINDINGS`: Findings array has invalid format (details in message, e.g., empty id, invalid severity, duplicate id)
+- `400 FINDINGS_NOT_ALLOWED`: Findings are only allowed on review-kind tasks
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `404 NOT_FOUND`: Task not found
 - `409 CONFLICT`: Task is not in_progress or is not assigned to the provided agent_id
