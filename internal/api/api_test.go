@@ -6319,21 +6319,36 @@ func TestPprofProfileWithoutAuthReturns401(t *testing.T) {
 }
 
 // TestPprofDisabledForNonLiteralValues regression test: ODONIAN_PPROF must match exactly "true",
-// not case variations like "TRUE" or "True". This test verifies that when pprof is disabled,
-// all endpoints return 404 even with authentication.
+// not case variations like "TRUE", "True", "1", "yes", or whitespace variations.
+// This test verifies that non-literal values return 404 even with authentication.
 func TestPprofDisabledForNonLiteralValues(t *testing.T) {
-	server := setupTestServerWithPprof(t, "test-token", false)
 	authHeader := "Bearer test-token"
+	testCases := []string{
+		"TRUE",  // uppercase
+		"True",  // mixed case
+		"1",     // numeric
+		"yes",   // different word
+		" true", // leading whitespace
+		"true ", // trailing whitespace
+		"",      // unset/empty
+	}
 
-	paths := []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/profile", "/debug/pprof/goroutine"}
-	for _, path := range paths {
-		req := httptest.NewRequest("GET", path, nil)
-		req.Header.Set("Authorization", authHeader)
-		w := httptest.NewRecorder()
-		server.mux.ServeHTTP(w, req)
+	for _, envValue := range testCases {
+		t.Run("env="+envValue, func(t *testing.T) {
+			t.Setenv("ODONIAN_PPROF", envValue)
+			server := setupTestServerWithPprof(t, "test-token", envValue == "true")
 
-		if w.Code != http.StatusNotFound {
-			t.Errorf("expected 404 for %s with pprof disabled, got %d", path, w.Code)
-		}
+			paths := []string{"/debug/pprof/", "/debug/pprof/heap", "/debug/pprof/profile"}
+			for _, path := range paths {
+				req := httptest.NewRequest("GET", path, nil)
+				req.Header.Set("Authorization", authHeader)
+				w := httptest.NewRecorder()
+				server.mux.ServeHTTP(w, req)
+
+				if w.Code != http.StatusNotFound {
+					t.Errorf("expected 404 for %s with ODONIAN_PPROF=%q, got %d", path, envValue, w.Code)
+				}
+			}
+		})
 	}
 }
