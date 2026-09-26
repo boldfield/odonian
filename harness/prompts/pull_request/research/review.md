@@ -105,8 +105,11 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
      if none). The fence must hold **only the JSON array** — no title or other text inside it — so
      the next milestone can parse it directly. Each entry has: `id` (unique within the task, assigned
      by you), `severity` (`P1`/`P2`/`P3`), `file`, `line`, `summary` (one or two sentences),
-     `in_changed_text` (bool; always `true` in round 1), `status` (`new`, `still_open` or `resolved`),
-     and `prior_id` (the earlier finding's id, for `still_open`/`resolved`; omit or null for `new`).
+     `in_changed_text` (bool: `true` in round 1 for every finding; from round 2 on, `true` only when
+     the defect is in text changed since YOUR last review of this task, `false` for a defect in text
+     that was already there), `status` (`new`, `still_open` or `resolved`), and `prior_id` (the
+     earlier finding's id, for `still_open`/`resolved`; **omit the key entirely** for `new` — the
+     server rejects `prior_id: null` on a new finding).
      For example:
 
      Findings
@@ -114,12 +117,21 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
      [
        {"id": "f1", "severity": "P2", "file": "claims.md", "line": 42,
         "summary": "Claim overstates the source, which only supports a weaker statement.",
-        "in_changed_text": true, "status": "new", "prior_id": null}
+        "in_changed_text": true, "status": "new"}
      ]
      ```
 
+   - **Write the JSON array alone to a temp file and pass it to `submit`** — this is the recorded
+     copy the server validates and stores, and the copy the worker's rework context is built from.
+     The fenced block in your prose is for humans; the flag is the record. For example:
+     `F="$(mktemp)"; printf '%s' '<the JSON array>' > "$F"` (or write it with your editor tool), then
+     check it parses: `python3 -m json.tool "$F" >/dev/null`. A malformed array is rejected with
+     `INVALID_FINDINGS` naming the bad field — fix the file and resubmit; do not drop the flag.
+
    - Submit: `odonian submit <review-task-id> --result "<prose findings + the fenced Findings JSON
-     block above>" --verdict approve` (or `--verdict reject`). The server records it on the parent and
+     block above>" --verdict approve --findings-file "$F"` (or `--verdict reject --findings-file "$F"`).
+     Pass `--findings-file` on EVERY verdict, including an approve with an empty array `[]`. The
+     server records it on the parent and
      drives the parent automatically: **reject → parent back to `ready`** (worker reworks); **approve
      →** once *all* of this round's reviewers approve, the parent moves to `approved`. **Then mirror
      your verdict as a PR comment** so a human draining the merge queue can see it: `gh pr comment
@@ -147,11 +159,19 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
   a `pending` claim with a recorded access attempt is not penalized for being inaccessible.
 - **Re-run every tool the project's task contract names** on the merged result and treat any
   difference from the worker's included output as a P1 finding.
+- **Reproduce every search claim.** Wherever the deliverable says a search found, or did not find,
+  something (a term, a case number, a name, a phrase), run that search yourself over the same files.
+  A hit the deliverable omits, or a hit it lists that does not exist, is a P1 finding: a search
+  record that reports only some of its hits is a false claim about the evidence.
+- **A finished correction task does not establish its claim.** Treat "task X corrected this" as a
+  pointer to evidence, not as evidence. Check what the corrected file actually says.
 - **Reject on any P1 or P2 finding; otherwise approve and list P3s.** This is a full review every
   round — check the whole file plus every earlier finding's status, not just the diff.
 - **Every verdict ends with a `Findings` heading followed by a fenced `json` block containing only
   the JSON array** (id, severity, file, line, summary, in_changed_text, status, prior_id), in
-  addition to prose, even when the list is empty. No title or prose inside the fence.
+  addition to prose, even when the list is empty. No title or prose inside the fence. **The same
+  array is submitted with `--findings-file` on every verdict** — the prose block is for humans, the
+  flag is what the server stores and what the worker's rework context shows.
 - Your verdict goes on the **review task you claimed** (via `submit` with `verdict`), not on the
   parent.
 - **NEVER merge a PR and NEVER transition a parent task** — merging is the merger's job (the server

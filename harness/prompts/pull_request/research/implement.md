@@ -74,6 +74,14 @@ more than a minute. Pin heartbeats to those points; do not rely on sensing elaps
      output** in your deliverable or the PR — never hand-transcribe or summarize a tool's output.
      Anything mechanical (locating items, running searches, enumerating rows) must come from running
      the tool, not from being written by hand.
+   - **A search record lists every hit or none.** When you record that a search for a term found
+     something, list every hit the search returns, with file and line; never a subset. When it found
+     nothing, say so. A reviewer re-runs every recorded search, and a record that omits hits is a
+     blocking finding.
+   - **Never infer absence.** A search that found nothing establishes only that nothing was found in
+     the files and terms you searched; write it that way. Do not conclude that a document, ruling,
+     or statement does not exist, and do not treat a search about a different question (a different
+     person, case, or claim) as evidence for or against this one.
 6. Sync with main, then verify. FIRST `git fetch origin && git merge origin/main` to bring your
    branch up to date so the PR merges cleanly. If the merge conflicts, resolve it — keep both
    sides' intent (for test files that almost always means keeping every test) — then `git add` the
@@ -138,7 +146,7 @@ more than a minute. Pin heartbeats to those points; do not rely on sensing elaps
    the submit step until `pr-feedback list` returns nothing outstanding. Empty GitHub feedback alone
    is not sufficient — ensure your diff addresses the recorded review findings shown by `odonian show`.
 8. Commit, push, PR. End the commit message with a blank line then
-   `Co-Authored-By: Claude (<value of $AGENT_MODEL>) <noreply@anthropic.com>`. Push your (detached)
+   `Co-Authored-By: Odonian worker (<value of $AGENT_MODEL>) <noreply@odonian.local>`. Push your (detached)
    HEAD to the deterministic branch: `git push origin HEAD:mr/<TASKID8>`. Then **FIND-OR-CREATE the
    PR** — never fabricate one:
    - First look for an existing open PR for this branch: `gh pr list --head mr/<TASKID8> --state open
