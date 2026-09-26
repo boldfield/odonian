@@ -116,6 +116,16 @@ else
   test_fail "get_prompt_file failed to resolve a pull_request research prompt"
 fi
 
+# Test 7c: the research review prompt must submit structured findings via --findings-file, so the
+# server stores them (the fenced block in prose is not parsed by anything).
+echo "Test 7c: research review prompt submits findings with --findings-file"
+_rr_prompt="$HARNESS_DIR/prompts/pull_request/research/review.md"
+if grep -q -- '--findings-file' "$_rr_prompt" && grep -q 'in_changed_text' "$_rr_prompt"; then
+  test_pass "research review prompt uses --findings-file and defines in_changed_text"
+else
+  test_fail "research review prompt is missing --findings-file or in_changed_text guidance"
+fi
+
 # Test 8: Check fleet.sh exists and is executable
 echo "Test 8: fleet.sh exists"
 if [ -x "$FLEET_SCRIPT" ]; then
