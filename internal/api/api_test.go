@@ -7112,21 +7112,21 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 	}
 
 	// Find review tasks for the no-op task (should be 2: opus and sonnet)
-	var reviewTaskIDs []string
+	// Map review task IDs to their models from the list
+	reviewTaskToModel := make(map[string]string)
 	for _, task := range allTasks {
 		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == noOpTaskID {
-			reviewTaskIDs = append(reviewTaskIDs, task.ID)
+			reviewTaskToModel[task.ID] = task.Model
 		}
 	}
 
-	if len(reviewTaskIDs) != 2 {
-		t.Fatalf("expected 2 review tasks for no-op task, got %d; all tasks: %v", len(reviewTaskIDs), len(allTasks))
+	if len(reviewTaskToModel) != 2 {
+		t.Fatalf("expected 2 review tasks for no-op task, got %d; all tasks: %v", len(reviewTaskToModel), len(allTasks))
 	}
 
-	// Claim and approve from both reviewers
-	reviewerModels := []string{"opus", "sonnet"}
-	for i, reviewTaskID := range reviewTaskIDs {
-		reviewClaimPayload := map[string]string{"agent_id": "reviewer-" + reviewerModels[i], "model": reviewerModels[i]}
+	// Claim and approve from both reviewers using each task's actual model
+	for reviewTaskID, model := range reviewTaskToModel {
+		reviewClaimPayload := map[string]string{"agent_id": "reviewer-" + model + "-noop", "model": model}
 		reviewClaimBody, _ := json.Marshal(reviewClaimPayload)
 		reviewClaimReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/claim", bytes.NewReader(reviewClaimBody))
 		reviewClaimReq.Header.Set("Authorization", authHeader)
@@ -7140,7 +7140,7 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 
 		// Submit approval
 		reviewSubmitPayload := map[string]interface{}{
-			"agent_id": "reviewer-" + reviewerModels[i],
+			"agent_id": "reviewer-" + model + "-noop",
 			"result":   "Verified no-op approach",
 			"verdict":  "approve",
 		}
@@ -7152,7 +7152,50 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 		server.mux.ServeHTTP(reviewSubmitW, reviewSubmitReq)
 
 		if reviewSubmitW.Code != http.StatusOK {
-			t.Fatalf("failed to submit review approval from %s: got status %d; body: %s", reviewerModels[i], reviewSubmitW.Code, reviewSubmitW.Body.String())
+			t.Fatalf("failed to submit review approval from %s: got status %d; body: %s", model, reviewSubmitW.Code, reviewSubmitW.Body.String())
+		}
+	}
+
+	// Check the no-op task state after all reviewers approved
+	getAfterApprovalReq := httptest.NewRequest("GET", "/tasks/"+noOpTaskID, nil)
+	getAfterApprovalReq.Header.Set("Authorization", authHeader)
+	getAfterApprovalW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getAfterApprovalW, getAfterApprovalReq)
+
+	if getAfterApprovalW.Code != http.StatusOK {
+		t.Fatalf("failed to get no-op task after approval: got status %d", getAfterApprovalW.Code)
+	}
+
+	var taskAfterApproval store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(getAfterApprovalW.Body).Decode(&taskAfterApproval); err != nil {
+		t.Fatalf("failed to decode task after approval: %v", err)
+	}
+
+	// If still in review state, check dependent is not claimable yet
+	if taskAfterApproval.State == "review" {
+		dependentNotClaimableReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?claimable=true", nil)
+		dependentNotClaimableReq.Header.Set("Authorization", authHeader)
+		dependentNotClaimableW := httptest.NewRecorder()
+		server.mux.ServeHTTP(dependentNotClaimableW, dependentNotClaimableReq)
+
+		if dependentNotClaimableW.Code != http.StatusOK {
+			t.Fatalf("failed to get claimable tasks before finalization: got status %d", dependentNotClaimableW.Code)
+		}
+
+		var claimableTasksBeforeFinalize []store.Task
+		if err := json.NewDecoder(dependentNotClaimableW.Body).Decode(&claimableTasksBeforeFinalize); err != nil {
+			t.Fatalf("failed to decode claimable tasks before finalization: %v", err)
+		}
+
+		dependentClaimableBeforeFinalize := false
+		for _, task := range claimableTasksBeforeFinalize {
+			if task.ID == dependentTaskID {
+				dependentClaimableBeforeFinalize = true
+				break
+			}
+		}
+		if dependentClaimableBeforeFinalize {
+			t.Error("dependent should not be claimable while parent is in review")
 		}
 	}
 
@@ -7193,9 +7236,24 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 		t.Error("expected no_op link to be present")
 	}
 
+	// Re-list tasks after approval to check for merge task (merge tasks spawn on approval)
+	listAfterApprovalReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listAfterApprovalReq.Header.Set("Authorization", authHeader)
+	listAfterApprovalW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listAfterApprovalW, listAfterApprovalReq)
+
+	if listAfterApprovalW.Code != http.StatusOK {
+		t.Fatalf("failed to get task list after approval: got status %d", listAfterApprovalW.Code)
+	}
+
+	var tasksAfterApproval []store.Task
+	if err := json.NewDecoder(listAfterApprovalW.Body).Decode(&tasksAfterApproval); err != nil {
+		t.Fatalf("failed to decode task list after approval: %v", err)
+	}
+
 	// Verify no merge task was created for the no-op task
 	mergeTaskExists := false
-	for _, task := range allTasks {
+	for _, task := range tasksAfterApproval {
 		if task.Kind == "merge" && task.TargetTaskID != nil && *task.TargetTaskID == noOpTaskID {
 			mergeTaskExists = true
 			break
@@ -7210,6 +7268,10 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 	claimableReq.Header.Set("Authorization", authHeader)
 	claimableW := httptest.NewRecorder()
 	server.mux.ServeHTTP(claimableW, claimableReq)
+
+	if claimableW.Code != http.StatusOK {
+		t.Fatalf("failed to get claimable tasks after finalization: got status %d", claimableW.Code)
+	}
 
 	var claimableTasks []store.Task
 	if err := json.NewDecoder(claimableW.Body).Decode(&claimableTasks); err != nil {
