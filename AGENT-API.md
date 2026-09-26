@@ -118,8 +118,24 @@ curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/submit" -d "$(jq -n \
 Submit clears your lease, moves the task to `review`, and **auto-spawns one `review`-kind task per
 entry in `review_models`** (default `["opus"]`), each `ready` and pinned to that reviewer's model.
 Only the assignee may submit, only from `in_progress`. Valid link kinds: `pr`, `branch`, `commit`,
-`ci`. On rework (a rejected task bounced back to `ready`), continue the **existing** PR — don't open
+`ci`, `no_op`. On rework (a rejected task bounced back to `ready`), continue the **existing** PR — don't open
 a new one — and omit links you already attached.
+
+### No-op submissions (acceptance already satisfied)
+
+If the acceptance criteria are already satisfied (e.g., a fix merged to `main` before you claimed
+the task, making implementation unnecessary), submit with a `no_op` link and no `pr` link:
+
+```bash
+curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/submit" -d "$(jq -n \
+  --arg a "$AGENT_ID" \
+  '{agent_id:$a, result:"acceptance already satisfied on main at <commit>", links:[{kind:"no_op",value:"<commit>"}]}')"
+```
+
+A `no_op` link with no `pr` link signals that the task requires no merge and reviewers should verify
+the no-op claim. Once **all** reviewers approve, the task goes straight to `done` (regardless of
+`agent_merge`), with no merge task spawned. `agent_merge` remains immutable; it's the absence of a
+`pr` link that triggers the no-op path.
 
 ### 9. Stop
 

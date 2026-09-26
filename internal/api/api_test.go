@@ -6988,6 +6988,382 @@ func TestLatencyLoggingQueryParams(t *testing.T) {
 	_ = project
 }
 
+// TestNoOpRegressionWithDependentReady verifies that an agent_merge=false task submitted
+// with only a no_op link (no PR) moves to done after two independent reviewers approve,
+// no merge task is created, and a ready dependent becomes claimable.
+// Also includes a PR-backed agent_merge=false control that remains approved.
+func TestNoOpRegressionWithDependentReady(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create implement task with agent_merge=false (default) and two reviewers
+	taskPayload := []store.TaskInput{
+		{
+			Key:          "impl-noop",
+			Title:        "No-op implementation",
+			Spec:         "Implement with no-op link submission",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			AgentMerge:   false,
+		},
+		{
+			Key:          "impl-pr-control",
+			Title:        "PR-backed implementation (control)",
+			Spec:         "Implement with normal PR submission",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			AgentMerge:   false,
+		},
+		{
+			Key:        "dependent-task",
+			Title:      "Dependent task",
+			Spec:       "This task depends on the no-op task",
+			DocumentID: docID,
+			DependsOn:  []string{"impl-noop"},
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("failed to create tasks: got status %d; body: %s", createW.Code, createW.Body.String())
+	}
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode created tasks: %v", err)
+	}
+
+	if len(createdTasks) != 3 {
+		t.Fatalf("expected 3 tasks, got %d", len(createdTasks))
+	}
+
+	noOpTaskID := createdTasks[0].ID
+	prControlTaskID := createdTasks[1].ID
+	dependentTaskID := createdTasks[2].ID
+
+	// Promote all tasks to ready
+	for _, task := range []string{noOpTaskID, prControlTaskID, dependentTaskID} {
+		promoteReq := httptest.NewRequest("POST", "/tasks/"+task+"/promote", nil)
+		promoteReq.Header.Set("Authorization", authHeader)
+		promoteW := httptest.NewRecorder()
+		server.mux.ServeHTTP(promoteW, promoteReq)
+		if promoteW.Code != http.StatusOK {
+			t.Fatalf("failed to promote task %s: got status %d", task, promoteW.Code)
+		}
+	}
+
+	// Claim and submit the no-op task with only no_op link
+	claimPayload := map[string]string{"agent_id": "agent-noop", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+noOpTaskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	if claimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim no-op task: got status %d", claimW.Code)
+	}
+
+	// Submit with only no_op link (no PR link)
+	submitPayload := map[string]interface{}{
+		"agent_id": "agent-noop",
+		"result":   "Verified no-op",
+		"links":    []map[string]string{{"kind": "no_op", "value": "acceptance already satisfied on main at abc123"}},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+noOpTaskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	if submitW.Code != http.StatusOK {
+		t.Fatalf("failed to submit no-op task: got status %d; body: %s", submitW.Code, submitW.Body.String())
+	}
+
+	var submittedTask store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(submitW.Body).Decode(&submittedTask); err != nil {
+		t.Fatalf("failed to decode submit response: %v", err)
+	}
+
+	if submittedTask.State != "review" {
+		t.Errorf("expected state 'review' after submit, got %q", submittedTask.State)
+	}
+
+	// Get all tasks to find review tasks for the no-op implementation
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var allTasks []store.Task
+	if err := json.NewDecoder(listW.Body).Decode(&allTasks); err != nil {
+		t.Fatalf("failed to decode task list: %v", err)
+	}
+
+	// Find review tasks for the no-op task (should be 2: opus and sonnet)
+	var reviewTaskIDs []string
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == noOpTaskID {
+			reviewTaskIDs = append(reviewTaskIDs, task.ID)
+		}
+	}
+
+	if len(reviewTaskIDs) != 2 {
+		t.Fatalf("expected 2 review tasks for no-op task, got %d; all tasks: %v", len(reviewTaskIDs), len(allTasks))
+	}
+
+	// Claim and approve from both reviewers
+	reviewerModels := []string{"opus", "sonnet"}
+	for i, reviewTaskID := range reviewTaskIDs {
+		reviewClaimPayload := map[string]string{"agent_id": "reviewer-" + reviewerModels[i], "model": reviewerModels[i]}
+		reviewClaimBody, _ := json.Marshal(reviewClaimPayload)
+		reviewClaimReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/claim", bytes.NewReader(reviewClaimBody))
+		reviewClaimReq.Header.Set("Authorization", authHeader)
+		reviewClaimReq.Header.Set("Content-Type", "application/json")
+		reviewClaimW := httptest.NewRecorder()
+		server.mux.ServeHTTP(reviewClaimW, reviewClaimReq)
+
+		if reviewClaimW.Code != http.StatusOK {
+			t.Fatalf("failed to claim review task: got status %d", reviewClaimW.Code)
+		}
+
+		// Submit approval
+		reviewSubmitPayload := map[string]interface{}{
+			"agent_id": "reviewer-" + reviewerModels[i],
+			"result":   "Verified no-op approach",
+			"verdict":  "approve",
+		}
+		reviewSubmitBody, _ := json.Marshal(reviewSubmitPayload)
+		reviewSubmitReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(reviewSubmitBody))
+		reviewSubmitReq.Header.Set("Authorization", authHeader)
+		reviewSubmitReq.Header.Set("Content-Type", "application/json")
+		reviewSubmitW := httptest.NewRecorder()
+		server.mux.ServeHTTP(reviewSubmitW, reviewSubmitReq)
+
+		if reviewSubmitW.Code != http.StatusOK {
+			t.Fatalf("failed to submit review approval from %s: got status %d; body: %s", reviewerModels[i], reviewSubmitW.Code, reviewSubmitW.Body.String())
+		}
+	}
+
+	// GET the no-op task and verify it's now done (not approved waiting for merge)
+	getReq := httptest.NewRequest("GET", "/tasks/"+noOpTaskID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+
+	if getW.Code != http.StatusOK {
+		t.Fatalf("failed to get no-op task: got status %d", getW.Code)
+	}
+
+	var finalTask store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(getW.Body).Decode(&finalTask); err != nil {
+		t.Fatalf("failed to decode final task: %v", err)
+	}
+
+	if finalTask.State != "done" {
+		t.Errorf("expected no-op task state 'done' after both reviewers approve, got %q", finalTask.State)
+	}
+
+	// Verify no PR link exists (only no_op link)
+	hasPRLink := false
+	hasNoOpLink := false
+	for _, link := range finalTask.Links {
+		if link.Kind == "pr" {
+			hasPRLink = true
+		}
+		if link.Kind == "no_op" {
+			hasNoOpLink = true
+		}
+	}
+	if hasPRLink {
+		t.Error("expected no PR link for no-op submission")
+	}
+	if !hasNoOpLink {
+		t.Error("expected no_op link to be present")
+	}
+
+	// Verify no merge task was created for the no-op task
+	mergeTaskExists := false
+	for _, task := range allTasks {
+		if task.Kind == "merge" && task.TargetTaskID != nil && *task.TargetTaskID == noOpTaskID {
+			mergeTaskExists = true
+			break
+		}
+	}
+	if mergeTaskExists {
+		t.Error("expected no merge task to be created for no-op submission")
+	}
+
+	// Verify the dependent task is now claimable (parent is done)
+	claimableReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?claimable=true", nil)
+	claimableReq.Header.Set("Authorization", authHeader)
+	claimableW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimableW, claimableReq)
+
+	var claimableTasks []store.Task
+	if err := json.NewDecoder(claimableW.Body).Decode(&claimableTasks); err != nil {
+		t.Fatalf("failed to decode claimable tasks: %v", err)
+	}
+
+	dependentIsClaimable := false
+	for _, task := range claimableTasks {
+		if task.ID == dependentTaskID {
+			dependentIsClaimable = true
+			break
+		}
+	}
+	if !dependentIsClaimable {
+		t.Errorf("expected dependent task to be claimable after parent is done, but it's not in claimable list. Claimable tasks: %v", len(claimableTasks))
+	}
+
+	// Now test the PR-backed control: claim and submit with normal PR link
+	controlClaimPayload := map[string]string{"agent_id": "agent-pr-control", "model": "haiku"}
+	controlClaimBody, _ := json.Marshal(controlClaimPayload)
+	controlClaimReq := httptest.NewRequest("POST", "/tasks/"+prControlTaskID+"/claim", bytes.NewReader(controlClaimBody))
+	controlClaimReq.Header.Set("Authorization", authHeader)
+	controlClaimReq.Header.Set("Content-Type", "application/json")
+	controlClaimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(controlClaimW, controlClaimReq)
+
+	if controlClaimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim PR control task: got status %d", controlClaimW.Code)
+	}
+
+	// Submit with PR link
+	controlSubmitPayload := map[string]interface{}{
+		"agent_id": "agent-pr-control",
+		"result":   "Implemented with PR",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/999"}},
+	}
+	controlSubmitBody, _ := json.Marshal(controlSubmitPayload)
+	controlSubmitReq := httptest.NewRequest("POST", "/tasks/"+prControlTaskID+"/submit", bytes.NewReader(controlSubmitBody))
+	controlSubmitReq.Header.Set("Authorization", authHeader)
+	controlSubmitReq.Header.Set("Content-Type", "application/json")
+	controlSubmitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(controlSubmitW, controlSubmitReq)
+
+	if controlSubmitW.Code != http.StatusOK {
+		t.Fatalf("failed to submit PR control task: got status %d", controlSubmitW.Code)
+	}
+
+	// Get review task for PR control and approve it
+	listReq2 := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq2.Header.Set("Authorization", authHeader)
+	listW2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW2, listReq2)
+
+	var allTasks2 []store.Task
+	if err := json.NewDecoder(listW2.Body).Decode(&allTasks2); err != nil {
+		t.Fatalf("failed to decode task list after PR control submit: %v", err)
+	}
+
+	var controlReviewTaskID string
+	for _, task := range allTasks2 {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == prControlTaskID {
+			controlReviewTaskID = task.ID
+			break
+		}
+	}
+
+	if controlReviewTaskID == "" {
+		t.Fatalf("review task not found for PR control task")
+	}
+
+	// Claim and approve the PR control review task
+	controlReviewClaimPayload := map[string]string{"agent_id": "reviewer-opus-control", "model": "opus"}
+	controlReviewClaimBody, _ := json.Marshal(controlReviewClaimPayload)
+	controlReviewClaimReq := httptest.NewRequest("POST", "/tasks/"+controlReviewTaskID+"/claim", bytes.NewReader(controlReviewClaimBody))
+	controlReviewClaimReq.Header.Set("Authorization", authHeader)
+	controlReviewClaimReq.Header.Set("Content-Type", "application/json")
+	controlReviewClaimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(controlReviewClaimW, controlReviewClaimReq)
+
+	if controlReviewClaimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim PR control review task: got status %d", controlReviewClaimW.Code)
+	}
+
+	// Submit approval for PR control
+	controlReviewSubmitPayload := map[string]interface{}{
+		"agent_id": "reviewer-opus-control",
+		"result":   "Looks good",
+		"verdict":  "approve",
+	}
+	controlReviewSubmitBody, _ := json.Marshal(controlReviewSubmitPayload)
+	controlReviewSubmitReq := httptest.NewRequest("POST", "/tasks/"+controlReviewTaskID+"/submit", bytes.NewReader(controlReviewSubmitBody))
+	controlReviewSubmitReq.Header.Set("Authorization", authHeader)
+	controlReviewSubmitReq.Header.Set("Content-Type", "application/json")
+	controlReviewSubmitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(controlReviewSubmitW, controlReviewSubmitReq)
+
+	if controlReviewSubmitW.Code != http.StatusOK {
+		t.Fatalf("failed to submit PR control review approval: got status %d", controlReviewSubmitW.Code)
+	}
+
+	// GET the PR control task and verify it's in approved state (not done, because it has PR and agent_merge=false)
+	controlGetReq := httptest.NewRequest("GET", "/tasks/"+prControlTaskID, nil)
+	controlGetReq.Header.Set("Authorization", authHeader)
+	controlGetW := httptest.NewRecorder()
+	server.mux.ServeHTTP(controlGetW, controlGetReq)
+
+	if controlGetW.Code != http.StatusOK {
+		t.Fatalf("failed to get PR control task: got status %d", controlGetW.Code)
+	}
+
+	var controlFinalTask store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(controlGetW.Body).Decode(&controlFinalTask); err != nil {
+		t.Fatalf("failed to decode PR control final task: %v", err)
+	}
+
+	if controlFinalTask.State != "approved" {
+		t.Errorf("expected PR control task state 'approved' (waiting for human merge), got %q", controlFinalTask.State)
+	}
+
+	// Verify PR link exists for control
+	controlHasPRLink := false
+	for _, link := range controlFinalTask.Links {
+		if link.Kind == "pr" && link.Value == "https://github.com/example/test-repo/pull/999" {
+			controlHasPRLink = true
+			break
+		}
+	}
+	if !controlHasPRLink {
+		t.Error("expected PR link for PR control task")
+	}
+
+	// Verify no merge task was created for PR control (because agent_merge=false)
+	mergeTaskExistsForControl := false
+	listReq3 := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq3.Header.Set("Authorization", authHeader)
+	listW3 := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW3, listReq3)
+
+	var allTasks3 []store.Task
+	if err := json.NewDecoder(listW3.Body).Decode(&allTasks3); err != nil {
+		t.Fatalf("failed to decode final task list: %v", err)
+	}
+
+	for _, task := range allTasks3 {
+		if task.Kind == "merge" && task.TargetTaskID != nil && *task.TargetTaskID == prControlTaskID {
+			mergeTaskExistsForControl = true
+			break
+		}
+	}
+	if mergeTaskExistsForControl {
+		t.Error("expected no merge task for PR control (agent_merge=false)")
+	}
+}
+
 // TestLatencyLoggingAuthNotLogged verifies Authorization token and query values are never logged.
 func TestLatencyLoggingAuthNotLogged(t *testing.T) {
 	capture := &logCapture{}
