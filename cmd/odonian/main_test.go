@@ -4591,6 +4591,32 @@ func TestExecuteSubmitWithFindingsFile(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			var f []map[string]interface{}
+			if err := json.Unmarshal(req.Findings, &f); err != nil {
+				t.Errorf("failed to unmarshal findings: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if len(f) != 1 {
+				t.Errorf("expected 1 finding, got %d", len(f))
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if f[0]["id"] != "f1" {
+				t.Errorf("expected id 'f1', got %v", f[0]["id"])
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if f[0]["severity"] != "P2" {
+				t.Errorf("expected severity 'P2', got %v", f[0]["severity"])
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if f[0]["file"] != "main.go" {
+				t.Errorf("expected file 'main.go', got %v", f[0]["file"])
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 		}
 	}))
@@ -4612,11 +4638,8 @@ func TestExecuteSubmitWithFindingsFile(t *testing.T) {
 
 func TestExecuteSubmitFindingsFileNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" && r.URL.Path == "/tasks/task123" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task123", "review_round": 0, "links": []map[string]string{}})
-			return
-		}
+		t.Errorf("unexpected request to server: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
@@ -4650,11 +4673,8 @@ func TestExecuteSubmitFindingsInvalidJSON(t *testing.T) {
 	tmpFile.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" && r.URL.Path == "/tasks/task123" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task123", "review_round": 0, "links": []map[string]string{}})
-			return
-		}
+		t.Errorf("unexpected request to server: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
@@ -4688,11 +4708,8 @@ func TestExecuteSubmitFindingsNotArray(t *testing.T) {
 	tmpFile.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" && r.URL.Path == "/tasks/task123" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task123", "review_round": 0, "links": []map[string]string{}})
-			return
-		}
+		t.Errorf("unexpected request to server: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
@@ -4806,6 +4823,132 @@ func TestExtractReviewFindingsWithoutStructuredFindings(t *testing.T) {
 	}
 	if f.Severity != "" {
 		t.Errorf("expected empty severity for prose finding, got %s", f.Severity)
+	}
+}
+
+// TestExecuteShowStructuredFindingsRendering tests that structured findings are rendered
+// with severity, file:line, status and summary in the text output
+func TestExecuteShowStructuredFindingsRendering(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks/task-structured":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:          "task-structured",
+				Title:       "Task with Structured Findings",
+				Spec:        "Fix the issues",
+				State:       "ready",
+				ReviewRound: 1,
+				Kind:        "implement",
+				Model:       "haiku",
+			})
+		case "/tasks/task-structured/events":
+			w.Header().Set("Content-Type", "application/json")
+			severityP1 := "P1"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:     "event-0",
+					TaskID: "task-structured",
+					Actor:  "system",
+					Kind:   "spawn_review",
+					Note: func() *string {
+						s := "Round 1 with models: [\"opus\"]"
+						return &s
+					}(),
+					CreatedAt: "2026-01-01T00:00:00Z",
+				},
+				{
+					ID:     "event-1",
+					TaskID: "task-structured",
+					Actor:  "opus-reviewer",
+					Kind:   "review",
+					Verdict: func() *string {
+						s := "reject"
+						return &s
+					}(),
+					Findings: &[]tuiclient.Finding{
+						{
+							ID:            "f1",
+							Severity:      severityP1,
+							File:          "handler.go",
+							Line:          156,
+							Summary:       "Missing nil check before dereference",
+							InChangedText: true,
+							Status:        "new",
+						},
+					},
+					CreatedAt: "2026-01-01T00:00:01Z",
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-structured"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	// Check that the structured finding is rendered with severity, file:line, status and summary
+	if !strings.Contains(output, "opus-reviewer] rejection [P1] handler.go:156 (new): Missing nil check before dereference") {
+		t.Errorf("expected structured finding with severity, file:line, status and summary in output, got: %s", output)
+	}
+}
+
+// TestExtractReviewFindingsApproveWithStructuredFindings tests that structured findings
+// with approve verdict are labeled as "approval" kind
+func TestExtractReviewFindingsApproveWithStructuredFindings(t *testing.T) {
+	severityP2 := "P2"
+	findings := []tuiclient.Finding{
+		{
+			ID:            "f1",
+			Severity:      severityP2,
+			File:          "main.go",
+			Line:          42,
+			Summary:       "Missing error check",
+			InChangedText: true,
+			Status:        "new",
+		},
+	}
+
+	events := []tuiclient.Event{
+		{
+			Kind:      "spawn_review",
+			Note:      strPtr("Round 1 with models: [opus]"),
+			Actor:     "system",
+			CreatedAt: "2026-09-25T00:00:00Z",
+		},
+		{
+			Kind:      "review",
+			Verdict:   strPtr("approve"),
+			Findings:  &findings,
+			Actor:     "reviewer1",
+			CreatedAt: "2026-09-25T00:01:00Z",
+		},
+	}
+
+	result := extractReviewFindings(events, 1)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 round, got %d", len(result))
+	}
+	if len(result[0].Findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(result[0].Findings))
+	}
+
+	f := result[0].Findings[0]
+	if f.Kind != "approval" {
+		t.Errorf("expected kind 'approval' for approve verdict, got %s", f.Kind)
+	}
+	if f.Severity != "P2" {
+		t.Errorf("expected severity P2, got %s", f.Severity)
+	}
+	if f.File != "main.go" {
+		t.Errorf("expected file main.go, got %s", f.File)
 	}
 }
 
