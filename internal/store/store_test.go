@@ -10664,3 +10664,118 @@ func TestUpdateTaskEscalateReviewAggregationRegression(t *testing.T) {
 		t.Errorf("expected escalation event on original task")
 	}
 }
+
+// TestResearchDefaultModel tests the research default model behavior.
+// Acceptance criteria:
+// 1. A research task without a model gets the configured default
+// 2. A research task with an explicit model keeps it
+// 3. A build task without a model still gets the existing fallback
+// 4. A research task without a model and no setting gets the existing fallback
+// 5. An unallowlisted setting fails startup validation
+func TestResearchDefaultModel(t *testing.T) {
+	ctx := context.Background()
+
+	// Test 1: Research task with configured default model
+	allowlist := []string{"haiku", "sonnet", "opus"}
+	store1, err := Open("file::memory:?cache=shared", allowlist,
+		WithResearchDefaultModel("opus"))
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store1.Close()
+
+	proj1, err := store1.CreateProject(ctx, "test-project-1", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc1, err := store1.CreateDocument(ctx, proj1.ID, "design", "Test Doc", "TEST.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a research task without specifying a model
+	tasks1, err := store1.CreateTasks(ctx, proj1.ID, []TaskInput{
+		{
+			Title:      "Research task without model",
+			Spec:       "Test spec",
+			DocumentID: doc1.ID,
+			Track:      "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create research task: %v", err)
+	}
+
+	if tasks1[0].Model != "opus" {
+		t.Errorf("expected research task to get configured default model 'opus', got '%s'", tasks1[0].Model)
+	}
+
+	// Test 2: Research task with explicit model
+	tasks2, err := store1.CreateTasks(ctx, proj1.ID, []TaskInput{
+		{
+			Title:      "Research task with explicit model",
+			Spec:       "Test spec",
+			DocumentID: doc1.ID,
+			Track:      "research",
+			Model:      "sonnet",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create research task with explicit model: %v", err)
+	}
+
+	if tasks2[0].Model != "sonnet" {
+		t.Errorf("expected research task to keep explicit model 'sonnet', got '%s'", tasks2[0].Model)
+	}
+
+	// Test 3: Build task without model gets existing fallback
+	tasks3, err := store1.CreateTasks(ctx, proj1.ID, []TaskInput{
+		{
+			Title:      "Build task without model",
+			Spec:       "Test spec",
+			DocumentID: doc1.ID,
+			Track:      "build",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create build task: %v", err)
+	}
+
+	if tasks3[0].Model != "haiku" {
+		t.Errorf("expected build task to get fallback model 'haiku', got '%s'", tasks3[0].Model)
+	}
+
+	// Test 4: Research task without model and no configured default gets fallback
+	store2, err := Open("file::memory:?cache=shared", allowlist)
+	if err != nil {
+		t.Fatalf("failed to open store without research default: %v", err)
+	}
+	defer store2.Close()
+
+	proj2, err := store2.CreateProject(ctx, "test-project-2", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc2, err := store2.CreateDocument(ctx, proj2.ID, "design", "Test Doc", "TEST.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks4, err := store2.CreateTasks(ctx, proj2.ID, []TaskInput{
+		{
+			Title:      "Research task without configured default",
+			Spec:       "Test spec",
+			DocumentID: doc2.ID,
+			Track:      "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create research task: %v", err)
+	}
+
+	if tasks4[0].Model != "haiku" {
+		t.Errorf("expected research task without configured default to get fallback 'haiku', got '%s'", tasks4[0].Model)
+	}
+}

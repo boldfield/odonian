@@ -12,6 +12,7 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_ADDR` | `:8080` | Listen address. |
 | `ODONIAN_MODELS` | `haiku,sonnet,opus` | Allowlist of model names that may be pinned to a task or named as a reviewer. |
 | `ODONIAN_ESCALATION_LADDER` | same as `ODONIAN_MODELS` | Ordered tiers for the review circuit breaker's escalation path. Every entry must be in `ODONIAN_MODELS`. A model can be a valid reviewer without being on the ladder; `gpt-5.5` via Codex is the usual example. |
+| `ODONIAN_RESEARCH_DEFAULT_MODEL` | unset | Default model for research tasks created without an explicit model. Must be in `ODONIAN_MODELS` if set. Recommended: `claude-opus-5-5`. When unset, research tasks without an explicit model use the default fallback (prefers `haiku`). |
 | `ODONIAN_ESCALATION_THRESHOLDS` | `haiku=8,sonnet=6,opus=4` | Per-model review-round threshold. A rejection that pushes a task past its threshold trips the circuit breaker. A malformed value logs a warning and falls back to the defaults. |
 | `ODONIAN_MAX_REVIEW_ROUNDS` | `5` | Threshold for models with no entry in `ODONIAN_ESCALATION_THRESHOLDS`. |
 | `ODONIAN_LEASE_TTL` | `5m` | Lease granted on claim and extended by each heartbeat. A task whose lease has lapsed is claimable again, so a session that outlives its lease loses the task to another worker. Kept generous in production because renewal is agent-driven. |
