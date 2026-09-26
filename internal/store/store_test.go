@@ -11291,3 +11291,562 @@ func TestNoOpDependentTaskClaimability(t *testing.T) {
 		t.Fatalf("failed to claim dependent task after parent done: %v", err)
 	}
 }
+
+// TestTwoReviewersBothApproveFinalizesNoOp verifies that a no-op task finalizes to done when all reviewers approve.
+func TestTwoReviewersBothApproveFinalizesNoOp(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Two reviewer no-op task",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	maxReviewRounds := 5
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "no_op", Value: "acceptance-already-met"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+	if len(reviewTasks) != 2 {
+		t.Fatalf("expected 2 review tasks, got %d", len(reviewTasks))
+	}
+
+	var opusReviewTask, sonnetReviewTask Task
+	for _, rt := range reviewTasks {
+		if rt.Model == "opus" {
+			opusReviewTask = rt
+		} else if rt.Model == "sonnet" {
+			sonnetReviewTask = rt
+		}
+	}
+
+	// Both reviewers approve
+	_, err = store.ClaimTask(ctx, opusReviewTask.ID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim opus review task: %v", err)
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, opusReviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit opus review verdict: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, sonnetReviewTask.ID, "sonnet-reviewer", "sonnet", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim sonnet review task: %v", err)
+	}
+
+	_, err = store.SubmitTask(ctx, sonnetReviewTask.ID, "sonnet-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit sonnet review verdict: %v", err)
+	}
+
+	// Task should transition to done when all reviewers approve a no-op task
+	finalTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get final task: %v", err)
+	}
+	if finalTask.State != "done" {
+		t.Errorf("task should transition to done when both reviewers approve no-op, got %s", finalTask.State)
+	}
+}
+
+// TestNoOpNoMergeTaskCreated verifies that no merge task is created on no-op finalization.
+func TestNoOpNoMergeTaskCreated(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "No-op task",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	maxReviewRounds := 5
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "no_op", Value: "acceptance-already-met"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, reviewTasks[0].ID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTasks[0].ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	// Verify no merge task is created on no-op finalization
+	mergeTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{Kind: ptrStr("merge")})
+	if err != nil {
+		t.Fatalf("failed to list merge tasks: %v", err)
+	}
+	if len(mergeTasks) != 0 {
+		t.Errorf("expected 0 merge tasks on no-op finalization, got %d", len(mergeTasks))
+	}
+}
+
+// TestAgentMergeFalseWithPRRemainsApproved verifies that agent_merge=false tasks with PR links remain approved.
+func TestAgentMergeFalseWithPRRemainsApproved(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "PR task with agent_merge=false",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	maxReviewRounds := 5
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#123"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, reviewTasks[0].ID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTasks[0].ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if task.State != "approved" {
+		t.Errorf("agent_merge=false PR task should remain approved, got %s", task.State)
+	}
+
+	// Verify no merge task is created for agent_merge=false
+	mergeTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{Kind: ptrStr("merge")})
+	if err != nil {
+		t.Fatalf("failed to list merge tasks: %v", err)
+	}
+	if len(mergeTasks) != 0 {
+		t.Errorf("expected 0 merge tasks for agent_merge=false, got %d", len(mergeTasks))
+	}
+}
+
+// TestAgentMergeTrueWithPRCreatesExactlyOneMergeTask verifies that agent_merge=true tasks with PR links create exactly one merge task.
+func TestAgentMergeTrueWithPRCreatesExactlyOneMergeTask(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "PR task with agent_merge=true",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Set agent_merge=true
+	_, err = store.Conn().ExecContext(ctx, `UPDATE task SET agent_merge = true WHERE id = ?`, taskID)
+	if err != nil {
+		t.Fatalf("failed to set agent_merge: %v", err)
+	}
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	maxReviewRounds := 5
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#123"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, reviewTasks[0].ID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTasks[0].ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if task.State != "approved" {
+		t.Errorf("agent_merge=true PR task should remain approved, got %s", task.State)
+	}
+
+	// Verify exactly one merge task is created
+	mergeTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{Kind: ptrStr("merge")})
+	if err != nil {
+		t.Fatalf("failed to list merge tasks: %v", err)
+	}
+	if len(mergeTasks) != 1 {
+		t.Errorf("expected 1 merge task for agent_merge=true with PR, got %d", len(mergeTasks))
+	}
+}
+
+// TestTombstonedPRPreventFinalizationWithActivePR verifies that a tombstoned PR doesn't affect no-op finalization if an active PR exists.
+func TestTombstonedPRPreventFinalizationWithActivePR(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "No-op task with tombstoned PR",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	maxReviewRounds := 5
+	// Submit with no_op only
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "no_op", Value: "acceptance-already-met"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Manually add a tombstoned PR link to verify it's filtered
+	now := time.Now().Format(time.RFC3339Nano)
+	_, err = store.Conn().ExecContext(ctx, `
+		INSERT INTO task_link (id, task_id, kind, value, tombstoned_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, GenerateID(), taskID, "pr", "#123", now)
+	if err != nil {
+		t.Fatalf("failed to insert tombstoned link: %v", err)
+	}
+
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, reviewTasks[0].ID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTasks[0].ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	// Task should still finalize to done since tombstoned PR is ignored
+	finalTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get final task: %v", err)
+	}
+	if finalTask.State != "done" {
+		t.Errorf("task with no_op and only tombstoned PR should finalize to done, got %s", finalTask.State)
+	}
+}
+
+// TestTombstonedNoOpDoesNotFinalize verifies that a tombstoned no_op link doesn't trigger finalization.
+func TestTombstonedNoOpDoesNotFinalize(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Rework task",
+			Spec:         "Test spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	maxReviewRounds := 5
+	// First submission with no_op
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "no_op", Value: "acceptance-already-met"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	reviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, reviewTasks[0].ID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	// Reject the first review to trigger rework
+	reject := "reject"
+	_, err = store.SubmitTask(ctx, reviewTasks[0].ID, "opus-reviewer", "Needs more work", &reject, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit review verdict: %v", err)
+	}
+
+	// Task should be back to ready
+	taskAfterReject, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task after reject: %v", err)
+	}
+	if taskAfterReject.State != "ready" {
+		t.Fatalf("task should be ready after rejection, got %s", taskAfterReject.State)
+	}
+
+	// Claim again and submit with just PR (no_op link is now tombstoned)
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task for rework: %v", err)
+	}
+
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#456"}}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit reworked task: %v", err)
+	}
+
+	newReviewTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{State: ptrStr("ready"), Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("failed to list new review tasks: %v", err)
+	}
+
+	// Find the new review task (there should be 2 now, find the one we haven't touched)
+	var newReviewTaskID string
+	for _, rt := range newReviewTasks {
+		if rt.ID != reviewTasks[0].ID {
+			newReviewTaskID = rt.ID
+			break
+		}
+	}
+
+	_, err = store.ClaimTask(ctx, newReviewTaskID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim new review task: %v", err)
+	}
+
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, newReviewTaskID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, maxReviewRounds, nil)
+	if err != nil {
+		t.Fatalf("failed to submit approval: %v", err)
+	}
+
+	// Task should remain approved (not finalized) because the no_op is tombstoned
+	finalTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get final task: %v", err)
+	}
+	if finalTask.State != "approved" {
+		t.Errorf("task should remain approved with tombstoned no_op and PR link, got %s", finalTask.State)
+	}
+}

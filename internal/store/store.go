@@ -2251,20 +2251,25 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			var hasNoOp bool
 			var hasPR bool
 			rows, err := tx.QueryContext(ctx, `
-				SELECT kind FROM task_link WHERE task_id = ?
+				SELECT kind FROM task_link WHERE task_id = ? AND tombstoned_at IS NULL
 			`, parentID)
-			if err == nil {
-				defer rows.Close()
-				for rows.Next() {
-					var kind string
-					if err := rows.Scan(&kind); err == nil {
-						if kind == "no_op" {
-							hasNoOp = true
-						} else if kind == "pr" {
-							hasPR = true
-						}
-					}
+			if err != nil {
+				return "", fmt.Errorf("failed to query active task links: %w", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var kind string
+				if err := rows.Scan(&kind); err != nil {
+					return "", fmt.Errorf("failed to scan task link kind: %w", err)
 				}
+				if kind == "no_op" {
+					hasNoOp = true
+				} else if kind == "pr" {
+					hasPR = true
+				}
+			}
+			if err := rows.Err(); err != nil {
+				return "", fmt.Errorf("failed to iterate task links: %w", err)
 			}
 
 			// If no_op link with no pr link, go straight to done (regardless of agent_merge)
