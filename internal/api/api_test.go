@@ -7100,11 +7100,55 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 		t.Errorf("expected state 'review' after submit, got %q", submittedTask.State)
 	}
 
+	// Check that dependent is NOT claimable while parent is in review
+	listBeforeReviewReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?claimable=true", nil)
+	listBeforeReviewReq.Header.Set("Authorization", authHeader)
+	listBeforeReviewW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listBeforeReviewW, listBeforeReviewReq)
+
+	if listBeforeReviewW.Code != http.StatusOK {
+		t.Fatalf("failed to get claimable tasks before review: got status %d", listBeforeReviewW.Code)
+	}
+
+	var claimableBeforeReview []store.Task
+	if err := json.NewDecoder(listBeforeReviewW.Body).Decode(&claimableBeforeReview); err != nil {
+		t.Fatalf("failed to decode claimable tasks before review: %v", err)
+	}
+
+	for _, task := range claimableBeforeReview {
+		if task.ID == dependentTaskID {
+			t.Error("dependent should not be claimable while parent is in review (before any approvals)")
+		}
+	}
+
+	// Verify dependent task is in ready state
+	dependentBeforeReviewReq := httptest.NewRequest("GET", "/tasks/"+dependentTaskID, nil)
+	dependentBeforeReviewReq.Header.Set("Authorization", authHeader)
+	dependentBeforeReviewW := httptest.NewRecorder()
+	server.mux.ServeHTTP(dependentBeforeReviewW, dependentBeforeReviewReq)
+
+	if dependentBeforeReviewW.Code != http.StatusOK {
+		t.Fatalf("failed to get dependent task: got status %d", dependentBeforeReviewW.Code)
+	}
+
+	var dependentTaskBefore store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(dependentBeforeReviewW.Body).Decode(&dependentTaskBefore); err != nil {
+		t.Fatalf("failed to decode dependent task: %v", err)
+	}
+
+	if dependentTaskBefore.State != "ready" {
+		t.Errorf("expected dependent task state 'ready' while parent is in review, got %q", dependentTaskBefore.State)
+	}
+
 	// Get all tasks to find review tasks for the no-op implementation
 	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
 	listReq.Header.Set("Authorization", authHeader)
 	listW := httptest.NewRecorder()
 	server.mux.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Fatalf("failed to get task list: got status %d", listW.Code)
+	}
 
 	var allTasks []store.Task
 	if err := json.NewDecoder(listW.Body).Decode(&allTasks); err != nil {
@@ -7125,6 +7169,8 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 	}
 
 	// Claim and approve from both reviewers using each task's actual model
+	// We need to track approvals to check dependent state after first and second approval
+	approvalCount := 0
 	for reviewTaskID, model := range reviewTaskToModel {
 		reviewClaimPayload := map[string]string{"agent_id": "reviewer-" + model + "-noop", "model": model}
 		reviewClaimBody, _ := json.Marshal(reviewClaimPayload)
@@ -7154,6 +7200,31 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 		if reviewSubmitW.Code != http.StatusOK {
 			t.Fatalf("failed to submit review approval from %s: got status %d; body: %s", model, reviewSubmitW.Code, reviewSubmitW.Body.String())
 		}
+
+		approvalCount++
+
+		// After first approval, check that dependent is still not claimable
+		if approvalCount == 1 {
+			listAfterFirstApprovalReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?claimable=true", nil)
+			listAfterFirstApprovalReq.Header.Set("Authorization", authHeader)
+			listAfterFirstApprovalW := httptest.NewRecorder()
+			server.mux.ServeHTTP(listAfterFirstApprovalW, listAfterFirstApprovalReq)
+
+			if listAfterFirstApprovalW.Code != http.StatusOK {
+				t.Fatalf("failed to get claimable tasks after first approval: got status %d", listAfterFirstApprovalW.Code)
+			}
+
+			var claimableAfterFirstApproval []store.Task
+			if err := json.NewDecoder(listAfterFirstApprovalW.Body).Decode(&claimableAfterFirstApproval); err != nil {
+				t.Fatalf("failed to decode claimable tasks after first approval: %v", err)
+			}
+
+			for _, task := range claimableAfterFirstApproval {
+				if task.ID == dependentTaskID {
+					t.Error("dependent should not be claimable after only one reviewer approved")
+				}
+			}
+		}
 	}
 
 	// Check the no-op task state after all reviewers approved
@@ -7171,57 +7242,14 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 		t.Fatalf("failed to decode task after approval: %v", err)
 	}
 
-	// If still in review state, check dependent is not claimable yet
-	if taskAfterApproval.State == "review" {
-		dependentNotClaimableReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?claimable=true", nil)
-		dependentNotClaimableReq.Header.Set("Authorization", authHeader)
-		dependentNotClaimableW := httptest.NewRecorder()
-		server.mux.ServeHTTP(dependentNotClaimableW, dependentNotClaimableReq)
-
-		if dependentNotClaimableW.Code != http.StatusOK {
-			t.Fatalf("failed to get claimable tasks before finalization: got status %d", dependentNotClaimableW.Code)
-		}
-
-		var claimableTasksBeforeFinalize []store.Task
-		if err := json.NewDecoder(dependentNotClaimableW.Body).Decode(&claimableTasksBeforeFinalize); err != nil {
-			t.Fatalf("failed to decode claimable tasks before finalization: %v", err)
-		}
-
-		dependentClaimableBeforeFinalize := false
-		for _, task := range claimableTasksBeforeFinalize {
-			if task.ID == dependentTaskID {
-				dependentClaimableBeforeFinalize = true
-				break
-			}
-		}
-		if dependentClaimableBeforeFinalize {
-			t.Error("dependent should not be claimable while parent is in review")
-		}
-	}
-
-	// GET the no-op task and verify it's now done (not approved waiting for merge)
-	getReq := httptest.NewRequest("GET", "/tasks/"+noOpTaskID, nil)
-	getReq.Header.Set("Authorization", authHeader)
-	getW := httptest.NewRecorder()
-	server.mux.ServeHTTP(getW, getReq)
-
-	if getW.Code != http.StatusOK {
-		t.Fatalf("failed to get no-op task: got status %d", getW.Code)
-	}
-
-	var finalTask store.TaskWithDepsAndLinks
-	if err := json.NewDecoder(getW.Body).Decode(&finalTask); err != nil {
-		t.Fatalf("failed to decode final task: %v", err)
-	}
-
-	if finalTask.State != "done" {
-		t.Errorf("expected no-op task state 'done' after both reviewers approve, got %q", finalTask.State)
+	if taskAfterApproval.State != "done" {
+		t.Errorf("expected no-op task state 'done' after both reviewers approve, got %q", taskAfterApproval.State)
 	}
 
 	// Verify no PR link exists (only no_op link)
 	hasPRLink := false
 	hasNoOpLink := false
-	for _, link := range finalTask.Links {
+	for _, link := range taskAfterApproval.Links {
 		if link.Kind == "pr" {
 			hasPRLink = true
 		}
@@ -7249,6 +7277,11 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 	var tasksAfterApproval []store.Task
 	if err := json.NewDecoder(listAfterApprovalW.Body).Decode(&tasksAfterApproval); err != nil {
 		t.Fatalf("failed to decode task list after approval: %v", err)
+	}
+
+	// Assert parent task is done
+	if taskAfterApproval.State != "done" {
+		t.Errorf("expected no-op task state 'done' after both reviewers approve, got %q", taskAfterApproval.State)
 	}
 
 	// Verify no merge task was created for the no-op task
@@ -7286,7 +7319,7 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 		}
 	}
 	if !dependentIsClaimable {
-		t.Errorf("expected dependent task to be claimable after parent is done, but it's not in claimable list. Claimable tasks: %v", len(claimableTasks))
+		t.Errorf("expected dependent task to be claimable after parent is done, but it's not in claimable list. Claimable tasks: %d", len(claimableTasks))
 	}
 
 	// Now test the PR-backed control: claim and submit with normal PR link
@@ -7324,6 +7357,10 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 	listReq2.Header.Set("Authorization", authHeader)
 	listW2 := httptest.NewRecorder()
 	server.mux.ServeHTTP(listW2, listReq2)
+
+	if listW2.Code != http.StatusOK {
+		t.Fatalf("failed to get task list after PR control submit: got status %d", listW2.Code)
+	}
 
 	var allTasks2 []store.Task
 	if err := json.NewDecoder(listW2.Body).Decode(&allTasks2); err != nil {
@@ -7409,6 +7446,10 @@ func TestNoOpRegressionWithDependentReady(t *testing.T) {
 	listReq3.Header.Set("Authorization", authHeader)
 	listW3 := httptest.NewRecorder()
 	server.mux.ServeHTTP(listW3, listReq3)
+
+	if listW3.Code != http.StatusOK {
+		t.Fatalf("failed to get final task list: got status %d", listW3.Code)
+	}
 
 	var allTasks3 []store.Task
 	if err := json.NewDecoder(listW3.Body).Decode(&allTasks3); err != nil {
