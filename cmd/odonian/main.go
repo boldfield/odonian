@@ -646,7 +646,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 				if len(finding.Findings) > 0 {
 					fmt.Fprintf(out, "    Findings:\n")
 					for _, f := range finding.Findings {
-						fmt.Fprintf(out, "      - [%s] %s: %s\n", f.Reviewer, f.Kind, f.Text)
+						if f.Severity != "" && f.File != "" {
+							filePos := fmt.Sprintf("%s:%d", f.File, f.Line)
+							fmt.Fprintf(out, "      - [%s] %s [%s] %s (%s): %s\n", f.Reviewer, f.Kind, f.Severity, filePos, f.Status, f.Summary)
+						} else {
+							fmt.Fprintf(out, "      - [%s] %s: %s\n", f.Reviewer, f.Kind, f.Text)
+						}
 						if f.IsHistory {
 							fmt.Fprintf(out, "        (historical)\n")
 						}
@@ -788,6 +793,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	noOpFlag := fs.Bool("no-op", false, "mark as already-satisfied (no-op)")
 	messageFlag := fs.String("message", "", "commit message override (local_commit mode)")
 	agentFlag := fs.String("agent", "", "agent ID")
+	findingsFileFlag := fs.String("findings-file", "", "path to JSON file with structured findings")
 	skipFeedbackGateFlag := fs.Bool("skip-feedback-gate", false, "bypass the mechanical PR-feedback rework gate (humans/emergencies only)")
 	positionals, err := parseFlagsWithPositionals(fs, args)
 	if err != nil {
@@ -813,6 +819,26 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 
 	if *noOpFlag && (*prFlag != "" || *branchFlag != "") {
 		return fmt.Errorf("--no-op cannot be combined with --pr or --branch")
+	}
+
+	// Validate findings file early, before any HTTP requests
+	var findings []byte
+	if *findingsFileFlag != "" {
+		fileData, err := os.ReadFile(*findingsFileFlag)
+		if err != nil {
+			return fmt.Errorf("failed to read findings file: %w", err)
+		}
+
+		var f interface{}
+		if err := json.Unmarshal(fileData, &f); err != nil {
+			return fmt.Errorf("findings file is not valid JSON: %w", err)
+		}
+
+		if _, isArray := f.([]interface{}); !isArray {
+			return fmt.Errorf("findings file must be a JSON array")
+		}
+
+		findings = fileData
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
@@ -931,7 +957,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		verdict = verdictFlag
 	}
 
-	if err := client.SubmitTask(ctx, taskID, agentID, *resultFlag, verdict, links); err != nil {
+	if err := client.SubmitTaskWithFindings(ctx, taskID, agentID, *resultFlag, verdict, links, findings); err != nil {
 		return fmt.Errorf("failed to submit task: %w", err)
 	}
 
@@ -1453,12 +1479,18 @@ type ReviewVerdictInfo struct {
 	Verdict string `json:"verdict"`
 }
 
-// ReviewFindingInfo holds a single review finding
+// ReviewFindingInfo holds a single review finding (prose or structured)
 type ReviewFindingInfo struct {
-	Reviewer  string `json:"reviewer"`
-	Kind      string `json:"kind"`
-	Text      string `json:"text"`
-	IsHistory bool   `json:"is_history,omitempty"`
+	Reviewer      string `json:"reviewer"`
+	Kind          string `json:"kind"`
+	Text          string `json:"text,omitempty"`
+	IsHistory     bool   `json:"is_history,omitempty"`
+	Severity      string `json:"severity,omitempty"`
+	File          string `json:"file,omitempty"`
+	Line          int    `json:"line,omitempty"`
+	Summary       string `json:"summary,omitempty"`
+	Status        string `json:"status,omitempty"`
+	InChangedText bool   `json:"in_changed_text,omitempty"`
 }
 
 // ReviewRoundFindings holds all findings for a single review round
@@ -1503,6 +1535,25 @@ func extractReviewFindings(events []tuiclient.Event, currentReviewRound int) []R
 						Actor:   event.Actor,
 						Verdict: *event.Verdict,
 					})
+				}
+				// Extract structured findings if present
+				if event.Findings != nil && len(*event.Findings) > 0 {
+					kind := "approval"
+					if event.Verdict != nil && *event.Verdict == "reject" {
+						kind = "rejection"
+					}
+					for _, f := range *event.Findings {
+						roundMap[activeRound].Findings = append(roundMap[activeRound].Findings, ReviewFindingInfo{
+							Reviewer:      event.Actor,
+							Kind:          kind,
+							Severity:      f.Severity,
+							File:          f.File,
+							Line:          f.Line,
+							Summary:       f.Summary,
+							Status:        f.Status,
+							InChangedText: f.InChangedText,
+						})
+					}
 				}
 				// Extract findings from the note field of review events. Only reject
 				// verdicts are labeled as rejection findings the worker must address;
