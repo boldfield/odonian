@@ -106,14 +106,26 @@ type Document struct {
 	UpdatedAt string  `json:"updated_at"`
 }
 
+type Finding struct {
+	ID            string  `json:"id"`
+	Severity      string  `json:"severity"`
+	File          string  `json:"file"`
+	Line          int     `json:"line"`
+	Summary       string  `json:"summary"`
+	InChangedText bool    `json:"in_changed_text"`
+	Status        string  `json:"status"`
+	PriorID       *string `json:"prior_id,omitempty"`
+}
+
 type Event struct {
-	ID        string  `json:"id"`
-	TaskID    string  `json:"task_id"`
-	Actor     string  `json:"actor"`
-	Kind      string  `json:"kind"`
-	Verdict   *string `json:"verdict"`
-	Note      *string `json:"note"`
-	CreatedAt string  `json:"created_at"`
+	ID        string     `json:"id"`
+	TaskID    string     `json:"task_id"`
+	Actor     string     `json:"actor"`
+	Kind      string     `json:"kind"`
+	Verdict   *string    `json:"verdict"`
+	Note      *string    `json:"note"`
+	Findings  *[]Finding `json:"findings"`
+	CreatedAt string     `json:"created_at"`
 }
 
 // HTTPClient implements the Client interface.
@@ -555,19 +567,26 @@ func (c *HTTPClient) HeartbeatTask(ctx context.Context, id, agentID string) erro
 
 // submitTaskRequest is the request body for SubmitTask.
 type submitTaskRequest struct {
-	AgentID string      `json:"agent_id"`
-	Result  string      `json:"result"`
-	Verdict *string     `json:"verdict,omitempty"`
-	Links   []LinkInput `json:"links"`
+	AgentID  string          `json:"agent_id"`
+	Result   string          `json:"result"`
+	Verdict  *string         `json:"verdict,omitempty"`
+	Links    []LinkInput     `json:"links"`
+	Findings json.RawMessage `json:"findings,omitempty"`
 }
 
 // SubmitTask submits a task result with optional verdict and links.
 func (c *HTTPClient) SubmitTask(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput) error {
+	return c.SubmitTaskWithFindings(ctx, id, agentID, result, verdict, links, nil)
+}
+
+// SubmitTaskWithFindings submits a task result with optional verdict, links, and findings.
+func (c *HTTPClient) SubmitTaskWithFindings(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage) error {
 	body := submitTaskRequest{
-		AgentID: agentID,
-		Result:  result,
-		Verdict: verdict,
-		Links:   links,
+		AgentID:  agentID,
+		Result:   result,
+		Verdict:  verdict,
+		Links:    links,
+		Findings: findings,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/submit", id), body)
