@@ -646,7 +646,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 				if len(finding.Findings) > 0 {
 					fmt.Fprintf(out, "    Findings:\n")
 					for _, f := range finding.Findings {
-						fmt.Fprintf(out, "      - [%s] %s: %s\n", f.Reviewer, f.Kind, f.Text)
+						if f.Severity != "" && f.File != "" {
+							filePos := fmt.Sprintf("%s:%d", f.File, f.Line)
+							fmt.Fprintf(out, "      - [%s] %s [%s] %s (%s): %s\n", f.Reviewer, f.Kind, f.Severity, filePos, f.Status, f.Summary)
+						} else {
+							fmt.Fprintf(out, "      - [%s] %s: %s\n", f.Reviewer, f.Kind, f.Text)
+						}
 						if f.IsHistory {
 							fmt.Fprintf(out, "        (historical)\n")
 						}
@@ -816,6 +821,26 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		return fmt.Errorf("--no-op cannot be combined with --pr or --branch")
 	}
 
+	// Validate findings file early, before any HTTP requests
+	var findings []byte
+	if *findingsFileFlag != "" {
+		fileData, err := os.ReadFile(*findingsFileFlag)
+		if err != nil {
+			return fmt.Errorf("failed to read findings file: %w", err)
+		}
+
+		var f interface{}
+		if err := json.Unmarshal(fileData, &f); err != nil {
+			return fmt.Errorf("findings file is not valid JSON: %w", err)
+		}
+
+		if _, isArray := f.([]interface{}); !isArray {
+			return fmt.Errorf("findings file must be a JSON array")
+		}
+
+		findings = fileData
+	}
+
 	client := tuiclient.NewHTTPClient(baseURL, token)
 
 	task, taskErr := client.GetTask(ctx, taskID)
@@ -930,25 +955,6 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 			return fmt.Errorf("verdict must be 'approve' or 'reject', got %q", *verdictFlag)
 		}
 		verdict = verdictFlag
-	}
-
-	var findings []byte
-	if *findingsFileFlag != "" {
-		fileData, err := os.ReadFile(*findingsFileFlag)
-		if err != nil {
-			return fmt.Errorf("failed to read findings file: %w", err)
-		}
-
-		var f interface{}
-		if err := json.Unmarshal(fileData, &f); err != nil {
-			return fmt.Errorf("findings file is not valid JSON: %w", err)
-		}
-
-		if _, isArray := f.([]interface{}); !isArray {
-			return fmt.Errorf("findings file must be a JSON array")
-		}
-
-		findings = fileData
 	}
 
 	if err := client.SubmitTaskWithFindings(ctx, taskID, agentID, *resultFlag, verdict, links, findings); err != nil {
@@ -1532,10 +1538,14 @@ func extractReviewFindings(events []tuiclient.Event, currentReviewRound int) []R
 				}
 				// Extract structured findings if present
 				if event.Findings != nil && len(*event.Findings) > 0 {
+					kind := "approval"
+					if event.Verdict != nil && *event.Verdict == "reject" {
+						kind = "rejection"
+					}
 					for _, f := range *event.Findings {
 						roundMap[activeRound].Findings = append(roundMap[activeRound].Findings, ReviewFindingInfo{
 							Reviewer:      event.Actor,
-							Kind:          "rejection",
+							Kind:          kind,
 							Severity:      f.Severity,
 							File:          f.File,
 							Line:          f.Line,
