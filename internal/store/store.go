@@ -63,11 +63,12 @@ type Store interface {
 
 // sqliteStore wraps a SQLite database connection and provides migration functionality.
 type sqliteStore struct {
-	conn             *sql.DB
-	readConn         *sql.DB
-	allowedModels    []string
-	allowedModelsM   map[string]bool
-	escalationLadder []string
+	conn                 *sql.DB
+	readConn             *sql.DB
+	allowedModels        []string
+	allowedModelsM       map[string]bool
+	escalationLadder     []string
+	researchDefaultModel string
 
 	// supersedeCloseHook, when set, is invoked after each background
 	// closeSupersededPR attempt finishes. It exists solely so tests can
@@ -85,6 +86,14 @@ type StoreOption func(*sqliteStore)
 func WithEscalationLadder(ladder []string) StoreOption {
 	return func(s *sqliteStore) {
 		s.escalationLadder = append([]string{}, ladder...) // Copy to avoid external mutation
+	}
+}
+
+// WithResearchDefaultModel sets the default model for research tasks.
+// If not provided, research tasks without an explicit model use getDefaultModel.
+func WithResearchDefaultModel(model string) StoreOption {
+	return func(s *sqliteStore) {
+		s.researchDefaultModel = model
 	}
 }
 
@@ -1152,7 +1161,11 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 
 		model := input.Model
 		if model == "" {
-			model = s.getDefaultModel()
+			if input.Track == "research" && s.researchDefaultModel != "" {
+				model = s.researchDefaultModel
+			} else {
+				model = s.getDefaultModel()
+			}
 		}
 
 		// Validate model against allowlist

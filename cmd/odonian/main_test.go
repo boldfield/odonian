@@ -4952,6 +4952,72 @@ func TestExtractReviewFindingsApproveWithStructuredFindings(t *testing.T) {
 	}
 }
 
+func TestValidateResearchDefaultModel(t *testing.T) {
+	allowedModels := []string{"haiku", "sonnet", "opus"}
+
+	tests := []struct {
+		name      string
+		modelStr  string
+		allowed   []string
+		wantModel string
+		wantErr   bool
+		errMsg    string
+	}{
+		{
+			name:      "empty string returns empty",
+			modelStr:  "",
+			allowed:   allowedModels,
+			wantModel: "",
+			wantErr:   false,
+		},
+		{
+			name:      "whitespace only returns empty",
+			modelStr:  "   ",
+			allowed:   allowedModels,
+			wantModel: "",
+			wantErr:   false,
+		},
+		{
+			name:      "allowed model returns trimmed",
+			modelStr:  "  opus  ",
+			allowed:   allowedModels,
+			wantModel: "opus",
+			wantErr:   false,
+		},
+		{
+			name:      "unallowlisted model returns error",
+			modelStr:  "gpt-4",
+			allowed:   allowedModels,
+			wantModel: "",
+			wantErr:   true,
+			errMsg:    "ODONIAN_MODELS",
+		},
+		{
+			name:      "unallowlisted model with whitespace returns error",
+			modelStr:  "  invalid-model  ",
+			allowed:   allowedModels,
+			wantModel: "",
+			wantErr:   true,
+			errMsg:    "ODONIAN_MODELS",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model, err := validateResearchDefaultModel(tt.modelStr, tt.allowed)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateResearchDefaultModel() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if model != tt.wantModel {
+				t.Errorf("validateResearchDefaultModel() model = %q, want %q", model, tt.wantModel)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("validateResearchDefaultModel() error = %v, want error containing %q", err, tt.errMsg)
+			}
+		})
+	}
+}
+
 func strPtr(s string) *string {
 	return &s
 }

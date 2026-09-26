@@ -188,6 +188,12 @@ func runServer() {
 	// Parse escalation ladder
 	escalationLadder := parseEscalationLadder(os.Getenv("ODONIAN_ESCALATION_LADDER"), allowedModels)
 
+	// Parse research default model
+	researchDefaultModel, err := validateResearchDefaultModel(os.Getenv("ODONIAN_RESEARCH_DEFAULT_MODEL"), allowedModels)
+	if err != nil {
+		log.Fatalf("invalid research default model: %v", err)
+	}
+
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
 	if eventTerminalRetentionDaysStr == "" {
@@ -236,7 +242,9 @@ func runServer() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	// Open the store
-	s, err := store.Open(dbPath, allowedModels, store.WithEscalationLadder(escalationLadder))
+	s, err := store.Open(dbPath, allowedModels,
+		store.WithEscalationLadder(escalationLadder),
+		store.WithResearchDefaultModel(researchDefaultModel))
 	if err != nil {
 		log.Fatalf("failed to open store: %v", err)
 	}
@@ -1094,6 +1102,28 @@ func parseEscalationThresholds(thresholdsStr string) map[string]int {
 		result[model] = threshold
 	}
 	return result
+}
+
+func validateResearchDefaultModel(modelStr string, allowedModels []string) (string, error) {
+	if modelStr == "" {
+		return "", nil
+	}
+
+	modelStr = strings.TrimSpace(modelStr)
+	if modelStr == "" {
+		return "", nil
+	}
+
+	allowedModelsM := make(map[string]bool)
+	for _, m := range allowedModels {
+		allowedModelsM[m] = true
+	}
+
+	if !allowedModelsM[modelStr] {
+		return "", fmt.Errorf("model %q not in ODONIAN_MODELS allowlist", modelStr)
+	}
+
+	return modelStr, nil
 }
 
 func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, args []string) error {
