@@ -189,7 +189,10 @@ func runServer() {
 	escalationLadder := parseEscalationLadder(os.Getenv("ODONIAN_ESCALATION_LADDER"), allowedModels)
 
 	// Parse research default model
-	researchDefaultModel := parseResearchDefaultModel(os.Getenv("ODONIAN_RESEARCH_DEFAULT_MODEL"), allowedModels)
+	researchDefaultModel, err := validateResearchDefaultModel(os.Getenv("ODONIAN_RESEARCH_DEFAULT_MODEL"), allowedModels)
+	if err != nil {
+		log.Fatalf("invalid research default model: %v", err)
+	}
 
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
@@ -1101,14 +1104,14 @@ func parseEscalationThresholds(thresholdsStr string) map[string]int {
 	return result
 }
 
-func parseResearchDefaultModel(modelStr string, allowedModels []string) string {
+func validateResearchDefaultModel(modelStr string, allowedModels []string) (string, error) {
 	if modelStr == "" {
-		return ""
+		return "", nil
 	}
 
 	modelStr = strings.TrimSpace(modelStr)
 	if modelStr == "" {
-		return ""
+		return "", nil
 	}
 
 	allowedModelsM := make(map[string]bool)
@@ -1117,10 +1120,10 @@ func parseResearchDefaultModel(modelStr string, allowedModels []string) string {
 	}
 
 	if !allowedModelsM[modelStr] {
-		log.Fatalf("research default model %q not in ODONIAN_MODELS allowlist", modelStr)
+		return "", fmt.Errorf("model %q not in ODONIAN_MODELS allowlist", modelStr)
 	}
 
-	return modelStr
+	return modelStr, nil
 }
 
 func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, args []string) error {
