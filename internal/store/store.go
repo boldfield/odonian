@@ -2244,46 +2244,42 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			// Not all done yet; parent stays in review
 			newParentState = ""
 		} else if doneReviewTasks == totalReviewTasks && approveReviewTasks == totalReviewTasks {
-			// All done and all approved; check if this is an agent_merge no_op
+			// All done and all approved; check for no_op link without pr link
 			newParentState = "approved"
 
-			if parentAgentMerge {
-				// Check if parent has a no_op link (and no pr link)
-				var hasNoOp bool
-				var hasPR bool
-				rows, err := tx.QueryContext(ctx, `
-					SELECT kind FROM task_link WHERE task_id = ?
-				`, parentID)
-				if err == nil {
-					defer rows.Close()
-					for rows.Next() {
-						var kind string
-						if err := rows.Scan(&kind); err == nil {
-							if kind == "no_op" {
-								hasNoOp = true
-							} else if kind == "pr" {
-								hasPR = true
-							}
+			// Check if parent has a no_op link (and no pr link)
+			var hasNoOp bool
+			var hasPR bool
+			rows, err := tx.QueryContext(ctx, `
+				SELECT kind FROM task_link WHERE task_id = ?
+			`, parentID)
+			if err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var kind string
+					if err := rows.Scan(&kind); err == nil {
+						if kind == "no_op" {
+							hasNoOp = true
+						} else if kind == "pr" {
+							hasPR = true
 						}
 					}
 				}
+			}
 
-				// If agent_merge=true and no_op link with no pr link, go straight to done
-				if hasNoOp && !hasPR {
-					newParentState = "done"
-				}
-
+			// If no_op link with no pr link, go straight to done (regardless of agent_merge)
+			if hasNoOp && !hasPR {
+				newParentState = "done"
+			} else if parentAgentMerge && hasPR {
 				// Spawn merge task if approved with agent_merge && pr (not the no_op case)
-				if newParentState == "approved" && hasPR {
-					mergeTaskID := GenerateID()
-					mergeTitle := "Merge: " + parentTitle
-					_, err := tx.ExecContext(ctx, `
-						INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, created_at, updated_at)
-						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-					`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, now, now)
-					if err != nil {
-						return "", fmt.Errorf("failed to create merge task: %w", err)
-					}
+				mergeTaskID := GenerateID()
+				mergeTitle := "Merge: " + parentTitle
+				_, err := tx.ExecContext(ctx, `
+					INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, now, now)
+				if err != nil {
+					return "", fmt.Errorf("failed to create merge task: %w", err)
 				}
 			}
 		} else if doneReviewTasks == totalReviewTasks && approveReviewTasks < totalReviewTasks {
@@ -2351,7 +2347,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		if newParentState == "approved" {
 			eventNote = "Aggregation: all reviewers approved"
 		} else if newParentState == "done" {
-			eventNote = "auto-finalized: agent_merge no-op approved by all reviewers"
+			eventNote = "auto-finalized: no-op task approved by all reviewers"
 		} else if newParentState == "ready" {
 			eventNote = "Aggregation: at least one reviewer rejected"
 		} else if newParentState == "blocked" {
