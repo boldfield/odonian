@@ -15634,3 +15634,164 @@ func TestResearchSupersessionCarriesUnreviewedFindings(t *testing.T) {
 		t.Errorf("C's spec should contain the unresolved findings section, got: %s", taskC.Spec)
 	}
 }
+
+// TestResearchSupersessionMidRoundKeepsPriorFindings verifies that superseding a
+// research task while its latest review round has been spawned but not yet submitted
+// (the normal "re-route a task that is stuck waiting in review" case for `odonian
+// supersede`) does not drop the previous, completed round's unresolved findings.
+// getUnresolvedFindingsFromLastRound's notion of "last round" must be the last round
+// with a submitted review event, not merely the last round whose review tasks exist.
+func TestResearchSupersessionMidRoundKeepsPriorFindings(t *testing.T) {
+	store, ctx, projID, taskA := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
+
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskA, 1)
+	if opus1 == nil {
+		t.Fatalf("round 1: expected review task")
+	}
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+
+	// Rework and resubmit, spawning round 2's review task, then supersede while it is
+	// still pending: round 2 has no submitted findings of its own yet.
+	resubmitResearchImplementTask(t, store, ctx, taskA)
+	opus2, _ := findResearchReviewTasks(t, store, ctx, projID, taskA, 2)
+	if opus2 == nil {
+		t.Fatalf("round 2: expected review task to be spawned")
+	}
+
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("supersession failed: %v", err)
+	}
+	if !strings.Contains(taskB.Spec, `"id":"f1"`) {
+		t.Errorf("B's spec should carry forward round 1's unresolved finding f1 even though round 2 is still pending, got: %s", taskB.Spec)
+	}
+}
+
+// TestResearchSupersessionMidRoundReplacementKeepsCarriedFindings verifies the
+// replacement-side half of the same bug: a replacement task that has reached its own
+// pending (spawned, not yet submitted) review round is superseded again, and the
+// finding it was carrying forward from its predecessor must not be dropped just
+// because it now has review tasks of its own.
+func TestResearchSupersessionMidRoundReplacementKeepsCarriedFindings(t *testing.T) {
+	store, ctx, projID, taskA := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
+
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskA, 1)
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("first supersession failed: %v", err)
+	}
+	if !strings.Contains(taskB.Spec, `"id":"f1"`) {
+		t.Fatalf("B's spec should carry forward unresolved finding f1, got: %s", taskB.Spec)
+	}
+
+	// B is claimed and resubmitted, spawning its own round 1 review task, which is
+	// left pending (not yet reviewed) before B is superseded again.
+	if _, err := store.PromoteTask(ctx, taskB.ID); err != nil {
+		t.Fatalf("failed to promote B: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskB.ID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim B: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskB.ID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#101"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to resubmit B: %v", err)
+	}
+	bOpus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskB.ID, 1)
+	if bOpus1 == nil {
+		t.Fatalf("expected B's round 1 review task to be spawned")
+	}
+
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("second supersession failed: %v", err)
+	}
+	if !strings.Contains(taskC.Spec, `"id":"f1"`) {
+		t.Errorf("C's spec should still carry forward finding f1 from B's pending round, got: %s", taskC.Spec)
+	}
+}
+
+// TestResearchSupersessionCarriedFindingsIgnoreUserContent verifies that
+// extractCarriedFindings, used when a replacement is superseded before its own review
+// round, only recovers findings from the generated block after researchHistorySentinel
+// and never parses a coincidental "**Structured findings (JSON):**" fenced block that
+// happens to appear in the user-authored original assignment.
+func TestResearchSupersessionCarriedFindingsIgnoreUserContent(t *testing.T) {
+	store, ctx, projID, _ := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
+
+	userSpec := "Research task description\n\n" +
+		"**Structured findings (JSON):**\n```json\n" +
+		`[{"id":"bogus-user-finding","severity":"P1","file":"z.md","line":1,"summary":"not a real finding","in_changed_text":true,"status":"new"}]` +
+		"\n```\n\nMore of the assignment."
+
+	doc, err := store.CreateDocument(ctx, projID, "feature_spec", "test-doc-carried", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, projID, []TaskInput{
+		{
+			Title:        "research with bogus findings block in spec",
+			Spec:         userSpec,
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			Track:        "research",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil || len(tasks) == 0 {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskA := tasks[0].ID
+
+	if _, err := store.PromoteTask(ctx, taskA); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskA, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskA, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskA, 1)
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"real finding","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("first supersession failed: %v", err)
+	}
+
+	// B is superseded again immediately, with no review round of its own, exercising
+	// extractCarriedFindings against B's spec (which still contains the user's bogus
+	// block ahead of the generated one).
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("second supersession failed: %v", err)
+	}
+	if !strings.Contains(taskC.Spec, `"id":"f1"`) {
+		t.Errorf("C's spec should carry forward the real finding f1, got: %s", taskC.Spec)
+	}
+	// The literal text "bogus-user-finding" legitimately survives inside the preserved,
+	// verbatim original assignment. What must NOT happen is extractCarriedFindings
+	// parsing it as a real carried finding and rendering it into the generated
+	// "Unresolved findings" bullet list or structured-findings array.
+	if strings.Contains(taskC.Spec, "- **bogus-user-finding**") {
+		t.Errorf("C's spec should not render the user-authored bogus block as a carried finding, got: %s", taskC.Spec)
+	}
+	structuredIdx := strings.Index(taskC.Spec, researchHistorySentinel)
+	if structuredIdx == -1 {
+		t.Fatalf("expected generated compaction block in C's spec, got: %s", taskC.Spec)
+	}
+	if strings.Contains(taskC.Spec[structuredIdx:], "bogus-user-finding") {
+		t.Errorf("C's generated block should not contain the user-authored bogus finding, got: %s", taskC.Spec)
+	}
+}

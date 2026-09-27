@@ -3493,24 +3493,34 @@ func extractOriginalAssignment(spec string) string {
 	return strings.TrimRight(spec[:idx], "\n")
 }
 
-// getUnresolvedFindingsFromLastRound returns the findings from taskID's last review
-// round that are still outstanding, per docs/features/research-track.md section 7:
-// the replacement spec on supersession attaches only these, not the task's full
-// review history. It reuses collectResearchReviewFindings and researchFindingChains,
-// the same prior_id lineage tracking createResearchFollowUpTasks and
-// describeChainWideBlockingFindings use, so "unresolved" here has the same meaning
-// everywhere in the research track: not itself resolved, and not settled by a later
-// resolved report in its chain. Findings are deduplicated by (severity, file, line,
-// summary) so the same finding raised by two reviewers in the same round is listed
-// once. The second return value reports whether taskID has had any review round at
-// all; the caller needs this to tell "no review yet, so nothing to carry forward
-// beyond what the predecessor already attached" apart from "reviewed, and every
-// finding from the last round is resolved".
+// getUnresolvedFindingsFromLastRound returns the findings from taskID's last
+// *submitted* review round that are still outstanding, per
+// docs/features/research-track.md section 7: the replacement spec on supersession
+// attaches only these, not the task's full review history. It reuses
+// collectResearchReviewFindings and researchFindingChains, the same prior_id lineage
+// tracking createResearchFollowUpTasks and describeChainWideBlockingFindings use, so
+// "unresolved" here has the same meaning everywhere in the research track: not itself
+// resolved, and not settled by a later resolved report in its chain. Findings are
+// deduplicated by (severity, file, line, summary) so the same finding raised by two
+// reviewers in the same round is listed once. The second return value reports whether
+// taskID has had any *submitted* review round at all; the caller needs this to tell
+// "no review yet, so nothing to carry forward beyond what the predecessor already
+// attached" apart from "reviewed, and every finding from the last round is resolved".
+//
+// maxRound only counts rounds that have at least one submitted review event recorded
+// on taskID (an event.kind='review' row whose source_task_id is one of taskID's
+// review tasks), not merely spawned: a round whose review tasks have been created but
+// not yet submitted (e.g. supersession while a rework's fresh review round is still
+// pending) must not shadow the last round that actually reported findings, or those
+// findings would be silently dropped instead of carried forward.
 func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx *sql.Tx, taskID string) ([]Finding, bool, error) {
 	var maxRound int
 	if err := tx.QueryRowContext(ctx, `
-		SELECT COALESCE(MAX(review_round), 0) FROM task WHERE target_task_id = ? AND kind = 'review'
-	`, taskID).Scan(&maxRound); err != nil {
+		SELECT COALESCE(MAX(t.review_round), 0)
+		FROM task t
+		JOIN event e ON e.task_id = ? AND e.kind = 'review' AND e.source_task_id = t.id
+		WHERE t.target_task_id = ? AND t.kind = 'review'
+	`, taskID, taskID).Scan(&maxRound); err != nil {
 		return nil, false, fmt.Errorf("failed to find max review round: %w", err)
 	}
 	if maxRound == 0 {
@@ -3546,14 +3556,23 @@ func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx
 // only looks at taskID's own reviews, so without this, findings that are still
 // outstanding from the predecessor's last round would be silently dropped instead of
 // carried forward, since extractOriginalAssignment strips the whole generated block
-// (including this one) from the new spec. Returns nil if spec has no such block.
+// (including this one) from the new spec. Returns nil if spec has no such block. The
+// search starts after researchHistorySentinel, not the whole spec, so a coincidental
+// "Structured findings (JSON):" fenced block in the user-authored original assignment
+// can never be parsed as carried findings.
 func extractCarriedFindings(spec string) []Finding {
+	sentinelIdx := strings.Index(spec, researchHistorySentinel)
+	if sentinelIdx == -1 {
+		return nil
+	}
+	block := spec[sentinelIdx:]
+
 	const marker = "**Structured findings (JSON):**\n```json\n"
-	idx := strings.Index(spec, marker)
+	idx := strings.Index(block, marker)
 	if idx == -1 {
 		return nil
 	}
-	rest := spec[idx+len(marker):]
+	rest := block[idx+len(marker):]
 	end := strings.Index(rest, "\n```")
 	if end == -1 {
 		return nil
