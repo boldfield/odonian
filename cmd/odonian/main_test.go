@@ -4651,12 +4651,111 @@ func TestParseResearchEscalationThresholds(t *testing.T) {
 	}
 }
 
+func TestParseResearchEscalationLadder(t *testing.T) {
+	tests := []struct {
+		name          string
+		ladderStr     string
+		allowedModels []string
+		want          []string
+		wantErr       bool
+		errMsg        string
+	}{
+		{
+			"empty string returns empty ladder",
+			"",
+			[]string{"haiku", "sonnet", "opus"},
+			[]string{},
+			false,
+			"",
+		},
+		{
+			"single model",
+			"opus",
+			[]string{"haiku", "sonnet", "opus"},
+			[]string{"opus"},
+			false,
+			"",
+		},
+		{
+			"valid ladder",
+			"haiku,sonnet,opus",
+			[]string{"haiku", "sonnet", "opus"},
+			[]string{"haiku", "sonnet", "opus"},
+			false,
+			"",
+		},
+		{
+			"ladder with spaces",
+			"haiku , sonnet , opus",
+			[]string{"haiku", "sonnet", "opus"},
+			[]string{"haiku", "sonnet", "opus"},
+			false,
+			"",
+		},
+		{
+			"deduplicates models",
+			"haiku,sonnet,haiku,opus",
+			[]string{"haiku", "sonnet", "opus"},
+			[]string{"haiku", "sonnet", "opus"},
+			false,
+			"",
+		},
+		{
+			"unknown model",
+			"haiku,unknown",
+			[]string{"haiku", "sonnet", "opus"},
+			nil,
+			true,
+			"not in ODONIAN_MODELS allowlist",
+		},
+		{
+			"trailing comma skipped",
+			"haiku,sonnet,",
+			[]string{"haiku", "sonnet", "opus"},
+			[]string{"haiku", "sonnet"},
+			false,
+			"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseResearchEscalationLadder(tt.ladderStr, tt.allowedModels)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseResearchEscalationLadder(%q, ...) error = %v, wantErr %v", tt.ladderStr, err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				if err != nil && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("parseResearchEscalationLadder(%q, ...) error = %v, want error containing %q", tt.ladderStr, err, tt.errMsg)
+				}
+				return
+			}
+			if !slicesEqual(got, tt.want) {
+				t.Errorf("parseResearchEscalationLadder(%q, ...) = %v, want %v", tt.ladderStr, got, tt.want)
+			}
+		})
+	}
+}
+
 func mapsEqual(a, b map[string]int) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for k, v := range a {
 		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}

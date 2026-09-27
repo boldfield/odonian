@@ -201,7 +201,10 @@ func runServer() {
 	}
 
 	// Parse research escalation ladder
-	researchEscalationLadder := parseResearchEscalationLadder(os.Getenv("ODONIAN_RESEARCH_ESCALATION_LADDER"), allowedModels)
+	researchEscalationLadder, err := parseResearchEscalationLadder(os.Getenv("ODONIAN_RESEARCH_ESCALATION_LADDER"), allowedModels)
+	if err != nil {
+		log.Fatalf("failed to parse ODONIAN_RESEARCH_ESCALATION_LADDER: %v", err)
+	}
 
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
@@ -1088,10 +1091,10 @@ func parseEscalationLadder(ladderStr string, allowedModels []string) []string {
 	return result
 }
 
-func parseResearchEscalationLadder(ladderStr string, allowedModels []string) []string {
+func parseResearchEscalationLadder(ladderStr string, allowedModels []string) ([]string, error) {
 	// Empty/unset research ladder means no model escalation for research tasks
 	if ladderStr == "" {
-		return []string{}
+		return []string{}, nil
 	}
 
 	allowedModelsM := make(map[string]bool)
@@ -1107,14 +1110,14 @@ func parseResearchEscalationLadder(ladderStr string, allowedModels []string) []s
 			continue
 		}
 		if !allowedModelsM[model] {
-			log.Fatalf("research escalation ladder contains model %q not in ODONIAN_MODELS allowlist", model)
+			return nil, fmt.Errorf("research escalation ladder contains model %q not in ODONIAN_MODELS allowlist", model)
 		}
 		if !seen[model] {
 			seen[model] = true
 			result = append(result, model)
 		}
 	}
-	return result
+	return result, nil
 }
 
 func parseEscalationThresholds(thresholdsStr string) map[string]int {

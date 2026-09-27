@@ -64,13 +64,15 @@ type Store interface {
 
 // sqliteStore wraps a SQLite database connection and provides migration functionality.
 type sqliteStore struct {
-	conn                     *sql.DB
-	readConn                 *sql.DB
-	allowedModels            []string
-	allowedModelsM           map[string]bool
-	escalationLadder         []string
-	researchDefaultModel     string
-	researchEscalationLadder []string
+	conn                         *sql.DB
+	readConn                     *sql.DB
+	allowedModels                []string
+	allowedModelsM               map[string]bool
+	escalationLadder             []string
+	escalationThresholds         map[string]int
+	researchDefaultModel         string
+	researchEscalationLadder     []string
+	researchEscalationThresholds map[string]int
 
 	// supersedeCloseHook, when set, is invoked after each background
 	// closeSupersededPR attempt finishes. It exists solely so tests can
@@ -107,6 +109,26 @@ func WithResearchEscalationLadder(ladder []string) StoreOption {
 	}
 }
 
+// WithEscalationThresholds sets the escalation thresholds for build/design tasks.
+func WithEscalationThresholds(thresholds map[string]int) StoreOption {
+	return func(s *sqliteStore) {
+		s.escalationThresholds = make(map[string]int)
+		for k, v := range thresholds {
+			s.escalationThresholds[k] = v
+		}
+	}
+}
+
+// WithResearchEscalationThresholds sets the escalation thresholds for research tasks.
+func WithResearchEscalationThresholds(thresholds map[string]int) StoreOption {
+	return func(s *sqliteStore) {
+		s.researchEscalationThresholds = make(map[string]int)
+		for k, v := range thresholds {
+			s.researchEscalationThresholds[k] = v
+		}
+	}
+}
+
 // Open opens a database connection and applies all pending migrations.
 // The dbPath should be a file path (e.g., "odonian.db") or "file::memory:?cache=shared"
 // for an in-memory database.
@@ -133,10 +155,12 @@ func Open(dbPath string, allowedModels []string, opts ...StoreOption) (Store, er
 	}
 
 	store := &sqliteStore{
-		conn:             conn,
-		allowedModels:    allowedModels,
-		allowedModelsM:   allowedModelsM,
-		escalationLadder: append([]string{}, allowedModels...), // Default to allowedModels
+		conn:                         conn,
+		allowedModels:                allowedModels,
+		allowedModelsM:               allowedModelsM,
+		escalationLadder:             append([]string{}, allowedModels...), // Default to allowedModels
+		escalationThresholds:         make(map[string]int),
+		researchEscalationThresholds: make(map[string]int),
 	}
 
 	// Apply functional options
@@ -1866,6 +1890,15 @@ func thresholdFor(model string, escalationThresholds map[string]int, maxReviewRo
 	return maxReviewRounds
 }
 
+func researchThresholdFor(model string, researchThresholds map[string]int, maxReviewRounds int) int {
+	if len(researchThresholds) > 0 {
+		if threshold, ok := researchThresholds[model]; ok {
+			return threshold
+		}
+	}
+	return maxReviewRounds
+}
+
 // When all reviews are done and at least one rejected, the parent transitions to ready if review_round <= threshold,
 // or to blocked if review_round > threshold (circuit breaker).
 // Returns the updated TaskWithDepsAndLinks on success.
@@ -2891,7 +2924,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 
 			if parentTrack == "research" {
 				// Research tasks use research-specific escalation
-				threshold = thresholdFor(parentModel, researchEscalationThresholds, maxReviewRounds)
+				threshold = researchThresholdFor(parentModel, researchEscalationThresholds, maxReviewRounds)
 				isTopTier = s.isResearchTopTier(parentModel)
 				if parentEscalate && !isTopTier {
 					nextModel, hasNextTier = s.researchNextTier(parentModel)

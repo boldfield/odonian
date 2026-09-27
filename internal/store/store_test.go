@@ -31,6 +31,14 @@ func ptrStr(s string) *string {
 	return &s
 }
 
+func ptrBool(b bool) *bool {
+	return &b
+}
+
+func ptrString(s string) *string {
+	return &s
+}
+
 // createTestFSWithBadMigration creates a test filesystem with the standard migrations
 // plus a bad migration (0003_bad.sql) that leaves a dangling foreign key.
 // It wraps the embedded migrations and adds the bad migration on top.
@@ -3630,11 +3638,16 @@ func findResearchReviewTasks(t *testing.T, store Store, ctx context.Context, pro
 // verdict and findings.
 func submitResearchReview(t *testing.T, store Store, ctx context.Context, reviewTask *Task, agent, verdict string, findings json.RawMessage) {
 	t.Helper()
+	submitResearchReviewWithThresholds(t, store, ctx, reviewTask, agent, verdict, findings, 8, nil, nil)
+}
+
+func submitResearchReviewWithThresholds(t *testing.T, store Store, ctx context.Context, reviewTask *Task, agent, verdict string, findings json.RawMessage, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) {
+	t.Helper()
 	if _, err := store.ClaimTask(ctx, reviewTask.ID, agent, reviewTask.Model, 5*time.Minute); err != nil {
 		t.Fatalf("failed to claim review task %s: %v", reviewTask.ID, err)
 	}
 	v := verdict
-	if _, err := store.SubmitTask(ctx, reviewTask.ID, agent, "review notes", &v, []LinkInput{}, 8, nil, nil, findings); err != nil {
+	if _, err := store.SubmitTask(ctx, reviewTask.ID, agent, "review notes", &v, []LinkInput{}, maxReviewRounds, escalationThresholds, researchEscalationThresholds, findings); err != nil {
 		t.Fatalf("failed to submit review task %s: %v", reviewTask.ID, err)
 	}
 }
@@ -4056,55 +4069,119 @@ func TestResearchAggregation_CircuitBreakerEscalates(t *testing.T) {
 }
 
 // TestResearchAggregation_NoEscalationLadder verifies that research tasks with no escalation
-// ladder (the default) never escalate on rejection.
+// ladder (the default) block on rejection and never escalate. Unset research thresholds
+// use maxReviewRounds, not build defaults.
 func TestResearchAggregation_NoEscalationLadder(t *testing.T) {
-	store, ctx, projID, parentID := newResearchTask(t, true)
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
 
-	blockingRound := func(round int) {
-		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, round)
-		if opus == nil || sonnet == nil {
-			t.Fatalf("round %d: expected both review tasks", round)
-		}
-		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
-		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blocking)
-		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims in the doc",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+			Escalate:     ptrBool(true),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	if _, err = store.PromoteTask(ctx, parentID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
 	}
 
-	// With no escalation ladder (default), the task should not escalate even after
-	// multiple rejections. The model tier stays "haiku".
-	for i := 1; i <= 5; i++ {
-		blockingRound(i)
+	// Submit with maxReviewRounds=2, so research task will block after 2 rounds
+	if _, err = store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 2, nil, nil); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Helper to resubmit with the correct maxReviewRounds
+	resubmit := func(round int) {
+		if _, err := store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim parent round %d: %v", round, err)
+		}
+		if _, err := store.SubmitTask(ctx, parentID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 2, nil, nil); err != nil {
+			t.Fatalf("failed to resubmit round %d: %v", round, err)
+		}
+	}
+
+	// Run two rejection rounds with blocking findings
+	for i := 1; i <= 2; i++ {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, i)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("round %d: expected both review tasks", i)
+		}
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+		// Pass thresholds explicitly so the parent's threshold (2) is used, not the review task's default
+		submitResearchReviewWithThresholds(t, store, ctx, opus, "opus-reviewer", "reject", blocking, 2, nil, nil)
+		submitResearchReviewWithThresholds(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`), 2, nil, nil)
+
 		parent, err := store.GetTask(ctx, parentID)
 		if err != nil {
-			t.Fatalf("failed to get parent (round %d): %v", i, parent)
+			t.Fatalf("failed to get parent (round %d): %v", i, err)
 		}
+		// Rounds 1-2 should stay ready (not yet exceeding threshold)
 		if parent.State != "ready" {
 			t.Fatalf("round %d: expected ready, got %s", i, parent.State)
 		}
 		if parent.Model != "haiku" {
 			t.Errorf("round %d: expected model haiku, got %s", i, parent.Model)
 		}
-		resubmitResearchImplementTask(t, store, ctx, parentID)
+		resubmit(i)
 	}
 
-	blockingRound(6)
+	// Third round should block (exceeds threshold of 2, no escalation ladder)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, 3)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("round 3: expected both review tasks")
+	}
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+	// Pass thresholds explicitly so the parent's threshold (2) is used
+	submitResearchReviewWithThresholds(t, store, ctx, opus, "opus-reviewer", "reject", blocking, 2, nil, nil)
+	submitResearchReviewWithThresholds(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`), 2, nil, nil)
+
 	parent, err := store.GetTask(ctx, parentID)
 	if err != nil {
-		t.Fatalf("failed to get parent after round 6: %v", err)
+		t.Fatalf("failed to get parent after round 3: %v", err)
 	}
-	if parent.State != "ready" {
-		t.Fatalf("round 6: expected ready (not escalated), got %s", parent.State)
+	if parent.State != "blocked" {
+		t.Fatalf("round 3: expected blocked, got %s", parent.State)
 	}
 	if parent.Model != "haiku" {
-		t.Errorf("round 6: expected model haiku (not escalated), got %s", parent.Model)
+		t.Errorf("round 3: expected model haiku (not escalated), got %s", parent.Model)
 	}
 }
 
 // TestResearchAggregation_IndependentLadders verifies that research and build escalation
-// ladders can be configured independently without interfering with each other.
+// ladders can be configured independently. Research tasks escalate along the research ladder
+// using research thresholds, while build tasks escalate along the build ladder using build
+// thresholds, independently.
 func TestResearchAggregation_IndependentLadders(t *testing.T) {
+	// Build ladder: haiku -> sonnet
+	// Research ladder: sonnet -> opus (no haiku)
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
-		WithEscalationLadder([]string{"haiku", "sonnet", "opus"}),
+		WithEscalationLadder([]string{"haiku", "sonnet"}),
 		WithResearchEscalationLadder([]string{"sonnet", "opus"}))
 	if err != nil {
 		t.Fatalf("failed to open test database: %v", err)
@@ -4123,36 +4200,105 @@ func TestResearchAggregation_IndependentLadders(t *testing.T) {
 		t.Fatalf("failed to create document: %v", err)
 	}
 
-	// Create both a research and build task to verify they're independent
-	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+	// Create a research task that will escalate from sonnet to opus
+	researchTasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
 		{
 			Title:        "Research task",
 			Spec:         "research something",
 			DocumentID:   doc.ID,
-			Model:        "haiku",
-			ReviewModels: []string{"sonnet", "opus"},
+			Model:        "sonnet",
+			ReviewModels: []string{"opus"},
 			Track:        "research",
-		},
-		{
-			Title:      "Build task",
-			Spec:       "build something",
-			DocumentID: doc.ID,
-			Model:      "haiku",
-			Track:      "build",
+			Escalate:     ptrBool(true),
 		},
 	})
 	if err != nil {
-		t.Fatalf("failed to create tasks: %v", err)
+		t.Fatalf("failed to create research task: %v", err)
 	}
 
-	researchTask := tasks[0]
-	buildTask := tasks[1]
+	researchTaskID := researchTasks[0].ID
 
-	if researchTask.Track != "research" {
-		t.Errorf("research task track should be 'research', got %s", researchTask.Track)
+	// Promote and claim research task
+	if _, err := store.PromoteTask(ctx, researchTaskID); err != nil {
+		t.Fatalf("failed to promote research task: %v", err)
 	}
-	if buildTask.Track != "build" {
-		t.Errorf("build task track should be 'build', got %s", buildTask.Track)
+	if _, err := store.ClaimTask(ctx, researchTaskID, "agent-1", "sonnet", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim research task: %v", err)
+	}
+	// Submit with threshold of 1 so escalation happens quickly
+	if _, err := store.SubmitTask(ctx, researchTaskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 1, nil, nil); err != nil {
+		t.Fatalf("failed to submit research task: %v", err)
+	}
+
+	// Get the review task for round 1
+	opus1, _ := findResearchReviewTasks(t, store, ctx, proj.ID, researchTaskID, 1)
+	if opus1 == nil {
+		t.Fatalf("failed to find research review task round 1")
+	}
+
+	// Reject with blocking findings (pass thresholds so parent's threshold is used)
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+	submitResearchReviewWithThresholds(t, store, ctx, opus1, "opus-reviewer", "reject", blocking, 1, nil, map[string]int{"sonnet": 2, "opus": 2})
+
+	// Helper to resubmit with correct params
+	resubmitResearch := func() {
+		if _, err := store.ClaimTask(ctx, researchTaskID, "agent-1", "sonnet", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim research task for resubmit: %v", err)
+		}
+		if _, err := store.SubmitTask(ctx, researchTaskID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 1, nil, nil); err != nil {
+			t.Fatalf("failed to resubmit research task: %v", err)
+		}
+	}
+
+	// Resubmit to trigger round 2
+	resubmitResearch()
+
+	// Get review task for round 2
+	opus2, _ := findResearchReviewTasks(t, store, ctx, proj.ID, researchTaskID, 2)
+	if opus2 == nil {
+		t.Fatalf("failed to find research review task round 2")
+	}
+
+	// Reject round 2 (still not exceeding threshold of 2)
+	submitResearchReviewWithThresholds(t, store, ctx, opus2, "opus-reviewer", "reject", blocking, 1, nil, map[string]int{"sonnet": 2, "opus": 2})
+
+	// Resubmit to trigger round 3
+	resubmitResearch()
+
+	// Get review task for round 3
+	opus3, _ := findResearchReviewTasks(t, store, ctx, proj.ID, researchTaskID, 3)
+	if opus3 == nil {
+		t.Fatalf("failed to find research review task round 3")
+	}
+
+	// Reject round 3 (exceeds threshold of 2, should escalate)
+	submitResearchReviewWithThresholds(t, store, ctx, opus3, "opus-reviewer", "reject", blocking, 1, nil, map[string]int{"sonnet": 2, "opus": 2})
+
+	// Check research task escalated to opus
+	originalTask, err := store.GetTask(ctx, researchTaskID)
+	if err != nil {
+		t.Fatalf("failed to get research task: %v", err)
+	}
+
+	// The original task should be superseded
+	if originalTask.State != "superseded" {
+		t.Errorf("original research task state: expected superseded, got %s", originalTask.State)
+	}
+
+	// Get the escalated task (superseded_by)
+	if originalTask.SupersededBy == nil {
+		t.Fatalf("original task should have been superseded")
+	}
+	escalatedTask, err := store.GetTask(ctx, *originalTask.SupersededBy)
+	if err != nil {
+		t.Fatalf("failed to get escalated research task: %v", err)
+	}
+
+	if escalatedTask.State != "ready" {
+		t.Errorf("escalated research task state: expected ready, got %s", escalatedTask.State)
+	}
+	if escalatedTask.Model != "opus" {
+		t.Errorf("escalated research task model: expected opus, got %s", escalatedTask.Model)
 	}
 }
 
