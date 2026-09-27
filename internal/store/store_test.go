@@ -16584,3 +16584,106 @@ func TestResearchAdjudication_NoConfigurationAllowed(t *testing.T) {
 		t.Fatalf("expected no adjudicator, got %s", store.(*sqliteStore).researchAdjudicator)
 	}
 }
+
+// TestResearchAdjudication_MaintainedWithPriorID verifies that adjudication tasks
+// are spawned even when the maintained finding has a new ID with prior_id.
+func TestResearchAdjudication_MaintainedWithPriorID(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", []string{"haiku", "sonnet", "opus"},
+		WithResearchAdjudicator("haiku"))
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	escalateFalse := false
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims in the doc",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+			Escalate:     &escalateFalse,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	if _, err = store.PromoteTask(ctx, parentID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err = store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Round 1: get and submit reviews
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, 1)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("expected both review tasks")
+	}
+
+	// Round 1: opus finds f1, sonnet approves
+	f1Finding := []Finding{
+		{ID: "f1", Severity: "P1", File: "test.txt", Line: 10, Summary: "Finding f1", Status: "new", InChangedText: true},
+	}
+	f1JSON, _ := json.Marshal(f1Finding)
+	submitResearchReview(t, store, ctx, opus, "opus1", "reject", f1JSON)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet1", "approve", json.RawMessage(`[]`))
+
+	// Worker resubmits with dispute
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"More evidence for f1"}]`)
+	_, err = resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes)
+	if err != nil {
+		t.Fatalf("failed to resubmit with disputes: %v", err)
+	}
+
+	// Round 2: get review tasks
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, 2)
+	if opus2 == nil || sonnet2 == nil {
+		t.Fatalf("expected both round 2 review tasks")
+	}
+
+	// Round 2: opus maintains f1 as f2 with prior_id f1
+	f1PriorID := "f1"
+	f2Finding := []Finding{
+		{ID: "f2", Severity: "P1", File: "test.txt", Line: 10, Summary: "Finding f1", Status: "still_open", InChangedText: true, PriorID: &f1PriorID},
+	}
+	f2JSON, _ := json.Marshal(f2Finding)
+	submitResearchReview(t, store, ctx, opus2, "opus1", "reject", f2JSON)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet1", "approve", json.RawMessage(`[]`))
+
+	// Should have spawned adjudication task with finding ID f2
+	allTasks, _ := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	var adjudicationTask *Task
+	for i := range allTasks {
+		if allTasks[i].Model == "haiku" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == parentID && allTasks[i].ReviewRound == 2 && allTasks[i].Kind == "review" {
+			t := allTasks[i]
+			adjudicationTask = &t
+			break
+		}
+	}
+
+	if adjudicationTask == nil {
+		t.Fatalf("expected adjudication task for prior_id finding, but none found")
+	}
+	if adjudicationTask.State != "ready" {
+		t.Fatalf("expected adjudication task ready, got %s", adjudicationTask.State)
+	}
+}

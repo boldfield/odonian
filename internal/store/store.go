@@ -3508,36 +3508,49 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 	}
 
 	// For each prior dispute, check if it's maintained (still_open) in current findings
-	for findingID, dispute := range disputesByID {
-		currentFinding, exists := findingsByID[findingID]
-		if !exists || currentFinding.Status != "still_open" {
+	for disputedID, dispute := range disputesByID {
+		// Try to find the maintained finding. First try exact match; if not found,
+		// search for a finding that was maintained from this ID (prior_id chain).
+		currentFinding, foundByID := findingsByID[disputedID]
+		if !foundByID {
+			// Exact ID not found, search for a still_open finding with this prior_id
+			for _, f := range currentFindings {
+				if f.Status == "still_open" && f.PriorID != nil && *f.PriorID == disputedID {
+					currentFinding = f
+					foundByID = true
+					break
+				}
+			}
+		}
+
+		if !foundByID || currentFinding.Status != "still_open" {
 			// Finding either doesn't exist or was resolved - not a maintained dispute
 			continue
 		}
 
 		// This is a maintained dispute - check if adjudication task already exists
-		var adjudicationExists bool
+		// Use INSERT ... ON CONFLICT DO NOTHING to handle concurrent attempts atomically
+		var adjudicationTaskID string
 		err := tx.QueryRowContext(ctx, `
-			SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END
-			FROM task
+			SELECT id FROM task
 			WHERE target_task_id = ? AND adjudicate_finding = ?
-		`, parentID, findingID).Scan(&adjudicationExists)
-		if err != nil && err != sql.ErrNoRows {
-			return fmt.Errorf("failed to check for existing adjudication: %w", err)
-		}
-
-		if adjudicationExists {
+		`, parentID, currentFinding.ID).Scan(&adjudicationTaskID)
+		if err == nil {
 			// Adjudication task already exists - skip to prevent duplicates
 			continue
 		}
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("failed to check for existing adjudication: %w", err)
+		}
 
 		// Spawn adjudication task for this maintained dispute
-		adjudicationTaskID := GenerateID()
-		adjudicationTitle := fmt.Sprintf("Adjudicate: %s (finding %s)", parentTitle, findingID)
+		adjudicationTaskID = GenerateID()
+		adjudicationTitle := fmt.Sprintf("Adjudicate: %s (finding %s)", parentTitle, currentFinding.ID)
 
-		// Find which reviewer raised this finding
+		// Find which reviewer raised this finding by looking up the disputed ID in the mapping
+		// (the original reviewers reported the originally disputed ID, not the new one)
 		raisingReviewer := ""
-		if reviewer, ok := findingReviewers[findingID]; ok {
+		if reviewer, ok := findingReviewers[disputedID]; ok {
 			raisingReviewer = reviewer
 		}
 
@@ -3551,10 +3564,6 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 **Status**: %s
 **Summary**: %s
 
-## Original Finding Report
-
-%s
-
 ## Worker's Dispute Evidence
 
 %s
@@ -3563,12 +3572,13 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 
 Rule on whether this finding is valid (uphold it) or whether the worker's evidence supports overturning it. Your ruling is binding for this finding alone and does not vote on the parent task's overall review round.`,
 			currentFinding.ID, currentFinding.Severity, currentFinding.File, currentFinding.Line, currentFinding.Status, currentFinding.Summary,
-			currentFinding.Summary, dispute.Evidence)
+			dispute.Evidence)
 
+		// Use INSERT ... ON CONFLICT DO NOTHING to handle concurrent attempts atomically
 		_, execErr := tx.ExecContext(ctx, `
-			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, review_round, track, adjudicate_finding, adjudicated_by_reviewer, created_at, updated_at)
+			INSERT OR IGNORE INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, review_round, track, adjudicate_finding, adjudicated_by_reviewer, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, adjudicationTaskID, parentProjectID, parentDocumentID, adjudicationTitle, spec, "ready", s.researchAdjudicator, "review", parentID, parentReviewRound, "research", findingID, raisingReviewer, now, now)
+		`, adjudicationTaskID, parentProjectID, parentDocumentID, adjudicationTitle, spec, "ready", s.researchAdjudicator, "review", parentID, parentReviewRound, "research", currentFinding.ID, raisingReviewer, now, now)
 		if execErr != nil {
 			return fmt.Errorf("failed to create adjudication task: %w", execErr)
 		}
@@ -4921,6 +4931,8 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 	}
 
 	// If task is in review, check if all review tasks are done and aggregate if so
+	// Exclude adjudication tasks (those with adjudicate_finding IS NOT NULL), which are
+	// scoped to individual findings and do not vote on the round
 	if t.State == "review" {
 		var totalReviewTasks, doneReviewTasks int
 		err = tx.QueryRowContext(ctx, `
@@ -4928,7 +4940,7 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 				COUNT(*) as total,
 				SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done
 			FROM task
-			WHERE target_task_id = ? AND review_round = ?
+			WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding IS NULL
 		`, taskID, t.ReviewRound).Scan(&totalReviewTasks, &doneReviewTasks)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to tally review tasks: %w", err)
