@@ -126,7 +126,7 @@ For each reviewer model on the research track, record:
 - findings withdrawn or overturned
 - rounds it approved in which another reviewer's blocking finding was later fixed
 
-This goes through a read-only API endpoint and a view in the TUI. It is the basis for choosing the reviewer pair, which today is chosen on anecdote.
+This goes through a read-only API endpoint and a view in the TUI. It is the basis for choosing the reviewer pair, which today is chosen on anecdote. Section 8 "Reviewer scorecards" is scheduled for milestone 4.
 
 ### 9. Evidence tooling
 
@@ -199,13 +199,14 @@ Blocking rules from section 3, follow-up tasks from section 4, the research ladd
 
 Dispute submission, adjudication tasks and binding rulings from section 5. The review prompt switches to scoped re-review once follow-up tasks exist.
 
-### Milestone 4: sizing guidance
+### Milestone 4: scorecards and sizing
 
-Sizing guidance in the `odonian-breakdown` skill for decomposing research designs into properly-sized tasks.
+The scorecard endpoint and TUI view from section 8. Sizing guidance in the `odonian-breakdown` skill for decomposing research designs into properly-sized tasks.
 
-- **M4.1. Research task sizing guidelines in odonian-breakdown.** Guidance in `skills/odonian-breakdown/SKILL.md` on sizing research tasks. Cap of six independently checkable claim rows per task, with rationale tied to the 13-round correction task. Research tasks start on their configured default model (recommended: `claude-opus-5-5`) and do not use the build Haiku-sized constraint or build escalation ladder.
-- **M4.2. Primary source diversity rule.** Sizing guidance for selecting at most four distinct primary sources per research task, with examples of primary sources (court opinions, statutes, filings, vendor advisories, RFCs). Guidance on why Wikipedia is not a primary source. When a task requires more primary sources, split it by the domain the items originate in.
-- **M4.3. Case study and complexity rule.** One case study or complex opinion/record per task when domain knowledge, precedent, or conflicting sources must be weighed. Guidance on when to split such tasks from fact-verification.
-- **M4.4. Cross-file mapping decomposition.** When a research task maps items across files, split by the domain or system the items originate in, not by file. Example: mapping file with rows from multiple jurisdictions should be split per jurisdiction, not split by file position.
-- **M4.5. Decomposition after budget block.** Guidance on decomposing a research task when it reaches its round budget without passing. Explains that budget counts across the supersede chain and replacements inherit exhausted budget, so new fresh tasks should be created instead of superseding. Breaks a blocked task into smaller, independent claims suitable for separate research tasks.
-- **M4.6. Sizing examples and anti-patterns.** Concrete examples of appropriately-sized research tasks (e.g., verify claims in one security advisory, trace one vendor's stance on an issue over time, audit compliance requirements for one jurisdiction), and patterns to avoid (e.g., "verify all third-party claims in the codebase").
+- **M4.1. Scorecard endpoint and TUI view.** A read-only API endpoint and a TUI view showing, per reviewer model on the research track: findings raised by severity, findings that held up (fixed or upheld on adjudication), findings withdrawn or overturned, and rounds approved where another reviewer's blocking finding was later fixed. The basis for choosing the reviewer pair.
+- **M4.2. Research task sizing guidelines in odonian-breakdown.** Guidance in `skills/odonian-breakdown/SKILL.md` on sizing research tasks. Cap of six independently checkable claim rows per task, with rationale tied to the 13-round correction task. Research tasks start on their configured default model (recommended: `claude-opus-5-5`) and do not use the build Haiku-sized constraint or build escalation ladder.
+- **M4.3. Primary source diversity rule.** Sizing guidance for selecting at most four distinct primary sources per research task, with examples of primary sources (court opinions, statutes, filings, vendor advisories, RFCs). Guidance on why Wikipedia is not a primary source. When a task requires more primary sources, split it by the domain the items originate in.
+- **M4.4. Case study and complexity rule.** One case study or complex opinion/record per task when domain knowledge, precedent, or conflicting sources must be weighed. Guidance on when to split such tasks from fact-verification.
+- **M4.5. Cross-file mapping decomposition.** When a research task maps items across files, split by the domain or system the items originate in, not by file. Example: mapping file with rows from multiple jurisdictions should be split per jurisdiction, not split by file position.
+- **M4.6. Decomposition after budget block.** Guidance on decomposing a research task when it reaches its round budget without passing. Explains that budget counts across the supersede chain and replacements inherit exhausted budget, so new fresh tasks should be created instead of superseding. Breaks a blocked task into smaller, independent claims suitable for separate research tasks.
+- **M4.7. Sizing examples and anti-patterns.** Concrete examples of appropriately-sized research tasks (e.g., verify claims in one security advisory, trace one vendor's stance on an issue over time, audit compliance requirements for one jurisdiction), and patterns to avoid (e.g., "verify all third-party claims in the codebase").

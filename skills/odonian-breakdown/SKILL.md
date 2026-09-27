@@ -118,7 +118,7 @@ Non-negotiable decomposition rules:
 
 ### Sizing research tasks
 
-Research tasks verify factual claims against primary sources and are tracked separately from build tasks. Unlike build tasks (which are Haiku-sized and start on Haiku with optional escalation), research tasks **start on their configured default model** (recommended: `claude-opus-5-5`), do not use the build escalation ladder, and are not Haiku-sized — their sizing is by claim count and source diversity, not by code volume. Sizing rules ensure each research task is reviewable within the research round budget. Apply these rules when decomposing a research design into tasks:
+Research tasks verify factual claims against primary sources and are tracked separately from build tasks. Unlike build tasks (which are Haiku-sized and start on Haiku with optional escalation), research tasks **start on their configured default model** (recommended: `claude-opus-5-5`), do not use the build escalation ladder, and are not Haiku-sized — their sizing is by claim count and source diversity, not by code volume. Sizing rules ensure each research task is reviewable within the research round budget. The sizing split and post-budget-block decomposition are proposed here and then STOP for the human to decide task boundaries and confirm the breakdown. Once created, research tasks go through the same independent reviews and human merge gate as build tasks. Apply these rules when decomposing a research design into tasks:
 
 - **Claim row limit: six independently checkable rows maximum.** Each row is one verifiable claim
   (e.g., "function X was added in version Y", "vendor Z's CVE-2024-1234 affects this library").
@@ -178,4 +178,4 @@ board (`ODONIAN_PROJECT=<id>` + the worker/reviewer loops).
 - The human owns the **merge gate** — tasks default `agent_merge=false`; review workers approve but
   never merge.
 - You never finalize a design choice, a task boundary, or a task's spec alone.
-- Tasks are Haiku-sized and start on Haiku; escalation is allowed. Specs carry no code; same-file tasks are dependency-ordered.
+- **Build and design tasks** are Haiku-sized and start on Haiku; escalation is allowed. **Research tasks** start on their configured default model (recommended `claude-opus-5-5`) and are sized by claim count and source diversity, not by code volume (see "Sizing research tasks" above). Specs carry no code; same-file tasks are dependency-ordered.
