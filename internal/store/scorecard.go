@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -145,21 +146,26 @@ func globalRound(taskIdx, localRound int) int {
 
 // findingThread is one logical finding raised by one reviewer lineage (model plus
 // slot, researchReviewerLineage), followed across rounds within a task via prior_id
-// (researchFindingChains) and across a supersede boundary by matching severity, file,
-// line and summary against a thread still open when the predecessor was superseded —
-// see processChain. Its classification (held, withdrawn or unresolved) is decided
-// once, in buildScorecards, after every chain and every adjudication has been applied.
+// (researchFindingChains) and across a supersede boundary the same way: the
+// replacement's round 1 report must itself carry a prior_id, set to the id the
+// predecessor's carried findings block (buildResearchSupersessionSpec) gave the
+// finding, matched against lastKnownID — see findCarriedByPriorID and processChain.
+// Unlike matching by severity/file/line/summary, this never depends on the
+// replacement reviewer's wording, which section 3 gives them free rein to change on
+// every round. A carried thread nothing in the replacement's own round links to stays
+// unresolved rather than being inferred fixed, since a replacement's round 1 is a full
+// review, not one scoped to the carried findings the way a same-task re-review is.
+// Its classification (held, withdrawn or unresolved) is decided once, in
+// buildScorecards, after every chain and every adjudication has been applied.
 type findingThread struct {
 	reviewerModel string
-	severity      string // lowercased, from the report that first raised it
-	file          string
-	line          int
-	summary       string
+	lastKnownID   string // the id of the most recent report in this thread, for cross-boundary prior_id matching (findCarriedByPriorID)
 
 	firstBlockingGlobalRound int   // 0 if never a blocking finding; else the earliest globalRound it was
 	resolvedGlobalRounds     []int // every globalRound at which a report, or an implicit non-restatement, settled it
 	finalOutstanding         bool  // per the latest information seen, whether it is still outstanding
 
+	disputed    bool   // true if the worker disputed one of this thread's reports (event.disputes) and it later settled without adjudication
 	adjudicated string // "", "held" or "withdrawn": set by applyAdjudications, overriding the natural classification
 }
 
@@ -214,15 +220,19 @@ func reportKey(taskID, lineage string, round int, findingID string) string {
 	return fmt.Sprintf("%s\x00%s\x00%d\x00%s", taskID, lineage, round, findingID)
 }
 
-// findCarried looks for an open thread, carried out of an earlier chain member, whose
-// identity (severity, file, line, summary) matches a freshly reported finding: the
-// same identity buildResearchSupersessionSpec carries forward in its "Structured
-// findings (JSON)" block. A chain boundary can never be crossed by prior_id the way a
-// same-task round can: a replacement's round 1 is always a full review, so a
-// persisting defect is rediscovered fresh, with a new id and no prior_id.
-func findCarried(candidates []*findingThread, severity, file string, line int, summary string) *findingThread {
+// findCarriedByPriorID looks for an open thread, carried out of an earlier chain
+// member, whose most recent report's id (lastKnownID) matches a chain member's own
+// round-1 report's prior_id: the id buildResearchSupersessionSpec gave the finding,
+// carried forward from the predecessor's last round, in its "Structured findings
+// (JSON)" block. Unlike matching by severity, file, line and summary, this never
+// depends on how the replacement's reviewer words the same defect on rediscovery,
+// which section 3 gives them free rein to change every round: a replacement's round 1
+// is always a full review, so a persisting defect is normally rediscovered fresh,
+// reworded, and under a new id, unless the reviewer deliberately links back with
+// prior_id against the id it was carried under.
+func findCarriedByPriorID(candidates []*findingThread, priorID string) *findingThread {
 	for _, c := range candidates {
-		if c.severity == severity && c.file == file && c.line == line && c.summary == summary {
+		if c.lastKnownID == priorID {
 			return c
 		}
 	}
@@ -247,13 +257,17 @@ func groupResearchFindingsByChain(allFindings []researchCollectedFinding, chainO
 // processChain aggregates one supersede chain's findings and review rounds into agg.
 // Within one task, a finding's identity across rounds is its prior_id lineage
 // (researchFindingChains, reused from the same section-3 aggregation the review round
-// itself uses). Across a chain boundary, a still-outstanding thread is matched into
-// the next chain member's own findings by identity (see findCarried); a reviewer
-// lineage that has since reviewed the next chain member without restating a carried
-// thread has, by a full review finding nothing there, fixed it — the same "not
-// restated means settled" rule unresolvedResearchFindings applies to a lineage's own
-// rounds within one task, applied here at a chain boundary. A lineage that has not
-// reviewed the next chain member yet keeps its carried threads open.
+// itself uses), and a lineage that reviews a later round of the same task without
+// restating an earlier, still-open report has settled it — the same "not restated
+// means settled" rule unresolvedResearchFindings applies when deciding what a
+// replacement's spec still needs to carry. Across a chain boundary, that same
+// implicit rule does not apply: a replacement's round 1 is always a full review, so a
+// reviewer simply rediscovers persisting defects fresh, under a new id and reworded,
+// rather than deliberately restating each one. A still-outstanding thread only carries
+// across the boundary as the same thread when the next chain member's own round-1
+// report explicitly links back to it with prior_id (see findCarriedByPriorID); one a
+// reviewer never links stays open, carried forward unchanged, however many further
+// rounds or chain members pass, since nothing establishes it was ever revisited.
 func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s *sqliteStore, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, chain []Task) error {
 	openByLineage := make(map[string][]*findingThread)
 
@@ -285,20 +299,17 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 
 			ragg := agg.reviewerAgg(first.reviewerModel)
 
-			thread := findCarried(openIn[lineage], severity, first.File, first.Line, first.Summary)
+			var thread *findingThread
+			if first.round == 1 && first.PriorID != nil {
+				thread = findCarriedByPriorID(openIn[lineage], *first.PriorID)
+			}
 			if thread != nil {
 				if matchedIn[lineage] == nil {
 					matchedIn[lineage] = make(map[*findingThread]bool)
 				}
 				matchedIn[lineage][thread] = true
 			} else {
-				thread = &findingThread{
-					reviewerModel: first.reviewerModel,
-					severity:      severity,
-					file:          first.File,
-					line:          first.Line,
-					summary:       first.Summary,
-				}
+				thread = &findingThread{reviewerModel: first.reviewerModel}
 				agg.threads = append(agg.threads, thread)
 				ragg.findingsRaised[severity]++
 			}
@@ -311,29 +322,34 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 				}
 				agg.threadByReport[reportKey(task.ID, f.lineage, f.round, f.ID)] = thread
 			}
+			thread.lastKnownID = last.ID
 
-			thread.finalOutstanding = isOutstanding(idxs[len(idxs)-1])
+			// A thread is settled either by an explicit resolved report (isOutstanding
+			// false) or, within this task, by its lineage reviewing a later round
+			// without restating it (last.round before the lineage's own latest
+			// submitted round here). The round it actually settled is whichever of
+			// those applied.
+			settledRound := last.round
+			outstanding := isOutstanding(idxs[len(idxs)-1])
+			if outstanding && last.round != latestSubmittedRound[lineage] {
+				outstanding = false
+				settledRound = latestSubmittedRound[lineage]
+			}
+			thread.finalOutstanding = outstanding
 			if thread.finalOutstanding {
 				openOut[lineage] = append(openOut[lineage], thread)
 			} else {
-				thread.resolvedGlobalRounds = append(thread.resolvedGlobalRounds, globalRound(taskIdx, last.round))
+				thread.resolvedGlobalRounds = append(thread.resolvedGlobalRounds, globalRound(taskIdx, settledRound))
 			}
 		}
 
-		for lineage, latestRound := range latestSubmittedRound {
-			for _, thread := range openIn[lineage] {
-				if matchedIn[lineage][thread] {
-					continue
-				}
-				thread.finalOutstanding = false
-				thread.resolvedGlobalRounds = append(thread.resolvedGlobalRounds, globalRound(taskIdx, latestRound))
-			}
-		}
 		for lineage, threads := range openIn {
-			if _, reviewed := latestSubmittedRound[lineage]; reviewed {
-				continue // handled above: matched threads already carried via openOut, unmatched ones just settled
+			for _, thread := range threads {
+				if matchedIn[lineage][thread] {
+					continue // handled above: resolved there, or already carried into openOut
+				}
+				openOut[lineage] = append(openOut[lineage], thread) // never linked here; stays open, unchanged
 			}
-			openOut[lineage] = append(openOut[lineage], threads...) // pending review, carried forward unchanged
 		}
 
 		openByLineage = openOut
@@ -346,31 +362,62 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 }
 
 // collectVerdicts records each of taskID's own review events (sample size, total
-// review rounds and approvals) by reviewer model. This is separate from the findings
-// walked in processChain because collectResearchReviewReports is findings-only: a
-// reviewer who approves with no findings at all still reviewed the task and must
-// still count toward sample size and total rounds.
+// review rounds and approvals) by reviewer model, and each of its own submit events'
+// disputes. This is separate from the findings walked in processChain because
+// collectResearchReviewReports is findings-only: a reviewer who approves with no
+// findings at all still reviewed the task and must still count toward sample size and
+// total rounds. Disputes are collected here, rather than in processChain, because a
+// dispute must be matched against threadByReport, which processChain has already
+// fully populated for this task by the time it calls this method.
 func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, s *sqliteStore, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, taskID string, taskIdx int) error {
 	events, err := s.ListEvents(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("failed to list events for %s: %w", taskID, err)
 	}
 	for _, event := range events {
-		if event.Kind != "review" || event.SourceTaskID == nil {
-			continue
+		switch event.Kind {
+		case "review":
+			if event.SourceTaskID == nil {
+				continue
+			}
+			if adjudicationTaskIDs[*event.SourceTaskID] {
+				continue // an adjudicator's ruling is binding for one finding only; it never votes on a round
+			}
+			reviewTask, ok := allTasks[*event.SourceTaskID]
+			if !ok {
+				continue
+			}
+			ragg := agg.reviewerAgg(reviewTask.Model)
+			ragg.tasksReviewed[taskID] = true
+			ragg.totalReviews++
+			if event.Verdict != nil && *event.Verdict == "approve" {
+				agg.approvals = append(agg.approvals, scorecardApproval{model: reviewTask.Model, globalRound: globalRound(taskIdx, reviewTask.ReviewRound)})
+			}
+		case "submit":
+			if err := agg.recordDisputes(taskID, event); err != nil {
+				return err
+			}
 		}
-		if adjudicationTaskIDs[*event.SourceTaskID] {
-			continue // an adjudicator's ruling is binding for one finding only; it never votes on a round
-		}
-		reviewTask, ok := allTasks[*event.SourceTaskID]
-		if !ok {
-			continue
-		}
-		ragg := agg.reviewerAgg(reviewTask.Model)
-		ragg.tasksReviewed[taskID] = true
-		ragg.totalReviews++
-		if event.Verdict != nil && *event.Verdict == "approve" {
-			agg.approvals = append(agg.approvals, scorecardApproval{model: reviewTask.Model, globalRound: globalRound(taskIdx, reviewTask.ReviewRound)})
+	}
+	return nil
+}
+
+// recordDisputes marks every thread named by a submit event's disputes (R10) as
+// disputed: docs/features/research-track.md section 5 says a disputed finding the
+// reviewer subsequently reports resolved, without going to adjudication, was
+// withdrawn, not fixed by the worker. applyAdjudications overrides this when the
+// reviewer instead maintains the finding and it goes to adjudication.
+func (agg *scorecardAggregation) recordDisputes(taskID string, event Event) error {
+	if event.Disputes == nil {
+		return nil
+	}
+	var disputes []Dispute
+	if err := json.Unmarshal(*event.Disputes, &disputes); err != nil {
+		return fmt.Errorf("failed to unmarshal disputes for %s: %w", taskID, err)
+	}
+	for _, d := range disputes {
+		if thread, ok := agg.threadByReport[reportKey(taskID, d.Lineage, d.Round, d.FindingID)]; ok {
+			thread.disputed = true
 		}
 	}
 	return nil
@@ -448,9 +495,12 @@ func (agg *scorecardAggregation) computeApprovalsWithLaterFix() {
 }
 
 // buildScorecards decides each thread's final classification — an adjudication
-// ruling wins if one applies, otherwise a thread that ended outstanding is
-// unresolved and one that was resolved (naturally, per processChain) is held — then
-// renders every reviewer's counters, sorted by model for a deterministic response.
+// ruling wins if one applies; otherwise a thread that ended outstanding is unresolved,
+// and one that settled naturally (per processChain) is held, unless the worker
+// disputed it and the reviewer never maintained it into adjudication, per section 5
+// ("if it withdraws the finding, the finding is resolved") — that settlement is a
+// withdrawal, not a fix — then renders every reviewer's counters, sorted by model for
+// a deterministic response.
 func (agg *scorecardAggregation) buildScorecards() []ReviewerScorecard {
 	for _, thread := range agg.threads {
 		ragg := agg.reviewerAgg(thread.reviewerModel)
@@ -459,6 +509,8 @@ func (agg *scorecardAggregation) buildScorecards() []ReviewerScorecard {
 			ragg.withdrawn++
 		case thread.adjudicated == "held":
 			ragg.held++
+		case !thread.finalOutstanding && thread.disputed:
+			ragg.withdrawn++
 		case !thread.finalOutstanding:
 			ragg.held++
 		default:

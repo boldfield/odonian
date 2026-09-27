@@ -504,12 +504,13 @@ func TestGetResearchReviewerScorecards_RenumberedFindings(t *testing.T) {
 }
 
 // TestGetResearchReviewerScorecards_SupersededChain_NoDoubleCount verifies that a
-// finding still outstanding when a research task is superseded, and independently
-// rediscovered by the same reviewer lineage on the replacement (under a new id, since
-// a replacement's round 1 is always a full review and never carries prior_id across
-// the boundary), is counted as raised once, not twice, and correctly held once the
-// replacement resolves it. This is the section 8 "span superseded task chains without
-// counting the same finding twice" requirement.
+// finding still outstanding when a research task is superseded, and explicitly linked
+// by the same reviewer lineage back to its carried id (buildResearchSupersessionSpec's
+// "Structured findings (JSON)" block) via prior_id on the replacement, is counted as
+// raised once, not twice, and correctly held once the replacement resolves it — even
+// though the replacement's reviewer rewords it and reports it at a different line, as
+// section 3 gives it free rein to do on every round. This is the section 8 "span
+// superseded task chains without counting the same finding twice" requirement.
 func TestGetResearchReviewerScorecards_SupersededChain_NoDoubleCount(t *testing.T) {
 	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
 
@@ -534,13 +535,14 @@ func TestGetResearchReviewerScorecards_SupersededChain_NoDoubleCount(t *testing.
 		t.Fatalf("failed to submit successor: %v", err)
 	}
 
-	// Round 1 on the replacement is a full review: opus rediscovers the same defect
-	// fresh, under a different id, with status "new" and no prior_id.
+	// Round 1 on the replacement is a full review: opus rediscovers the same defect,
+	// reworded and at a different line, but deliberately links it back to the carried
+	// id ("f1") the predecessor's spec listed it under.
 	opusB1, _ := findResearchReviewTasks(t, store, ctx, projID, successor.ID, 1)
 	if opusB1 == nil {
 		t.Fatalf("expected opus review task on the successor")
 	}
-	findingsB1 := json.RawMessage(`[{"id":"g7","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	findingsB1 := json.RawMessage(`[{"id":"g7","severity":"P2","file":"test.txt","line":5,"summary":"still missing the info","in_changed_text":true,"status":"still_open","prior_id":"f1"}]`)
 	submitResearchReview(t, store, ctx, opusB1, "opus-reviewer", "reject", findingsB1)
 
 	resubmitResearchImplementTask(t, store, ctx, successor.ID)
@@ -549,7 +551,7 @@ func TestGetResearchReviewerScorecards_SupersededChain_NoDoubleCount(t *testing.
 	if opusB2 == nil {
 		t.Fatalf("expected opus review task for successor round 2")
 	}
-	findingsB2 := json.RawMessage(`[{"id":"g8","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":false,"status":"resolved","prior_id":"g7"}]`)
+	findingsB2 := json.RawMessage(`[{"id":"g8","severity":"P2","file":"test.txt","line":5,"summary":"still missing the info","in_changed_text":false,"status":"resolved","prior_id":"g7"}]`)
 	submitResearchReview(t, store, ctx, opusB2, "opus-reviewer", "approve", findingsB2)
 
 	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
@@ -577,12 +579,154 @@ func TestGetResearchReviewerScorecards_SupersededChain_NoDoubleCount(t *testing.
 	}
 }
 
+// TestGetResearchReviewerScorecards_SupersededChain_UnlinkedFindingStaysUnresolved
+// verifies that a carried finding never counts as fixed, and is never merged with an
+// unrelated report, merely because the replacement's round 1 (a full review) happens
+// to raise a similarly worded finding under a new id: without an explicit prior_id
+// link back to the carried id, there is no reliable evidence the two are the same
+// defect, or that the original was ever revisited at all, so it must stay unresolved.
+// Section 8 requires accuracy is never inferred for unresolved findings.
+func TestGetResearchReviewerScorecards_SupersededChain_UnlinkedFindingStaysUnresolved(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	opusA, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusA == nil {
+		t.Fatalf("expected opus review task on the original task")
+	}
+	findingsA := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":10,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusA, "opus-reviewer", "reject", findingsA)
+
+	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	if err != nil {
+		t.Fatalf("failed to supersede: %v", err)
+	}
+	if _, err := store.PromoteTask(ctx, successor.ID); err != nil {
+		t.Fatalf("failed to promote successor: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, successor.ID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim successor: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, successor.ID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit successor: %v", err)
+	}
+
+	// Round 1 on the replacement: opus reports a similarly worded finding under a
+	// brand new id, status "new" (which cannot itself carry a prior_id), with no link
+	// back to "f1" at all.
+	opusB1, _ := findResearchReviewTasks(t, store, ctx, projID, successor.ID, 1)
+	if opusB1 == nil {
+		t.Fatalf("expected opus review task on the successor")
+	}
+	findingsB1 := json.RawMessage(`[{"id":"g1","severity":"P2","file":"test.txt","line":12,"summary":"still missing the info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusB1, "opus-reviewer", "reject", findingsB1)
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	if len(scorecards.Scorecards) != 1 {
+		t.Fatalf("expected 1 scorecard, got %d", len(scorecards.Scorecards))
+	}
+	sc := scorecards.Scorecards[0]
+	// f1 (carried, never linked) and g1 (freshly raised) are each counted: 2 raised.
+	if sc.FindingsRaised["p2"] != 2 {
+		t.Errorf("expected 2 P2 raised (carried f1 plus fresh g1), got %d", sc.FindingsRaised["p2"])
+	}
+	// Neither is inferred fixed: f1 was never linked to, and g1 was never resolved.
+	if sc.FindingsHeld != 0 {
+		t.Errorf("expected 0 held findings (no fix inferred without a link), got %d", sc.FindingsHeld)
+	}
+	if sc.FindingsUnresolved != 2 {
+		t.Errorf("expected 2 unresolved findings, got %d", sc.FindingsUnresolved)
+	}
+}
+
+// TestGetResearchReviewerScorecards_NotRestatedInLaterRound_SettledWithinTask verifies
+// that within one task (no supersession involved), a blocking finding a lineage
+// raises and then does not restate in a later round it reviews is held, not
+// unresolved: the same "not restated means settled" rule unresolvedResearchFindings
+// applies when deciding what a replacement's spec still needs to carry.
+func TestGetResearchReviewerScorecards_NotRestatedInLaterRound_SettledWithinTask(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	opusTask1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil {
+		t.Fatalf("expected opus review task for round 1")
+	}
+	findingsRound1 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", findingsRound1)
+
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Round 2: opus approves without restating f1 at all (no report, no prior_id).
+	opusTask2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusTask2 == nil {
+		t.Fatalf("expected opus review task for round 2")
+	}
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "approve", json.RawMessage(`[]`))
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	sc := scorecards.Scorecards[0]
+	if sc.FindingsHeld != 1 {
+		t.Errorf("expected 1 held finding (settled by non-restatement), got %d", sc.FindingsHeld)
+	}
+	if sc.FindingsUnresolved != 0 {
+		t.Errorf("expected 0 unresolved findings, got %d", sc.FindingsUnresolved)
+	}
+}
+
+// TestGetResearchReviewerScorecards_DisputeWithdrawnWithoutAdjudication verifies that
+// a finding the worker disputes, which the reviewer then reports resolved in its next
+// round without the dispute going to adjudication, is counted as withdrawn rather than
+// held: docs/features/research-track.md section 5 says "if it withdraws the finding,
+// the finding is resolved" — that resolution is the reviewer's withdrawal, not a fix
+// the worker made, and section 8 counts these separately from fixes.
+func TestGetResearchReviewerScorecards_DisputeWithdrawnWithoutAdjudication(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	opusTask1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil {
+		t.Fatalf("expected opus review task for round 1")
+	}
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"already covered elsewhere"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	// Round 2: opus re-evaluates against the evidence and withdraws the finding.
+	opusTask2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusTask2 == nil {
+		t.Fatalf("expected opus review task for round 2")
+	}
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "approve", json.RawMessage(`[{"id":"f2","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":false,"status":"resolved","prior_id":"f1"}]`))
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	sc := scorecards.Scorecards[0]
+	if sc.FindingsWithdrawn != 1 {
+		t.Errorf("expected 1 withdrawn (dispute settled without adjudication), got %d", sc.FindingsWithdrawn)
+	}
+	if sc.FindingsHeld != 0 {
+		t.Errorf("expected 0 held, got %d", sc.FindingsHeld)
+	}
+	if sc.FindingsUnresolved != 0 {
+		t.Errorf("expected 0 unresolved, got %d", sc.FindingsUnresolved)
+	}
+}
+
 // TestGetResearchReviewerScorecards_SupersededChain_ApprovalsWithLaterFix verifies
 // that approvals-with-later-fix compares rounds by their position across the whole
 // supersede chain, not by each chain member's own review_round (which restarts at 1
 // on every replacement): an approval on the original task and a fix landing in round
-// 1 of its replacement must still be recognized as "later", even though both are
-// task-local round 1.
+// 1 of its replacement, explicitly linked back via prior_id, must still be recognized
+// as "later", even though both are task-local round 1.
 func TestGetResearchReviewerScorecards_SupersededChain_ApprovalsWithLaterFix(t *testing.T) {
 	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "sonnet"})
 
@@ -610,14 +754,15 @@ func TestGetResearchReviewerScorecards_SupersededChain_ApprovalsWithLaterFix(t *
 	}
 
 	// Round 1 on the replacement (task-local round 1, same number as the original
-	// task's own round 1): opus approves again, and sonnet's full review finds the
-	// defect gone (fixed), so it reports nothing there at all.
+	// task's own round 1): opus approves again, and sonnet explicitly links its
+	// report back to the carried finding ("f1") and reports it resolved.
 	opusB1, sonnetB1 := findResearchReviewTasks(t, store, ctx, projID, successor.ID, 1)
 	if opusB1 == nil || sonnetB1 == nil {
 		t.Fatalf("expected both review tasks on the successor")
 	}
 	submitResearchReview(t, store, ctx, opusB1, "opus-reviewer", "approve", emptyFindings)
-	submitResearchReview(t, store, ctx, sonnetB1, "sonnet-reviewer", "approve", emptyFindings)
+	fixedFindings := json.RawMessage(`[{"id":"g1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":false,"status":"resolved","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, sonnetB1, "sonnet-reviewer", "approve", fixedFindings)
 
 	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
 	if err != nil {
