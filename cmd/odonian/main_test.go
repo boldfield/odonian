@@ -979,6 +979,163 @@ func TestExecuteSubmitMissingAgent(t *testing.T) {
 	}
 }
 
+func TestExecuteSubmitWithValidDisputesFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	disputesFile := filepath.Join(tmpDir, "disputes.json")
+	disputesData := `[
+		{"finding_id": "f1", "evidence": "Reviewer's evidence contradicts claim X"}
+	]`
+	if err := os.WriteFile(disputesFile, []byte(disputesData), 0644); err != nil {
+		t.Fatalf("failed to create disputes file: %v", err)
+	}
+
+	var gotDisputesRaw json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/tasks/task123" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task123", "review_round": 0, "links": []map[string]string{}})
+			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/tasks/task123/submit" {
+			var req struct {
+				AgentID  string
+				Result   string
+				Disputes json.RawMessage
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.Result != "dispute submitted" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if len(req.Disputes) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			gotDisputesRaw = req.Disputes
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	oldAgent := os.Getenv("AGENT_ID")
+	defer os.Setenv("AGENT_ID", oldAgent)
+	os.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+		"--result", "dispute submitted",
+		"--disputes-file", disputesFile,
+		"task123",
+	})
+	if err != nil {
+		t.Fatalf("executeSubmit with disputes-file failed: %v", err)
+	}
+
+	if len(gotDisputesRaw) == 0 {
+		t.Fatal("expected disputes to be present in request body")
+	}
+
+	var disputes []map[string]interface{}
+	if err := json.Unmarshal(gotDisputesRaw, &disputes); err != nil {
+		t.Fatalf("failed to unmarshal disputes: %v", err)
+	}
+
+	if len(disputes) != 1 {
+		t.Errorf("expected 1 dispute, got %d", len(disputes))
+	}
+	if disputes[0]["finding_id"] != "f1" {
+		t.Errorf("expected finding_id f1, got %v", disputes[0]["finding_id"])
+	}
+}
+
+func TestExecuteSubmitWithInvalidJSONDisputesFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	disputesFile := filepath.Join(tmpDir, "disputes.json")
+	invalidJSON := `not valid json {`
+	if err := os.WriteFile(disputesFile, []byte(invalidJSON), 0644); err != nil {
+		t.Fatalf("failed to create disputes file: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	oldAgent := os.Getenv("AGENT_ID")
+	defer os.Setenv("AGENT_ID", oldAgent)
+	os.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+		"--result", "test",
+		"--disputes-file", disputesFile,
+		"task123",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid JSON disputes file, got nil")
+	}
+	if !strings.Contains(err.Error(), "not valid JSON") {
+		t.Errorf("expected error to mention 'not valid JSON', got: %v", err)
+	}
+}
+
+func TestExecuteSubmitWithNonArrayDisputesFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	disputesFile := filepath.Join(tmpDir, "disputes.json")
+	nonArrayJSON := `{"finding_id": "f1", "evidence": "test"}`
+	if err := os.WriteFile(disputesFile, []byte(nonArrayJSON), 0644); err != nil {
+		t.Fatalf("failed to create disputes file: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	oldAgent := os.Getenv("AGENT_ID")
+	defer os.Setenv("AGENT_ID", oldAgent)
+	os.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+		"--result", "test",
+		"--disputes-file", disputesFile,
+		"task123",
+	})
+	if err == nil {
+		t.Fatal("expected error for non-array disputes file, got nil")
+	}
+	if !strings.Contains(err.Error(), "must be a JSON array") {
+		t.Errorf("expected error to mention 'must be a JSON array', got: %v", err)
+	}
+}
+
+func TestExecuteSubmitWithUnreadableDisputesFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	disputesFile := filepath.Join(tmpDir, "nonexistent.json")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	oldAgent := os.Getenv("AGENT_ID")
+	defer os.Setenv("AGENT_ID", oldAgent)
+	os.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+		"--result", "test",
+		"--disputes-file", disputesFile,
+		"task123",
+	})
+	if err == nil {
+		t.Fatal("expected error for unreadable disputes file, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to read disputes file") {
+		t.Errorf("expected error to mention 'failed to read disputes file', got: %v", err)
+	}
+}
+
 func TestExecuteSubmitLocalCommitFirstSubmit(t *testing.T) {
 	t.Setenv("ODONIAN_DELIVERY_MODE", "local_commit")
 	tmpDir := t.TempDir()

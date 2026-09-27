@@ -1209,3 +1209,99 @@ func TestSubmitTaskError(t *testing.T) {
 		t.Errorf("Expected StatusCode 400, got %d", apiErr.StatusCode)
 	}
 }
+
+func TestSubmitTaskWithDisputesAndFindings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/tasks/task123/submit" {
+			t.Errorf("expected /tasks/task123/submit, got %s", r.URL.Path)
+		}
+
+		auth := r.Header.Get("Authorization")
+		if auth != "Bearer testtoken" {
+			t.Errorf("expected Bearer testtoken, got %s", auth)
+		}
+
+		var req struct {
+			AgentID  string          `json:"agent_id"`
+			Result   string          `json:"result"`
+			Disputes json.RawMessage `json:"disputes"`
+			Findings json.RawMessage `json:"findings"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("failed to decode request body: %v", err)
+		}
+
+		if req.AgentID != "agent123" {
+			t.Errorf("expected agent_id=agent123, got %s", req.AgentID)
+		}
+
+		if req.Result != "dispute submitted" {
+			t.Errorf("expected result='dispute submitted', got %s", req.Result)
+		}
+
+		if len(req.Disputes) == 0 {
+			t.Errorf("expected disputes to be present")
+		}
+
+		var disputes []map[string]interface{}
+		if err := json.Unmarshal(req.Disputes, &disputes); err != nil {
+			t.Errorf("failed to unmarshal disputes: %v", err)
+		}
+		if len(disputes) != 1 {
+			t.Errorf("expected 1 dispute, got %d", len(disputes))
+		}
+		if disputes[0]["finding_id"] != "f1" {
+			t.Errorf("expected finding_id f1, got %v", disputes[0]["finding_id"])
+		}
+
+		if len(req.Findings) > 0 {
+			t.Errorf("expected no findings in this test, got %d bytes", len(req.Findings))
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+
+	disputes := []byte(`[{"finding_id": "f1", "evidence": "test evidence"}]`)
+	findings := []byte{}
+
+	err := client.SubmitTaskWithDisputesAndFindings(context.Background(), "task123", "agent123", "dispute submitted", nil, []LinkInput{}, findings, disputes)
+	if err != nil {
+		t.Fatalf("SubmitTaskWithDisputesAndFindings failed: %v", err)
+	}
+}
+
+func TestSubmitTaskWithEmptyDisputesFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Disputes json.RawMessage `json:"disputes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		if len(req.Disputes) > 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+
+	disputes := []byte{}
+	findings := []byte{}
+
+	err := client.SubmitTaskWithDisputesAndFindings(context.Background(), "task123", "agent123", "result", nil, []LinkInput{}, findings, disputes)
+	if err != nil {
+		t.Fatalf("SubmitTaskWithDisputesAndFindings with empty disputes failed: %v", err)
+	}
+}
