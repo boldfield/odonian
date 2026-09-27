@@ -160,8 +160,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 16 {
-		t.Errorf("expected 16 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 17 {
+		t.Errorf("expected 17 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -176,8 +176,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 16 {
-		t.Errorf("expected 16 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 17 {
+		t.Errorf("expected 17 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -273,8 +273,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 16 {
-		t.Errorf("expected 16 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 17 {
+		t.Errorf("expected 17 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -16001,5 +16001,553 @@ func TestResearchSupersessionDedupedFindingKeepsAllReviewerLineages(t *testing.T
 	}
 	if carriedD := extractCarriedFindings(taskD.Spec); len(carriedD) != 0 {
 		t.Errorf("D should carry nothing once both reviewers re-reviewed clean, got: %s", taskD.Spec)
+	}
+}
+
+// resubmitResearchImplementTaskWithDisputes is resubmitResearchImplementTask but
+// carries a disputes payload on the rework submission, per
+// docs/features/research-track.md section 5.
+func resubmitResearchImplementTaskWithDisputes(t *testing.T, store Store, ctx context.Context, parentID string, disputes json.RawMessage) (TaskWithDepsAndLinks, error) {
+	t.Helper()
+	if _, err := store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim parent for resubmit: %v", err)
+	}
+	return store.SubmitTaskWithDisputes(ctx, parentID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes)
+}
+
+// TestResearchDisputes_ValidDisputePersistedAndDoesNotAlterFinding verifies that a
+// well-formed dispute of a real round-1 finding is accepted and recorded, without
+// altering the original review event's finding (docs/features/research-track.md
+// section 5: a dispute never overturns a finding on its own).
+func TestResearchDisputes_ValidDisputePersistedAndDoesNotAlterFinding(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("expected both review tasks to be ready")
+	}
+
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"overstates source","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 1 to be rejected (parent back to ready), got %s", parent.State)
+	}
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"the source supports the claim as written"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("expected dispute submission to succeed, got: %v", err)
+	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	var disputeEvent *Event
+	var opusReviewEvent *Event
+	for i := range events {
+		e := &events[i]
+		if e.Kind == "submit" && e.Disputes != nil {
+			disputeEvent = e
+		}
+		if e.Kind == "review" && e.Findings != nil {
+			var findings []Finding
+			if err := json.Unmarshal(*e.Findings, &findings); err == nil {
+				for _, f := range findings {
+					if f.ID == "f1" {
+						opusReviewEvent = e
+					}
+				}
+			}
+		}
+	}
+	if disputeEvent == nil {
+		t.Fatalf("expected a submit event with disputes recorded")
+	}
+	var storedDisputes []Dispute
+	if err := json.Unmarshal(*disputeEvent.Disputes, &storedDisputes); err != nil {
+		t.Fatalf("failed to unmarshal stored disputes: %v", err)
+	}
+	if len(storedDisputes) != 1 || storedDisputes[0].FindingID != "f1" || storedDisputes[0].Evidence == "" {
+		t.Fatalf("unexpected stored disputes: %+v", storedDisputes)
+	}
+
+	if opusReviewEvent == nil {
+		t.Fatalf("expected original opus review event with f1 still present")
+	}
+	var origFindings []Finding
+	if err := json.Unmarshal(*opusReviewEvent.Findings, &origFindings); err != nil {
+		t.Fatalf("failed to unmarshal original findings: %v", err)
+	}
+	if origFindings[0].Status != "new" || origFindings[0].Severity != "P2" {
+		t.Errorf("dispute must not alter the original finding, got %+v", origFindings[0])
+	}
+
+	// The dispute must reach opus's (the raiser's) round-2 review spec, and not
+	// sonnet's, since sonnet never raised f1.
+	opusRound2, sonnetRound2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusRound2 == nil || sonnetRound2 == nil {
+		t.Fatalf("expected round-2 review tasks for both reviewers")
+	}
+	if !strings.Contains(opusRound2.Spec, "Prior Review Round") || !strings.Contains(opusRound2.Spec, "f1") {
+		t.Errorf("expected opus round-2 spec to include the dispute, got: %s", opusRound2.Spec)
+	}
+	if strings.Contains(sonnetRound2.Spec, "Prior Review Round") {
+		t.Errorf("expected sonnet round-2 spec to have no dispute context, got: %s", sonnetRound2.Spec)
+	}
+}
+
+// TestResearchDisputes_UnknownFindingID verifies that disputing a finding_id never
+// raised in the round being reworked is rejected.
+func TestResearchDisputes_UnknownFindingID(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"does-not-exist","evidence":"e"}]`)
+	_, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "UNKNOWN_FINDING_ID" {
+		t.Fatalf("expected UNKNOWN_FINDING_ID validation error, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_AmbiguousFindingID verifies that when two reviewers both use
+// the same finding_id in the same round, disputing it is rejected as ambiguous
+// rather than silently resolved against whichever reviewer's finding is scanned
+// first.
+func TestResearchDisputes_AmbiguousFindingID(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	sameID := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", sameID)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "reject", sameID)
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e"}]`)
+	_, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "AMBIGUOUS_FINDING_ID" {
+		t.Fatalf("expected AMBIGUOUS_FINDING_ID validation error, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_EmptyEvidence verifies that a dispute with empty (or
+// whitespace-only) evidence is rejected.
+func TestResearchDisputes_EmptyEvidence(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"   "}]`)
+	_, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "INVALID_DISPUTES" {
+		t.Fatalf("expected INVALID_DISPUTES validation error, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_DuplicateWithinPayload verifies that disputing the same
+// finding_id twice within one submission is rejected.
+func TestResearchDisputes_DuplicateWithinPayload(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e1"},{"finding_id":"f1","evidence":"e2"}]`)
+	_, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "INVALID_DISPUTES" {
+		t.Fatalf("expected INVALID_DISPUTES validation error, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_DuplicateAcrossRounds verifies that a finding_id already
+// disputed on an earlier rework round cannot be disputed a second time, even when
+// the raising reviewer reuses the same id in a later round (e.g. reporting it
+// still_open).
+func TestResearchDisputes_DuplicateAcrossRounds(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"first"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("expected first dispute to succeed, got: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusR2 == nil || sonnetR2 == nil {
+		t.Fatalf("expected round-2 review tasks")
+	}
+	stillOpen := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", stillOpen)
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 to be rejected (still_open blocks), got %s", parent.State)
+	}
+
+	disputesAgain := json.RawMessage(`[{"finding_id":"f1","evidence":"second attempt"}]`)
+	_, err = resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputesAgain)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "DUPLICATE_DISPUTE" {
+		t.Fatalf("expected DUPLICATE_DISPUTE validation error, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_NotAllowedOnNonResearchTrack verifies that a disputes payload
+// on a build-track implement submission is rejected, and never affects ordinary
+// build rework.
+func TestResearchDisputes_NotAllowedOnNonResearchTrack(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Build feature", Spec: "Do it", DocumentID: doc.ID, Model: "haiku", ReviewModels: []string{"opus"}},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e"}]`)
+	_, err = store.SubmitTaskWithDisputes(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "DISPUTES_NOT_ALLOWED" {
+		t.Fatalf("expected DISPUTES_NOT_ALLOWED validation error, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_NoPriorRound verifies that a research task's first implement
+// submission, with no prior review round, rejects a disputes payload.
+func TestResearchDisputes_NoPriorRound(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	escalate := false
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Verify claims", Spec: "Verify", DocumentID: doc.ID, Model: "haiku", ReviewModels: []string{"opus"}, Track: "research", Escalate: &escalate},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e"}]`)
+	_, err = store.SubmitTaskWithDisputes(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "NO_PRIOR_ROUND" {
+		t.Fatalf("expected NO_PRIOR_ROUND validation error, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_NotAllowedOnReviewKindTask verifies that a disputes payload
+// on a review-kind task submission is rejected, regardless of track.
+func TestResearchDisputes_NotAllowedOnReviewKindTask(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("expected both review tasks to be ready")
+	}
+	if _, err := store.ClaimTask(ctx, opus.ID, "opus-reviewer", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+	verdict := "approve"
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e"}]`)
+	_, err := store.SubmitTaskWithDisputes(ctx, opus.ID, "opus-reviewer", "notes", &verdict, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`[]`), disputes)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "DISPUTES_NOT_ALLOWED" {
+		t.Fatalf("expected DISPUTES_NOT_ALLOWED validation error, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_BuildReworkSpecUnaffected verifies that ordinary build-track
+// rework (no disputes involved anywhere in the flow) produces a round-2 review spec
+// with no "Prior Review Round" section, confirming the disputes feature never
+// changes build/design behavior.
+func TestResearchDisputes_BuildReworkSpecUnaffected(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Build feature", Spec: "Do it", DocumentID: doc.ID, Model: "haiku", ReviewModels: []string{"opus"}},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	var reviewTaskID string
+	for _, tk := range allTasks {
+		if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == taskID {
+			reviewTaskID = tk.ID
+		}
+	}
+	if reviewTaskID == "" {
+		t.Fatalf("expected a review task to be spawned")
+	}
+	if _, err := store.ClaimTask(ctx, reviewTaskID, "opus-reviewer", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+	verdict := "reject"
+	if _, err := store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "needs work", &verdict, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit review: %v", err)
+	}
+
+	parent, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected build task rejected round to return to ready, got %s", parent.State)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim for rework: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to resubmit: %v", err)
+	}
+
+	allTasks, err = store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	var round2Spec string
+	found := false
+	for _, tk := range allTasks {
+		if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == taskID && tk.ReviewRound == 2 {
+			round2Spec = tk.Spec
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a round-2 review task")
+	}
+	if strings.Contains(round2Spec, "Prior Review Round") {
+		t.Errorf("expected no dispute context in build-track review spec, got: %s", round2Spec)
+	}
+}
+
+// TestResearchDisputes_StaleDisputeDoesNotLeakIntoLaterRound verifies that a
+// round-3 rework with NO disputes does not carry a round-1 dispute forward into the
+// round-3 review spec: only the triggering (latest) submit event's own disputes are
+// ever surfaced, never an earlier round's.
+func TestResearchDisputes_StaleDisputeDoesNotLeakIntoLaterRound(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+	opus, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil {
+		t.Fatalf("expected round-1 opus review task")
+	}
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+
+	// Round-2 rework disputes f1.
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e1"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("expected round-2 dispute to succeed, got: %v", err)
+	}
+
+	opusR2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusR2 == nil {
+		t.Fatalf("expected round-2 opus review task")
+	}
+	if !strings.Contains(opusR2.Spec, "f1") {
+		t.Fatalf("expected round-2 spec to include the round-1 dispute")
+	}
+	// Opus maintains the finding (still_open), so round 2 is rejected too.
+	stillOpen := json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", stillOpen)
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 to be rejected (still_open blocks), got %s", parent.State)
+	}
+
+	// Round-3 rework submits ordinary rework with NO disputes.
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opusR3, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
+	if opusR3 == nil {
+		t.Fatalf("expected round-3 opus review task")
+	}
+	if strings.Contains(opusR3.Spec, "Prior Review Round") {
+		t.Errorf("expected no stale dispute context in round-3 spec (round 3 submitted no disputes), got: %s", opusR3.Spec)
+	}
+}
+
+// TestResearchDisputes_DifferentReviewerReusingIDIsNotADuplicate verifies that
+// disputing a finding_id is scoped to the specific reviewer lineage and prior_id
+// chain it resolved against, not the bare finding_id string: a different reviewer's
+// unrelated finding that happens to reuse an already-disputed id is a genuinely new
+// finding and must not be rejected as DUPLICATE_DISPUTE.
+func TestResearchDisputes_DifferentReviewerReusingIDIsNotADuplicate(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("expected both review tasks to be ready")
+	}
+
+	// Round 1: opus raises f1 and it's disputed; sonnet has nothing to report.
+	opusF1 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"overstates source","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", opusF1)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"the source supports the claim as written"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("expected round-1 dispute to succeed, got: %v", err)
+	}
+
+	// Round 2: opus reports its finding resolved under a new id (r1, prior_id f1).
+	// sonnet raises its OWN, unrelated finding, and happens to reuse the id "f1" —
+	// reviewers pick their own ids independently, so this collision is expected.
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusR2 == nil || sonnetR2 == nil {
+		t.Fatalf("expected round-2 review tasks")
+	}
+	opusResolved := json.RawMessage(`[{"id":"r1","severity":"P2","file":"a.md","line":3,"summary":"overstates source","in_changed_text":false,"status":"resolved","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "approve", opusResolved)
+	sonnetF1 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"b.md","line":9,"summary":"a different, unrelated defect","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "reject", sonnetF1)
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 to be rejected (sonnet's new finding blocks), got %s", parent.State)
+	}
+
+	// Disputing sonnet's round-2 "f1" must succeed: it is a different reviewer's
+	// different finding, never disputed before, even though the raw id matches
+	// opus's already-disputed round-1 "f1".
+	disputesAgain := json.RawMessage(`[{"finding_id":"f1","evidence":"b.md line 9 is unrelated to a.md"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputesAgain); err != nil {
+		t.Fatalf("expected sonnet's new finding to be disputable, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_MaintainedFindingCannotBeDisputedAgainUnderNewID verifies
+// that once a finding has been disputed, the same finding carried forward under a new
+// id in a later round (still_open, linked by prior_id) cannot be disputed again: the
+// duplicate check must follow the reviewer's prior_id chain, not just the bare id.
+func TestResearchDisputes_MaintainedFindingCannotBeDisputedAgainUnderNewID(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+	opus, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil {
+		t.Fatalf("expected round-1 opus review task")
+	}
+
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"first"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("expected round-1 dispute to succeed, got: %v", err)
+	}
+
+	// Round 2: opus maintains the same finding under a new id, linked by prior_id.
+	opusR2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusR2 == nil {
+		t.Fatalf("expected round-2 opus review task")
+	}
+	maintained := json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", maintained)
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 to be rejected (still_open blocks), got %s", parent.State)
+	}
+
+	// Disputing "f2" must fail: it is the same finding chain as the already-disputed
+	// "f1", just carried forward under a new id.
+	disputesAgain := json.RawMessage(`[{"finding_id":"f2","evidence":"second attempt"}]`)
+	_, err = resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputesAgain)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "DUPLICATE_DISPUTE" {
+		t.Fatalf("expected DUPLICATE_DISPUTE validation error, got: %v", err)
 	}
 }

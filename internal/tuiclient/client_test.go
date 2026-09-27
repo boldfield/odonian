@@ -1209,3 +1209,41 @@ func TestSubmitTaskError(t *testing.T) {
 		t.Errorf("Expected StatusCode 400, got %d", apiErr.StatusCode)
 	}
 }
+
+func TestSubmitTaskWithDisputesAndFindings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req submitTaskRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("failed to decode request body: %v", err)
+		}
+
+		if req.AgentID != "agent123" {
+			t.Errorf("expected agent_id=agent123, got %s", req.AgentID)
+		}
+		if req.Findings == nil {
+			t.Errorf("expected findings to be forwarded, got nil")
+		}
+		if req.Disputes == nil {
+			t.Errorf("expected disputes to be forwarded, got nil")
+		}
+		var disputes []map[string]interface{}
+		if err := json.Unmarshal(req.Disputes, &disputes); err != nil {
+			t.Fatalf("failed to unmarshal disputes: %v", err)
+		}
+		if len(disputes) != 1 || disputes[0]["finding_id"] != "f1" {
+			t.Errorf("expected one dispute for f1, got %+v", disputes)
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	links := []LinkInput{{Kind: "pr", Value: "https://github.com/test/pr"}}
+	findings := json.RawMessage(`[]`)
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"cited evidence"}]`)
+	err := client.SubmitTaskWithDisputesAndFindings(context.Background(), "task123", "agent123", "reworked", nil, links, findings, disputes)
+	if err != nil {
+		t.Fatalf("SubmitTaskWithDisputesAndFindings failed: %v", err)
+	}
+}

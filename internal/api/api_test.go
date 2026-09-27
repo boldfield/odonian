@@ -7563,3 +7563,647 @@ func TestLatencyLoggingResponseSize(t *testing.T) {
 		t.Errorf("expected bytes %d, got %d", expectedBytes, bytesVal)
 	}
 }
+
+// --- R10 dispute tests (docs/features/research-track.md section 5) ---
+
+// apiClaimTask claims a task via the HTTP API and fails the test on a non-200.
+func apiClaimTask(t *testing.T, server *Server, authHeader, taskID, agent, model string) {
+	t.Helper()
+	payload := map[string]string{"agent_id": agent, "model": model}
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to claim task %s: got status %d; body: %s", taskID, w.Code, w.Body.String())
+	}
+}
+
+// apiSubmit posts a submit payload and returns the raw HTTP status and body, without
+// asserting on the outcome, so callers can check both success and rejection paths.
+func apiSubmit(t *testing.T, server *Server, authHeader, taskID string, payload map[string]interface{}) (int, []byte) {
+	t.Helper()
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	return w.Code, w.Body.Bytes()
+}
+
+// apiErrorCode decodes an error response body and returns its code field.
+func apiErrorCode(t *testing.T, body []byte) string {
+	t.Helper()
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("failed to decode error response: %v; body: %s", err, body)
+	}
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("error response missing 'error' field; body: %s", body)
+	}
+	code, _ := errObj["code"].(string)
+	return code
+}
+
+// setupResearchTaskAtReworkPoint creates a research-track task with two reviewers
+// (opus, sonnet), submits round 1, has opus raise a blocking P2/changed-text finding
+// "f1" and sonnet approve with no findings (so the round is rejected and the parent
+// returns to "ready"), then claims the parent again so it is in_progress and ready
+// for a rework submission carrying disputes. Returns the parent task id.
+func setupResearchTaskAtReworkPoint(t *testing.T, server *Server, authHeader string) string {
+	t.Helper()
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims in the doc",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode created tasks: %v", err)
+	}
+	parentID := createdTasks[0].ID
+
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+parentID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+	if promoteW.Code != http.StatusOK {
+		t.Fatalf("failed to promote parent: got status %d; body: %s", promoteW.Code, promoteW.Body.String())
+	}
+
+	apiClaimTask(t, server, authHeader, parentID, "agent-1", "haiku")
+
+	code, respBody := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Implemented",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed to submit parent round 1: got status %d; body: %s", code, respBody)
+	}
+
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+	var allTasks []store.Task
+	if err := json.NewDecoder(listW.Body).Decode(&allTasks); err != nil {
+		t.Fatalf("failed to decode task list: %v", err)
+	}
+
+	var opusTaskID, sonnetTaskID string
+	for _, task := range allTasks {
+		if task.Kind != "review" || task.TargetTaskID == nil || *task.TargetTaskID != parentID {
+			continue
+		}
+		switch task.Model {
+		case "opus":
+			opusTaskID = task.ID
+		case "sonnet":
+			sonnetTaskID = task.ID
+		}
+	}
+	if opusTaskID == "" || sonnetTaskID == "" {
+		t.Fatalf("expected both opus and sonnet review tasks to be spawned")
+	}
+
+	apiClaimTask(t, server, authHeader, opusTaskID, "opus-reviewer", "opus")
+	code, respBody = apiSubmit(t, server, authHeader, opusTaskID, map[string]interface{}{
+		"agent_id": "opus-reviewer",
+		"result":   "review notes",
+		"verdict":  "reject",
+		"findings": []map[string]interface{}{
+			{
+				"id": "f1", "severity": "P2", "file": "src/main.go", "line": 10,
+				"summary": "Overstates the source", "in_changed_text": true, "status": "new",
+			},
+		},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed to submit opus review: got status %d; body: %s", code, respBody)
+	}
+
+	apiClaimTask(t, server, authHeader, sonnetTaskID, "sonnet-reviewer", "sonnet")
+	code, respBody = apiSubmit(t, server, authHeader, sonnetTaskID, map[string]interface{}{
+		"agent_id": "sonnet-reviewer",
+		"result":   "review notes",
+		"verdict":  "approve",
+		"findings": []map[string]interface{}{},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed to submit sonnet review: got status %d; body: %s", code, respBody)
+	}
+
+	// Opus's P2/changed-text finding blocks the round, so the parent returned to
+	// "ready". Claim it again so it's in_progress for the rework submission.
+	apiClaimTask(t, server, authHeader, parentID, "agent-1", "haiku")
+
+	return parentID
+}
+
+// TestSubmitWithValidDisputePersistsAndDoesNotAlterFinding verifies that a
+// well-formed dispute of a real, unambiguous round-1 finding is accepted, is
+// recorded on the submit event, and never touches the original review event's
+// stored finding (docs/features/research-track.md section 5: "It does not vote on
+// the round" / no unilateral overturning).
+func TestSubmitWithValidDisputePersistsAndDoesNotAlterFinding(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	parentID := setupResearchTaskAtReworkPoint(t, server, authHeader)
+
+	code, respBody := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Reworked, disputing f1",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+		"disputes": []map[string]interface{}{
+			{"finding_id": "f1", "evidence": "The source actually supports the claim as written; see page 4."},
+		},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d; body: %s", code, respBody)
+	}
+
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+parentID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+	var events []store.Event
+	if err := json.NewDecoder(eventsW.Body).Decode(&events); err != nil {
+		t.Fatalf("failed to decode events: %v", err)
+	}
+
+	var disputeEvent, opusReviewEvent *store.Event
+	for i := range events {
+		e := &events[i]
+		if e.Kind == "submit" && e.Disputes != nil {
+			disputeEvent = e
+		}
+		if e.Kind == "review" && e.Findings != nil {
+			var findings []store.Finding
+			if err := json.Unmarshal(*e.Findings, &findings); err == nil {
+				for _, f := range findings {
+					if f.ID == "f1" {
+						opusReviewEvent = e
+					}
+				}
+			}
+		}
+	}
+	if disputeEvent == nil {
+		t.Fatalf("expected a submit event with disputes recorded")
+	}
+	var storedDisputes []store.Dispute
+	if err := json.Unmarshal(*disputeEvent.Disputes, &storedDisputes); err != nil {
+		t.Fatalf("failed to unmarshal stored disputes: %v", err)
+	}
+	if len(storedDisputes) != 1 || storedDisputes[0].FindingID != "f1" {
+		t.Fatalf("expected one stored dispute for f1, got %+v", storedDisputes)
+	}
+	if storedDisputes[0].Evidence == "" {
+		t.Errorf("expected stored dispute to carry the evidence text")
+	}
+
+	if opusReviewEvent == nil {
+		t.Fatalf("expected the original opus review event with finding f1 to still exist")
+	}
+	var origFindings []store.Finding
+	if err := json.Unmarshal(*opusReviewEvent.Findings, &origFindings); err != nil {
+		t.Fatalf("failed to unmarshal original findings: %v", err)
+	}
+	if origFindings[0].ID != "f1" || origFindings[0].Status != "new" || origFindings[0].Severity != "P2" {
+		t.Errorf("dispute must not alter the original finding, got %+v", origFindings[0])
+	}
+
+	// The dispute must reach the raising reviewer's (opus's) next-round review task,
+	// and NOT the other reviewer's (sonnet's), since sonnet never raised f1.
+	tasksReq := httptest.NewRequest("GET", "/tasks/"+parentID, nil)
+	tasksReq.Header.Set("Authorization", authHeader)
+	tasksW := httptest.NewRecorder()
+	server.mux.ServeHTTP(tasksW, tasksReq)
+	var parentTask store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(tasksW.Body).Decode(&parentTask); err != nil {
+		t.Fatalf("failed to decode parent task: %v", err)
+	}
+
+	listReq2 := httptest.NewRequest("GET", "/projects/"+parentTask.ProjectID+"/tasks", nil)
+	listReq2.Header.Set("Authorization", authHeader)
+	listW2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW2, listReq2)
+	var allTasks []store.Task
+	if err := json.NewDecoder(listW2.Body).Decode(&allTasks); err != nil {
+		t.Fatalf("failed to decode task list: %v", err)
+	}
+
+	var opusRound2, sonnetRound2 *store.Task
+	for i := range allTasks {
+		task := allTasks[i]
+		if task.Kind != "review" || task.TargetTaskID == nil || *task.TargetTaskID != parentID || task.ReviewRound != 2 {
+			continue
+		}
+		switch task.Model {
+		case "opus":
+			opusRound2 = &allTasks[i]
+		case "sonnet":
+			sonnetRound2 = &allTasks[i]
+		}
+	}
+	if opusRound2 == nil || sonnetRound2 == nil {
+		t.Fatalf("expected round-2 review tasks for both reviewers")
+	}
+	if !strings.Contains(opusRound2.Spec, "Prior Review Round") || !strings.Contains(opusRound2.Spec, "f1") {
+		t.Errorf("expected opus's round-2 spec (the reviewer who raised f1) to include the dispute, got: %s", opusRound2.Spec)
+	}
+	if strings.Contains(sonnetRound2.Spec, "Prior Review Round") {
+		t.Errorf("expected sonnet's round-2 spec (who never raised f1) to have no dispute context, got: %s", sonnetRound2.Spec)
+	}
+}
+
+// TestSubmitDisputeUnknownFindingID verifies that disputing a finding_id never
+// raised in the round being reworked returns 400 UNKNOWN_FINDING_ID.
+func TestSubmitDisputeUnknownFindingID(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	parentID := setupResearchTaskAtReworkPoint(t, server, authHeader)
+
+	code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Reworked",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+		"disputes": []map[string]interface{}{
+			{"finding_id": "does-not-exist", "evidence": "some evidence"},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", code, body)
+	}
+	if got := apiErrorCode(t, body); got != "UNKNOWN_FINDING_ID" {
+		t.Errorf("expected error code UNKNOWN_FINDING_ID, got %q", got)
+	}
+}
+
+// TestSubmitDisputeAmbiguousFindingID verifies that when both reviewers raise a
+// finding with the same id in the same round, disputing that id returns 400
+// AMBIGUOUS_FINDING_ID rather than silently picking one reviewer's finding.
+func TestSubmitDisputeAmbiguousFindingID(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+	taskPayload := []store.TaskInput{
+		{
+			Title: "Verify claims", Spec: "Verify the claims in the doc", DocumentID: docID,
+			Model: "haiku", ReviewModels: []string{"opus", "sonnet"}, Track: "research",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	parentID := createdTasks[0].ID
+
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+parentID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	server.mux.ServeHTTP(httptest.NewRecorder(), promoteReq)
+
+	apiClaimTask(t, server, authHeader, parentID, "agent-1", "haiku")
+	code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1", "result": "Implemented",
+		"links": []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed round-1 submit: %d; body: %s", code, body)
+	}
+
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+	var allTasks []store.Task
+	json.NewDecoder(listW.Body).Decode(&allTasks)
+	var opusTaskID, sonnetTaskID string
+	for _, task := range allTasks {
+		if task.Kind != "review" || task.TargetTaskID == nil || *task.TargetTaskID != parentID {
+			continue
+		}
+		switch task.Model {
+		case "opus":
+			opusTaskID = task.ID
+		case "sonnet":
+			sonnetTaskID = task.ID
+		}
+	}
+
+	// Both reviewers independently assign the same finding_id "f1" to a blocking
+	// (P2, in_changed_text) finding, so the round is rejected and the parent
+	// returns to "ready" for rework.
+	sameIDFinding := []map[string]interface{}{
+		{"id": "f1", "severity": "P2", "file": "src/main.go", "line": 1, "summary": "overstates the source", "in_changed_text": true, "status": "new"},
+	}
+	apiClaimTask(t, server, authHeader, opusTaskID, "opus-reviewer", "opus")
+	code, body = apiSubmit(t, server, authHeader, opusTaskID, map[string]interface{}{
+		"agent_id": "opus-reviewer", "result": "notes", "verdict": "reject", "findings": sameIDFinding,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed opus review submit: %d; body: %s", code, body)
+	}
+	apiClaimTask(t, server, authHeader, sonnetTaskID, "sonnet-reviewer", "sonnet")
+	code, body = apiSubmit(t, server, authHeader, sonnetTaskID, map[string]interface{}{
+		"agent_id": "sonnet-reviewer", "result": "notes", "verdict": "reject", "findings": sameIDFinding,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed sonnet review submit: %d; body: %s", code, body)
+	}
+
+	// The round was rejected, so the parent returned to "ready"; claim it again for
+	// the rework submission under test.
+	apiClaimTask(t, server, authHeader, parentID, "agent-1", "haiku")
+
+	code, body = apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Reworked",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+		"disputes": []map[string]interface{}{
+			{"finding_id": "f1", "evidence": "some evidence"},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", code, body)
+	}
+	if got := apiErrorCode(t, body); got != "AMBIGUOUS_FINDING_ID" {
+		t.Errorf("expected error code AMBIGUOUS_FINDING_ID, got %q", got)
+	}
+}
+
+// TestSubmitDisputeEmptyEvidence verifies that a dispute with empty (or
+// whitespace-only) evidence is rejected with 400 INVALID_DISPUTES.
+func TestSubmitDisputeEmptyEvidence(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	parentID := setupResearchTaskAtReworkPoint(t, server, authHeader)
+
+	code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Reworked",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+		"disputes": []map[string]interface{}{
+			{"finding_id": "f1", "evidence": "   "},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", code, body)
+	}
+	if got := apiErrorCode(t, body); got != "INVALID_DISPUTES" {
+		t.Errorf("expected error code INVALID_DISPUTES, got %q", got)
+	}
+}
+
+// TestSubmitDisputeNotAllowedOffResearchTrack verifies that disputes are rejected on
+// a non-research-track implement submission and on any review-kind submission,
+// regardless of track, so ordinary build/design workflows are never affected by the
+// disputes feature.
+func TestSubmitDisputeNotAllowedOffResearchTrack(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	t.Run("build-track implement task", func(t *testing.T) {
+		projectID, docID := setupProjectAndDocument(t, server, authHeader)
+		taskPayload := []store.TaskInput{
+			{Title: "Build feature", Spec: "Do it", DocumentID: docID, Model: "haiku", ReviewModels: []string{"opus"}},
+		}
+		taskBody, _ := json.Marshal(taskPayload)
+		createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+		createReq.Header.Set("Authorization", authHeader)
+		createReq.Header.Set("Content-Type", "application/json")
+		createW := httptest.NewRecorder()
+		server.mux.ServeHTTP(createW, createReq)
+		var createdTasks []store.Task
+		json.NewDecoder(createW.Body).Decode(&createdTasks)
+		taskID := createdTasks[0].ID
+
+		promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+		promoteReq.Header.Set("Authorization", authHeader)
+		server.mux.ServeHTTP(httptest.NewRecorder(), promoteReq)
+
+		apiClaimTask(t, server, authHeader, taskID, "agent-1", "haiku")
+		code, body := apiSubmit(t, server, authHeader, taskID, map[string]interface{}{
+			"agent_id": "agent-1",
+			"result":   "Implemented",
+			"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+			"disputes": []map[string]interface{}{
+				{"finding_id": "f1", "evidence": "some evidence"},
+			},
+		})
+		if code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d; body: %s", code, body)
+		}
+		if got := apiErrorCode(t, body); got != "DISPUTES_NOT_ALLOWED" {
+			t.Errorf("expected error code DISPUTES_NOT_ALLOWED, got %q", got)
+		}
+	})
+
+	t.Run("review-kind task", func(t *testing.T) {
+		reviewTaskID, _ := setupClaimedReviewTask(t, server, authHeader)
+		code, body := apiSubmit(t, server, authHeader, reviewTaskID, map[string]interface{}{
+			"agent_id": "opus-reviewer",
+			"result":   "notes",
+			"verdict":  "approve",
+			"disputes": []map[string]interface{}{
+				{"finding_id": "f1", "evidence": "some evidence"},
+			},
+		})
+		if code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d; body: %s", code, body)
+		}
+		if got := apiErrorCode(t, body); got != "DISPUTES_NOT_ALLOWED" {
+			t.Errorf("expected error code DISPUTES_NOT_ALLOWED, got %q", got)
+		}
+	})
+}
+
+// TestSubmitDisputeNoPriorRound verifies that a research task's first implement
+// submission (no prior review round to dispute a finding from) rejects a disputes
+// payload with 400 NO_PRIOR_ROUND.
+func TestSubmitDisputeNoPriorRound(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+	taskPayload := []store.TaskInput{
+		{Title: "Verify claims", Spec: "Verify", DocumentID: docID, Model: "haiku", ReviewModels: []string{"opus"}, Track: "research"},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	server.mux.ServeHTTP(httptest.NewRecorder(), promoteReq)
+
+	apiClaimTask(t, server, authHeader, taskID, "agent-1", "haiku")
+	code, body := apiSubmit(t, server, authHeader, taskID, map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Implemented",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+		"disputes": []map[string]interface{}{
+			{"finding_id": "f1", "evidence": "some evidence"},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", code, body)
+	}
+	if got := apiErrorCode(t, body); got != "NO_PRIOR_ROUND" {
+		t.Errorf("expected error code NO_PRIOR_ROUND, got %q", got)
+	}
+}
+
+// TestSubmitDisputeDuplicateAcrossRounds verifies that a finding_id already
+// disputed on an earlier rework round cannot be disputed a second time, even when
+// the same reviewer reuses that id in a later round's findings (e.g. reporting it
+// still_open).
+func TestSubmitDisputeDuplicateAcrossRounds(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	parentID := setupResearchTaskAtReworkPoint(t, server, authHeader)
+
+	// Round-2 rework: dispute f1.
+	code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Reworked, disputing f1",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+		"disputes": []map[string]interface{}{
+			{"finding_id": "f1", "evidence": "first dispute"},
+		},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("expected status 200 for first dispute, got %d; body: %s", code, body)
+	}
+
+	// Find round-2's review tasks; opus (who raised f1) maintains it, reusing the
+	// same finding_id "f1" with status still_open.
+	listReq := httptest.NewRequest("GET", "/projects/"+mustProjectID(t, server, authHeader, parentID)+"/tasks", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+	var allTasks []store.Task
+	json.NewDecoder(listW.Body).Decode(&allTasks)
+	var opusRound2, sonnetRound2 string
+	for _, task := range allTasks {
+		if task.Kind != "review" || task.TargetTaskID == nil || *task.TargetTaskID != parentID || task.ReviewRound != 2 {
+			continue
+		}
+		switch task.Model {
+		case "opus":
+			opusRound2 = task.ID
+		case "sonnet":
+			sonnetRound2 = task.ID
+		}
+	}
+	if opusRound2 == "" || sonnetRound2 == "" {
+		t.Fatalf("expected round-2 review tasks for both reviewers")
+	}
+
+	apiClaimTask(t, server, authHeader, opusRound2, "opus-reviewer", "opus")
+	code, body = apiSubmit(t, server, authHeader, opusRound2, map[string]interface{}{
+		"agent_id": "opus-reviewer", "result": "still not resolved", "verdict": "reject",
+		"findings": []map[string]interface{}{
+			{"id": "f1", "severity": "P2", "file": "src/main.go", "line": 10, "summary": "overstates the source", "in_changed_text": false, "status": "still_open", "prior_id": "f1"},
+		},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed opus round-2 review submit: %d; body: %s", code, body)
+	}
+	apiClaimTask(t, server, authHeader, sonnetRound2, "sonnet-reviewer", "sonnet")
+	code, body = apiSubmit(t, server, authHeader, sonnetRound2, map[string]interface{}{
+		"agent_id": "sonnet-reviewer", "result": "notes", "verdict": "approve", "findings": []map[string]interface{}{},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed sonnet round-2 review submit: %d; body: %s", code, body)
+	}
+
+	// Round 2 rejected (still_open always blocks), so the parent is back in
+	// "ready". Claim it and try to dispute "f1" again.
+	apiClaimTask(t, server, authHeader, parentID, "agent-1", "haiku")
+	code, body = apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Reworked again",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+		"disputes": []map[string]interface{}{
+			{"finding_id": "f1", "evidence": "second dispute attempt"},
+		},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d; body: %s", code, body)
+	}
+	if got := apiErrorCode(t, body); got != "DUPLICATE_DISPUTE" {
+		t.Errorf("expected error code DUPLICATE_DISPUTE, got %q", got)
+	}
+}
+
+// mustProjectID fetches a task's project id via the API.
+func mustProjectID(t *testing.T, server *Server, authHeader, taskID string) string {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	var task store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(w.Body).Decode(&task); err != nil {
+		t.Fatalf("failed to decode task: %v", err)
+	}
+	return task.ProjectID
+}
+
+// TestSubmitDisputeNonOwnerAgentReturns409 verifies that submitting a rework with
+// disputes as an agent other than the task's assignee returns 409 CONFLICT, exactly
+// like any other submit — ownership is not weakened for a disputes payload.
+func TestSubmitDisputeNonOwnerAgentReturns409(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	parentID := setupResearchTaskAtReworkPoint(t, server, authHeader)
+
+	code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "someone-else",
+		"result":   "Reworked",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+		"disputes": []map[string]interface{}{
+			{"finding_id": "f1", "evidence": "some evidence"},
+		},
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d; body: %s", code, body)
+	}
+}

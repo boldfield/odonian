@@ -737,6 +737,26 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
 - `result` (required): Summary of work completed
 - `links` (optional): Array of external resource references
 - `verdict` (forbidden): Must not be present for implement tasks
+- `disputes` (optional, research-track rework only): Array of finding disputes, per
+  docs/features/research-track.md §5. Only accepted on an `implement`-kind, `research`-track task
+  that has at least one prior review round (a rework submission, not the first submission).
+  Omitting the field, or sending an explicit `null`, behaves exactly as before on every other
+  submission. Each dispute:
+  - `finding_id` (required): Non-empty string naming a finding from the round being reworked,
+    unique within the submission (no disputing the same id twice in one payload). It must have
+    been raised by exactly one reviewer in that round — an id two reviewers both used is
+    ambiguous and rejected.
+  - `evidence` (required): Non-empty string citing the source evidence the dispute relies on.
+
+  A dispute never alters the finding it names. It is recorded on the submission's own event and
+  delivered, in the next round, to the review task of the reviewer who raised that finding — the
+  raising reviewer re-evaluates the finding against the evidence and either withdraws it (reports
+  it `resolved`) or maintains it (reports it `still_open`). The same finding cannot be disputed a
+  second time, even if the raising reviewer carries it forward under a new id in a later round
+  (`still_open` with `prior_id` linking back to it): this is checked by the finding's identity —
+  the raising reviewer plus its `prior_id` chain — not by the bare `finding_id` string, since
+  reviewers choose ids independently and two reviewers may reuse the same id for unrelated
+  findings.
 
 **Link Types:**
 - `pr`: Pull request reference (e.g., `#123` or `owner/repo#123`)
@@ -870,6 +890,17 @@ it. See docs/features/research-track.md §3 for the full blocking rules.
 - `400 INVALID_FINDINGS`: A findings array is malformed; the message names the first invalid field
 - `400 MISSING_FINDINGS`: findings were omitted (or `null`) on a research-track review task
 - `400 FINDINGS_NOT_ALLOWED`: findings were provided on a non-review-kind task
+- `400 INVALID_DISPUTES`: A disputes array is malformed (not an array, a non-empty-string
+  `finding_id`/`evidence` missing, or a `finding_id` repeated in the same submission)
+- `400 DISPUTES_NOT_ALLOWED`: disputes were provided on a task that is not a research-track
+  implement rework submission
+- `400 NO_PRIOR_ROUND`: disputes were provided on a research-track task's first implement
+  submission, which has no prior review round to dispute a finding from
+- `400 UNKNOWN_FINDING_ID`: a disputed `finding_id` was not raised by any reviewer in the round
+  being reworked
+- `400 AMBIGUOUS_FINDING_ID`: a disputed `finding_id` was raised by more than one reviewer in the
+  round being reworked, so it cannot be resolved to a single reviewer
+- `400 DUPLICATE_DISPUTE`: a disputed `finding_id` was already disputed on an earlier rework round
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `404 NOT_FOUND`: Task not found
 - `409 CONFLICT`: Task is not in_progress or is not assigned to the provided agent_id
