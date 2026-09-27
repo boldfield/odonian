@@ -29,7 +29,8 @@ type ReviewerScorecards struct {
 // spanning superseded task chains without counting the same finding twice.
 func (s *sqliteStore) GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error) {
 	// Query all research track tasks (including review tasks to look up reviewer models)
-	query := `SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+	// Include adjudication columns to distinguish review tasks from adjudication tasks
+	query := `SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by, adjudicate_finding_id, adjudicate_finding_reviewer_model, adjudicate_finding_reviewer_slot
 		FROM task
 		WHERE project_id = ? AND track = 'research'
 		ORDER BY created_at, id`
@@ -41,11 +42,13 @@ func (s *sqliteStore) GetResearchReviewerScorecards(ctx context.Context, project
 	defer rows.Close()
 
 	tasksMap := make(map[string]Task)
-	implementTasks := make(map[string]Task) // only implement/design tasks for processing
+	adjudicationTasks := make(map[string]bool) // track which tasks are adjudication tasks
+	implementTasks := make(map[string]Task)    // only implement/design tasks for processing
 	for rows.Next() {
 		var t Task
 		var reviewModelsJSON *string
-		if err := rows.Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy); err != nil {
+		var adjFindingID, adjFindingReviewerModel, adjFindingReviewerSlot *string
+		if err := rows.Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy, &adjFindingID, &adjFindingReviewerModel, &adjFindingReviewerSlot); err != nil {
 			return ReviewerScorecards{}, fmt.Errorf("failed to scan task: %w", err)
 		}
 		t.ReviewModels = []string{}
@@ -55,6 +58,9 @@ func (s *sqliteStore) GetResearchReviewerScorecards(ctx context.Context, project
 			}
 		}
 		tasksMap[t.ID] = t
+		if adjFindingID != nil {
+			adjudicationTasks[t.ID] = true
+		}
 		// Only add implement/design tasks to be processed
 		if t.Kind == "implement" || t.Kind == "design" {
 			implementTasks[t.ID] = t
@@ -66,13 +72,13 @@ func (s *sqliteStore) GetResearchReviewerScorecards(ctx context.Context, project
 	}
 
 	// Aggregate findings by reviewer model
-	scorecards := aggregateScorecards(ctx, s, tasksMap, implementTasks)
+	scorecards := aggregateScorecards(ctx, s, tasksMap, implementTasks, adjudicationTasks)
 
 	return ReviewerScorecards{Scorecards: scorecards}, nil
 }
 
 // aggregateScorecards aggregates findings by reviewer across research tasks
-func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[string]Task, implementTasks map[string]Task) []ReviewerScorecard {
+func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[string]Task, implementTasks map[string]Task, adjudicationTasks map[string]bool) []ReviewerScorecard {
 	reviewerData := make(map[string]*reviewerAggregator)
 
 	// Build chain roots map: for each task, find the root of its supersede chain
@@ -81,7 +87,9 @@ func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[st
 		chainRoots[taskID] = findChainRoot(taskID, allTasksMap)
 	}
 
-	// Process each task's findings (only implement/design tasks)
+	// First pass: collect all findings and approvals by reviewer
+	blockingFindingsByTask := make(map[string][]blockingFinding) // taskID -> list of blocking findings
+
 	for taskID := range implementTasks {
 		chainRoot := chainRoots[taskID]
 
@@ -96,9 +104,12 @@ func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[st
 				continue
 			}
 
-			// Get the reviewer model from the review task
+			// Get the reviewer model from the review task; skip adjudication tasks
 			reviewTask, ok := allTasksMap[*event.SourceTaskID]
 			if !ok {
+				continue
+			}
+			if adjudicationTasks[*event.SourceTaskID] {
 				continue
 			}
 
@@ -112,14 +123,25 @@ func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[st
 					findingsByStatus: make(map[string]int), // held, withdrawn, unresolved
 					findingMap:       make(map[string]reviewingFinding),
 					tasksReviewed:    make(map[string]bool),
+					approvals:        make([]approvalRecord, 0), // track approvals for later-fixed logic
 				}
 			}
 
 			agg := reviewerData[reviewerModel]
 			agg.tasksReviewed[taskID] = true
 
-			// Count total review rounds (both approve and reject)
+			// Count total review rounds (count any review, approve or reject)
 			agg.totalReviews++
+
+			// Track if this is an approval
+			isApproval := event.Verdict != nil && *event.Verdict == "approve"
+			if isApproval {
+				agg.approvals = append(agg.approvals, approvalRecord{
+					taskID:   taskID,
+					round:    reviewTask.ReviewRound,
+					roundNum: len(agg.tasksReviewed), // approximate round count for this task
+				})
+			}
 
 			// Parse findings
 			var findings []Finding
@@ -131,22 +153,35 @@ func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[st
 
 			// Process each finding
 			for _, finding := range findings {
-				// Use chain root + finding id as key to avoid duplicates across supersede chain
-				key := fmt.Sprintf("%s:%s", chainRoot, finding.ID)
+				// Use chain root + finding id + reviewer model as key for dedup
+				// (same finding raised by same reviewer across rounds)
+				key := fmt.Sprintf("%s:%s:%s", chainRoot, finding.ID, reviewerModel)
+
+				// Track blocking findings for this task
+				if isBlockingFinding(finding) {
+					blockingFindingsByTask[taskID] = append(blockingFindingsByTask[taskID], blockingFinding{
+						findingID:     finding.ID,
+						reviewerModel: reviewerModel,
+						reviewerSlot:  reviewTask.ReviewRound,
+						roundRaised:   reviewTask.ReviewRound,
+						chainRoot:     chainRoot,
+					})
+				}
 
 				if _, exists := agg.findingMap[key]; !exists {
-					// New finding
+					// New finding (counting at first appearance)
 					severity := strings.ToLower(finding.Severity)
 					agg.findingsRaised[severity]++
 				}
 
-				// Update finding status
+				// Update finding status (keep latest status)
 				agg.findingMap[key] = reviewingFinding{
 					id:            finding.ID,
 					chainRoot:     chainRoot,
 					severity:      strings.ToLower(finding.Severity),
 					status:        finding.Status,
 					reviewerModel: reviewerModel,
+					reviewerSlot:  reviewTask.ReviewRound,
 				}
 			}
 
@@ -154,43 +189,71 @@ func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[st
 		}
 	}
 
-	// Check adjudication results to determine final finding status
-	// Query for adjudication tasks and apply their verdicts
-	adjQuery := `SELECT target_task_id, adjudicate_finding_id, verdict
+	// Load and apply adjudication results
+	// Query adjudication tasks scoped to this project
+	adjQuery := `SELECT target_task_id, adjudicate_finding_id, adjudicate_finding_reviewer_model, adjudicate_finding_reviewer_slot, verdict
 		FROM task
-		WHERE kind = 'review' AND adjudicate_finding_id IS NOT NULL AND verdict IS NOT NULL`
+		WHERE project_id = ? AND kind = 'review' AND adjudicate_finding_id IS NOT NULL AND verdict IS NOT NULL`
 
-	adjRows, err := s.readConn.QueryContext(ctx, adjQuery)
+	adjRows, err := s.readConn.QueryContext(ctx, adjQuery, allTasksMap[getAnyTask(implementTasks)].ProjectID)
 	if err == nil {
 		defer adjRows.Close()
 
-		adjResults := make(map[string]string) // "chainRoot:findingId" -> "upheld" or "overturned"
+		adjResults := make(map[string]string) // key -> "upheld" or "overturned"
 		for adjRows.Next() {
-			var targetTaskID, findingID, verdict string
-			if err := adjRows.Scan(&targetTaskID, &findingID, &verdict); err != nil {
+			var targetTaskID, findingID, reviewerModel string
+			var reviewerSlot int
+			var verdict string
+			if err := adjRows.Scan(&targetTaskID, &findingID, &reviewerModel, &reviewerSlot, &verdict); err != nil {
 				continue
 			}
 
 			// Find the chain root for the target task
-			if chainRoot, ok := findChainRootForAdjudication(targetTaskID, allTasksMap); ok {
-				key := fmt.Sprintf("%s:%s", chainRoot, findingID)
-				if verdict == "approve" {
-					adjResults[key] = "overturned"
+			chainRoot := chainRoots[targetTaskID]
+			if chainRoot == "" {
+				// Fall back to looking it up in allTasksMap
+				if _, ok := allTasksMap[targetTaskID]; ok {
+					chainRoot = findChainRoot(targetTaskID, allTasksMap)
+					chainRoots[targetTaskID] = chainRoot
 				} else {
-					adjResults[key] = "upheld"
+					continue
 				}
+			}
+
+			// Use same key format as findingMap: chainRoot:findingID:reviewerModel
+			key := fmt.Sprintf("%s:%s:%s", chainRoot, findingID, reviewerModel)
+			if verdict == "approve" {
+				adjResults[key] = "overturned"
+			} else {
+				adjResults[key] = "upheld"
 			}
 		}
 
-		// Apply adjudication results
-		for model, agg := range reviewerData {
+		// Apply adjudication results to findings
+		for _, agg := range reviewerData {
 			for key, finding := range agg.findingMap {
 				adjResult, hasAdj := adjResults[key]
 				if hasAdj {
 					if adjResult == "overturned" {
 						agg.findingsByStatus["withdrawn"]++
+						agg.findingMap[key] = reviewingFinding{
+							id:            finding.id,
+							chainRoot:     finding.chainRoot,
+							severity:      finding.severity,
+							status:        "withdrawn",
+							reviewerModel: finding.reviewerModel,
+							reviewerSlot:  finding.reviewerSlot,
+						}
 					} else { // upheld
 						agg.findingsByStatus["held"]++
+						agg.findingMap[key] = reviewingFinding{
+							id:            finding.id,
+							chainRoot:     finding.chainRoot,
+							severity:      finding.severity,
+							status:        "upheld",
+							reviewerModel: finding.reviewerModel,
+							reviewerSlot:  finding.reviewerSlot,
+						}
 					}
 				} else if finding.status == "resolved" {
 					agg.findingsByStatus["held"]++
@@ -200,9 +263,12 @@ func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[st
 					agg.findingsByStatus["unresolved"]++
 				}
 			}
-			reviewerData[model] = agg
 		}
 	}
+
+	// Compute approvals with later fixed blocking findings
+	// For each approval, check if another reviewer's blocking finding was later fixed
+	computeApprovalsWithLaterFix(reviewerData, blockingFindingsByTask, chainRoots)
 
 	// Build final scorecards, sorted by model for determinism
 	var scorecards []ReviewerScorecard
@@ -246,6 +312,85 @@ func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[st
 	return scorecards
 }
 
+// Helper function to check if a finding is blocking
+func isBlockingFinding(f Finding) bool {
+	severity := strings.ToUpper(f.Severity)
+	// P1 or P2 in changed text is blocking
+	if (severity == "P1" || severity == "P2") && f.InChangedText {
+		return true
+	}
+	// P1 or P2 in any text during round 1 (status new) is blocking
+	if (severity == "P1" || severity == "P2") && f.Status == "new" {
+		return true
+	}
+	// Still open findings are blocking
+	if f.Status == "still_open" {
+		return true
+	}
+	return false
+}
+
+// Helper to get any task from map for project ID extraction
+func getAnyTask(taskMap map[string]Task) string {
+	for id := range taskMap {
+		return id
+	}
+	return ""
+}
+
+// Compute approvals where another reviewer's blocking finding was later fixed
+func computeApprovalsWithLaterFix(reviewerData map[string]*reviewerAggregator, blockingFindingsByTask map[string][]blockingFinding, chainRoots map[string]string) {
+	// For each reviewer
+	for _, agg := range reviewerData {
+		// Track which tasks we've already counted for this reviewer
+		countedTasks := make(map[string]bool)
+
+		for _, approval := range agg.approvals {
+			// Only count each task once per reviewer
+			if countedTasks[approval.taskID] {
+				continue
+			}
+
+			// Check if there were blocking findings in this task from other reviewers
+			if blockings, ok := blockingFindingsByTask[approval.taskID]; ok {
+				taskHasFixedBlockingFinding := false
+
+				for _, blocking := range blockings {
+					// Skip if from same reviewer model
+					if blocking.reviewerModel == agg.model {
+						continue
+					}
+
+					// Check if this blocking finding was later resolved/fixed
+					// by looking for it in any reviewer's findings marked as held/resolved
+					for _, otherAgg := range reviewerData {
+						for _, finding := range otherAgg.findingMap {
+							if finding.chainRoot == blocking.chainRoot &&
+								finding.id == blocking.findingID &&
+								(finding.status == "held" || finding.status == "upheld" || finding.status == "resolved") {
+								taskHasFixedBlockingFinding = true
+								break
+							}
+						}
+						if taskHasFixedBlockingFinding {
+							break
+						}
+					}
+
+					if taskHasFixedBlockingFinding {
+						break
+					}
+				}
+
+				if taskHasFixedBlockingFinding {
+					agg.approvalsWithLaterFix++
+					countedTasks[approval.taskID] = true
+				}
+			}
+		}
+	}
+}
+
 // findChainRoot finds the root of the supersede chain for a task
 func findChainRoot(taskID string, tasksMap map[string]Task) string {
 	if _, ok := tasksMap[taskID]; !ok {
@@ -283,42 +428,6 @@ func findChainRoot(taskID string, tasksMap map[string]Task) string {
 	}
 }
 
-// findChainRootForAdjudication finds the chain root for an adjudication target task
-func findChainRootForAdjudication(targetTaskID string, tasksMap map[string]Task) (string, bool) {
-	// For adjudication, we need to find the root of the chain that the target task belongs to
-	if _, ok := tasksMap[targetTaskID]; !ok {
-		return "", false
-	}
-
-	// Start from the target task and follow supersede chain
-	current := targetTaskID
-	seen := make(map[string]bool)
-	for {
-		if seen[current] {
-			return current, true
-		}
-		seen[current] = true
-
-		if _, ok := tasksMap[current]; !ok {
-			return current, true
-		}
-
-		// Check if this task supersedes another (look for tasks that have current as SupersededBy)
-		found := false
-		for _, otherTask := range tasksMap {
-			if otherTask.SupersededBy != nil && *otherTask.SupersededBy == current {
-				current = otherTask.ID
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			return current, true
-		}
-	}
-}
-
 // reviewerAggregator accumulates finding data for a single reviewer
 type reviewerAggregator struct {
 	model                 string
@@ -326,6 +435,7 @@ type reviewerAggregator struct {
 	findingsByStatus      map[string]int // held, withdrawn, unresolved -> count
 	findingMap            map[string]reviewingFinding
 	tasksReviewed         map[string]bool
+	approvals             []approvalRecord
 	totalReviews          int
 	approvalsWithLaterFix int
 }
@@ -337,4 +447,21 @@ type reviewingFinding struct {
 	severity      string
 	status        string
 	reviewerModel string
+	reviewerSlot  int
+}
+
+// approvalRecord tracks a reviewer's approval on a task
+type approvalRecord struct {
+	taskID   string
+	round    int
+	roundNum int
+}
+
+// blockingFinding tracks blocking findings for later-fix logic
+type blockingFinding struct {
+	findingID     string
+	reviewerModel string
+	reviewerSlot  int
+	roundRaised   int
+	chainRoot     string
 }

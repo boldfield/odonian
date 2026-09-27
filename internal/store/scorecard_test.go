@@ -177,3 +177,193 @@ func TestGetResearchReviewerScorecards_BuildDesignExcluded(t *testing.T) {
 		t.Errorf("expected 0 scorecards for non-research tasks, got %d", len(scorecards.Scorecards))
 	}
 }
+
+func TestGetResearchReviewerScorecards_MultipleRounds_ResolvedFindings(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	// Round 1: Opus raises a P2 finding
+	opusTask1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil {
+		t.Fatalf("expected opus review task for round 1")
+	}
+	findingsRound1 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", findingsRound1)
+
+	// Resubmit parent to trigger round 2
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Round 2: Opus reviews and marks f1 as resolved
+	opusTask2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusTask2 == nil {
+		t.Fatalf("expected opus review task for round 2")
+	}
+	findingsRound2 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":false,"status":"resolved","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "approve", findingsRound2)
+
+	// Check scorecards
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	if len(scorecards.Scorecards) != 1 {
+		t.Errorf("expected 1 scorecard, got %d", len(scorecards.Scorecards))
+	}
+
+	sc := scorecards.Scorecards[0]
+	if sc.FindingsRaised["p2"] != 1 {
+		t.Errorf("expected 1 P2 raised, got %d", sc.FindingsRaised["p2"])
+	}
+	if sc.FindingsHeld != 1 {
+		t.Errorf("expected 1 held finding, got %d", sc.FindingsHeld)
+	}
+	if sc.FindingsUnresolved != 0 {
+		t.Errorf("expected 0 unresolved findings, got %d", sc.FindingsUnresolved)
+	}
+	if sc.TotalReviewRounds != 2 {
+		t.Errorf("expected 2 total review rounds, got %d", sc.TotalReviewRounds)
+	}
+}
+
+func TestGetResearchReviewerScorecards_ApprovalsWithLaterFixedBlockingFindings(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "sonnet"})
+
+	// Round 1: Opus approves, Sonnet rejects with P2 blocking finding
+	opusTask1, sonnetTask1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil || sonnetTask1 == nil {
+		t.Fatalf("expected both review tasks")
+	}
+	emptyFindings := json.RawMessage(`[]`)
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "approve", emptyFindings)
+	blockingFindings := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, sonnetTask1, "sonnet-reviewer", "reject", blockingFindings)
+
+	// Resubmit parent to trigger round 2
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Round 2: Opus approves again, Sonnet marks f1 as resolved
+	opusTask2, sonnetTask2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusTask2 == nil || sonnetTask2 == nil {
+		t.Fatalf("expected both round 2 review tasks")
+	}
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "approve", emptyFindings)
+	resolvedFindings := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"resolved","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, sonnetTask2, "sonnet-reviewer", "approve", resolvedFindings)
+
+	// Check scorecards
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	sonnetCard := findScorecardByModel(scorecards.Scorecards, "sonnet")
+
+	if opusCard == nil || sonnetCard == nil {
+		t.Fatalf("expected both reviewers in scorecards")
+	}
+
+	// Opus approved while sonnet had a blocking finding that was later fixed
+	if opusCard.ApprovalsWithLaterFixedBlockingFindings != 1 {
+		t.Errorf("expected opus 1 approval with later fixed, got %d", opusCard.ApprovalsWithLaterFixedBlockingFindings)
+	}
+
+	// Sonnet raised a P2 and later resolved it
+	if sonnetCard.FindingsRaised["p2"] != 1 {
+		t.Errorf("expected sonnet 1 P2 raised, got %d", sonnetCard.FindingsRaised["p2"])
+	}
+	if sonnetCard.FindingsHeld != 1 {
+		t.Errorf("expected sonnet 1 held, got %d", sonnetCard.FindingsHeld)
+	}
+}
+
+func findScorecardByModel(scorecards []ReviewerScorecard, model string) *ReviewerScorecard {
+	for i := range scorecards {
+		if scorecards[i].Model == model {
+			return &scorecards[i]
+		}
+	}
+	return nil
+}
+
+func TestGetResearchReviewerScorecards_TwoReviewersSharedFindingID(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "sonnet"})
+
+	// Round 1: Both opus and sonnet raise finding with same ID but different models
+	opusTask1, sonnetTask1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil || sonnetTask1 == nil {
+		t.Fatalf("expected both review tasks")
+	}
+
+	// Both raise f1 with different severities
+	opusFindings := json.RawMessage(`[{"id":"f1","severity":"P1","file":"test.txt","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"}]`)
+	sonnetFindings := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":2,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", opusFindings)
+	submitResearchReview(t, store, ctx, sonnetTask1, "sonnet-reviewer", "reject", sonnetFindings)
+
+	// Check scorecards - each should count their own finding
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	sonnetCard := findScorecardByModel(scorecards.Scorecards, "sonnet")
+
+	if opusCard == nil || sonnetCard == nil {
+		t.Fatalf("expected both reviewers")
+	}
+
+	// Opus should have 1 P1
+	if opusCard.FindingsRaised["p1"] != 1 {
+		t.Errorf("expected opus 1 P1, got %d", opusCard.FindingsRaised["p1"])
+	}
+	if opusCard.FindingsRaised["p2"] != 0 {
+		t.Errorf("expected opus 0 P2, got %d", opusCard.FindingsRaised["p2"])
+	}
+
+	// Sonnet should have 1 P2
+	if sonnetCard.FindingsRaised["p2"] != 1 {
+		t.Errorf("expected sonnet 1 P2, got %d", sonnetCard.FindingsRaised["p2"])
+	}
+	if sonnetCard.FindingsRaised["p1"] != 0 {
+		t.Errorf("expected sonnet 0 P1, got %d", sonnetCard.FindingsRaised["p1"])
+	}
+}
+
+func TestGetResearchReviewerScorecards_DuplicateFindings_SameReviewer(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	// Round 1: Opus raises f1
+	opusTask1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil {
+		t.Fatalf("expected opus review task")
+	}
+	findingsRound1 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", findingsRound1)
+
+	// Resubmit parent
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Round 2: Opus raises f1 again as still_open
+	opusTask2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusTask2 == nil {
+		t.Fatalf("expected opus review task for round 2")
+	}
+	findingsRound2 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"still_open","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "reject", findingsRound2)
+
+	// Check scorecards - should count the finding only once
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+
+	sc := scorecards.Scorecards[0]
+	if sc.FindingsRaised["p2"] != 1 {
+		t.Errorf("expected 1 P2 raised (not doubled), got %d", sc.FindingsRaised["p2"])
+	}
+	if sc.FindingsUnresolved != 1 {
+		t.Errorf("expected 1 unresolved, got %d", sc.FindingsUnresolved)
+	}
+}
