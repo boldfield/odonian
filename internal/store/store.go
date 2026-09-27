@@ -2517,14 +2517,33 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		return allFindings[i].ID < allFindings[j].ID
 	})
 
-	// A finding is no longer outstanding once any reviewer, in any round, reports the
-	// same file/line/summary as resolved: that means the worker's changes fixed the
-	// text the finding was raised against.
+	// Findings are only unique within a task, so prior_id is resolved against the same
+	// reviewer's own earlier findings (finding ids from different review tasks can
+	// collide).
+	identityByReviewerAndFindingID := make(map[string]researchFindingIdentity, len(allFindings))
+	for _, cf := range allFindings {
+		identityByReviewerAndFindingID[cf.reviewerModel+"\x00"+cf.ID] = researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
+	}
+
+	// A finding is no longer outstanding once any reviewer, in any round, reports it
+	// resolved: that means the worker's changes fixed the text the finding was raised
+	// against. Resolution is tracked by prior_id back to the original finding's
+	// identity, not by the resolving report's own file/line/summary, because a
+	// reviewer is not required to repeat the original summary verbatim when marking it
+	// resolved (docs/features/research-track.md section 3 defines prior_id for exactly
+	// this: "the id of the earlier finding").
 	resolved := make(map[researchFindingIdentity]bool)
 	for _, cf := range allFindings {
-		if cf.Status == "resolved" {
-			resolved[researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}] = true
+		if cf.Status != "resolved" {
+			continue
 		}
+		if cf.PriorID != nil {
+			if identity, ok := identityByReviewerAndFindingID[cf.reviewerModel+"\x00"+*cf.PriorID]; ok {
+				resolved[identity] = true
+				continue
+			}
+		}
+		resolved[researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}] = true
 	}
 
 	candidatesByIdentity := make(map[researchFindingIdentity]researchCollectedFinding)
@@ -2601,10 +2620,20 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		)
 
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, track, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, 'backlog', ?, 'implement', ?, 'research', ?, ?)
-		`, followUpID, parentProjectID, parentDocumentID, title, spec, model, parentID, now, now); err != nil {
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, track, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'backlog', ?, 'implement', 'research', ?, ?)
+		`, followUpID, parentProjectID, parentDocumentID, title, spec, model, now, now); err != nil {
 			return nil, fmt.Errorf("failed to create follow-up task: %w", err)
+		}
+
+		// Linked to the parent via a task_link, not task.target_task_id: see the
+		// migration 0016 comment for why target_task_id would corrupt the parent's own
+		// review round tally once the follow-up has review rounds of its own.
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO task_link (id, task_id, kind, value)
+			VALUES (?, ?, 'research_parent', ?)
+		`, GenerateID(), followUpID, parentID); err != nil {
+			return nil, fmt.Errorf("failed to insert parent link: %w", err)
 		}
 
 		if _, err := tx.ExecContext(ctx, `

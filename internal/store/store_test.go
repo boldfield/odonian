@@ -3998,8 +3998,8 @@ func TestResearchAggregation_CircuitBreakerEscalates(t *testing.T) {
 	}
 }
 
-// findResearchFollowUps returns every backlog follow-up task linked (via
-// target_task_id) to the given research parent.
+// findResearchFollowUps returns every backlog follow-up task linked (via a
+// research_parent task_link) to the given research parent.
 func findResearchFollowUps(t *testing.T, store Store, ctx context.Context, projID, parentID string) []Task {
 	t.Helper()
 	allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
@@ -4008,8 +4008,14 @@ func findResearchFollowUps(t *testing.T, store Store, ctx context.Context, projI
 	}
 	var followUps []Task
 	for _, tk := range allTasks {
-		if tk.Kind == "implement" && tk.Track == "research" && tk.TargetTaskID != nil && *tk.TargetTaskID == parentID {
-			followUps = append(followUps, tk)
+		if tk.Kind != "implement" || tk.Track != "research" {
+			continue
+		}
+		for _, v := range taskLinkValues(t, store, ctx, tk.ID, "research_parent") {
+			if v == parentID {
+				followUps = append(followUps, tk)
+				break
+			}
 		}
 	}
 	sort.Slice(followUps, func(i, j int) bool { return followUps[i].Title < followUps[j].Title })
@@ -4074,8 +4080,8 @@ func TestResearchFollowUps_NonBlockingCreatesFollowUp(t *testing.T) {
 	if fu.DocumentID != parent.DocumentID {
 		t.Errorf("expected follow-up document %s, got %s", parent.DocumentID, fu.DocumentID)
 	}
-	if fu.TargetTaskID == nil || *fu.TargetTaskID != parentID {
-		t.Errorf("expected follow-up linked to parent %s via target_task_id, got %v", parentID, fu.TargetTaskID)
+	if got := taskLinkValues(t, store, ctx, fu.ID, "research_parent"); len(got) != 1 || got[0] != parentID {
+		t.Errorf("expected follow-up linked to parent %s via research_parent task_link, got %v", parentID, got)
 	}
 	if !strings.Contains(fu.Spec, "wrong footnote") || !strings.Contains(fu.Spec, "a.md") || !strings.Contains(fu.Spec, "P3") {
 		t.Errorf("expected follow-up spec to carry finding text/file/severity, got %q", fu.Spec)
@@ -4264,7 +4270,7 @@ func TestResearchFollowUps_DedupAcrossRounds(t *testing.T) {
 
 // TestResearchFollowUps_StructuredLinks verifies the data-model requirement in
 // docs/features/research-track.md ("A link from a follow-up task to the parent task
-// and finding it came from"): the follow-up's target_task_id points at the parent,
+// and finding it came from"): a research_parent task_link points at the parent,
 // and a research_finding_source task_link points at the specific review task and
 // finding id it was raised on.
 func TestResearchFollowUps_StructuredLinks(t *testing.T) {
@@ -4280,8 +4286,8 @@ func TestResearchFollowUps_StructuredLinks(t *testing.T) {
 	}
 	fu := followUps[0]
 
-	if fu.TargetTaskID == nil || *fu.TargetTaskID != parentID {
-		t.Fatalf("expected target_task_id to link the follow-up to the parent, got %v", fu.TargetTaskID)
+	if got := taskLinkValues(t, store, ctx, fu.ID, "research_parent"); len(got) != 1 || got[0] != parentID {
+		t.Fatalf("expected research_parent task_link to link the follow-up to the parent, got %v", got)
 	}
 
 	sourceValues := taskLinkValues(t, store, ctx, fu.ID, "research_finding_source")
@@ -4376,11 +4382,11 @@ func TestResearchFollowUps_ParentScopedDedup(t *testing.T) {
 	if followUpsA[0].ID == followUpsB[0].ID {
 		t.Errorf("expected distinct follow-up tasks per parent, got the same task %s for both", followUpsA[0].ID)
 	}
-	if *followUpsA[0].TargetTaskID != parentA {
-		t.Errorf("expected parent A's follow-up to target parent A, got %s", *followUpsA[0].TargetTaskID)
+	if got := taskLinkValues(t, store, ctx, followUpsA[0].ID, "research_parent"); len(got) != 1 || got[0] != parentA {
+		t.Errorf("expected parent A's follow-up to link to parent A, got %v", got)
 	}
-	if *followUpsB[0].TargetTaskID != parentB {
-		t.Errorf("expected parent B's follow-up to target parent B, got %s", *followUpsB[0].TargetTaskID)
+	if got := taskLinkValues(t, store, ctx, followUpsB[0].ID, "research_parent"); len(got) != 1 || got[0] != parentB {
+		t.Errorf("expected parent B's follow-up to link to parent B, got %v", got)
 	}
 }
 
@@ -4595,6 +4601,148 @@ func TestResearchFollowUps_Model(t *testing.T) {
 			t.Errorf("expected follow-up model to fall back to the store default 'haiku', got %q", followUps[0].Model)
 		}
 	})
+}
+
+// findSingleResearchReviewTask locates the single ready review task for the given
+// target task and round. Follow-up tasks don't set review_models, so they get exactly
+// one reviewer (the "opus" default).
+func findSingleResearchReviewTask(t *testing.T, store Store, ctx context.Context, projID, targetID string, round int) *Task {
+	t.Helper()
+	allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	for i := range allTasks {
+		tk := allTasks[i]
+		if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == targetID && tk.ReviewRound == round && tk.State == "ready" {
+			return &allTasks[i]
+		}
+	}
+	t.Fatalf("no ready review task found for target %s round %d", targetID, round)
+	return nil
+}
+
+// TestResearchFollowUps_DoNotPolluteParentReviewTally is a regression test for a bug
+// found in review: a follow-up used to be linked to its parent via task.target_task_id,
+// the same column review and merge tasks use to point at the task they act on. Round
+// tallies (aggregateReviewRound, reconcile) count every task with a matching
+// target_task_id and review_round, without filtering on kind='review'. Since a
+// follow-up is an ordinary implement task that goes through its own review rounds, its
+// review_round eventually collides with a later round of the parent (for example after
+// a human sends an approved parent back to ready and it's resubmitted), and the
+// follow-up's own pending review got counted as one of the parent's reviewers, leaving
+// the parent stuck in review. Follow-ups now link to their parent via a research_parent
+// task_link instead, so this must no longer happen.
+func TestResearchFollowUps_DoNotPolluteParentReviewTally(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "approve",
+		json.RawMessage(`[{"id":"f1","severity":"P3","file":"a.md","line":1,"summary":"typo","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up, got %d", len(followUps))
+	}
+	fu := followUps[0]
+
+	// Advance the follow-up through its own review rounds until its review_round
+	// reaches 2 - the same round number the parent will be resubmitted into below - and
+	// leave its round-2 review pending (not done), so a tally that wrongly picks it up
+	// would see a non-approving review still outstanding.
+	if _, err := store.PromoteTask(ctx, fu.ID); err != nil {
+		t.Fatalf("failed to promote follow-up: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, fu.ID, "agent-2", fu.Model, 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim follow-up: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, fu.ID, "agent-2", "Working on follow-up", nil, []LinkInput{{Kind: "pr", Value: "#200"}}, 8, nil); err != nil {
+		t.Fatalf("failed to submit follow-up round 1: %v", err)
+	}
+	fuReview1 := findSingleResearchReviewTask(t, store, ctx, projID, fu.ID, 1)
+	submitResearchReview(t, store, ctx, fuReview1, "fu-reviewer", "reject",
+		json.RawMessage(`[{"id":"g1","severity":"P1","file":"x.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"}]`))
+
+	fuAfterRound1, err := store.GetTask(ctx, fu.ID)
+	if err != nil {
+		t.Fatalf("failed to get follow-up: %v", err)
+	}
+	if fuAfterRound1.State != "ready" {
+		t.Fatalf("expected follow-up round 1 to fail, got %s", fuAfterRound1.State)
+	}
+	if _, err := store.ClaimTask(ctx, fu.ID, "agent-2", fu.Model, 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim follow-up for round 2: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, fu.ID, "agent-2", "Reworked follow-up", nil, []LinkInput{{Kind: "pr", Value: "#200"}}, 8, nil); err != nil {
+		t.Fatalf("failed to resubmit follow-up into round 2: %v", err)
+	}
+
+	note := "reopen for follow-up"
+	if _, err := store.TransitionTask(ctx, parentID, "ready", &note); err != nil {
+		t.Fatalf("failed to send parent back to ready: %v", err)
+	}
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opus2 == nil || sonnet2 == nil {
+		t.Fatalf("expected 2 round-2 review tasks for the parent")
+	}
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", json.RawMessage(`[]`))
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parentAfter, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parentAfter.State != "approved" {
+		t.Fatalf("expected the parent to reach approved once both its own round-2 reviewers approved (got %s); the follow-up's own pending round-2 review must not be tallied into the parent's round", parentAfter.State)
+	}
+}
+
+// TestResearchFollowUps_ResolvedByPriorIDDespiteRewording is a regression test for a
+// bug found in review: resolution was matched by the resolving report's own
+// file/line/summary, but section 3 defines prior_id as the link back to the earlier
+// finding, and a reviewer isn't required to repeat the original summary verbatim when
+// marking it resolved. A P3 resolved with a reworded summary must not get a stale
+// follow-up.
+func TestResearchFollowUps_ResolvedByPriorIDDespiteRewording(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	round1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong locator","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	round2 := json.RawMessage(`[
+		{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"bad claim, now fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"},
+		{"id":"f2b","severity":"P3","file":"b.md","line":5,"summary":"wrong locator, fixed","in_changed_text":true,"status":"resolved","prior_id":"f2"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	if got := findResearchFollowUps(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Errorf("expected no follow-ups: the P3 was explicitly resolved via prior_id, even though its resolution summary was reworded, got %d", len(got))
+	}
 }
 
 // TestBuildDesignAggregationUnchanged is a regression test: research aggregation
