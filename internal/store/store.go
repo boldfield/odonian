@@ -61,6 +61,7 @@ type Store interface {
 	UnarchiveTask(ctx context.Context, taskID string) (Task, error)
 	ArchiveProject(ctx context.Context, projectID string) (Project, error)
 	UnarchiveProject(ctx context.Context, projectID string) (Project, error)
+	GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error)
 	TombstoneLink(ctx context.Context, taskID, linkID string) error
 }
 

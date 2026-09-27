@@ -8207,3 +8207,166 @@ func TestSubmitDisputeNonOwnerAgentReturns409(t *testing.T) {
 		t.Fatalf("expected status 409, got %d; body: %s", code, body)
 	}
 }
+
+// --- Research reviewer scorecard tests (docs/features/research-track.md section 8) ---
+
+// TestGetResearchReviewerScorecards verifies the reviewer scorecard endpoint for research tasks.
+func TestGetResearchReviewerScorecards(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create research task
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims",
+			DocumentID:   docID,
+			Model:        "opus",
+			ReviewModels: []string{"sonnet"},
+			Track:        "research",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	taskReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	taskReq.Header.Set("Authorization", authHeader)
+	taskReq.Header.Set("Content-Type", "application/json")
+	taskW := httptest.NewRecorder()
+	server.mux.ServeHTTP(taskW, taskReq)
+	var tasks []store.Task
+	json.NewDecoder(taskW.Body).Decode(&tasks)
+	parentTaskID := tasks[0].ID
+
+	// Promote and claim
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+parentTaskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	apiClaimTask(t, server, authHeader, parentTaskID, "agent-1", "opus")
+
+	// Submit implement task
+	submitPayload := map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Implemented",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+	}
+	code, respBody := apiSubmit(t, server, authHeader, parentTaskID, submitPayload)
+	if code != http.StatusOK {
+		t.Fatalf("failed to submit: got status %d; body: %s", code, respBody)
+	}
+
+	// Get review tasks
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+	var allTasks []store.Task
+	json.NewDecoder(listW.Body).Decode(&allTasks)
+
+	var reviewTaskID string
+	for _, task := range allTasks {
+		if task.Kind != "review" || task.TargetTaskID == nil || *task.TargetTaskID != parentTaskID {
+			continue
+		}
+		reviewTaskID = task.ID
+		break
+	}
+	if reviewTaskID == "" {
+		t.Fatalf("expected review task to be spawned")
+	}
+
+	// Claim review task and submit with findings
+	apiClaimTask(t, server, authHeader, reviewTaskID, "sonnet-reviewer", "sonnet")
+	code, respBody = apiSubmit(t, server, authHeader, reviewTaskID, map[string]interface{}{
+		"agent_id": "sonnet-reviewer",
+		"result":   "review notes",
+		"verdict":  "reject",
+		"findings": []map[string]interface{}{
+			{
+				"id": "f1", "severity": "P1", "file": "a.md", "line": 1,
+				"summary": "Bad claim", "in_changed_text": true, "status": "new",
+			},
+			{
+				"id": "f2", "severity": "P2", "file": "b.md", "line": 2,
+				"summary": "Missing info", "in_changed_text": true, "status": "new",
+			},
+		},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("failed to submit review: got status %d; body: %s", code, respBody)
+	}
+
+	// Get reviewer scorecards
+	scorecardsReq := httptest.NewRequest("GET", "/projects/"+projectID+"/research/reviewers", nil)
+	scorecardsReq.Header.Set("Authorization", authHeader)
+	scorecardsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(scorecardsW, scorecardsReq)
+
+	if scorecardsW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", scorecardsW.Code)
+	}
+
+	var scorecards store.ReviewerScorecards
+	if err := json.NewDecoder(scorecardsW.Body).Decode(&scorecards); err != nil {
+		t.Fatalf("failed to decode scorecards: %v", err)
+	}
+
+	// Verify scorecard structure
+	if len(scorecards.Scorecards) == 0 {
+		t.Fatalf("expected at least 1 scorecard, got 0")
+	}
+
+	sc := scorecards.Scorecards[0]
+	if sc.Model != "sonnet" {
+		t.Errorf("expected model 'sonnet', got %q", sc.Model)
+	}
+
+	// Verify the reviewer reviewed at least one task
+	if sc.SampleSize != 1 {
+		t.Errorf("expected sample size 1, got %d", sc.SampleSize)
+	}
+
+	// Verify FindingsRaised map is present and initialized
+	if sc.FindingsRaised == nil {
+		t.Errorf("expected FindingsRaised map to be initialized, got nil")
+	}
+	if _, ok := sc.FindingsRaised["p1"]; !ok {
+		t.Errorf("expected FindingsRaised map to have p1 key")
+	}
+}
+
+// TestGetResearchReviewerScorecards_NoResearchTasks verifies empty response for projects with no research tasks.
+func TestGetResearchReviewerScorecards_NoResearchTasks(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create project
+	projPayload := map[string]interface{}{"name": "test-project", "repo": "https://github.com/example/test-repo"}
+	projBody, _ := json.Marshal(projPayload)
+	projReq := httptest.NewRequest("POST", "/projects", bytes.NewReader(projBody))
+	projReq.Header.Set("Authorization", authHeader)
+	projReq.Header.Set("Content-Type", "application/json")
+	projW := httptest.NewRecorder()
+	server.mux.ServeHTTP(projW, projReq)
+	var proj store.Project
+	json.NewDecoder(projW.Body).Decode(&proj)
+
+	// Get scorecards for empty project
+	scorecardsReq := httptest.NewRequest("GET", "/projects/"+proj.ID+"/research/reviewers", nil)
+	scorecardsReq.Header.Set("Authorization", authHeader)
+	scorecardsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(scorecardsW, scorecardsReq)
+
+	if scorecardsW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", scorecardsW.Code)
+	}
+
+	var scorecards store.ReviewerScorecards
+	json.NewDecoder(scorecardsW.Body).Decode(&scorecards)
+
+	if len(scorecards.Scorecards) != 0 {
+		t.Fatalf("expected 0 scorecards, got %d", len(scorecards.Scorecards))
+	}
+}
