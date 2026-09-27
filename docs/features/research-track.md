@@ -202,3 +202,13 @@ Dispute submission, adjudication tasks and binding rulings from section 5. The r
 ### Milestone 4: scorecards and sizing
 
 The scorecard endpoint and TUI view from section 8, and sizing guidance in the `odonian-breakdown` skill.
+
+- **M4.1. Scorecard data model.** Store reviewer scorecards: findings raised by severity, findings that held up (fixed or upheld on adjudication), findings withdrawn or overturned, rounds approved where another reviewer's blocking finding was later fixed. Migrations and schema.
+- **M4.2. Scorecard API endpoint.** Read-only endpoint to fetch a reviewer model's scorecard for a project or across all projects. Returns aggregates by severity and status.
+- **M4.3. Scorecard TUI view.** Display reviewer scorecards in the TUI, sortable by metric and model.
+- **M4.4. Research task sizing guidelines in odonian-breakdown.** Guidance in `skills/odonian-breakdown/SKILL.md` on breaking research tasks into Haiku-sized claims. Cap of six independently checkable claim rows per task, with rationale tied to the 13-round correction task that exceeded this cap.
+- **M4.5. Primary source diversity rule.** Sizing guidance for selecting at most four distinct primary sources per research task. When a task requires more sources, split it by source domain.
+- **M4.6. Case study and complexity rule.** One case study or complex opinion/record per task when domain knowledge, precedent, or conflicting sources must be weighed. Guidance on when to split such tasks from fact-verification.
+- **M4.7. Cross-file mapping decomposition.** When a research task maps items across files, split by the domain or system the items originate in, not by file. Example: inventory task split by subsystem, not by which directory each item is found in.
+- **M4.8. Decomposition after budget block.** Guidance on decomposing a research task when it reaches its round budget without passing, with examples of how to break a blocked task into smaller, independent claims suitable for separate research tasks.
+- **M4.9. Sizing examples and anti-patterns.** Concrete examples of appropriately-sized research tasks (e.g., one function's API documentation, one subsystem's deprecation status, a single vendor's security advisory), and patterns to avoid (e.g., "audit all dependencies in the project", "verify all third-party claims in the codebase").

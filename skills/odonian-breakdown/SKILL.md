@@ -116,6 +116,48 @@ Non-negotiable decomposition rules:
   permanently unclaimable, and the server rejects only self-deps, not cycles — so catch them here.
 - Keep each spec to one change; prefer a `file:line` pattern-pointer over prose where it says more.
 
+### Sizing research tasks
+
+Research tasks verify factual claims against primary sources. Unlike build tasks, they are sized by
+claim count and source diversity, not by code volume. Apply these rules when decomposing a research
+design into tasks:
+
+- **Claim row limit: six independently checkable rows maximum.** Each row is one verifiable claim
+  (e.g., "function X was added in version Y", "vendor Z's CVE-2024-1234 affects this library").
+  Cap at six rows per task. This default responds to a documented 13-row task that took 13 review
+  rounds with recurring P1/P2 findings. At six rows, a task is reviewable in one or two rounds.
+  If a design requires more than six claims, split it into separate tasks, each with its own scope
+  and acceptance criteria.
+
+- **Primary sources: four distinct sources maximum.** A research task should cite at most four
+  distinct primary sources (e.g., an RFC, a GitHub issue, a vendor advisory, a Wikipedia article).
+  More sources mean reviewers must retrieve and cross-check more evidence, which compounds review
+  difficulty. When a design requires many sources, group them by domain (see next rule) and create
+  one task per domain.
+
+- **Complex opinions or records: one case per task.** If a claim requires weighing conflicting
+  evidence, prior precedent, or domain expertise (e.g., "interpret this vendor's security stance
+  over time" or "evaluate the architectural trade-off here"), include only one such complex case
+  per task. Pair it with simpler, direct-lookup claims to keep the task's total complexity bounded.
+  If a design has multiple complex cases, make them separate tasks.
+
+- **Cross-file mappings: split by item domain, not by file.** When mapping items across files
+  (e.g., "list all deprecated APIs in the codebase" or "inventory all subsystems that import X"),
+  decompose by the *origin domain* of the items, not by their file locations. For example, if a
+  task is "audit security advisories in go.mod and package.json", split it into one research task
+  for Go ecosystem advisories and one for JavaScript ecosystem advisories — not "audit go.mod" and
+  "audit package.json". This keeps related items together and makes findings reusable.
+
+- **After budget block: decompose for independent verification.** When a research task reaches its
+  round budget without passing (marked `blocked` with reason `decompose`), the owner decomposes it
+  into smaller tasks before resubmitting any of them. Decompose by claim independence: if you can
+  verify claims A and B separately and both are correct, they are independent. Group independent
+  claims into new tasks such that each is reviewable in two rounds. This is not a retry of the same
+  task; it is a redesign into tasks that reviewers can pass. If individual claims from the blocked
+  task are correct but the task as a whole failed, new tasks for the passing claims can be marked
+  as dependencies of a reworked task that addresses only the failing claims, allowing partial
+  progress to land.
+
 ## Phase 5 — Register + hand off
 
 Using `scripts/odonian.sh`:
