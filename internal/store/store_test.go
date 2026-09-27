@@ -17037,6 +17037,58 @@ func TestResearchAdjudication_AdjudicatorSameAsReviewer(t *testing.T) {
 	}
 }
 
+// TestResearchAdjudication_AdjudicatorSameAsDefaultReviewer verifies that the
+// adjudicator-differs-from-reviewers check (decision 2) also catches a conflict when
+// the task has no explicit ReviewModels: SubmitTask defaults an empty review_models to
+// ["opus"] when spawning the round's review tasks, so the adjudicator check must apply
+// that same default rather than comparing against an empty list, which would pass
+// vacuously and let the raising reviewer adjudicate its own maintained finding.
+func TestResearchAdjudication_AdjudicatorSameAsDefaultReviewer(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, nil, "opus")
+
+	opus, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil {
+		t.Fatalf("expected a default opus review task in round 1")
+	}
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusR2 == nil {
+		t.Fatalf("expected a default opus review task in round 2")
+	}
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 decided immediately (adjudicator equals the default reviewer), got %s", parent.State)
+	}
+	if got := findAdjudicationTasks(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Errorf("expected no adjudication task spawned when the adjudicator equals the default reviewer, got %d", len(got))
+	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var found bool
+	for _, e := range events {
+		if e.Kind == "research_adjudication_unavailable" && e.Note != nil && strings.Contains(*e.Note, "one of this task's reviewers") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an explicit research_adjudication_unavailable event citing the reviewer conflict, got events: %+v", events)
+	}
+}
+
 // TestResearchAdjudication_OverturnPersistsAcrossLaterCarriedForwardRounds verifies
 // that once an adjudicator overturns a maintained disputed finding, the ruling stays
 // binding for that finding's chain no matter how many further rounds the same

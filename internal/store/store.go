@@ -2342,10 +2342,7 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			isNoOp := noOpMarker != "" && prLink == ""
 
 			// Determine reviewers (default to ["opus"] if empty)
-			reviewers := t.ReviewModels
-			if len(reviewers) == 0 {
-				reviewers = []string{"opus"}
-			}
+			reviewers := defaultReviewModels(t.ReviewModels)
 
 			// Create a review task for each reviewer
 			reviewerSlotsTaken := make(map[string]int)
@@ -2847,6 +2844,17 @@ func (s *sqliteStore) applyResearchAdjudication(ctx context.Context, tx *sql.Tx,
 	}
 
 	return excluded, pending, nil
+}
+
+// defaultReviewModels returns models, or ["opus"] when it is empty: the fallback
+// SubmitTask applies when spawning a task's review tasks. Every later decision about
+// who reviewed a round (e.g. the adjudicator-conflict check) must apply the same
+// default, or an empty stored review_models makes that check pass vacuously.
+func defaultReviewModels(models []string) []string {
+	if len(models) == 0 {
+		return []string{"opus"}
+	}
+	return models
 }
 
 // researchAdjudicatorUnavailableReason reports why docs/features/research-track.md
@@ -3739,6 +3747,11 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			return "", fmt.Errorf("failed to unmarshal parent review_models: %w", err)
 		}
 	}
+	// Same default SubmitTask applied when it spawned this round's review tasks
+	// (see defaultReviewModels): an empty review_models column means the round's
+	// actual reviewer was "opus", not "no reviewers", so the adjudicator-conflict
+	// check below must compare against the same default or it passes vacuously.
+	parentReviewModels = defaultReviewModels(parentReviewModels)
 
 	// If parent is held, skip auto-transition (hold is an operator lock that overrides auto-flow)
 	if parentHeld {
