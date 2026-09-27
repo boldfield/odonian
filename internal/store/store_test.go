@@ -15525,24 +15525,37 @@ func TestResearchSupersessionDependencyPreservation(t *testing.T) {
 	store, ctx, projID, taskA := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
 
 	taskAObj, _ := store.GetTask(ctx, taskA)
-	depTasks, err := store.CreateTasks(ctx, projID, []TaskInput{
+	extraTasks, err := store.CreateTasks(ctx, projID, []TaskInput{
 		{
 			Title:      "dependent task",
 			Spec:       "test",
 			DocumentID: taskAObj.DocumentID,
 			Track:      "build",
 		},
+		{
+			Title:      "upstream task",
+			Spec:       "test",
+			DocumentID: taskAObj.DocumentID,
+			Track:      "build",
+		},
 	})
-	if err != nil || len(depTasks) == 0 {
-		t.Fatalf("failed to create dependent task: %v", err)
+	if err != nil || len(extraTasks) != 2 {
+		t.Fatalf("failed to create dependency fixture tasks: %v", err)
 	}
-	depTaskID := depTasks[0].ID
+	depTaskID := extraTasks[0].ID
+	upstreamTaskID := extraTasks[1].ID
 
 	conn := store.(*sqliteStore).conn
 	if _, err := conn.Exec(`
 		INSERT INTO task_dep (task_id, depends_on_id) VALUES (?, ?)
 	`, depTaskID, taskA); err != nil {
 		t.Fatalf("failed to add dependency: %v", err)
+	}
+	// taskA's own upstream dependency: must still be depended on by taskA's replacement.
+	if _, err := conn.Exec(`
+		INSERT INTO task_dep (task_id, depends_on_id) VALUES (?, ?)
+	`, taskA, upstreamTaskID); err != nil {
+		t.Fatalf("failed to add upstream dependency: %v", err)
 	}
 
 	var dep string
@@ -15567,11 +15580,57 @@ func TestResearchSupersessionDependencyPreservation(t *testing.T) {
 		t.Errorf("expected dependency re-pointed to %s, got %v or %v", taskB.ID, dep, err)
 	}
 
+	var upstreamDep string
+	err = conn.QueryRow(`SELECT depends_on_id FROM task_dep WHERE task_id = ?`, taskB.ID).Scan(&upstreamDep)
+	if err != nil || upstreamDep != upstreamTaskID {
+		t.Errorf("expected replacement to keep upstream dependency on %s, got %v or %v", upstreamTaskID, upstreamDep, err)
+	}
+
 	oldTask, _ := store.GetTask(ctx, taskA)
 	if oldTask.State != "superseded" {
 		t.Errorf("old task should be superseded, got %s", oldTask.State)
 	}
 	if oldTask.SupersededBy == nil || *oldTask.SupersededBy != taskB.ID {
 		t.Errorf("old task should reference new task")
+	}
+}
+
+// TestResearchSupersessionCarriesUnreviewedFindings verifies that a research
+// replacement which is itself superseded before ever reaching a review round of its
+// own does not silently drop the unresolved findings it was carrying forward from its
+// predecessor. A gets a P1 reject with f1 and is superseded to B (B's spec carries
+// f1). B is then superseded to C immediately, with no review round on B. C's spec
+// must still carry f1, not just the bare history section.
+func TestResearchSupersessionCarriesUnreviewedFindings(t *testing.T) {
+	store, ctx, projID, taskA := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
+
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskA, 1)
+	if opus1 == nil {
+		t.Fatalf("round 1: expected review task")
+	}
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("first supersession failed: %v", err)
+	}
+	if !strings.Contains(taskB.Spec, `"id":"f1"`) {
+		t.Fatalf("B's spec should carry forward unresolved finding f1, got: %s", taskB.Spec)
+	}
+
+	// B is superseded again without ever getting a review round of its own.
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("second supersession failed: %v", err)
+	}
+
+	if !strings.Contains(taskC.Spec, `"id":"f1"`) {
+		t.Errorf("C's spec should still carry unreviewed-forward finding f1, got: %s", taskC.Spec)
+	}
+	if !strings.Contains(taskC.Spec, "Unresolved findings from last review round") {
+		t.Errorf("C's spec should contain the unresolved findings section, got: %s", taskC.Spec)
 	}
 }
