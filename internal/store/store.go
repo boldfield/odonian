@@ -2823,38 +2823,53 @@ func (s *sqliteStore) countTaskRejectedRounds(ctx context.Context, tx *sql.Tx, t
 	return count, nil
 }
 
-func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.Tx, taskID string) (int, error) {
-	// Collect the chain in reverse (from current back to root), then count in forward order
-	chain := []string{taskID}
-	current := taskID
-	seen := make(map[string]bool)
-	seen[current] = true
+func (s *sqliteStore) getSupersededChain(ctx context.Context, tx *sql.Tx, taskID string) ([]string, error) {
+	// Walk backward from current task to root, finding all predecessors via superseded_by.
+	// Each predecessor P has superseded_by pointing to its successor.
+	// Start from current task and find who points to it with superseded_by, then recurse.
+	var chain []string
+	var toVisit []string
+	toVisit = append(toVisit, taskID)
+	visited := make(map[string]bool)
 
-	for {
-		var supersededBy sql.NullString
+	for len(toVisit) > 0 {
+		current := toVisit[len(toVisit)-1]
+		toVisit = toVisit[:len(toVisit)-1]
+
+		if visited[current] {
+			continue
+		}
+		visited[current] = true
+		chain = append(chain, current)
+
+		// Find the immediate predecessor: the task with superseded_by = current
+		var predecessorID sql.NullString
 		err := tx.QueryRowContext(ctx, `
-			SELECT superseded_by FROM task WHERE id = ?
-		`, current).Scan(&supersededBy)
+			SELECT id FROM task WHERE superseded_by = ?
+		`, current).Scan(&predecessorID)
 		if err != nil {
 			if err == sql.ErrNoRows {
-				break
+				continue
 			}
-			return 0, fmt.Errorf("failed to fetch superseded_by: %w", err)
+			return nil, fmt.Errorf("failed to fetch predecessor: %w", err)
 		}
-		if !supersededBy.Valid {
-			break
+		if predecessorID.Valid {
+			toVisit = append(toVisit, predecessorID.String)
 		}
-		if seen[supersededBy.String] {
-			break
-		}
-		current = supersededBy.String
-		chain = append(chain, current)
-		seen[current] = true
 	}
 
 	// Reverse chain to go from root to current task
 	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
 		chain[i], chain[j] = chain[j], chain[i]
+	}
+
+	return chain, nil
+}
+
+func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.Tx, taskID string) (int, error) {
+	chain, err := s.getSupersededChain(ctx, tx, taskID)
+	if err != nil {
+		return 0, err
 	}
 
 	// Count rejected rounds for each task in the chain, only for research tasks
@@ -2887,40 +2902,12 @@ func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.
 // from each round, returning them grouped by chain-wide round number for display in the budget block event.
 // Rounds are numbered 1, 2, 3, ... starting from the root of the chain (oldest predecessor).
 func (s *sqliteStore) collectChainBlockingFindings(ctx context.Context, tx *sql.Tx, taskID string) (map[int][]Finding, error) {
+	chain, err := s.getSupersededChain(ctx, tx, taskID)
+	if err != nil {
+		return nil, err
+	}
+
 	findings := make(map[int][]Finding)
-
-	// Collect the chain in reverse (from current back to root), then process in forward order
-	chain := []string{taskID}
-	current := taskID
-	seen := make(map[string]bool)
-	seen[current] = true
-
-	for {
-		var supersededBy sql.NullString
-		err := tx.QueryRowContext(ctx, `
-			SELECT superseded_by FROM task WHERE id = ?
-		`, current).Scan(&supersededBy)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				break
-			}
-			return nil, fmt.Errorf("failed to fetch superseded_by: %w", err)
-		}
-		if !supersededBy.Valid {
-			break
-		}
-		if seen[supersededBy.String] {
-			break
-		}
-		current = supersededBy.String
-		chain = append(chain, current)
-		seen[current] = true
-	}
-
-	// Reverse chain to go from root to current task
-	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
-		chain[i], chain[j] = chain[j], chain[i]
-	}
 
 	// Process each task in chain order, numbering rounds chain-wide
 	chainWideRound := 1

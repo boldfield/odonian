@@ -14332,3 +14332,348 @@ func TestResearchBudget_BlockedReasonIncludesDecompose(t *testing.T) {
 		t.Errorf("block event note should include finding summary, got: %s", *blockEvent.Note)
 	}
 }
+
+// TestResearchBudget_MultipleSupersessions verifies that rejected rounds across
+// the entire supersede chain count toward the budget, and the budget persists
+// across both automatic escalation and manual supersession.
+func TestResearchBudget_MultipleSupersessions(t *testing.T) {
+	// Set up with escalation ladder and thresholds
+	// haiku=2 means escalate after 2 rejections, sonnet=4 means escalate after 4
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithResearchEscalationLadder([]string{"haiku", "sonnet", "opus"}))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	escalate := true
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims in the doc",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+			Escalate:     &escalate,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	// Promote, claim, and submit the initial task to spawn round 1 review tasks
+	if _, err = store.PromoteTask(ctx, parentID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Use research escalation thresholds: haiku=1 (escalate when round > 1, i.e., at round 2)
+	// sonnet is not in the map, so it will use the default (8 rounds before escalating to opus)
+	researchEscalationThresholds := map[string]int{"haiku": 1}
+	// Budget is 3: after 3 rejected rounds, block
+	researchRoundBudget := 3
+
+	if _, err = store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, researchRoundBudget); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Submit rejections until haiku escalates (round 2: 2 > 1, so escalate)
+	for round := 1; round <= 2; round++ {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, round)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("round %d: expected both review tasks", round)
+		}
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+		submitResearchReviewWithThresholds(t, store, ctx, opus, "opus-reviewer", "reject", blocking, 8, nil, researchEscalationThresholds, researchRoundBudget)
+		submitResearchReviewWithThresholds(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`), 8, nil, researchEscalationThresholds, researchRoundBudget)
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent (round %d): %v", round, err)
+		}
+
+		// After round 2, haiku should escalate to sonnet due to threshold
+		if round == 2 {
+			// Escalation causes the old task to become "superseded"
+			if parent.State != "superseded" {
+				t.Errorf("round %d: expected superseded after escalation, got %s", round, parent.State)
+			}
+			// Find the new sonnet task via SupersededBy
+			if parent.SupersededBy == nil {
+				t.Fatalf("expected SupersededBy to be set after escalation")
+			}
+			parentID = *parent.SupersededBy
+			continue
+		}
+
+		if parent.State != "ready" {
+			t.Errorf("round %d: expected ready (before budget), got %s", round, parent.State)
+		}
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+	}
+
+	// Now on the sonnet task, claim and submit it to spawn review tasks
+	// Then submit 1 more rejection to reach budget of 3 (2 from haiku + 1 from sonnet = 3)
+	if _, err := store.ClaimTask(ctx, parentID, "agent-1", "sonnet", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim sonnet task: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, researchRoundBudget); err != nil {
+		t.Fatalf("failed to submit sonnet task: %v", err)
+	}
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, 1)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("expected both review tasks on sonnet task")
+	}
+	blocking := json.RawMessage(`[{"id":"f2","severity":"P1","file":"b.md","line":2,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+	submitResearchReviewWithThresholds(t, store, ctx, opus, "opus-reviewer", "reject", blocking, 8, nil, researchEscalationThresholds, researchRoundBudget)
+	submitResearchReviewWithThresholds(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`), 8, nil, researchEscalationThresholds, researchRoundBudget)
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent after sonnet round 1: %v", err)
+	}
+
+	// At sonnet round 1, chain count is 3 (2 haiku + 1 sonnet), should block
+	if parent.State != "blocked" {
+		t.Errorf("expected blocked (chain count 3 >= budget 3), got %s", parent.State)
+	}
+	// Verify it's a budget block
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	found := false
+	for i := range events {
+		if events[i].Kind == "transition" && events[i].Note != nil &&
+			strings.Contains(*events[i].Note, "Chain-wide budget exhausted") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected budget block event")
+	}
+}
+
+// TestResearchBudget_EscalationOnlyIfBudgetRemains verifies that when a rejection
+// would trigger escalation, but the chain count reaches the budget, the task blocks
+// instead of escalating.
+func TestResearchBudget_EscalationOnlyIfBudgetRemains(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithResearchEscalationLadder([]string{"haiku", "sonnet", "opus"}))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	escalate := true
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims in the doc",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+			Escalate:     &escalate,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	// Promote, claim, and submit the initial task to spawn round 1 review tasks
+	if _, err = store.PromoteTask(ctx, parentID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Budget: 2
+	// Escalation threshold: haiku=1, so escalates when round > 1 (at round 2)
+	// When we submit the 2nd rejection, it would escalate but chain count reaches 2 = budget -> block instead of escalate
+	researchEscalationThresholds := map[string]int{"haiku": 1}
+	researchRoundBudget := 2
+
+	if _, err = store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, researchRoundBudget); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Submit rejections and verify escalation happens at the boundary
+	for round := 1; round <= 2; round++ {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, round)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("round %d: expected both review tasks", round)
+		}
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+		submitResearchReviewWithThresholds(t, store, ctx, opus, "opus-reviewer", "reject", blocking, 8, nil, researchEscalationThresholds, researchRoundBudget)
+		submitResearchReviewWithThresholds(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`), 8, nil, researchEscalationThresholds, researchRoundBudget)
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent (round %d): %v", round, err)
+		}
+
+		if round == 2 {
+			// At round 2, chain count is 2, which equals budget, so should block instead of escalate
+			if parent.State != "blocked" {
+				t.Errorf("round %d: expected blocked (chain count 2 >= budget 2), got %s", round, parent.State)
+			}
+			// Verify it's a budget block
+			events, err := store.ListEvents(ctx, parentID)
+			if err != nil {
+				t.Fatalf("failed to list events: %v", err)
+			}
+			found := false
+			for i := range events {
+				if events[i].Kind == "transition" && events[i].Note != nil &&
+					strings.Contains(*events[i].Note, "Chain-wide budget exhausted") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected budget block event")
+			}
+			return
+		}
+
+		if parent.State != "ready" {
+			t.Errorf("round %d: expected ready, got %s", round, parent.State)
+		}
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+	}
+}
+
+// TestResearchBudget_BuildDesignUnchanged verifies that build and design tasks
+// are unaffected by research budget feature (they use circuit breaker, not budget).
+func TestResearchBudget_BuildDesignUnchanged(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create build task with research budget set low (2)
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Build feature",
+			Spec:         "Build the feature",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			Track:        "build",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	buildTaskID := tasks[0].ID
+
+	// Promote, claim, and submit the task to spawn round 1 review tasks
+	if _, err = store.PromoteTask(ctx, buildTaskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, buildTaskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err = store.SubmitTask(ctx, buildTaskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, 2); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Submit rejections to exceed budget of 2
+	for round := 1; round <= 3; round++ {
+		_, err := store.GetTask(ctx, buildTaskID)
+		if err != nil {
+			t.Fatalf("failed to get task: %v", err)
+		}
+
+		// Find review task
+		allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+		var reviewTask *Task
+		for i := range allTasks {
+			tk := allTasks[i]
+			if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == buildTaskID && tk.State == "ready" && tk.ReviewRound == round {
+				reviewTask = &tk
+				break
+			}
+		}
+		if reviewTask == nil {
+			t.Fatalf("round %d: expected review task", round)
+		}
+
+		// Reject with findings
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+		submitResearchReviewWithThresholds(t, store, ctx, reviewTask, "opus-reviewer", "reject", blocking, 8, nil, nil, 2)
+
+		parent, err := store.GetTask(ctx, buildTaskID)
+		if err != nil {
+			t.Fatalf("failed to get parent (round %d): %v", round, err)
+		}
+
+		if round <= 2 {
+			// Below circuit breaker threshold (8 rounds), should be ready
+			if parent.State != "ready" {
+				t.Errorf("round %d: expected ready (build circuit breaker), got %s", round, parent.State)
+			}
+			// Resubmit
+			if _, err := store.ClaimTask(ctx, buildTaskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+				t.Fatalf("failed to claim parent for resubmit: %v", err)
+			}
+			if _, err := store.SubmitTask(ctx, buildTaskID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, 2); err != nil {
+				t.Fatalf("failed to resubmit parent: %v", err)
+			}
+		}
+	}
+
+	// After round 3, build task should still respect circuit breaker (not budget)
+	parent, err := store.GetTask(ctx, buildTaskID)
+	if err != nil {
+		t.Fatalf("failed to get final parent state: %v", err)
+	}
+	// Build uses circuit breaker (8 rounds), not budget, so at round 3 it should be ready
+	if parent.State != "ready" {
+		t.Errorf("expected ready (build circuit breaker applies, not budget), got %s", parent.State)
+	}
+}
