@@ -8370,3 +8370,20 @@ func TestGetResearchReviewerScorecards_NoResearchTasks(t *testing.T) {
 		t.Fatalf("expected 0 scorecards, got %d", len(scorecards.Scorecards))
 	}
 }
+
+// TestGetResearchReviewerScorecardsRequiresAuth verifies the reviewer scorecards
+// endpoint is read-only auth-protected: no Authorization header must be rejected with
+// 401, exactly like every other protected route (docs/features/research-track.md
+// section 8, "This goes through a read-only API endpoint").
+func TestGetResearchReviewerScorecardsRequiresAuth(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+
+	scorecardsReq := httptest.NewRequest("GET", "/projects/some-id/research/reviewers", nil)
+	// No Authorization header.
+	scorecardsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(scorecardsW, scorecardsReq)
+
+	if scorecardsW.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", scorecardsW.Code)
+	}
+}

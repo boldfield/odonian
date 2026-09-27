@@ -2,19 +2,20 @@ package store
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
 )
 
-// ReviewerScorecard aggregates findings by reviewer model for research tasks.
+// ReviewerScorecard aggregates one reviewer model's findings across every research
+// task in a project, per docs/features/research-track.md section 8.
 type ReviewerScorecard struct {
 	Model                                   string         `json:"model"`
 	FindingsRaised                          map[string]int `json:"findings_raised"`     // by severity (p1, p2, p3)
-	FindingsHeld                            int            `json:"findings_held"`       // fixed or upheld on adjudication
-	FindingsWithdrawn                       int            `json:"findings_withdrawn"`  // withdrawn or overturned
-	FindingsUnresolved                      int            `json:"findings_unresolved"` // still open
+	FindingsHeld                            int            `json:"findings_held"`       // fixed by the worker, or upheld on adjudication
+	FindingsWithdrawn                       int            `json:"findings_withdrawn"`  // withdrawn, or overturned on adjudication
+	FindingsUnresolved                      int            `json:"findings_unresolved"` // neither held nor withdrawn yet; accuracy is never inferred for these
 	ApprovalsWithLaterFixedBlockingFindings int            `json:"approvals_with_later_fixed_blocking_findings"`
 	TotalReviewRounds                       int            `json:"total_review_rounds"`
 	SampleSize                              int            `json:"sample_size"` // number of distinct tasks reviewed
@@ -25,536 +26,472 @@ type ReviewerScorecards struct {
 	Scorecards []ReviewerScorecard `json:"reviewer_scorecards"`
 }
 
-// GetResearchReviewerScorecards aggregates reviewer findings across all research tasks in a project,
-// spanning superseded task chains without counting the same finding twice.
+// GetResearchReviewerScorecards aggregates reviewer findings across every research
+// task in projectID, spanning each task's supersede chain per section 8 without
+// counting a finding carried across a supersession twice. See processChain for how a
+// finding's identity is tracked within and across a chain, and applyAdjudications for
+// how a disputed finding's ruling (section 5) overrides its natural classification.
 func (s *sqliteStore) GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error) {
-	// Query all research track tasks (including review tasks to look up reviewer models)
-	// Include adjudication columns to distinguish review tasks from adjudication tasks
-	query := `SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by, adjudicate_finding_id, adjudicate_finding_reviewer_model, adjudicate_finding_reviewer_slot
+	tx, err := s.readConn.BeginTx(ctx, nil)
+	if err != nil {
+		return ReviewerScorecards{}, fmt.Errorf("failed to begin read transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind,
+		       review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track,
+		       created_at, updated_at, archived_at, superseded_by, adjudicate_finding_id
 		FROM task
 		WHERE project_id = ? AND track = 'research'
-		ORDER BY created_at, id`
-
-	rows, err := s.readConn.QueryContext(ctx, query, projectID)
+		ORDER BY created_at, id
+	`, projectID)
 	if err != nil {
 		return ReviewerScorecards{}, fmt.Errorf("failed to query research tasks: %w", err)
 	}
-	defer rows.Close()
 
-	tasksMap := make(map[string]Task)
-	adjudicationTasks := make(map[string]bool) // track which tasks are adjudication tasks
-	implementTasks := make(map[string]Task)    // only implement/design tasks for processing
+	allTasks := make(map[string]Task)
+	adjudicationTaskIDs := make(map[string]bool)
+	var chainMembers []Task
 	for rows.Next() {
 		var t Task
 		var reviewModelsJSON *string
-		var adjFindingID, adjFindingReviewerModel, adjFindingReviewerSlot *string
-		if err := rows.Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy, &adjFindingID, &adjFindingReviewerModel, &adjFindingReviewerSlot); err != nil {
+		var adjFindingID sql.NullString
+		if err := rows.Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee,
+			&t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID,
+			&t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt,
+			&t.SupersededBy, &adjFindingID); err != nil {
+			rows.Close()
 			return ReviewerScorecards{}, fmt.Errorf("failed to scan task: %w", err)
 		}
-		t.ReviewModels = []string{}
-		if reviewModelsJSON != nil {
-			if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
-				return ReviewerScorecards{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
-			}
+		allTasks[t.ID] = t
+		if adjFindingID.Valid {
+			adjudicationTaskIDs[t.ID] = true
 		}
-		tasksMap[t.ID] = t
-		if adjFindingID != nil {
-			adjudicationTasks[t.ID] = true
-		}
-		// Only add implement/design tasks to be processed
 		if t.Kind == "implement" || t.Kind == "design" {
-			implementTasks[t.ID] = t
+			chainMembers = append(chainMembers, t)
 		}
 	}
-
 	if err := rows.Err(); err != nil {
-		return ReviewerScorecards{}, fmt.Errorf("error iterating tasks: %w", err)
+		rows.Close()
+		return ReviewerScorecards{}, fmt.Errorf("failed to iterate research tasks: %w", err)
+	}
+	rows.Close()
+
+	agg := newScorecardAggregation()
+	for _, chain := range buildResearchChains(chainMembers) {
+		if err := agg.processChain(ctx, tx, s, allTasks, adjudicationTaskIDs, chain); err != nil {
+			return ReviewerScorecards{}, err
+		}
+	}
+	if err := agg.applyAdjudications(ctx, tx, projectID); err != nil {
+		return ReviewerScorecards{}, err
 	}
 
-	// Aggregate findings by reviewer model
-	scorecards := aggregateScorecards(ctx, s, tasksMap, implementTasks, adjudicationTasks)
-
-	return ReviewerScorecards{Scorecards: scorecards}, nil
+	return ReviewerScorecards{Scorecards: agg.buildScorecards()}, nil
 }
 
-// aggregateScorecards aggregates findings by reviewer across research tasks
-func aggregateScorecards(ctx context.Context, s *sqliteStore, allTasksMap map[string]Task, implementTasks map[string]Task, adjudicationTasks map[string]bool) []ReviewerScorecard {
-	reviewerData := make(map[string]*reviewerAggregator)
-
-	// Build chain roots map: for each task, find the root of its supersede chain
-	chainRoots := make(map[string]string) // taskID -> chain root
-	for taskID := range implementTasks {
-		chainRoots[taskID] = findChainRoot(taskID, allTasksMap)
-	}
-
-	// Build prior_id chains: for each reviewer model on each chain root, track finding lineages
-	// across all tasks in that chain. Key: chainRoot:reviewerModel, Value: map from current ID to lineage
-	findingLineages := make(map[string]map[string]findingLineage)
-	blockingFindingsByTask := make(map[string][]blockingFinding) // taskID -> list of blocking findings
-
-	for taskID := range implementTasks {
-		chainRoot := chainRoots[taskID]
-
-		// Get events for this task
-		events, err := s.ListEvents(ctx, taskID)
-		if err != nil {
-			continue
-		}
-
-		for _, event := range events {
-			if event.Kind != "review" || event.SourceTaskID == nil {
-				continue
-			}
-
-			// Get the reviewer model from the review task; skip adjudication tasks
-			reviewTask, ok := allTasksMap[*event.SourceTaskID]
-			if !ok {
-				continue
-			}
-			if adjudicationTasks[*event.SourceTaskID] {
-				continue
-			}
-
-			reviewerModel := reviewTask.Model
-
-			// Initialize aggregator if needed
-			if reviewerData[reviewerModel] == nil {
-				reviewerData[reviewerModel] = &reviewerAggregator{
-					model:            reviewerModel,
-					findingsRaised:   make(map[string]int),
-					findingsByStatus: make(map[string]int), // held, withdrawn, unresolved
-					findingMap:       make(map[string]reviewingFinding),
-					tasksReviewed:    make(map[string]bool),
-					approvals:        make([]approvalRecord, 0), // track approvals for later-fixed logic
-				}
-			}
-
-			agg := reviewerData[reviewerModel]
-			agg.tasksReviewed[taskID] = true
-
-			// Count total review rounds
-			agg.totalReviews++
-
-			// Track if this is an approval
-			isApproval := event.Verdict != nil && *event.Verdict == "approve"
-			if isApproval {
-				agg.approvals = append(agg.approvals, approvalRecord{
-					taskID:        taskID,
-					round:         reviewTask.ReviewRound,
-					chainRoot:     chainRoot,
-					approvalRound: reviewTask.ReviewRound,
-				})
-			}
-
-			// Parse findings
-			var findings []Finding
-			if event.Findings != nil {
-				if err := json.Unmarshal(*event.Findings, &findings); err != nil {
-					continue
-				}
-			}
-
-			// Build lineage map for this reviewer on this entire chain root
-			lineageKey := fmt.Sprintf("%s:%s", chainRoot, reviewerModel)
-			if findingLineages[lineageKey] == nil {
-				findingLineages[lineageKey] = make(map[string]findingLineage)
-			}
-			lineageMap := findingLineages[lineageKey]
-
-			// Process each finding
-			for _, finding := range findings {
-				// Determine the root finding ID (follow prior_id chain backwards)
-				rootID := finding.ID
-				if finding.PriorID != nil {
-					if prior, exists := lineageMap[*finding.PriorID]; exists {
-						rootID = prior.rootID
-					} else {
-						// Prior ID not found yet, treat this as a new chain
-						rootID = finding.ID
-					}
-				}
-
-				// Get or initialize this lineage
-				lineage := findingLineage{
-					rootID:        rootID,
-					firstRound:    reviewTask.ReviewRound,
-					lastStatus:    finding.Status,
-					lastSeverity:  strings.ToLower(finding.Severity),
-					lastRound:     reviewTask.ReviewRound,
-					isBlocking:    isBlockingFinding(finding),
-					blockingRound: -1,
-				}
-
-				// Update if we've seen this before
-				if existing, exists := lineageMap[finding.ID]; exists {
-					lineage.rootID = existing.rootID
-					lineage.firstRound = existing.firstRound
-					lineage.blockingRound = existing.blockingRound
-					if isBlockingFinding(finding) && lineage.blockingRound == -1 {
-						lineage.blockingRound = reviewTask.ReviewRound
-					}
-				} else if isBlockingFinding(finding) {
-					lineage.blockingRound = reviewTask.ReviewRound
-				}
-
-				lineageMap[finding.ID] = lineage
-
-				// Use root ID + chain root + reviewer model as key for dedup
-				key := fmt.Sprintf("%s:%s:%s", chainRoot, lineage.rootID, reviewerModel)
-
-				// Track blocking findings for this task
-				if isBlockingFinding(finding) {
-					blockingFindingsByTask[taskID] = append(blockingFindingsByTask[taskID], blockingFinding{
-						findingID:     finding.ID,
-						rootFindingID: lineage.rootID,
-						reviewerModel: reviewerModel,
-						reviewerSlot:  reviewTask.ReviewRound,
-						roundRaised:   lineage.firstRound,
-						chainRoot:     chainRoot,
-					})
-				}
-
-				// Count raised findings only on first appearance (new status)
-				if _, exists := agg.findingMap[key]; !exists && finding.Status == "new" {
-					severity := strings.ToLower(finding.Severity)
-					agg.findingsRaised[severity]++
-				}
-
-				// Update finding status (keep latest by chain order)
-				agg.findingMap[key] = reviewingFinding{
-					id:            finding.ID,
-					rootID:        lineage.rootID,
-					chainRoot:     chainRoot,
-					severity:      strings.ToLower(finding.Severity),
-					status:        finding.Status,
-					reviewerModel: reviewerModel,
-					reviewerSlot:  reviewTask.ReviewRound,
-					round:         reviewTask.ReviewRound,
-				}
-			}
-
-			reviewerData[reviewerModel] = agg
+// buildResearchChains groups research implement/design tasks into their supersede
+// chains (docs/features/research-track.md section 7), each ordered from the chain's
+// original task through every replacement, oldest first. superseded_by already points
+// forward (predecessor to successor), so walking it from each chain's root is O(n)
+// total, unlike searching every task for a predecessor at every step.
+func buildResearchChains(tasks []Task) [][]Task {
+	byID := make(map[string]Task, len(tasks))
+	hasPredecessor := make(map[string]bool, len(tasks))
+	for _, t := range tasks {
+		byID[t.ID] = t
+		if t.SupersededBy != nil {
+			hasPredecessor[*t.SupersededBy] = true
 		}
 	}
 
-	// Get project ID for adjudication query
-	var projectID string
-	for _, task := range implementTasks {
-		projectID = task.ProjectID
-		break
-	}
-
-	// Load and apply adjudication results
-	adjQuery := `SELECT target_task_id, adjudicate_finding_id, adjudicate_finding_reviewer_model, adjudicate_finding_reviewer_slot, verdict
-		FROM task
-		WHERE project_id = ? AND track = 'research' AND kind = 'review' AND adjudicate_finding_id IS NOT NULL AND verdict IS NOT NULL`
-
-	adjRows, err := s.readConn.QueryContext(ctx, adjQuery, projectID)
-	if err != nil {
-		adjRows = nil
-	}
-
-	adjResults := make(map[string]string) // key -> "upheld" or "overturned"
-	if adjRows != nil {
-		defer adjRows.Close()
-
-		for adjRows.Next() {
-			var targetTaskID, findingID, reviewerModel string
-			var reviewerSlot int
-			var verdict string
-			if err := adjRows.Scan(&targetTaskID, &findingID, &reviewerModel, &reviewerSlot, &verdict); err != nil {
-				continue
+	var chains [][]Task
+	for _, t := range tasks {
+		if hasPredecessor[t.ID] {
+			continue // reached below, while walking forward from its chain's root
+		}
+		var chain []Task
+		seen := make(map[string]bool)
+		cur := t
+		for {
+			if seen[cur.ID] {
+				break // defensive: a cycle should never occur, but never loop forever
 			}
-
-			// Find the chain root for the target task
-			chainRoot := chainRoots[targetTaskID]
-			if chainRoot == "" {
-				// Fall back to looking it up in allTasksMap
-				if _, ok := allTasksMap[targetTaskID]; ok {
-					chainRoot = findChainRoot(targetTaskID, allTasksMap)
-					chainRoots[targetTaskID] = chainRoot
-				} else {
-					continue
-				}
-			}
-
-			// Look up the lineage for this reviewer's finding
-			lineageKey := fmt.Sprintf("%s:%s", chainRoot, reviewerModel)
-			if lineageMap, ok := findingLineages[lineageKey]; ok {
-				// Find the root ID for this finding through the lineage
-				// The adjudicate_finding_id is the original disputed finding ID,
-				// but it might have been renumbered, so we need to check the lineage
-				rootID := findingID
-				if lineage, exists := lineageMap[findingID]; exists {
-					rootID = lineage.rootID
-				}
-				// Use root ID + chain root + reviewer model as key
-				key := fmt.Sprintf("%s:%s:%s", chainRoot, rootID, reviewerModel)
-				if verdict == "approve" {
-					adjResults[key] = "overturned"
-				} else {
-					adjResults[key] = "upheld"
-				}
-			}
-		}
-	}
-
-	// Apply status classification
-	for _, agg := range reviewerData {
-		for key, finding := range agg.findingMap {
-			adjResult, hasAdj := adjResults[key]
-			if hasAdj {
-				if adjResult == "overturned" {
-					agg.findingsByStatus["withdrawn"]++
-					agg.findingMap[key] = reviewingFinding{
-						id:            finding.id,
-						rootID:        finding.rootID,
-						chainRoot:     finding.chainRoot,
-						severity:      finding.severity,
-						status:        "withdrawn",
-						reviewerModel: finding.reviewerModel,
-						reviewerSlot:  finding.reviewerSlot,
-						round:         finding.round,
-					}
-				} else { // upheld
-					agg.findingsByStatus["held"]++
-					agg.findingMap[key] = reviewingFinding{
-						id:            finding.id,
-						rootID:        finding.rootID,
-						chainRoot:     finding.chainRoot,
-						severity:      finding.severity,
-						status:        "upheld",
-						reviewerModel: finding.reviewerModel,
-						reviewerSlot:  finding.reviewerSlot,
-						round:         finding.round,
-					}
-				}
-			} else if finding.status == "resolved" {
-				agg.findingsByStatus["held"]++
-			} else if finding.status == "still_open" {
-				agg.findingsByStatus["unresolved"]++
-			} else if finding.status == "new" {
-				agg.findingsByStatus["unresolved"]++
-			}
-		}
-	}
-
-	// Compute approvals with later fixed blocking findings
-	// For each approval, check if another reviewer's blocking finding was later fixed
-	computeApprovalsWithLaterFix(reviewerData, blockingFindingsByTask)
-
-	// Build final scorecards, sorted by model for determinism
-	var scorecards []ReviewerScorecard
-	var models []string
-	for model := range reviewerData {
-		models = append(models, model)
-	}
-	sort.Strings(models)
-
-	for _, model := range models {
-		agg := reviewerData[model]
-		findingsRaised := agg.findingsRaised
-		if findingsRaised == nil {
-			findingsRaised = make(map[string]int)
-		}
-		// Ensure all keys are present
-		if _, ok := findingsRaised["p1"]; !ok {
-			findingsRaised["p1"] = 0
-		}
-		if _, ok := findingsRaised["p2"]; !ok {
-			findingsRaised["p2"] = 0
-		}
-		if _, ok := findingsRaised["p3"]; !ok {
-			findingsRaised["p3"] = 0
-		}
-
-		scorecard := ReviewerScorecard{
-			Model:                                   model,
-			FindingsRaised:                          findingsRaised,
-			FindingsHeld:                            agg.findingsByStatus["held"],
-			FindingsWithdrawn:                       agg.findingsByStatus["withdrawn"],
-			FindingsUnresolved:                      agg.findingsByStatus["unresolved"],
-			ApprovalsWithLaterFixedBlockingFindings: agg.approvalsWithLaterFix,
-			TotalReviewRounds:                       agg.totalReviews,
-			SampleSize:                              len(agg.tasksReviewed),
-		}
-
-		scorecards = append(scorecards, scorecard)
-	}
-
-	return scorecards
-}
-
-// Helper function to check if a finding is blocking
-func isBlockingFinding(f Finding) bool {
-	severity := strings.ToUpper(f.Severity)
-	// P1 or P2 in changed text is blocking
-	if (severity == "P1" || severity == "P2") && f.InChangedText {
-		return true
-	}
-	// P1 or P2 in any text during round 1 (status new) is blocking
-	if (severity == "P1" || severity == "P2") && f.Status == "new" {
-		return true
-	}
-	// Still open findings are blocking
-	if f.Status == "still_open" {
-		return true
-	}
-	return false
-}
-
-// Helper to get any task from map for project ID extraction
-func getAnyTask(taskMap map[string]Task) string {
-	for id := range taskMap {
-		return id
-	}
-	return ""
-}
-
-// Compute approvals where another reviewer's blocking finding was later fixed
-func computeApprovalsWithLaterFix(reviewerData map[string]*reviewerAggregator, blockingFindingsByTask map[string][]blockingFinding) {
-	// For each reviewer
-	for _, agg := range reviewerData {
-		// Track which tasks we've already counted for this reviewer
-		countedTasks := make(map[string]bool)
-
-		for _, approval := range agg.approvals {
-			// Only count each task once per reviewer
-			if countedTasks[approval.taskID] {
-				continue
-			}
-
-			// Check if there were blocking findings in this task from other reviewers
-			if blockings, ok := blockingFindingsByTask[approval.taskID]; ok {
-				taskHasFixedBlockingFinding := false
-
-				for _, blocking := range blockings {
-					// Skip if from same reviewer model
-					if blocking.reviewerModel == agg.model {
-						continue
-					}
-
-					// Check if this blocking finding was later resolved/fixed (AFTER the approval)
-					// by looking for it in the raising reviewer's findings marked as held/resolved
-					for _, otherAgg := range reviewerData {
-						if otherAgg.model != blocking.reviewerModel {
-							continue
-						}
-
-						for _, finding := range otherAgg.findingMap {
-							if finding.chainRoot == blocking.chainRoot &&
-								finding.rootID == blocking.rootFindingID &&
-								finding.round > approval.approvalRound &&
-								(finding.status == "held" || finding.status == "upheld" || finding.status == "resolved") {
-								taskHasFixedBlockingFinding = true
-								break
-							}
-						}
-						if taskHasFixedBlockingFinding {
-							break
-						}
-					}
-
-					if taskHasFixedBlockingFinding {
-						break
-					}
-				}
-
-				if taskHasFixedBlockingFinding {
-					agg.approvalsWithLaterFix++
-					countedTasks[approval.taskID] = true
-				}
-			}
-		}
-	}
-}
-
-// findChainRoot finds the root of the supersede chain for a task
-func findChainRoot(taskID string, tasksMap map[string]Task) string {
-	if _, ok := tasksMap[taskID]; !ok {
-		return taskID
-	}
-
-	// Follow the supersede chain backwards to find the root
-	current := taskID
-	seen := make(map[string]bool)
-	for {
-		if seen[current] {
-			// Cycle detected, return current
-			return current
-		}
-		seen[current] = true
-
-		if _, ok := tasksMap[current]; !ok {
-			return current
-		}
-
-		// Check if this task was superseded by another
-		found := false
-		for _, otherTask := range tasksMap {
-			if otherTask.SupersededBy != nil && *otherTask.SupersededBy == current {
-				current = otherTask.ID
-				found = true
+			seen[cur.ID] = true
+			chain = append(chain, cur)
+			if cur.SupersededBy == nil {
 				break
 			}
+			next, ok := byID[*cur.SupersededBy]
+			if !ok {
+				break
+			}
+			cur = next
 		}
+		chains = append(chains, chain)
+	}
+	return chains
+}
 
-		if !found {
-			// This is the root
-			return current
-		}
+const chainRoundOffset = 1_000_000
+
+// globalRound gives a chain member's review_round (which restarts at 1 on every
+// replacement) a position that increases monotonically across the whole chain, so
+// findings and approvals from different chain members can be compared temporally.
+func globalRound(taskIdx, localRound int) int {
+	return taskIdx*chainRoundOffset + localRound
+}
+
+// findingThread is one logical finding raised by one reviewer lineage (model plus
+// slot, researchReviewerLineage), followed across rounds within a task via prior_id
+// (researchFindingChains) and across a supersede boundary by matching severity, file,
+// line and summary against a thread still open when the predecessor was superseded —
+// see processChain. Its classification (held, withdrawn or unresolved) is decided
+// once, in buildScorecards, after every chain and every adjudication has been applied.
+type findingThread struct {
+	reviewerModel string
+	severity      string // lowercased, from the report that first raised it
+	file          string
+	line          int
+	summary       string
+
+	firstBlockingGlobalRound int   // 0 if never a blocking finding; else the earliest globalRound it was
+	resolvedGlobalRounds     []int // every globalRound at which a report, or an implicit non-restatement, settled it
+	finalOutstanding         bool  // per the latest information seen, whether it is still outstanding
+
+	adjudicated string // "", "held" or "withdrawn": set by applyAdjudications, overriding the natural classification
+}
+
+// scorecardApproval is one reviewer's approval of one review round, kept for
+// computeApprovalsWithLaterFix.
+type scorecardApproval struct {
+	model       string
+	globalRound int
+}
+
+// scorecardAggregation accumulates scorecard state across every research chain in a
+// project. threadByReport lets applyAdjudications map a disputed finding (identified
+// by the task, reviewer lineage, round and id it was disputed under) back to the
+// thread it belongs to, however that finding has since been renumbered or carried
+// across a supersession.
+type scorecardAggregation struct {
+	reviewers      map[string]*reviewerAggregator
+	threads        []*findingThread
+	threadByReport map[string]*findingThread
+	approvals      []scorecardApproval
+}
+
+func newScorecardAggregation() *scorecardAggregation {
+	return &scorecardAggregation{
+		reviewers:      make(map[string]*reviewerAggregator),
+		threadByReport: make(map[string]*findingThread),
 	}
 }
 
-// reviewerAggregator accumulates finding data for a single reviewer
+// reviewerAggregator accumulates the counters for one reviewer model.
 type reviewerAggregator struct {
 	model                 string
-	findingsRaised        map[string]int // severity -> count
-	findingsByStatus      map[string]int // held, withdrawn, unresolved -> count
-	findingMap            map[string]reviewingFinding
+	findingsRaised        map[string]int
+	held                  int
+	withdrawn             int
+	unresolved            int
 	tasksReviewed         map[string]bool
-	approvals             []approvalRecord
 	totalReviews          int
 	approvalsWithLaterFix int
 }
 
-// reviewingFinding tracks a single finding
-type reviewingFinding struct {
-	id            string
-	rootID        string
-	chainRoot     string
-	severity      string
-	status        string
-	reviewerModel string
-	reviewerSlot  int
-	round         int
+func (agg *scorecardAggregation) reviewerAgg(model string) *reviewerAggregator {
+	r, ok := agg.reviewers[model]
+	if !ok {
+		r = &reviewerAggregator{model: model, findingsRaised: make(map[string]int), tasksReviewed: make(map[string]bool)}
+		agg.reviewers[model] = r
+	}
+	return r
 }
 
-// approvalRecord tracks a reviewer's approval on a task
-type approvalRecord struct {
-	taskID        string
-	round         int
-	chainRoot     string
-	approvalRound int
+func reportKey(taskID, lineage string, round int, findingID string) string {
+	return fmt.Sprintf("%s\x00%s\x00%d\x00%s", taskID, lineage, round, findingID)
 }
 
-// blockingFinding tracks blocking findings for later-fix logic
-type blockingFinding struct {
-	findingID     string
-	rootFindingID string
-	reviewerModel string
-	reviewerSlot  int
-	roundRaised   int
-	chainRoot     string
+// findCarried looks for an open thread, carried out of an earlier chain member, whose
+// identity (severity, file, line, summary) matches a freshly reported finding: the
+// same identity buildResearchSupersessionSpec carries forward in its "Structured
+// findings (JSON)" block. A chain boundary can never be crossed by prior_id the way a
+// same-task round can: a replacement's round 1 is always a full review, so a
+// persisting defect is rediscovered fresh, with a new id and no prior_id.
+func findCarried(candidates []*findingThread, severity, file string, line int, summary string) *findingThread {
+	for _, c := range candidates {
+		if c.severity == severity && c.file == file && c.line == line && c.summary == summary {
+			return c
+		}
+	}
+	return nil
 }
 
-// findingLineage tracks a finding's lineage through prior_id chains
-type findingLineage struct {
-	rootID        string
-	firstRound    int
-	lastStatus    string
-	lastSeverity  string
-	lastRound     int
-	isBlocking    bool
-	blockingRound int
+// groupResearchFindingsByChain buckets allFindings' indices by their local
+// prior_id-chain root (researchFindingChains), preserving the order each root was
+// first seen in, so a chain's own findings are processed oldest first.
+func groupResearchFindingsByChain(allFindings []researchCollectedFinding, chainOf func(int) int) (groups map[int][]int, order []int) {
+	groups = make(map[int][]int)
+	for i := range allFindings {
+		root := chainOf(i)
+		if _, ok := groups[root]; !ok {
+			order = append(order, root)
+		}
+		groups[root] = append(groups[root], i)
+	}
+	return groups, order
+}
+
+// processChain aggregates one supersede chain's findings and review rounds into agg.
+// Within one task, a finding's identity across rounds is its prior_id lineage
+// (researchFindingChains, reused from the same section-3 aggregation the review round
+// itself uses). Across a chain boundary, a still-outstanding thread is matched into
+// the next chain member's own findings by identity (see findCarried); a reviewer
+// lineage that has since reviewed the next chain member without restating a carried
+// thread has, by a full review finding nothing there, fixed it — the same "not
+// restated means settled" rule unresolvedResearchFindings applies to a lineage's own
+// rounds within one task, applied here at a chain boundary. A lineage that has not
+// reviewed the next chain member yet keeps its carried threads open.
+func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s *sqliteStore, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, chain []Task) error {
+	openByLineage := make(map[string][]*findingThread)
+
+	for taskIdx, task := range chain {
+		var maxRound int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MAX(review_round), 0) FROM task WHERE target_task_id = ? AND kind = 'review'
+		`, task.ID).Scan(&maxRound); err != nil {
+			return fmt.Errorf("failed to find max review round for %s: %w", task.ID, err)
+		}
+
+		allFindings, latestSubmittedRound, err := s.collectResearchReviewReports(ctx, tx, task.ID, maxRound)
+		if err != nil {
+			return fmt.Errorf("failed to collect review findings for %s: %w", task.ID, err)
+		}
+		chainOf, isOutstanding := researchFindingChains(allFindings)
+		groups, order := groupResearchFindingsByChain(allFindings, chainOf)
+
+		openIn := openByLineage
+		matchedIn := make(map[string]map[*findingThread]bool)
+		openOut := make(map[string][]*findingThread)
+
+		for _, root := range order {
+			idxs := groups[root]
+			first := allFindings[idxs[0]]
+			last := allFindings[idxs[len(idxs)-1]]
+			lineage := first.lineage
+			severity := strings.ToLower(first.Severity)
+
+			ragg := agg.reviewerAgg(first.reviewerModel)
+
+			thread := findCarried(openIn[lineage], severity, first.File, first.Line, first.Summary)
+			if thread != nil {
+				if matchedIn[lineage] == nil {
+					matchedIn[lineage] = make(map[*findingThread]bool)
+				}
+				matchedIn[lineage][thread] = true
+			} else {
+				thread = &findingThread{
+					reviewerModel: first.reviewerModel,
+					severity:      severity,
+					file:          first.File,
+					line:          first.Line,
+					summary:       first.Summary,
+				}
+				agg.threads = append(agg.threads, thread)
+				ragg.findingsRaised[severity]++
+			}
+
+			for _, i := range idxs {
+				f := allFindings[i]
+				g := globalRound(taskIdx, f.round)
+				if isBlockingResearchFinding(f.Finding, f.round) && (thread.firstBlockingGlobalRound == 0 || g < thread.firstBlockingGlobalRound) {
+					thread.firstBlockingGlobalRound = g
+				}
+				agg.threadByReport[reportKey(task.ID, f.lineage, f.round, f.ID)] = thread
+			}
+
+			thread.finalOutstanding = isOutstanding(idxs[len(idxs)-1])
+			if thread.finalOutstanding {
+				openOut[lineage] = append(openOut[lineage], thread)
+			} else {
+				thread.resolvedGlobalRounds = append(thread.resolvedGlobalRounds, globalRound(taskIdx, last.round))
+			}
+		}
+
+		for lineage, latestRound := range latestSubmittedRound {
+			for _, thread := range openIn[lineage] {
+				if matchedIn[lineage][thread] {
+					continue
+				}
+				thread.finalOutstanding = false
+				thread.resolvedGlobalRounds = append(thread.resolvedGlobalRounds, globalRound(taskIdx, latestRound))
+			}
+		}
+		for lineage, threads := range openIn {
+			if _, reviewed := latestSubmittedRound[lineage]; reviewed {
+				continue // handled above: matched threads already carried via openOut, unmatched ones just settled
+			}
+			openOut[lineage] = append(openOut[lineage], threads...) // pending review, carried forward unchanged
+		}
+
+		openByLineage = openOut
+
+		if err := agg.collectVerdicts(ctx, s, allTasks, adjudicationTaskIDs, task.ID, taskIdx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectVerdicts records each of taskID's own review events (sample size, total
+// review rounds and approvals) by reviewer model. This is separate from the findings
+// walked in processChain because collectResearchReviewReports is findings-only: a
+// reviewer who approves with no findings at all still reviewed the task and must
+// still count toward sample size and total rounds.
+func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, s *sqliteStore, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, taskID string, taskIdx int) error {
+	events, err := s.ListEvents(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("failed to list events for %s: %w", taskID, err)
+	}
+	for _, event := range events {
+		if event.Kind != "review" || event.SourceTaskID == nil {
+			continue
+		}
+		if adjudicationTaskIDs[*event.SourceTaskID] {
+			continue // an adjudicator's ruling is binding for one finding only; it never votes on a round
+		}
+		reviewTask, ok := allTasks[*event.SourceTaskID]
+		if !ok {
+			continue
+		}
+		ragg := agg.reviewerAgg(reviewTask.Model)
+		ragg.tasksReviewed[taskID] = true
+		ragg.totalReviews++
+		if event.Verdict != nil && *event.Verdict == "approve" {
+			agg.approvals = append(agg.approvals, scorecardApproval{model: reviewTask.Model, globalRound: globalRound(taskIdx, reviewTask.ReviewRound)})
+		}
+	}
+	return nil
+}
+
+// applyAdjudications overrides a disputed finding's natural classification with the
+// adjudicator's binding ruling (docs/features/research-track.md section 5): approve
+// overturns it (withdrawn), reject upholds it (held) — regardless of whether the
+// finding was independently restated or resolved afterward. The disputed finding is
+// identified by the task, reviewer lineage and round it was disputed under, plus the
+// id it carried in that round; threadByReport resolves that back to its thread
+// however the finding has since been renumbered or carried across a supersession.
+func (agg *scorecardAggregation) applyAdjudications(ctx context.Context, tx *sql.Tx, projectID string) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT target_task_id, adjudicate_finding_round, adjudicate_finding_reviewer_model,
+		       adjudicate_finding_reviewer_slot, adjudicate_finding_id, verdict
+		FROM task
+		WHERE project_id = ? AND track = 'research' AND kind = 'review'
+		  AND adjudicate_finding_id IS NOT NULL AND verdict IS NOT NULL
+	`, projectID)
+	if err != nil {
+		return fmt.Errorf("failed to query adjudications: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var targetTaskID, model, findingID, verdict string
+		var round, slot int
+		if err := rows.Scan(&targetTaskID, &round, &model, &slot, &findingID, &verdict); err != nil {
+			return fmt.Errorf("failed to scan adjudication: %w", err)
+		}
+		lineage := researchReviewerLineage(model, slot)
+		thread, ok := agg.threadByReport[reportKey(targetTaskID, lineage, round, findingID)]
+		if !ok {
+			continue // the disputed finding's own report is out of the aggregation window
+		}
+		if verdict == "approve" {
+			thread.adjudicated = "withdrawn"
+		} else {
+			thread.adjudicated = "held"
+		}
+	}
+	return rows.Err()
+}
+
+// computeApprovalsWithLaterFix implements the fourth section 8 metric: for each
+// reviewer's approval of a round, whether another reviewer's blocking finding —
+// already raised as of that round — was fixed in a later round, anywhere in the same
+// chain. "Fixed" here means naturally resolved, not merely adjudicated: an
+// overturned finding was never valid, so nothing was fixed, and an upheld finding
+// still blocks, so it was not fixed either.
+func (agg *scorecardAggregation) computeApprovalsWithLaterFix() {
+	for _, appr := range agg.approvals {
+		ragg := agg.reviewerAgg(appr.model)
+		for _, thread := range agg.threads {
+			if thread.reviewerModel == appr.model {
+				continue
+			}
+			if thread.firstBlockingGlobalRound == 0 || thread.firstBlockingGlobalRound > appr.globalRound {
+				continue
+			}
+			fixedLater := false
+			for _, r := range thread.resolvedGlobalRounds {
+				if r > appr.globalRound {
+					fixedLater = true
+					break
+				}
+			}
+			if fixedLater {
+				ragg.approvalsWithLaterFix++
+				break
+			}
+		}
+	}
+}
+
+// buildScorecards decides each thread's final classification — an adjudication
+// ruling wins if one applies, otherwise a thread that ended outstanding is
+// unresolved and one that was resolved (naturally, per processChain) is held — then
+// renders every reviewer's counters, sorted by model for a deterministic response.
+func (agg *scorecardAggregation) buildScorecards() []ReviewerScorecard {
+	for _, thread := range agg.threads {
+		ragg := agg.reviewerAgg(thread.reviewerModel)
+		switch {
+		case thread.adjudicated == "withdrawn":
+			ragg.withdrawn++
+		case thread.adjudicated == "held":
+			ragg.held++
+		case !thread.finalOutstanding:
+			ragg.held++
+		default:
+			ragg.unresolved++
+		}
+	}
+
+	agg.computeApprovalsWithLaterFix()
+
+	var models []string
+	for model := range agg.reviewers {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+
+	scorecards := make([]ReviewerScorecard, 0, len(models))
+	for _, model := range models {
+		ragg := agg.reviewers[model]
+		for _, sev := range []string{"p1", "p2", "p3"} {
+			if _, ok := ragg.findingsRaised[sev]; !ok {
+				ragg.findingsRaised[sev] = 0
+			}
+		}
+		scorecards = append(scorecards, ReviewerScorecard{
+			Model:                                   model,
+			FindingsRaised:                          ragg.findingsRaised,
+			FindingsHeld:                            ragg.held,
+			FindingsWithdrawn:                       ragg.withdrawn,
+			FindingsUnresolved:                      ragg.unresolved,
+			ApprovalsWithLaterFixedBlockingFindings: ragg.approvalsWithLaterFix,
+			TotalReviewRounds:                       ragg.totalReviews,
+			SampleSize:                              len(ragg.tasksReviewed),
+		})
+	}
+	return scorecards
 }

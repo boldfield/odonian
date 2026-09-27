@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func TestGetResearchReviewerScorecards_EmptyProject(t *testing.T) {
@@ -175,6 +176,92 @@ func TestGetResearchReviewerScorecards_BuildDesignExcluded(t *testing.T) {
 	// Should have no scorecards since no research tasks
 	if len(scorecards.Scorecards) != 0 {
 		t.Errorf("expected 0 scorecards for non-research tasks, got %d", len(scorecards.Scorecards))
+	}
+}
+
+// TestGetResearchReviewerScorecards_BuildTrackReviewDataUntouched verifies that a
+// build-track task's own review activity, in the same project as a research task,
+// never leaks into the research reviewer scorecards: only track='research' review
+// data is aggregated.
+func TestGetResearchReviewerScorecards_BuildTrackReviewDataUntouched(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	doc, err := store.CreateDocument(ctx, projID, "feature_spec", "build-doc", "build.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	buildTasks, err := store.CreateTasks(ctx, projID, []TaskInput{
+		{
+			Title:        "Build task",
+			Spec:         "Build spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			Track:        "build",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create build task: %v", err)
+	}
+	buildTaskID := buildTasks[0].ID
+	if _, err := store.PromoteTask(ctx, buildTaskID); err != nil {
+		t.Fatalf("failed to promote build task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, buildTaskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim build task: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, buildTaskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#200"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit build task: %v", err)
+	}
+	allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	var buildReviewTask *Task
+	for i := range allTasks {
+		tk := allTasks[i]
+		if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == buildTaskID {
+			buildReviewTask = &tk
+			break
+		}
+	}
+	if buildReviewTask == nil {
+		t.Fatalf("expected a review task for the build task")
+	}
+	if _, err := store.ClaimTask(ctx, buildReviewTask.ID, "opus-reviewer", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim build review task: %v", err)
+	}
+	approve := "approve"
+	if _, err := store.SubmitTask(ctx, buildReviewTask.ID, "opus-reviewer", "looks good", &approve, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit build review: %v", err)
+	}
+
+	// The research task's own opus review, with one finding.
+	opusTask, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask == nil {
+		t.Fatalf("expected opus review task")
+	}
+	findingsJSON := json.RawMessage(`[{"id":"f1","severity":"P1","file":"test.txt","line":1,"summary":"test finding","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusTask, "opus-reviewer", "reject", findingsJSON)
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	if len(scorecards.Scorecards) != 1 {
+		t.Fatalf("expected 1 scorecard, got %d", len(scorecards.Scorecards))
+	}
+	sc := scorecards.Scorecards[0]
+	// The build task's approve-with-no-findings review round must not be counted
+	// alongside the research task's single reject round.
+	if sc.TotalReviewRounds != 1 {
+		t.Errorf("expected 1 total review round (build track excluded), got %d", sc.TotalReviewRounds)
+	}
+	if sc.SampleSize != 1 {
+		t.Errorf("expected sample size 1 (build track excluded), got %d", sc.SampleSize)
+	}
+	if sc.FindingsRaised["p1"] != 1 {
+		t.Errorf("expected 1 P1 raised, got %d", sc.FindingsRaised["p1"])
 	}
 }
 
@@ -413,5 +500,232 @@ func TestGetResearchReviewerScorecards_RenumberedFindings(t *testing.T) {
 	// Should have 0 unresolved
 	if sc.FindingsUnresolved != 0 {
 		t.Errorf("expected 0 unresolved findings, got %d", sc.FindingsUnresolved)
+	}
+}
+
+// TestGetResearchReviewerScorecards_SupersededChain_NoDoubleCount verifies that a
+// finding still outstanding when a research task is superseded, and independently
+// rediscovered by the same reviewer lineage on the replacement (under a new id, since
+// a replacement's round 1 is always a full review and never carries prior_id across
+// the boundary), is counted as raised once, not twice, and correctly held once the
+// replacement resolves it. This is the section 8 "span superseded task chains without
+// counting the same finding twice" requirement.
+func TestGetResearchReviewerScorecards_SupersededChain_NoDoubleCount(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	opusA, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusA == nil {
+		t.Fatalf("expected opus review task on the original task")
+	}
+	findingsA := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusA, "opus-reviewer", "reject", findingsA)
+
+	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	if err != nil {
+		t.Fatalf("failed to supersede: %v", err)
+	}
+	if _, err := store.PromoteTask(ctx, successor.ID); err != nil {
+		t.Fatalf("failed to promote successor: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, successor.ID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim successor: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, successor.ID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit successor: %v", err)
+	}
+
+	// Round 1 on the replacement is a full review: opus rediscovers the same defect
+	// fresh, under a different id, with status "new" and no prior_id.
+	opusB1, _ := findResearchReviewTasks(t, store, ctx, projID, successor.ID, 1)
+	if opusB1 == nil {
+		t.Fatalf("expected opus review task on the successor")
+	}
+	findingsB1 := json.RawMessage(`[{"id":"g7","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusB1, "opus-reviewer", "reject", findingsB1)
+
+	resubmitResearchImplementTask(t, store, ctx, successor.ID)
+
+	opusB2, _ := findResearchReviewTasks(t, store, ctx, projID, successor.ID, 2)
+	if opusB2 == nil {
+		t.Fatalf("expected opus review task for successor round 2")
+	}
+	findingsB2 := json.RawMessage(`[{"id":"g8","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":false,"status":"resolved","prior_id":"g7"}]`)
+	submitResearchReview(t, store, ctx, opusB2, "opus-reviewer", "approve", findingsB2)
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	if len(scorecards.Scorecards) != 1 {
+		t.Fatalf("expected 1 scorecard, got %d", len(scorecards.Scorecards))
+	}
+	sc := scorecards.Scorecards[0]
+	if sc.FindingsRaised["p2"] != 1 {
+		t.Errorf("expected 1 P2 raised (not doubled across the supersede boundary), got %d", sc.FindingsRaised["p2"])
+	}
+	if sc.FindingsHeld != 1 {
+		t.Errorf("expected 1 held finding, got %d", sc.FindingsHeld)
+	}
+	if sc.FindingsUnresolved != 0 {
+		t.Errorf("expected 0 unresolved findings, got %d", sc.FindingsUnresolved)
+	}
+	if sc.SampleSize != 2 {
+		t.Errorf("expected sample size 2 (both tasks in the chain), got %d", sc.SampleSize)
+	}
+	if sc.TotalReviewRounds != 3 {
+		t.Errorf("expected 3 total review rounds across the chain, got %d", sc.TotalReviewRounds)
+	}
+}
+
+// TestGetResearchReviewerScorecards_SupersededChain_ApprovalsWithLaterFix verifies
+// that approvals-with-later-fix compares rounds by their position across the whole
+// supersede chain, not by each chain member's own review_round (which restarts at 1
+// on every replacement): an approval on the original task and a fix landing in round
+// 1 of its replacement must still be recognized as "later", even though both are
+// task-local round 1.
+func TestGetResearchReviewerScorecards_SupersededChain_ApprovalsWithLaterFix(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "sonnet"})
+
+	opusA, sonnetA := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusA == nil || sonnetA == nil {
+		t.Fatalf("expected both review tasks on the original task")
+	}
+	emptyFindings := json.RawMessage(`[]`)
+	submitResearchReview(t, store, ctx, opusA, "opus-reviewer", "approve", emptyFindings)
+	blockingFindings := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, sonnetA, "sonnet-reviewer", "reject", blockingFindings)
+
+	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	if err != nil {
+		t.Fatalf("failed to supersede: %v", err)
+	}
+	if _, err := store.PromoteTask(ctx, successor.ID); err != nil {
+		t.Fatalf("failed to promote successor: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, successor.ID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim successor: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, successor.ID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit successor: %v", err)
+	}
+
+	// Round 1 on the replacement (task-local round 1, same number as the original
+	// task's own round 1): opus approves again, and sonnet's full review finds the
+	// defect gone (fixed), so it reports nothing there at all.
+	opusB1, sonnetB1 := findResearchReviewTasks(t, store, ctx, projID, successor.ID, 1)
+	if opusB1 == nil || sonnetB1 == nil {
+		t.Fatalf("expected both review tasks on the successor")
+	}
+	submitResearchReview(t, store, ctx, opusB1, "opus-reviewer", "approve", emptyFindings)
+	submitResearchReview(t, store, ctx, sonnetB1, "sonnet-reviewer", "approve", emptyFindings)
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	if opusCard == nil {
+		t.Fatalf("expected opus in scorecards")
+	}
+	if opusCard.ApprovalsWithLaterFixedBlockingFindings != 1 {
+		t.Errorf("expected opus 1 approval with a later fix across the supersede boundary, got %d", opusCard.ApprovalsWithLaterFixedBlockingFindings)
+	}
+}
+
+// TestGetResearchReviewerScorecards_AdjudicationOverturned verifies that a finding
+// overturned on adjudication (docs/features/research-track.md section 5) is counted
+// as withdrawn, not held or unresolved, even though it was never independently
+// resolved by the worker.
+func TestGetResearchReviewerScorecards_AdjudicationOverturned(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"resolves it"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	adjTasks := findAdjudicationTasks(t, store, ctx, projID, parentID)
+	if len(adjTasks) != 1 {
+		t.Fatalf("expected exactly one adjudication task, got %d", len(adjTasks))
+	}
+	submitAdjudication(t, store, ctx, &adjTasks[0], "approve") // overturns the finding
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	if opusCard == nil {
+		t.Fatalf("expected opus in scorecards")
+	}
+	if opusCard.FindingsRaised["p2"] != 1 {
+		t.Errorf("expected opus 1 P2 raised, got %d", opusCard.FindingsRaised["p2"])
+	}
+	if opusCard.FindingsWithdrawn != 1 {
+		t.Errorf("expected opus 1 withdrawn (overturned), got %d", opusCard.FindingsWithdrawn)
+	}
+	if opusCard.FindingsHeld != 0 {
+		t.Errorf("expected opus 0 held, got %d", opusCard.FindingsHeld)
+	}
+	if opusCard.FindingsUnresolved != 0 {
+		t.Errorf("expected opus 0 unresolved (adjudication settles it), got %d", opusCard.FindingsUnresolved)
+	}
+	// The adjudicator itself must never be scored as a reviewer: its ruling doesn't
+	// vote on the round and it never gets its own review task on this parent's chain.
+	if findScorecardByModel(scorecards.Scorecards, "haiku") != nil {
+		t.Errorf("expected the adjudicator model not to appear in reviewer scorecards")
+	}
+}
+
+// TestGetResearchReviewerScorecards_AdjudicationUpheld verifies that a finding upheld
+// on adjudication is counted as held, since it remains a valid finding despite the
+// worker's evidence, exactly as docs/features/research-track.md section 8 requires
+// ("findings that held up: fixed by the worker, or upheld on adjudication").
+func TestGetResearchReviewerScorecards_AdjudicationUpheld(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"does not resolve it"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	adjTasks := findAdjudicationTasks(t, store, ctx, projID, parentID)
+	if len(adjTasks) != 1 {
+		t.Fatalf("expected exactly one adjudication task, got %d", len(adjTasks))
+	}
+	submitAdjudication(t, store, ctx, &adjTasks[0], "reject") // upholds the finding
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	if opusCard == nil {
+		t.Fatalf("expected opus in scorecards")
+	}
+	if opusCard.FindingsHeld != 1 {
+		t.Errorf("expected opus 1 held (upheld on adjudication), got %d", opusCard.FindingsHeld)
+	}
+	if opusCard.FindingsWithdrawn != 0 {
+		t.Errorf("expected opus 0 withdrawn, got %d", opusCard.FindingsWithdrawn)
+	}
+	if opusCard.FindingsUnresolved != 0 {
+		t.Errorf("expected opus 0 unresolved, got %d", opusCard.FindingsUnresolved)
 	}
 }
