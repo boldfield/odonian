@@ -2486,7 +2486,15 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		followupModel = s.getDefaultModel()
 	}
 
-	for _, fwr := range findingsByKey {
+	// Sort findings by key for deterministic ordering
+	var sortedKeys []string
+	for key := range findingsByKey {
+		sortedKeys = append(sortedKeys, key)
+	}
+	sort.Strings(sortedKeys)
+
+	for _, key := range sortedKeys {
+		fwr := findingsByKey[key]
 		finding := fwr.finding
 		reviewer := fwr.reviewer
 		// Create the parent-scoped dedup key to prevent cross-parent collisions
@@ -2522,7 +2530,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			return fmt.Errorf("failed to create follow-up task: %w", execErr)
 		}
 
-		// Create task_link rows for deduplication and parent reference
+		// Create task_link rows for deduplication, parent reference, and source finding
 		// Dedup link: enables idempotency across repeated aggregation (parent-scoped)
 		dedupLinkID := GenerateID()
 		if _, execErr := tx.ExecContext(ctx, `
@@ -2539,6 +2547,15 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			VALUES (?, ?, ?, ?)
 		`, parentLinkID, followupID, "parent", parentID); execErr != nil {
 			return fmt.Errorf("failed to create parent link: %w", execErr)
+		}
+
+		// Source finding link: ties follow-up to the source finding it came from
+		sourceLinkID := GenerateID()
+		if _, execErr := tx.ExecContext(ctx, `
+			INSERT INTO task_link (id, task_id, kind, value)
+			VALUES (?, ?, ?, ?)
+		`, sourceLinkID, followupID, "research_source_finding", finding.ID); execErr != nil {
+			return fmt.Errorf("failed to create source finding link: %w", execErr)
 		}
 
 		newlyCreatedFollowupIDs = append(newlyCreatedFollowupIDs, followupID)
@@ -2570,13 +2587,9 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			return fmt.Errorf("failed to update parent result: %w", execErr)
 		}
 
-		// Record follow-up task IDs in a parent event
-		followupList := json.RawMessage(nil)
-		if data, marshalErr := json.Marshal(newlyCreatedFollowupIDs); marshalErr == nil {
-			followupList = json.RawMessage(data)
-		}
-		eventNote := fmt.Sprintf("Created %d research follow-up tasks for non-blocking findings", len(newlyCreatedFollowupIDs))
-		if _, appendErr := s.appendEvent(ctx, tx, parentID, "system", "follow_up_created", nil, &eventNote, nil, followupList); appendErr != nil {
+		// Record follow-up task IDs in a parent event note (not in findings, which is for Finding structs)
+		eventNote := fmt.Sprintf("Created %d research follow-up tasks for non-blocking findings: %s", len(newlyCreatedFollowupIDs), strings.Join(newlyCreatedFollowupIDs, ", "))
+		if _, appendErr := s.appendEvent(ctx, tx, parentID, "system", "follow_up_created", nil, &eventNote, nil); appendErr != nil {
 			return fmt.Errorf("failed to append follow-up event: %w", appendErr)
 		}
 	}

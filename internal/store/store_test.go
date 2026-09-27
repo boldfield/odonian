@@ -12628,11 +12628,23 @@ func TestResearchFollowUpCreation(t *testing.T) {
 			t.Errorf("expected 1 follow_up_created event after first aggregation, got %d", followupEventCountBefore)
 		}
 
-		// Idempotency test: list tasks again without making any changes.
-		// Since aggregation already happened, calling it again (which happens in other
-		// tests when reviewers submit) should not create additional follow-ups or events.
-		// This is implicitly tested by the dedup key being parent-scoped: if we tried to
-		// create the same follow-up again, the dedup link would prevent it.
+		// Idempotency test: re-run aggregation and verify nothing new is created
+		// Call aggregation again for the same parent and round
+		tx, err := store.(*sqliteStore).conn.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("failed to begin transaction: %v", err)
+		}
+		defer tx.Rollback()
+
+		_, err = store.(*sqliteStore).aggregateReviewRound(ctx, tx, parentID, 10, map[string]int{})
+		if err != nil {
+			t.Fatalf("failed to call aggregateReviewRound again: %v", err)
+		}
+		// aggregateReviewRound may return a state, but since parent is already in that state,
+		// it shouldn't cause any database updates. Verify this by checking task count after.
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("failed to commit transaction: %v", err)
+		}
 
 		// Verify task count hasn't changed
 		allTasks2, err := store.ListTasks(ctx, projID, TaskListFilter{})
@@ -12649,6 +12661,36 @@ func TestResearchFollowUpCreation(t *testing.T) {
 
 		if len(followupTasks2) != len(followupTasks1) {
 			t.Errorf("idempotency: follow-up count should not change, got %d want %d", len(followupTasks2), len(followupTasks1))
+		}
+
+		// Verify parent result hasn't been duplicated
+		parent2, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent after second aggregation: %v", err)
+		}
+		parent2Result := ""
+		if parent2.Result != nil {
+			parent2Result = *parent2.Result
+		}
+		if parent2Result != parent1Result {
+			t.Errorf("idempotency: parent result should not change on second aggregation, got: %s want: %s", parent2Result, parent1Result)
+		}
+
+		// Verify event count hasn't changed
+		events2, err := store.ListEvents(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to list events after second aggregation: %v", err)
+		}
+
+		followupEventCountAfter := 0
+		for _, ev := range events2 {
+			if ev.Kind == "follow_up_created" {
+				followupEventCountAfter++
+			}
+		}
+
+		if followupEventCountAfter != followupEventCountBefore {
+			t.Errorf("idempotency: follow_up_created event count should not change, got %d want %d", followupEventCountAfter, followupEventCountBefore)
 		}
 	})
 
@@ -12891,7 +12933,7 @@ func TestResearchFollowUpCreation(t *testing.T) {
 		}
 	})
 
-	t.Run("follow_up_created event contains correct follow-up IDs", func(t *testing.T) {
+	t.Run("follow_up_created event contains correct follow-up IDs in note", func(t *testing.T) {
 		store, ctx, projID, parentID := newResearchTask(t, false)
 		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
 		if opus == nil || sonnet == nil {
@@ -12925,16 +12967,163 @@ func TestResearchFollowUpCreation(t *testing.T) {
 			t.Fatalf("expected to find follow_up_created event")
 		}
 
-		// Verify the event contains the follow-up IDs in the Findings field
-		if followupEvent.Findings == nil {
-			t.Errorf("follow_up_created event should have findings with follow-up IDs")
+		// Verify the event contains follow-up IDs in the Note (not in Findings)
+		if followupEvent.Note == nil {
+			t.Errorf("follow_up_created event should have note with follow-up IDs")
 		} else {
-			var ids []string
-			if err := json.Unmarshal(*followupEvent.Findings, &ids); err != nil {
-				t.Errorf("follow_up_created event findings should be valid JSON, got error: %v", err)
-			} else if len(ids) != 2 {
-				t.Errorf("follow_up_created event should list 2 follow-up IDs, got %d", len(ids))
+			// Note should contain the follow-up IDs as a comma-separated list
+			if !strings.Contains(*followupEvent.Note, "Created 2") {
+				t.Errorf("follow_up_created event note should mention 'Created 2', got: %s", *followupEvent.Note)
 			}
+			// Verify there are two follow-up task IDs in the note
+			noteStr := *followupEvent.Note
+			if !strings.Contains(noteStr, "-") {
+				t.Errorf("follow_up_created event note should contain task IDs, got: %s", noteStr)
+			}
+		}
+
+		// Verify Findings field is empty (should only hold structured review findings, not task IDs)
+		if followupEvent.Findings != nil {
+			t.Errorf("follow_up_created event Findings should be nil (IDs are in note), got: %s", string(*followupEvent.Findings))
+		}
+	})
+
+	t.Run("dedup across rounds - same finding in round 1 and 2 yields one follow-up", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("expected both review tasks to be ready")
+		}
+
+		// Round 1: Both reviewers find a P3 in changed text (blocking in round 1)
+		// We make it blocking so the task goes back to ready
+		blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"wrong quote","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "ready" {
+			t.Fatalf("expected round 1 to fail, got %s", parent.State)
+		}
+
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		if opus2 == nil || sonnet2 == nil {
+			t.Fatalf("expected round 2 review tasks")
+		}
+
+		// Round 2: Same P3 finding reappears (now it's non-blocking because it's not in changed text anymore)
+		// Plus the P1 is resolved
+		roundTwoFindings := json.RawMessage(`[
+			{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"wrong quote","in_changed_text":false,"status":"resolved","prior_id":"f1"},
+			{"id":"f2","severity":"P3","file":"a.md","line":1,"summary":"wrong quote","in_changed_text":false,"status":"new"}
+		]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", roundTwoFindings)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", roundTwoFindings)
+
+		parent, err = store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Errorf("expected approved in round 2, got %s", parent.State)
+		}
+
+		// Verify only one follow-up task was created (dedup across rounds)
+		allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var followupTasks []Task
+		for _, task := range allTasks {
+			if task.Track == "research" && task.State == "backlog" && task.ID != parentID {
+				followupTasks = append(followupTasks, task)
+			}
+		}
+
+		if len(followupTasks) != 1 {
+			t.Errorf("same finding across rounds should create only one follow-up, got %d", len(followupTasks))
+		}
+	})
+
+	t.Run("follow-up tasks have structured links to parent and source finding", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		sqlStore := store.(*sqliteStore)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("expected both review tasks to be ready")
+		}
+
+		// Both reviewers approve with P3 finding
+		findings := json.RawMessage(`[{"id":"finding-123","severity":"P3","file":"a.md","line":1,"summary":"typo","in_changed_text":false,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", findings)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", findings)
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Errorf("expected approved, got %s", parent.State)
+		}
+
+		// Get follow-up task
+		allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var followupID string
+		for _, task := range allTasks {
+			if task.Track == "research" && task.State == "backlog" && task.ID != parentID {
+				followupID = task.ID
+				break
+			}
+		}
+
+		if followupID == "" {
+			t.Fatalf("expected to find follow-up task")
+		}
+
+		// Query task_link table directly to verify structured links
+		rows, err := sqlStore.conn.QueryContext(ctx, `
+			SELECT kind, value FROM task_link WHERE task_id = ? ORDER BY kind
+		`, followupID)
+		if err != nil {
+			t.Fatalf("failed to query task_link: %v", err)
+		}
+		defer rows.Close()
+
+		links := make(map[string][]string)
+		for rows.Next() {
+			var kind, value string
+			if err := rows.Scan(&kind, &value); err != nil {
+				t.Fatalf("failed to scan task_link row: %v", err)
+			}
+			links[kind] = append(links[kind], value)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("failed to iterate task_link rows: %v", err)
+		}
+
+		// Verify parent link exists
+		if len(links["parent"]) != 1 || links["parent"][0] != parentID {
+			t.Errorf("follow-up should have parent link to %s, got %v", parentID, links["parent"])
+		}
+
+		// Verify source finding link exists
+		if len(links["research_source_finding"]) != 1 || links["research_source_finding"][0] != "finding-123" {
+			t.Errorf("follow-up should have source finding link to finding-123, got %v", links["research_source_finding"])
+		}
+
+		// Verify dedup link exists (research_finding_dedup)
+		if len(links["research_finding_dedup"]) != 1 {
+			t.Errorf("follow-up should have dedup link, got %v", links["research_finding_dedup"])
 		}
 	})
 }

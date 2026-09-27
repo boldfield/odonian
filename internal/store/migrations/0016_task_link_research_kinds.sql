@@ -1,11 +1,12 @@
--- Add research-specific task_link kinds for deduplication and parent linking.
--- Research follow-up tasks need two links: one for deduplication (research_finding_dedup)
--- to ensure idempotency across repeated aggregation, and one for parent linking.
+-- Add research-specific task_link kinds for deduplication, parent linking, and source finding.
+-- Research follow-up tasks need three links: one for deduplication (research_finding_dedup)
+-- to ensure idempotency across repeated aggregation, one for parent linking (parent),
+-- and one for source finding reference (research_source_finding).
 
 CREATE TABLE task_link_new (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('pr', 'branch', 'commit', 'ci', 'no_op', 'research_finding_dedup', 'parent')),
+  kind TEXT NOT NULL CHECK (kind IN ('pr', 'branch', 'commit', 'ci', 'no_op', 'research_finding_dedup', 'parent', 'research_source_finding')),
   value TEXT NOT NULL,
   tombstoned_at TEXT,
   FOREIGN KEY (task_id) REFERENCES task(id)
