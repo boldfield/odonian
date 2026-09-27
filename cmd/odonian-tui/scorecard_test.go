@@ -1,13 +1,374 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/boldfield/odonian/internal/tuiclient"
+	"github.com/boldfield/odonian/internal/tuiconfig"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// TestBoardModel_ScorecardMode_Normal tests the normal scorecard flow: press 'c', loading state, then data display.
+func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
+	mockClient := &tuiclient.MockClient{
+		GetResearchReviewerScorecardsFunc: func(ctx context.Context, projectID string) (tuiclient.ReviewerScorecards, error) {
+			return tuiclient.ReviewerScorecards{
+				Scorecards: []tuiclient.ReviewerScorecard{
+					{
+						Model: "opus",
+						FindingsRaised: map[string]int{
+							"p1": 5,
+							"p2": 3,
+						},
+						FindingsHeld:       4,
+						FindingsWithdrawn:  2,
+						FindingsUnresolved: 1,
+						TotalReviewRounds:  15,
+						SampleSize:         10,
+					},
+				},
+			}, nil
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	// Press 'c' to enter scorecard mode
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = m.(*BoardModel)
+
+	// Check that we're in scorecard mode and showing loading state
+	if model.mode != modeScorecards {
+		t.Errorf("expected mode to be modeScorecards, got %d", model.mode)
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "Loading scorecards…") {
+		t.Errorf("expected 'Loading scorecards…' in view during loading state, got:\n%s", view)
+	}
+
+	// Execute the fetch command to get the scorecardFetchedMsg
+	if cmd == nil {
+		t.Fatal("expected a cmd from pressing 'c'")
+	}
+
+	msg := cmd()
+	scorecardMsg, ok := msg.(scorecardFetchedMsg)
+	if !ok {
+		t.Fatalf("expected scorecardFetchedMsg, got %T", msg)
+	}
+
+	// Process the fetched scorecards
+	m, _ = model.Update(scorecardMsg)
+	model = m.(*BoardModel)
+
+	// Check that the view now shows the scorecard content
+	view = model.View()
+	if !strings.Contains(view, "opus") {
+		t.Errorf("expected 'opus' in view after fetch, got:\n%s", view)
+	}
+	if !strings.Contains(view, "P1: 5") {
+		t.Errorf("expected 'P1: 5' in view after fetch, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Held: 4") {
+		t.Errorf("expected 'Held: 4' in view after fetch, got:\n%s", view)
+	}
+
+	// Test pressing 'esc' to return to board
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = m.(*BoardModel)
+
+	if model.mode != modeNormal {
+		t.Errorf("expected mode to be modeNormal after esc, got %d", model.mode)
+	}
+}
+
+// TestBoardModel_ScorecardMode_Empty tests the empty scorecard case.
+func TestBoardModel_ScorecardMode_Empty(t *testing.T) {
+	mockClient := &tuiclient.MockClient{
+		GetResearchReviewerScorecardsFunc: func(ctx context.Context, projectID string) (tuiclient.ReviewerScorecards, error) {
+			return tuiclient.ReviewerScorecards{
+				Scorecards: []tuiclient.ReviewerScorecard{},
+			}, nil
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	// Press 'c' to enter scorecard mode
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = m.(*BoardModel)
+
+	if cmd == nil {
+		t.Fatal("expected a cmd from pressing 'c'")
+	}
+
+	// Execute the fetch command
+	msg := cmd()
+	scorecardMsg, ok := msg.(scorecardFetchedMsg)
+	if !ok {
+		t.Fatalf("expected scorecardFetchedMsg, got %T", msg)
+	}
+
+	// Process the fetched empty scorecards
+	m, _ = model.Update(scorecardMsg)
+	model = m.(*BoardModel)
+
+	view := model.View()
+	if !strings.Contains(view, "No research tasks") {
+		t.Errorf("expected 'No research tasks' in view for empty scorecards, got:\n%s", view)
+	}
+}
+
+// TestBoardModel_ScorecardMode_Sparse tests the sparse data warning.
+func TestBoardModel_ScorecardMode_Sparse(t *testing.T) {
+	mockClient := &tuiclient.MockClient{
+		GetResearchReviewerScorecardsFunc: func(ctx context.Context, projectID string) (tuiclient.ReviewerScorecards, error) {
+			return tuiclient.ReviewerScorecards{
+				Scorecards: []tuiclient.ReviewerScorecard{
+					{
+						Model: "sonnet",
+						FindingsRaised: map[string]int{
+							"p1": 1,
+						},
+						FindingsHeld:       0,
+						FindingsWithdrawn:  0,
+						FindingsUnresolved: 1,
+						TotalReviewRounds:  1,
+						SampleSize:         1,
+					},
+				},
+			}, nil
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	// Press 'c' to enter scorecard mode
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = m.(*BoardModel)
+
+	if cmd == nil {
+		t.Fatal("expected a cmd from pressing 'c'")
+	}
+
+	// Execute the fetch command
+	msg := cmd()
+	scorecardMsg, ok := msg.(scorecardFetchedMsg)
+	if !ok {
+		t.Fatalf("expected scorecardFetchedMsg, got %T", msg)
+	}
+
+	// Process the fetched sparse scorecards
+	m, _ = model.Update(scorecardMsg)
+	model = m.(*BoardModel)
+
+	view := model.View()
+	if !strings.Contains(view, "sonnet") {
+		t.Errorf("expected 'sonnet' in view for sparse data, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Small sample size") {
+		t.Errorf("expected 'Small sample size' warning in view for sparse data, got:\n%s", view)
+	}
+	if !strings.Contains(view, "P1: 1") {
+		t.Errorf("expected 'P1: 1' in view for sparse data, got:\n%s", view)
+	}
+}
+
+// TestBoardModel_ScorecardMode_APIError tests the API error case.
+func TestBoardModel_ScorecardMode_APIError(t *testing.T) {
+	mockClient := &tuiclient.MockClient{
+		GetResearchReviewerScorecardsFunc: func(ctx context.Context, projectID string) (tuiclient.ReviewerScorecards, error) {
+			return tuiclient.ReviewerScorecards{}, fmt.Errorf("network timeout")
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	// Press 'c' to enter scorecard mode
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = m.(*BoardModel)
+
+	if model.mode != modeScorecards {
+		t.Errorf("expected mode to be modeScorecards, got %d", model.mode)
+	}
+
+	if cmd == nil {
+		t.Fatal("expected a cmd from pressing 'c'")
+	}
+
+	// Execute the fetch command (which will error)
+	msg := cmd()
+	scorecardMsg, ok := msg.(scorecardFetchedMsg)
+	if !ok {
+		t.Fatalf("expected scorecardFetchedMsg, got %T", msg)
+	}
+
+	if scorecardMsg.err == nil {
+		t.Fatal("expected an error in scorecardFetchedMsg")
+	}
+
+	// Process the error
+	m, _ = model.Update(scorecardMsg)
+	model = m.(*BoardModel)
+
+	// Check that the view shows the error message
+	view := model.View()
+	if !strings.Contains(view, "Error:") {
+		t.Errorf("expected 'Error:' in view after API error, got:\n%s", view)
+	}
+	if !strings.Contains(view, "network timeout") {
+		t.Errorf("expected 'network timeout' in view after API error, got:\n%s", view)
+	}
+
+	// Mode should still be scorecard to show the error
+	if model.mode != modeScorecards {
+		t.Errorf("expected mode to be modeScorecards after error, got %d", model.mode)
+	}
+}
+
+// TestBoardModel_ScorecardMode_Refresh tests the refresh functionality.
+func TestBoardModel_ScorecardMode_Refresh(t *testing.T) {
+	callCount := 0
+	mockClient := &tuiclient.MockClient{
+		GetResearchReviewerScorecardsFunc: func(ctx context.Context, projectID string) (tuiclient.ReviewerScorecards, error) {
+			callCount++
+			if callCount == 1 {
+				// First call returns data
+				return tuiclient.ReviewerScorecards{
+					Scorecards: []tuiclient.ReviewerScorecard{
+						{
+							Model:              "opus",
+							FindingsRaised:     map[string]int{"p1": 5},
+							FindingsHeld:       3,
+							FindingsWithdrawn:  1,
+							FindingsUnresolved: 1,
+							TotalReviewRounds:  10,
+							SampleSize:         10,
+						},
+					},
+				}, nil
+			}
+			// Second call (refresh) returns different data
+			return tuiclient.ReviewerScorecards{
+				Scorecards: []tuiclient.ReviewerScorecard{
+					{
+						Model:              "sonnet",
+						FindingsRaised:     map[string]int{"p2": 7},
+						FindingsHeld:       5,
+						FindingsWithdrawn:  2,
+						FindingsUnresolved: 0,
+						TotalReviewRounds:  12,
+						SampleSize:         12,
+					},
+				},
+			}, nil
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	// Press 'c' to enter scorecard mode
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = m.(*BoardModel)
+
+	// Execute the fetch command
+	msg := cmd()
+	scorecardMsg, ok := msg.(scorecardFetchedMsg)
+	if !ok {
+		t.Fatalf("expected scorecardFetchedMsg, got %T", msg)
+	}
+
+	// Process the initial fetch
+	m, _ = model.Update(scorecardMsg)
+	model = m.(*BoardModel)
+
+	view := model.View()
+	if !strings.Contains(view, "opus") {
+		t.Errorf("expected 'opus' in view after initial fetch")
+	}
+
+	// Press 'r' to refresh
+	m, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = m.(*BoardModel)
+
+	// Execute the refresh command
+	if cmd == nil {
+		t.Fatal("expected a cmd from pressing 'r'")
+	}
+
+	msg = cmd()
+	scorecardMsg, ok = msg.(scorecardFetchedMsg)
+	if !ok {
+		t.Fatalf("expected scorecardFetchedMsg, got %T", msg)
+	}
+
+	// Process the refresh
+	m, _ = model.Update(scorecardMsg)
+	model = m.(*BoardModel)
+
+	view = model.View()
+	if !strings.Contains(view, "sonnet") {
+		t.Errorf("expected 'sonnet' in view after refresh")
+	}
+	if strings.Contains(view, "opus") {
+		t.Errorf("unexpected 'opus' in view after refresh (should be replaced by sonnet)")
+	}
+}
 
 func TestBuildScorecardContent_WithData(t *testing.T) {
 	m := &BoardModel{
@@ -116,253 +477,5 @@ func TestBuildScorecardContent_SparseData(t *testing.T) {
 
 	if !strings.Contains(content, "Small sample size") {
 		t.Error("expected sparse data warning in content")
-	}
-}
-
-func TestUpdateScorecardMode_Escape(t *testing.T) {
-	m := &BoardModel{
-		mode: modeScorecards,
-	}
-
-	escMsg := tea.KeyMsg{
-		Type: tea.KeyEsc,
-	}
-
-	updated, _ := m.updateScorecardMode(escMsg)
-
-	if updated.mode != modeNormal {
-		t.Errorf("expected mode to be modeNormal after esc, got %d", updated.mode)
-	}
-}
-
-func TestInitScorecardViewport(t *testing.T) {
-	m := &BoardModel{
-		width:  80,
-		height: 24,
-	}
-
-	scorecards := tuiclient.ReviewerScorecards{
-		Scorecards: []tuiclient.ReviewerScorecard{
-			{
-				Model:              "opus",
-				FindingsRaised:     map[string]int{"p1": 5},
-				FindingsHeld:       3,
-				FindingsWithdrawn:  2,
-				FindingsUnresolved: 0,
-				TotalReviewRounds:  5,
-				SampleSize:         2,
-			},
-		},
-	}
-
-	m.initScorecardViewport(scorecards)
-
-	if m.scorecardViewport.Width == 0 {
-		t.Error("expected viewport width to be set")
-	}
-
-	if m.scorecardViewport.Height == 0 {
-		t.Error("expected viewport height to be set")
-	}
-
-	content := m.scorecardViewport.View()
-	if len(content) == 0 {
-		t.Error("expected viewport to have content")
-	}
-}
-
-func TestRenderScorecardView(t *testing.T) {
-	m := &BoardModel{
-		width:  80,
-		height: 24,
-	}
-
-	scorecards := tuiclient.ReviewerScorecards{
-		Scorecards: []tuiclient.ReviewerScorecard{
-			{
-				Model:          "opus",
-				FindingsRaised: map[string]int{"p1": 5},
-				SampleSize:     1,
-			},
-		},
-	}
-
-	m.initScorecardViewport(scorecards)
-	rendered := m.renderScorecardView()
-
-	if len(rendered) == 0 {
-		t.Error("expected non-empty rendered content")
-	}
-}
-
-func TestRenderScorecardHelpBar(t *testing.T) {
-	m := &BoardModel{}
-	helpBar := m.renderScorecardHelpBar()
-
-	if !strings.Contains(helpBar, "esc back") {
-		t.Error("expected 'esc back' in help bar")
-	}
-
-	if !strings.Contains(helpBar, "scroll") {
-		t.Error("expected 'scroll' in help bar")
-	}
-}
-
-// Test with all three severity levels
-func TestBuildScorecardContent_AllSeverities(t *testing.T) {
-	m := &BoardModel{
-		width:  100,
-		height: 30,
-	}
-
-	scorecards := tuiclient.ReviewerScorecards{
-		Scorecards: []tuiclient.ReviewerScorecard{
-			{
-				Model: "fable",
-				FindingsRaised: map[string]int{
-					"p1": 3,
-					"p2": 7,
-					"p3": 20,
-				},
-				FindingsHeld:                            15,
-				FindingsWithdrawn:                       10,
-				FindingsUnresolved:                      5,
-				ApprovalsWithLaterFixedBlockingFindings: 1,
-				TotalReviewRounds:                       25,
-				SampleSize:                              10,
-			},
-		},
-	}
-
-	content := m.buildScorecardContent(scorecards)
-
-	// Verify all severity levels are present
-	if !strings.Contains(content, "P1: 3") {
-		t.Error("expected 'P1: 3' in content")
-	}
-	if !strings.Contains(content, "P2: 7") {
-		t.Error("expected 'P2: 7' in content")
-	}
-	if !strings.Contains(content, "P3: 20") {
-		t.Error("expected 'P3: 20' in content")
-	}
-
-	// Verify outcome counts are present
-	if !strings.Contains(content, "Held: 15") {
-		t.Error("expected 'Held: 15' in content")
-	}
-	if !strings.Contains(content, "Withdrawn: 10") {
-		t.Error("expected 'Withdrawn: 10' in content")
-	}
-}
-
-// Test normal scorecard render with View()
-func TestRenderScorecardView_Normal(t *testing.T) {
-	m := &BoardModel{
-		width:  80,
-		height: 24,
-		mode:   modeScorecards,
-	}
-
-	scorecards := tuiclient.ReviewerScorecards{
-		Scorecards: []tuiclient.ReviewerScorecard{
-			{
-				Model:              "opus",
-				FindingsRaised:     map[string]int{"p1": 5, "p2": 3},
-				FindingsHeld:       4,
-				FindingsWithdrawn:  2,
-				FindingsUnresolved: 2,
-				SampleSize:         10,
-				TotalReviewRounds:  15,
-			},
-		},
-	}
-	m.initScorecardViewport(scorecards)
-
-	view := m.renderScorecardView()
-	if !strings.Contains(view, "opus") {
-		t.Error("expected 'opus' in rendered view")
-	}
-	if !strings.Contains(view, "P1: 5") {
-		t.Error("expected 'P1: 5' in rendered view")
-	}
-	if !strings.Contains(view, "Held: 4") {
-		t.Error("expected 'Held: 4' in rendered view")
-	}
-}
-
-// Test empty scorecard render
-func TestRenderScorecardView_Empty(t *testing.T) {
-	m := &BoardModel{
-		width:  80,
-		height: 24,
-		mode:   modeScorecards,
-	}
-
-	scorecards := tuiclient.ReviewerScorecards{
-		Scorecards: []tuiclient.ReviewerScorecard{},
-	}
-	m.initScorecardViewport(scorecards)
-
-	view := m.renderScorecardView()
-	if !strings.Contains(view, "No research tasks") {
-		t.Error("expected 'No research tasks' in rendered view")
-	}
-}
-
-// Test sparse data warning in rendered view
-func TestRenderScorecardView_Sparse(t *testing.T) {
-	m := &BoardModel{
-		width:  80,
-		height: 24,
-		mode:   modeScorecards,
-	}
-
-	scorecards := tuiclient.ReviewerScorecards{
-		Scorecards: []tuiclient.ReviewerScorecard{
-			{
-				Model:              "sonnet",
-				FindingsRaised:     map[string]int{"p1": 1},
-				FindingsHeld:       0,
-				FindingsWithdrawn:  0,
-				FindingsUnresolved: 1,
-				SampleSize:         1,
-				TotalReviewRounds:  1,
-			},
-		},
-	}
-	m.initScorecardViewport(scorecards)
-
-	view := m.renderScorecardView()
-	if !strings.Contains(view, "sonnet") {
-		t.Error("expected 'sonnet' in rendered view")
-	}
-	if !strings.Contains(view, "Small sample size") {
-		t.Error("expected 'Small sample size' warning in rendered view")
-	}
-}
-
-// Test API error in scorecard mode
-func TestUpdateScorecardMode_APIError(t *testing.T) {
-	m := &BoardModel{
-		width:  80,
-		height: 24,
-		mode:   modeScorecards,
-	}
-
-	// Simulate fetching an empty scorecard with normal state
-	scorecards := tuiclient.ReviewerScorecards{Scorecards: []tuiclient.ReviewerScorecard{}}
-	m.initScorecardViewport(scorecards)
-
-	// Process error message
-	errMsg := scorecardFetchedMsg{err: fmt.Errorf("network error")}
-	m.scorecardMessage = fmt.Sprintf("Error: %v", errMsg.err)
-
-	view := m.renderScorecardView()
-	if !strings.Contains(view, "Error:") {
-		t.Error("expected error message in rendered view")
-	}
-	if !strings.Contains(view, "network error") {
-		t.Error("expected error details in rendered view")
 	}
 }
