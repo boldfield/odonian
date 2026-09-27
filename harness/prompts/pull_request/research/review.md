@@ -50,13 +50,15 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
 
 **3-adjudicate. Adjudicate one disputed finding (adjudication path only).** This path applies ONLY when the spec begins with "Adjudicate one disputed research review finding".
 
-The spec contains the disputed finding's details (id, severity, file, line, summary, status) and the **Worker's evidence disputing the finding**. Independently verify the finding against the cited source, the worker's evidence, and the exact code in the parent task's PR head.
+First, **validate the PR link and fetch the merged code**, exactly as in step 3 (see above): verify the PR link resolves to a real OPEN PR, then fetch the PR head and merge current main. If the merge conflicts, abort and submit `reject` with note "merge conflict with main — sync `origin/main` and resolve before resubmitting".
+
+The spec contains the disputed finding's details (id, severity, file, line, summary, status) and the **Worker's evidence disputing the finding**. Independently verify the finding against the cited source, the worker's evidence, and the exact code in the parent task's PR head (the merged code you just prepared).
 
 Your ruling is binding for this finding only — it does not vote on the review round. Submit:
 - **Verdict `approve`** if the finding should be **OVERTURNED** — the worker's evidence resolves the dispute; the defect does not block and is not a valid finding.
 - **Verdict `reject`** if the finding should be **UPHELD** — it remains a valid blocking finding despite the worker's evidence.
 
-Submit with NO structured findings (`--findings-file` should be an empty JSON array: `[]`). Write your decision reasoning in a short prose comment and submit it with `odonian submit <task-id> --result "<your reasoning>" --verdict approve` (or `reject`). Do NOT use the JSON findings format for adjudication tasks.
+Submit with an empty findings array. Write your decision reasoning in a short prose comment and submit it with `odonian submit <task-id> --result "<your reasoning>" --verdict approve --findings-file <file>` (or `--verdict reject --findings-file <file>`), where `<file>` contains `[]`.
 
 3. **Validate the PR link, THEN reproduce AS MERGED WITH MAIN.** This step is for PR cases
    (recorded link from step 2 or branch-resolved from step 2) — the no-op path from step 2 is
@@ -79,8 +81,8 @@ Submit with NO structured findings (`--findings-file` should be an empty JSON ar
    - Clean merge → read the full diff (`gh pr diff <pr-url>`) and every claim it touches.
 4. **Check the evidence — this is the core of a research review, not a build gate.**
    - **Round scope:** The review round is indicated in the task metadata (`review_round` field returned by `odonian show`).
-     - **Round 1** (`review_round == 0`): **Full review.** Check every claim in the file(s) under review, not just the ones changed since the diff. Read the entire assignment.
-     - **Round 2 and later** (`review_round >= 1`): **Scoped re-review.** You have reviewed this task before. Check the findings from your *previous* review round and report each as `resolved` or `still_open`. Also check *every change* made since your last review — text changed in the latest PR diff. Still read the rest of the file. If you find a new defect in unchanged text, record it but handle it differently: see the "Newly discovered unchanged-text defects" section below.
+     - **Round 1** (`review_round == 1`): **Full review.** Check every claim in the file(s) under review, not just the ones changed since the diff. Read the entire assignment.
+     - **Round 2 and later** (`review_round >= 2`): **Scoped re-review.** You have reviewed this task before. Check the findings from your *previous* review round and report each as `resolved` or `still_open`. Also check *every change* made since your last review — text changed in the latest PR diff. Still read the rest of the file. If you find a new defect in unchanged text, record it but handle it differently: see the "Newly discovered unchanged-text defects" section below.
    - **Open every source yourself.** For each claim marked `confirmed`, retrieve and inspect the
      cited passage. A worker-supplied hash, export, or paraphrase never substitutes — you must open
      the actual source. If a claim is marked `confirmed` and you cannot open its source, that is a
@@ -155,8 +157,7 @@ Submit with NO structured findings (`--findings-file` should be an empty JSON ar
 
 6-adjudicate. **Submit adjudication verdict (adjudication path only).** 
    - Write a brief summary of your reasoning: whether the finding is valid and blocks despite the worker's evidence, or whether it should be overturned.
-   - Submit: `odonian submit <review-task-id> --result "<your reasoning>" --verdict approve` (if the finding should be overturned) or `--verdict reject` (if it should be upheld).
-   - Do NOT use `--findings-file` for adjudication tasks — submit with no findings.
+   - Submit: `odonian submit <review-task-id> --result "<your reasoning>" --verdict approve --findings-file <file>` (if the finding should be overturned, with `<file>` containing `[]`) or `--verdict reject --findings-file <file>` (if it should be upheld, with `<file>` containing `[]`).
    - The server records your verdict and it is **binding** for this finding alone. It does not vote on the review round.
 
 7. **Do NOT merge — ever.** After submitting your verdict you are DONE with this task. Never merge a
@@ -187,14 +188,14 @@ Submit with NO structured findings (`--findings-file` should be an empty JSON ar
   record that reports only some of its hits is a false claim about the evidence.
 - **A finished correction task does not establish its claim.** Treat "task X corrected this" as a
   pointer to evidence, not as evidence. Check what the corrected file actually says.
-- **Reject on any P1 or P2 finding in changed text; otherwise approve.** List P3s and P1/P2 findings in unchanged text (round 2+) in the findings, but they do not block. In round 1, all findings block (changed text rule applies to all text). P1/P2 findings in unchanged text from round 2+ go to follow-up tasks, not blocking the round.
+- **Reject on any P1 or P2 finding; otherwise approve.** In round 1, all text is changed text, so a P1 or P2 finding in any text blocks. From round 2 on, a P1 or P2 finding blocks only if in changed text; findings in unchanged text become follow-up tasks. P3 findings never block, in any round or text state. List all findings in your writeup, with the blocked and unblocked status clear.
 - **Round scope drives review scope.** Round 1 is a full review; round 2+ is a scoped re-review of your prior findings and changes since your last review.
 - **Re-evaluating disputed findings.** If a finding from your earlier review has been disputed by the worker, weigh the evidence and decide whether to resolve it or maintain it. Maintained disputes go to adjudication.
 - **Every verdict ends with a `Findings` heading followed by a fenced `json` block containing only
   the JSON array** (id, severity, file, line, summary, in_changed_text, status, prior_id), in
   addition to prose, even when the list is empty. No title or prose inside the fence. **The same
   array is submitted with `--findings-file` on every verdict** — the prose block is for humans, the
-  flag is what the server stores and what the worker's rework context shows. **Adjudication tasks do NOT use the JSON findings format** — submit with no `--findings-file`.
+  flag is what the server stores and what the worker's rework context shows. **EXCEPTION: Adjudication tasks submit with `--findings-file` containing an empty array `[]`**, not a formatted Findings section.
 - Your verdict goes on the **review task you claimed** (via `submit` with `verdict`), not on the
   parent.
 - **NEVER merge a PR and NEVER transition a parent task** — merging is the merger's job (the server

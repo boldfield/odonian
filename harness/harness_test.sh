@@ -214,6 +214,95 @@ else
   test_fail "agent.sh doesn't handle missing prompt correctly in multi-project"
 fi
 
+# Test 19: Check that research review prompt enforces round 1 full review
+echo "Test 19: research review prompt enforces round 1 full review"
+_rr_prompt="$HARNESS_DIR/prompts/pull_request/research/review.md"
+if grep -q 'review_round == 1.*Full review' "$_rr_prompt" && grep -q 'Check every claim in the file' "$_rr_prompt"; then
+  test_pass "research review prompt correctly detects round 1 and requires full review"
+else
+  test_fail "research review prompt does not correctly enforce round 1 full review"
+fi
+
+# Test 20: Check that research review prompt requires scoped re-review for round 2+
+echo "Test 20: research review prompt enforces round 2+ scoped re-review"
+if grep -q 'review_round >= 2.*Scoped re-review' "$_rr_prompt" && grep -q 'Check the findings from your.*previous.*review round' "$_rr_prompt"; then
+  test_pass "research review prompt correctly enforces round 2+ scoped re-review"
+else
+  test_fail "research review prompt does not correctly enforce round 2+ scoped re-review"
+fi
+
+# Test 21: Check that research review prompt handles unchanged-text defects
+echo "Test 21: research review prompt handles unchanged-text defects"
+if grep -q 'Newly discovered unchanged-text defects' "$_rr_prompt" && grep -q 'in_changed_text: false' "$_rr_prompt"; then
+  test_pass "research review prompt correctly handles unchanged-text defects"
+else
+  test_fail "research review prompt does not handle unchanged-text defects"
+fi
+
+# Test 22: Check that research review prompt supports dispute re-evaluation
+echo "Test 22: research review prompt supports dispute re-evaluation"
+if grep -q 'Re-evaluating disputed findings' "$_rr_prompt" && grep -q 'dispute evidence' "$_rr_prompt"; then
+  test_pass "research review prompt supports dispute re-evaluation"
+else
+  test_fail "research review prompt does not support dispute re-evaluation"
+fi
+
+# Test 23: Check that adjudication path exists and requires PR merge
+echo "Test 23: adjudication path includes PR validation and merge"
+if grep -q '3-adjudicate.*Adjudicate one disputed' "$_rr_prompt" && grep -q 'validate the PR link and fetch the merged code' "$_rr_prompt"; then
+  test_pass "adjudication path includes PR validation and merge"
+else
+  test_fail "adjudication path missing PR validation or merge"
+fi
+
+# Test 24: Check that adjudication submissions use empty findings array
+echo "Test 24: adjudication submissions use empty findings array"
+if grep -q '6-adjudicate' "$_rr_prompt" && grep -q '\--findings-file.*\[\]' "$_rr_prompt"; then
+  test_pass "adjudication submissions use empty findings array"
+else
+  test_fail "adjudication submissions do not use empty findings array"
+fi
+
+# Test 25: Check that build/design prompts are unchanged (regression check)
+echo "Test 25: build/design prompts unchanged"
+_build_implement="$HARNESS_DIR/prompts/pull_request/build/implement.md"
+_build_review="$HARNESS_DIR/prompts/pull_request/build/review.md"
+_design_implement="$HARNESS_DIR/prompts/pull_request/design/implement.md"
+_design_review="$HARNESS_DIR/prompts/pull_request/design/review.md"
+_all_exist=1
+for _f in "$_build_implement" "$_build_review" "$_design_implement" "$_design_review"; do
+  if [ ! -f "$_f" ]; then
+    _all_exist=0
+  fi
+done
+if [ "$_all_exist" -eq 1 ]; then
+  # Check that build prompts don't have research-specific language
+  if ! grep -q 'research_round' "$_build_implement" && ! grep -q 'research_round' "$_build_review"; then
+    test_pass "build/design prompts remain unchanged"
+  else
+    test_fail "build prompts accidentally contain research-specific content"
+  fi
+else
+  test_fail "one or more build/design prompts missing"
+fi
+
+# Test 26: Check that research implement prompt includes dispute submission guidance
+echo "Test 26: research implement prompt includes dispute submission"
+_ri_prompt="$HARNESS_DIR/prompts/pull_request/research/implement.md"
+if grep -q '\\-\\-disputes-file' "$_ri_prompt" && grep -q 'finding_id.*evidence' "$_ri_prompt"; then
+  test_pass "research implement prompt includes dispute submission with evidence"
+else
+  test_fail "research implement prompt missing dispute submission guidance"
+fi
+
+# Test 27: Check that severity rules correctly exclude P3 from blocking
+echo "Test 27: research review prompt correctly excludes P3 from blocking"
+if grep -q 'P3 findings never block' "$_rr_prompt" && grep -q 'Reject on any P1 or P2' "$_rr_prompt"; then
+  test_pass "research review prompt correctly excludes P3 from blocking"
+else
+  test_fail "research review prompt does not correctly exclude P3 from blocking"
+fi
+
 echo ""
 echo "=== Test Summary ==="
 echo "Total: $test_count | Passed: $pass_count | Failed: $fail_count"
