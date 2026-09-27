@@ -2837,11 +2837,11 @@ func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.
 		if err != nil {
 			return 0, fmt.Errorf("failed to find predecessors: %w", err)
 		}
-		defer rows.Close()
 
 		for rows.Next() {
 			var predID string
 			if err := rows.Scan(&predID); err != nil {
+				rows.Close()
 				return 0, fmt.Errorf("failed to scan predecessor: %w", err)
 			}
 			if !seen[predID] {
@@ -2850,11 +2850,102 @@ func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.
 		}
 
 		if err := rows.Err(); err != nil {
+			rows.Close()
 			return 0, fmt.Errorf("failed to iterate predecessors: %w", err)
 		}
+		rows.Close()
 	}
 
 	return count, nil
+}
+
+// collectChainBlockingFindings walks the task's supersede chain and collects blocking findings
+// from each round, returning them grouped by round for display in the budget block event.
+func (s *sqliteStore) collectChainBlockingFindings(ctx context.Context, tx *sql.Tx, taskID string) (map[int][]Finding, error) {
+	findings := make(map[int][]Finding)
+	seen := make(map[string]bool)
+
+	var toVisit []string
+	toVisit = append(toVisit, taskID)
+
+	for len(toVisit) > 0 {
+		currentID := toVisit[0]
+		toVisit = toVisit[1:]
+
+		if seen[currentID] {
+			continue
+		}
+		seen[currentID] = true
+
+		var reviewRound int
+		err := tx.QueryRowContext(ctx, `
+			SELECT review_round FROM task WHERE id = ?
+		`, currentID).Scan(&reviewRound)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
+			return nil, fmt.Errorf("failed to fetch task for findings: %w", err)
+		}
+
+		// Collect blocking findings from review events for this task across all rounds up to current
+		for round := 1; round <= reviewRound; round++ {
+			rows, err := tx.QueryContext(ctx, `
+				SELECT source_task_id, findings FROM event
+				WHERE task_id = ? AND kind = 'review' AND source_task_id IS NOT NULL
+				AND source_task_id IN (
+					SELECT id FROM task WHERE target_task_id = ? AND review_round = ? AND kind = 'review'
+				)
+				ORDER BY created_at ASC
+			`, currentID, currentID, round)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch findings for round %d: %w", round, err)
+			}
+
+			for rows.Next() {
+				var sourceTaskID string
+				var findingsText sql.NullString
+				if err := rows.Scan(&sourceTaskID, &findingsText); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("failed to scan findings: %w", err)
+				}
+
+				if findingsText.Valid && findingsText.String != "" {
+					var blockingFindings []Finding
+					if err := json.Unmarshal([]byte(findingsText.String), &blockingFindings); err == nil {
+						for _, f := range blockingFindings {
+							if isBlockingResearchFinding(f, round) {
+								findings[round] = append(findings[round], f)
+							}
+						}
+					}
+				}
+			}
+			rows.Close()
+		}
+
+		// Find predecessors: tasks where superseded_by = currentID
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id FROM task WHERE superseded_by = ?
+		`, currentID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find predecessors for findings: %w", err)
+		}
+
+		for rows.Next() {
+			var predID string
+			if err := rows.Scan(&predID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("failed to scan predecessor: %w", err)
+			}
+			if !seen[predID] {
+				toVisit = append(toVisit, predID)
+			}
+		}
+		rows.Close()
+	}
+
+	return findings, nil
 }
 
 // aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.
@@ -2970,43 +3061,33 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 				if err != nil {
 					return "", err
 				}
-				if chainWideRejectedRounds > researchRoundBudget {
+				if chainWideRejectedRounds >= researchRoundBudget {
 					shouldBlockForBudget = true
 				}
 			}
 
 			if shouldBlockForBudget {
-				// Budget exceeded: block with reason decompose
+				// Budget exhausted: block with reason decompose
 				newParentState = "blocked"
-				// Collect blocking findings from all rounds for the event note
-				var findings []string
-				for round := 1; round <= parentReviewRound; round++ {
-					rowsFind, err := tx.QueryContext(ctx, `
-						SELECT DISTINCT findings FROM event
-						WHERE task_id IN (
-							SELECT id FROM task WHERE target_task_id = ? AND review_round = ?
-						)
-						AND kind = 'review' AND findings IS NOT NULL
-						ORDER BY created_at ASC
-					`, parentID, round)
-					if err != nil {
-						return "", fmt.Errorf("failed to fetch findings for round %d: %w", round, err)
-					}
-					for rowsFind.Next() {
-						var findingsJSON *string
-						if err := rowsFind.Scan(&findingsJSON); err != nil {
-							rowsFind.Close()
-							return "", fmt.Errorf("failed to scan findings: %w", err)
-						}
-						if findingsJSON != nil && *findingsJSON != "" {
-							findings = append(findings, *findingsJSON)
-						}
-					}
-					rowsFind.Close()
+				// Collect blocking findings from the entire chain, grouped by round
+				chainFindings, err := s.collectChainBlockingFindings(ctx, tx, parentID)
+				if err != nil {
+					return "", err
 				}
-				eventNote := fmt.Sprintf("Chain-wide budget exhausted at %d rounds (threshold: %d); needs decomposition", chainWideRejectedRounds, researchRoundBudget)
-				if len(findings) > 0 {
-					eventNote += "; unresolved blocking findings: " + strings.Join(findings, "; ")
+				var findingsSummary []string
+				for round := 1; round <= parentReviewRound; round++ {
+					if len(chainFindings[round]) > 0 {
+						var summaries []string
+						for _, f := range chainFindings[round] {
+							summaries = append(summaries, fmt.Sprintf("%s[%s:%d]: %s", f.Severity, f.File, f.Line, f.Summary))
+						}
+						roundSummary := fmt.Sprintf("Round %d: %s", round, strings.Join(summaries, "; "))
+						findingsSummary = append(findingsSummary, roundSummary)
+					}
+				}
+				eventNote := fmt.Sprintf("Chain-wide budget exhausted at %d rounds (threshold: %d); reason decompose", chainWideRejectedRounds, researchRoundBudget)
+				if len(findingsSummary) > 0 {
+					eventNote += " — " + strings.Join(findingsSummary, " | ")
 				}
 				// We'll append the event after the state update at the end
 				parentBlockReason = &eventNote
