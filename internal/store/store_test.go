@@ -3548,6 +3548,12 @@ func TestSubmitReviewFindingsValidationFailures(t *testing.T) {
 // and submitted with a PR link, so its round-1 review tasks are ready to claim.
 func newResearchTask(t *testing.T, escalate bool) (Store, context.Context, string, string) {
 	t.Helper()
+	return newResearchTaskWithReviewers(t, escalate, []string{"opus", "sonnet"})
+}
+
+// newResearchTaskWithReviewers is newResearchTask with an explicit review_models list.
+func newResearchTaskWithReviewers(t *testing.T, escalate bool, reviewModels []string) (Store, context.Context, string, string) {
+	t.Helper()
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open test database: %v", err)
@@ -3570,7 +3576,7 @@ func newResearchTask(t *testing.T, escalate bool) (Store, context.Context, strin
 			Spec:         "Verify the claims in the doc",
 			DocumentID:   doc.ID,
 			Model:        "haiku",
-			ReviewModels: []string{"opus", "sonnet"},
+			ReviewModels: reviewModels,
 			Track:        "research",
 			Escalate:     &escalate,
 		},
@@ -4177,6 +4183,9 @@ func TestResearchFollowUps_DedupAcrossReviewers(t *testing.T) {
 	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
 	if len(followUps) != 1 {
 		t.Fatalf("expected 1 follow-up deduplicated across both reviewers, got %d", len(followUps))
+	}
+	if !strings.Contains(followUps[0].Spec, "Raised by: opus, sonnet\n") {
+		t.Errorf("expected the follow-up to credit both raising reviewers, got spec %q", followUps[0].Spec)
 	}
 }
 
@@ -4906,13 +4915,11 @@ func TestResearchFollowUps_StillOpenChainYieldsOneFollowUp(t *testing.T) {
 	}
 }
 
-// TestResearchFollowUps_ResolvedMarkSurvivesLaterUnion verifies that a chain's
-// resolved mark isn't lost when a later report re-parents the chain's root. Here
-// round 2 resolves f2 (reworded to "wrong locator, fixed") and, afterwards in
-// processing order, carries f3 forward as still_open under that exact same
-// identity, which merges f3's chain into f2's resolved one. Marking the resolved
-// root before that union would leave the merged chain looking unresolved and
-// create stale follow-ups for f2 once the parent is approved.
+// TestResearchFollowUps_ResolvedMarkSurvivesLaterUnion verifies that resolving one
+// chain doesn't leak into, or get undone by, another chain that shares a wording.
+// Round 2 resolves f2 (reworded to "wrong locator, fixed") and carries f3 forward as
+// still_open under that exact same wording. f2 must get no follow-up; f3, never
+// resolved, gets exactly one.
 func TestResearchFollowUps_ResolvedMarkSurvivesLaterUnion(t *testing.T) {
 	store, ctx, projID, parentID := newResearchTask(t, false)
 	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
@@ -4947,10 +4954,143 @@ func TestResearchFollowUps_ResolvedMarkSurvivesLaterUnion(t *testing.T) {
 		t.Fatalf("expected approved, got %s", parent.State)
 	}
 
-	for _, f := range findResearchFollowUps(t, store, ctx, projID, parentID) {
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	for _, f := range followUps {
 		if strings.Contains(f.Spec, "Finding: wrong locator\n") {
 			t.Errorf("expected no follow-up for resolved finding f2, got %s: %q", f.ID, f.Spec)
 		}
+	}
+	if len(followUps) != 1 {
+		t.Errorf("expected exactly 1 follow-up for the unresolved f3 chain, got %d", len(followUps))
+	}
+}
+
+// TestResearchFollowUps_ReRaisedAfterResolved verifies that resolution belongs to a
+// prior_id chain, not to a file/line/summary tuple: a P3 resolved in round 2 and then
+// raised again as a fresh finding with identical text in the passing round 3 still
+// gets its follow-up.
+func TestResearchFollowUps_ReRaisedAfterResolved(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	round1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong locator","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	round2 := json.RawMessage(`[
+		{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"still_open","prior_id":"f1"},
+		{"id":"f2b","severity":"P3","file":"b.md","line":5,"summary":"wrong locator","in_changed_text":true,"status":"resolved","prior_id":"f2"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", round2)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus3, sonnet3 := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
+	round3 := json.RawMessage(`[
+		{"id":"f1c","severity":"P1","file":"a.md","line":1,"summary":"bad claim, fixed","in_changed_text":true,"status":"resolved","prior_id":"f1b"},
+		{"id":"f3","severity":"P3","file":"b.md","line":5,"summary":"wrong locator","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus3, "opus-reviewer", "approve", round3)
+	submitResearchReview(t, store, ctx, sonnet3, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up for the P3 re-raised after its earlier resolution, got %d", len(followUps))
+	}
+	if !strings.Contains(followUps[0].Spec, "Finding: wrong locator\n") {
+		t.Errorf("expected follow-up for the re-raised P3, got spec %q", followUps[0].Spec)
+	}
+}
+
+// researchReviewTasksInSlotOrder returns the parent's review task ids for a round in
+// creation order, which is how reviewer slots are assigned.
+func researchReviewTasksInSlotOrder(t *testing.T, store Store, ctx context.Context, parentID string, round int) []string {
+	t.Helper()
+	rows, err := store.Conn().QueryContext(ctx, `
+		SELECT id FROM task WHERE target_task_id = ? AND kind = 'review' AND review_round = ? ORDER BY rowid
+	`, parentID, round)
+	if err != nil {
+		t.Fatalf("failed to list review tasks: %v", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("failed to scan review task id: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// TestResearchFollowUps_SameModelReviewersKeepOwnLineage verifies that prior_id is
+// resolved within one reviewer's own lineage, not across every reviewer sharing a
+// model. With review_models ["opus","opus"], reviewer A raises P3 f1 and reviewer B
+// raises a blocking P1 also called f1. In round 2 only B reports, resolving its own
+// f1. A's P3 must still get exactly one follow-up. Review-task ids are random, so the
+// scenario is repeated until both relative id orderings of A and B have been seen.
+func TestResearchFollowUps_SameModelReviewersKeepOwnLineage(t *testing.T) {
+	seenOrder := map[bool]bool{}
+	for attempt := 0; attempt < 64 && len(seenOrder) < 2; attempt++ {
+		t.Run(fmt.Sprintf("attempt=%d", attempt), func(t *testing.T) {
+			store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "opus"})
+			getTask := func(id string) *Task {
+				tk, err := store.GetTask(ctx, id)
+				if err != nil {
+					t.Fatalf("failed to get task %s: %v", id, err)
+				}
+				return &Task{ID: tk.ID, Model: tk.Model}
+			}
+
+			round1 := researchReviewTasksInSlotOrder(t, store, ctx, parentID, 1)
+			if len(round1) != 2 {
+				t.Fatalf("expected 2 round-1 review tasks, got %d", len(round1))
+			}
+			seenOrder[round1[0] < round1[1]] = true
+			submitResearchReview(t, store, ctx, getTask(round1[0]), "opus-a", "approve",
+				json.RawMessage(`[{"id":"f1","severity":"P3","file":"a.md","line":1,"summary":"typo","in_changed_text":true,"status":"new"}]`))
+			submitResearchReview(t, store, ctx, getTask(round1[1]), "opus-b", "reject",
+				json.RawMessage(`[{"id":"f1","severity":"P1","file":"c.md","line":3,"summary":"wrong claim","in_changed_text":true,"status":"new"}]`))
+			resubmitResearchImplementTask(t, store, ctx, parentID)
+
+			round2 := researchReviewTasksInSlotOrder(t, store, ctx, parentID, 2)
+			if len(round2) != 2 {
+				t.Fatalf("expected 2 round-2 review tasks, got %d", len(round2))
+			}
+			submitResearchReview(t, store, ctx, getTask(round2[0]), "opus-a", "approve", json.RawMessage(`[]`))
+			submitResearchReview(t, store, ctx, getTask(round2[1]), "opus-b", "approve",
+				json.RawMessage(`[{"id":"f1b","severity":"P1","file":"c.md","line":3,"summary":"wrong claim, fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"}]`))
+
+			parent, err := store.GetTask(ctx, parentID)
+			if err != nil {
+				t.Fatalf("failed to get parent: %v", err)
+			}
+			if parent.State != "approved" {
+				t.Fatalf("expected approved, got %s", parent.State)
+			}
+			followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+			if len(followUps) != 1 {
+				t.Fatalf("expected exactly 1 follow-up for reviewer A's unresolved P3, got %d", len(followUps))
+			}
+			if !strings.Contains(followUps[0].Spec, "Finding: typo\n") {
+				t.Errorf("expected the follow-up to be for A's P3, got spec %q", followUps[0].Spec)
+			}
+		})
+	}
+	if len(seenOrder) < 2 {
+		t.Fatalf("expected to exercise both review-task id orderings, saw %v", seenOrder)
 	}
 }
 

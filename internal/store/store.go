@@ -2412,6 +2412,7 @@ type researchCollectedFinding struct {
 	round         int
 	reviewTaskID  string
 	reviewerModel string
+	lineage       string
 }
 
 // createResearchFollowUpTasks implements docs/features/research-track.md section 4:
@@ -2435,19 +2436,23 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 
 	// Every review task this parent has had, across every round so far, with the
 	// round it belongs to and the model that reviewed it (recorded as the follow-up's
-	// raising reviewer).
+	// raising reviewer). Ordered by rowid, i.e. creation order, which is what
+	// assigns each review task its reviewer slot below.
 	taskRows, err := tx.QueryContext(ctx, `
 		SELECT id, review_round, model FROM task
 		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ?
+		ORDER BY review_round, rowid, id
 	`, parentID, throughRound)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list parent's review tasks: %w", err)
 	}
 	type reviewTaskInfo struct {
-		round int
-		model string
+		round   int
+		model   string
+		lineage string
 	}
 	reviewTasks := make(map[string]reviewTaskInfo)
+	slotsTaken := make(map[string]int)
 	for taskRows.Next() {
 		var id, model string
 		var round int
@@ -2455,7 +2460,16 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			taskRows.Close()
 			return nil, fmt.Errorf("failed to scan review task: %w", err)
 		}
-		reviewTasks[id] = reviewTaskInfo{round: round, model: model}
+		// A reviewer's lineage is its model plus its slot: the index of its review
+		// task among the same round's review tasks for that model, in creation
+		// order. Review tasks are spawned by iterating review_models in order, so
+		// the same slot names the same reviewer in every round, even when
+		// review_models lists a model more than once. Finding ids (and so
+		// prior_id) are only meaningful within one reviewer's lineage.
+		slotKey := fmt.Sprintf("%d\x00%s", round, model)
+		slot := slotsTaken[slotKey]
+		slotsTaken[slotKey] = slot + 1
+		reviewTasks[id] = reviewTaskInfo{round: round, model: model, lineage: fmt.Sprintf("%s\x00%d", model, slot)}
 	}
 	if err := taskRows.Err(); err != nil {
 		taskRows.Close()
@@ -2497,7 +2511,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			continue
 		}
 		for _, f := range findings {
-			allFindings = append(allFindings, researchCollectedFinding{Finding: f, round: info.round, reviewTaskID: sourceTaskID, reviewerModel: info.model})
+			allFindings = append(allFindings, researchCollectedFinding{Finding: f, round: info.round, reviewTaskID: sourceTaskID, reviewerModel: info.model, lineage: info.lineage})
 		}
 	}
 	if err := evRows.Err(); err != nil {
@@ -2518,84 +2532,106 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		return allFindings[i].ID < allFindings[j].ID
 	})
 
-	// Findings are only unique within a single review submission, not across a
-	// reviewer's rounds (docs/features/research-track.md section 3 asks for ids
-	// "unique within the task", but validation only enforces uniqueness within one
-	// submitted findings array), so a later round's report can reuse an earlier
-	// round's finding id. prior_id must therefore resolve against whichever instance
-	// of that id existed immediately before the current report, not against a later
-	// instance that happens to reuse the same id (including the current report
-	// itself, if it names its own id as prior_id). And a finding can be carried
-	// forward across several rounds as still_open, reworded each time, so every
-	// report in one prior_id chain describes the same underlying finding: resolving
-	// any of them suppresses the whole chain, and an unresolved chain yields at most
-	// one follow-up. A union-find over identities, built in chronological order,
-	// tracks the chains: each report unions its own identity with its prior_id's
-	// identity (as resolved from the state before this report). Identical identities
-	// from different reviewers or rounds are the same node, so they share a chain too.
-	parentOf := make(map[researchFindingIdentity]researchFindingIdentity)
-	var find func(researchFindingIdentity) researchFindingIdentity
-	find = func(x researchFindingIdentity) researchFindingIdentity {
-		p, ok := parentOf[x]
-		if !ok || p == x {
-			return x
+	// Union-find over report indices into allFindings.
+	newUnionFind := func() (func(int) int, func(int, int)) {
+		parent := make([]int, len(allFindings))
+		for i := range parent {
+			parent[i] = i
 		}
-		root := find(p)
-		parentOf[x] = root
-		return root
-	}
-	union := func(a, b researchFindingIdentity) {
-		ra, rb := find(a), find(b)
-		if ra != rb {
-			parentOf[ra] = rb
+		var find func(int) int
+		find = func(x int) int {
+			if parent[x] != x {
+				parent[x] = find(parent[x])
+			}
+			return parent[x]
 		}
-	}
-
-	var resolvedIdentities []researchFindingIdentity
-	latestIdentityByReviewerAndFindingID := make(map[string]researchFindingIdentity, len(allFindings))
-	for _, cf := range allFindings {
-		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
-		if cf.PriorID != nil {
-			if priorIdentity, ok := latestIdentityByReviewerAndFindingID[cf.reviewerModel+"\x00"+*cf.PriorID]; ok {
-				union(identity, priorIdentity)
+		union := func(a, b int) {
+			if ra, rb := find(a), find(b); ra != rb {
+				parent[ra] = rb
 			}
 		}
-		if cf.Status == "resolved" {
-			resolvedIdentities = append(resolvedIdentities, identity)
-		}
-		// Recorded only after resolving this report's own prior_id against the prior
-		// state, so a report that reuses its own id as prior_id (a self-reference)
-		// still resolves against the earlier instance rather than against itself.
-		latestIdentityByReviewerAndFindingID[cf.reviewerModel+"\x00"+cf.ID] = identity
+		return find, union
 	}
 
-	// Roots are only final once every union is done: a later union can re-parent a
-	// root, so marking resolved chains any earlier would depend on report order.
-	resolvedRoots := make(map[researchFindingIdentity]bool, len(resolvedIdentities))
-	for _, identity := range resolvedIdentities {
-		resolvedRoots[find(identity)] = true
+	// Chains: a finding carried forward across rounds as still_open, reworded each
+	// time, and finally resolved, is one chain of reports linked by prior_id within
+	// one reviewer lineage. Ids are only unique within a single submission (section
+	// 3 asks for ids "unique within the task", but validation only enforces
+	// uniqueness within one findings array), so a prior_id resolves against the
+	// latest instance of that id recorded before the current report, not against a
+	// later instance reusing the id (including the current report itself, if it
+	// names its own id as prior_id).
+	chainOf, linkChain := newUnionFind()
+	latestIndexByLineageAndID := make(map[string]int, len(allFindings))
+	for i, cf := range allFindings {
+		if cf.PriorID != nil {
+			if prior, ok := latestIndexByLineageAndID[cf.lineage+"\x00"+*cf.PriorID]; ok {
+				linkChain(i, prior)
+			}
+		}
+		latestIndexByLineageAndID[cf.lineage+"\x00"+cf.ID] = i
 	}
-	membersByRoot := make(map[researchFindingIdentity][]researchFindingIdentity)
-	for _, cf := range allFindings {
+
+	// A resolved report settles its chain up to and including its round. Only
+	// reports from later rounds (a chain re-opened after resolution) are still
+	// outstanding. Resolution is per chain, not per identity: a fresh report that
+	// happens to repeat a resolved finding's file, line and summary, without a
+	// prior_id into that chain, is a new finding and still outstanding.
+	lastResolvedRound := make(map[int]int)
+	for i, cf := range allFindings {
+		if cf.Status == "resolved" {
+			if root := chainOf(i); cf.round > lastResolvedRound[root] {
+				lastResolvedRound[root] = cf.round
+			}
+		}
+	}
+	isOutstanding := func(i int) bool {
+		cf := allFindings[i]
+		return cf.Status != "resolved" && cf.round > lastResolvedRound[chainOf(i)]
+	}
+
+	// Groups: outstanding reports of the same chain, plus outstanding reports with
+	// identical file, line and summary (the same finding raised by several
+	// reviewers, or in several rounds), describe one finding and yield at most one
+	// follow-up.
+	groupOf, linkGroup := newUnionFind()
+	firstIndexByIdentity := make(map[researchFindingIdentity]int)
+	for i, cf := range allFindings {
+		if !isOutstanding(i) {
+			continue
+		}
+		linkGroup(i, chainOf(i))
 		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
-		root := find(identity)
-		members := membersByRoot[root]
-		if !slices.Contains(members, identity) {
-			membersByRoot[root] = append(members, identity)
+		if first, ok := firstIndexByIdentity[identity]; ok {
+			linkGroup(i, first)
+		} else {
+			firstIndexByIdentity[identity] = i
 		}
 	}
 
-	// One candidate per unresolved chain. allFindings is in chronological order, so
-	// the last non-blocking report wins and the follow-up describes the finding's
-	// most recent wording.
-	candidatesByRoot := make(map[researchFindingIdentity]researchCollectedFinding)
-	for _, cf := range allFindings {
-		if cf.Status == "resolved" {
+	type followUpCandidate struct {
+		finding   researchCollectedFinding
+		members   []researchFindingIdentity
+		reviewers []string
+	}
+	// allFindings is in chronological order, so the group's last non-blocking
+	// report is its representative and the follow-up describes the finding's most
+	// recent wording. A group whose severity changed across reports is still
+	// represented by its last non-blocking report, not its latest report overall.
+	candidatesByGroup := make(map[int]*followUpCandidate)
+	for i, cf := range allFindings {
+		if !isOutstanding(i) {
 			continue
 		}
-		root := find(researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary})
-		if resolvedRoots[root] {
-			continue
+		group := groupOf(i)
+		candidate := candidatesByGroup[group]
+		if candidate == nil {
+			candidate = &followUpCandidate{}
+			candidatesByGroup[group] = candidate
+		}
+		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
+		if !slices.Contains(candidate.members, identity) {
+			candidate.members = append(candidate.members, identity)
 		}
 		// Non-blocking per section 3: P3 findings, and P1/P2 findings in unchanged
 		// text after round 1.
@@ -2604,16 +2640,20 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		if !nonBlocking {
 			continue
 		}
-		candidatesByRoot[root] = cf
+		candidate.finding = cf
+		if !slices.Contains(candidate.reviewers, cf.reviewerModel) {
+			candidate.reviewers = append(candidate.reviewers, cf.reviewerModel)
+		}
 	}
 
-	type followUpCandidate struct {
-		finding researchCollectedFinding
-		members []researchFindingIdentity
-	}
-	candidates := make([]followUpCandidate, 0, len(candidatesByRoot))
-	for root, cf := range candidatesByRoot {
-		candidates = append(candidates, followUpCandidate{finding: cf, members: membersByRoot[root]})
+	candidates := make([]followUpCandidate, 0, len(candidatesByGroup))
+	for _, candidate := range candidatesByGroup {
+		if len(candidate.reviewers) == 0 {
+			// No non-blocking report in this group.
+			continue
+		}
+		sort.Strings(candidate.reviewers)
+		candidates = append(candidates, *candidate)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		a, b := candidates[i].finding, candidates[j].finding
@@ -2672,7 +2712,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		title := fmt.Sprintf("Research follow-up: %s (%s:%d)", cf.Severity, cf.File, cf.Line)
 		spec := fmt.Sprintf(
 			"Follow-up for a non-blocking research finding. Not a rewrite of the parent's assignment.\n\nSeverity: %s\nFile: %s\nLine: %d\nRaised by: %s\nParent task: %s\n\nFinding: %s\n",
-			cf.Severity, cf.File, cf.Line, cf.reviewerModel, parentID, cf.Summary,
+			cf.Severity, cf.File, cf.Line, strings.Join(candidate.reviewers, ", "), parentID, cf.Summary,
 		)
 
 		if _, err := tx.ExecContext(ctx, `
