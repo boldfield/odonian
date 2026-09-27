@@ -206,6 +206,12 @@ func runServer() {
 		log.Fatalf("failed to parse ODONIAN_RESEARCH_ESCALATION_LADDER: %v", err)
 	}
 
+	// Parse research round budget
+	researchRoundBudget, err := parseResearchRoundBudget(os.Getenv("ODONIAN_RESEARCH_ROUND_BUDGET"))
+	if err != nil {
+		log.Fatalf("failed to parse ODONIAN_RESEARCH_ROUND_BUDGET: %v", err)
+	}
+
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
 	if eventTerminalRetentionDaysStr == "" {
@@ -274,7 +280,7 @@ func runServer() {
 	}
 
 	// Create API server
-	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, researchEscalationThresholds, pprofEnabled, slowRequestThresholdMs, logger)
+	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, pprofEnabled, slowRequestThresholdMs, logger)
 
 	// Set up graceful shutdown with signal handling
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1185,6 +1191,25 @@ func parseResearchEscalationThresholds(thresholdsStr string, allowedModels []str
 		result[model] = threshold
 	}
 	return result, nil
+}
+
+// parseResearchRoundBudget parses ODONIAN_RESEARCH_ROUND_BUDGET, the chain-wide
+// rejected-round budget from docs/features/research-track.md section 6. Empty
+// returns the recommended default of 6 (decision 1). The value must be a positive
+// integer: a research task blocks once its chain has this many rejected rounds, so
+// zero or negative would block every research task immediately.
+func parseResearchRoundBudget(budgetStr string) (int, error) {
+	if budgetStr == "" {
+		return 6, nil
+	}
+	budget, err := strconv.Atoi(strings.TrimSpace(budgetStr))
+	if err != nil {
+		return 0, fmt.Errorf("invalid research round budget %q: %w", budgetStr, err)
+	}
+	if budget <= 0 {
+		return 0, fmt.Errorf("research round budget must be positive, got %d", budget)
+	}
+	return budget, nil
 }
 
 func validateResearchDefaultModel(modelStr string, allowedModels []string) (string, error) {

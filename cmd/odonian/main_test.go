@@ -4651,6 +4651,42 @@ func TestParseResearchEscalationThresholds(t *testing.T) {
 	}
 }
 
+func TestParseResearchRoundBudget(t *testing.T) {
+	tests := []struct {
+		name      string
+		budgetStr string
+		want      int
+		wantErr   bool
+		errMsg    string
+	}{
+		{"empty string returns default 6", "", 6, false, ""},
+		{"valid positive value", "3", 3, false, ""},
+		{"valid value with whitespace", " 10 ", 10, false, ""},
+		{"non-numeric value", "abc", 0, true, "invalid research round budget"},
+		{"zero is rejected", "0", 0, true, "must be positive"},
+		{"negative value is rejected", "-1", 0, true, "must be positive"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseResearchRoundBudget(tt.budgetStr)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseResearchRoundBudget(%q) error = %v, wantErr %v", tt.budgetStr, err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				if err != nil && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("parseResearchRoundBudget(%q) error = %v, want error containing %q", tt.budgetStr, err, tt.errMsg)
+				}
+				return
+			}
+			if got != tt.want {
+				t.Errorf("parseResearchRoundBudget(%q) = %d, want %d", tt.budgetStr, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseResearchEscalationLadder(t *testing.T) {
 	tests := []struct {
 		name          string
