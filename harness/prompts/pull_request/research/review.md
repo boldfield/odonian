@@ -50,9 +50,9 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
 
 **3-adjudicate. Adjudicate one disputed finding (adjudication path only).** This path applies ONLY when the spec begins with "Adjudicate one disputed research review finding".
 
-First, **validate the PR link and fetch the merged code**, exactly as in step 3 (see above): verify the PR link resolves to a real OPEN PR, then fetch the PR head and merge current main. If the merge conflicts, abort and submit `reject` with note "merge conflict with main — sync `origin/main` and resolve before resubmitting".
+First, **validate the PR link and fetch the PR code**, exactly as in step 3 (see step 3 below): verify the PR link resolves to a real OPEN PR, then fetch the PR head. Do NOT merge with main; evaluate the disputed finding against the exact PR code, which is what the original review was about. (If you need the state as-merged for context, fetch and inspect it separately, but adjudicate the finding itself on the PR head alone.) If the PR link does not resolve or the PR head cannot be fetched, transition this task to `blocked` with note "PR link does not resolve or PR head is unavailable" and STOP — do NOT submit a verdict for an infrastructure failure.
 
-The spec contains the disputed finding's details (id, severity, file, line, summary, status) and the **Worker's evidence disputing the finding**. Independently verify the finding against the cited source, the worker's evidence, and the exact code in the parent task's PR head (the merged code you just prepared).
+The spec contains the disputed finding's details (id, severity, file, line, summary, status) and the **Worker's evidence disputing the finding**. Independently verify the finding against the cited source, the worker's evidence, and the exact code in the parent task's PR head.
 
 Your ruling is binding for this finding only — it does not vote on the review round. Submit:
 - **Verdict `approve`** if the finding should be **OVERTURNED** — the worker's evidence resolves the dispute; the defect does not block and is not a valid finding.
@@ -82,7 +82,7 @@ Submit with an empty findings array. Write your decision reasoning in a short pr
 4. **Check the evidence — this is the core of a research review, not a build gate.**
    - **Round scope:** The review round is indicated in the task metadata (`review_round` field returned by `odonian show`).
      - **Round 1** (`review_round == 1`): **Full review.** Check every claim in the file(s) under review, not just the ones changed since the diff. Read the entire assignment.
-     - **Round 2 and later** (`review_round >= 2`): **Scoped re-review.** You have reviewed this task before. Check the findings from your *previous* review round and report each as `resolved` or `still_open`. Also check *every change* made since your last review — text changed in the latest PR diff. Still read the rest of the file. If you find a new defect in unchanged text, record it but handle it differently: see the "Newly discovered unchanged-text defects" section below.
+     - **Round 2 and later** (`review_round >= 2`): **Scoped re-review.** If you have reviewed this task before, check the findings from your *previous* review round and report each as `resolved` or `still_open`. If you are reviewing this task for the first time in round 2+, do the full review. Either way, also check *every change* made since the last review round — text changed in the latest PR diff. Still read the rest of the file. If you find a new defect in unchanged text, record it but handle it differently: see the "Newly discovered unchanged-text defects" section below.
    - **Open every source yourself.** For each claim marked `confirmed`, retrieve and inspect the
      cited passage. A worker-supplied hash, export, or paraphrase never substitutes — you must open
      the actual source. If a claim is marked `confirmed` and you cannot open its source, that is a

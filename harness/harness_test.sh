@@ -225,7 +225,7 @@ fi
 
 # Test 20: Check that research review prompt requires scoped re-review for round 2+
 echo "Test 20: research review prompt enforces round 2+ scoped re-review"
-if grep -q 'review_round >= 2.*Scoped re-review' "$_rr_prompt" && grep -q 'Check the findings from your.*previous.*review round' "$_rr_prompt"; then
+if grep -q 'review_round >= 2.*Scoped re-review' "$_rr_prompt" && grep -q 'check the findings from your.*previous.*review round' "$_rr_prompt"; then
   test_pass "research review prompt correctly enforces round 2+ scoped re-review"
 else
   test_fail "research review prompt does not correctly enforce round 2+ scoped re-review"
@@ -247,12 +247,12 @@ else
   test_fail "research review prompt does not support dispute re-evaluation"
 fi
 
-# Test 23: Check that adjudication path exists and requires PR merge
-echo "Test 23: adjudication path includes PR validation and merge"
-if grep -q '3-adjudicate.*Adjudicate one disputed' "$_rr_prompt" && grep -q 'validate the PR link and fetch the merged code' "$_rr_prompt"; then
-  test_pass "adjudication path includes PR validation and merge"
+# Test 23: Check that adjudication path exists and validates the PR
+echo "Test 23: adjudication path includes PR validation and fetch"
+if grep -q '3-adjudicate.*Adjudicate one disputed' "$_rr_prompt" && grep -q 'validate the PR link and fetch the PR' "$_rr_prompt"; then
+  test_pass "adjudication path includes PR validation and fetch"
 else
-  test_fail "adjudication path missing PR validation or merge"
+  test_fail "adjudication path missing PR validation or fetch"
 fi
 
 # Test 24: Check that adjudication submissions use empty findings array
@@ -276,11 +276,14 @@ for _f in "$_build_implement" "$_build_review" "$_design_implement" "$_design_re
   fi
 done
 if [ "$_all_exist" -eq 1 ]; then
-  # Check that build prompts don't have research-specific language
-  if ! grep -q 'research_round' "$_build_implement" && ! grep -q 'research_round' "$_build_review"; then
+  # Check that build prompts retain their essential markers and don't leak research-specific content
+  if grep -q "make check" "$_build_implement" && \
+     grep -q "verdict" "$_build_review" && \
+     ! grep -q '3-adjudicate\|in_changed_text\|Scoped re-review' "$_build_implement" && \
+     ! grep -q '3-adjudicate\|in_changed_text\|Scoped re-review' "$_build_review"; then
     test_pass "build/design prompts remain unchanged"
   else
-    test_fail "build prompts accidentally contain research-specific content"
+    test_fail "build prompts accidentally contain research-specific content or lost essential markers"
   fi
 else
   test_fail "one or more build/design prompts missing"
@@ -289,7 +292,7 @@ fi
 # Test 26: Check that research implement prompt includes dispute submission guidance
 echo "Test 26: research implement prompt includes dispute submission"
 _ri_prompt="$HARNESS_DIR/prompts/pull_request/research/implement.md"
-if grep -q '\\-\\-disputes-file' "$_ri_prompt" && grep -q 'finding_id.*evidence' "$_ri_prompt"; then
+if grep -q -- '--disputes-file' "$_ri_prompt" && grep -q 'finding_id.*evidence' "$_ri_prompt"; then
   test_pass "research implement prompt includes dispute submission with evidence"
 else
   test_fail "research implement prompt missing dispute submission guidance"
