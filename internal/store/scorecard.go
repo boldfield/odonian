@@ -159,6 +159,7 @@ func globalRound(taskIdx, localRound int) int {
 // buildScorecards, after every chain and every adjudication has been applied.
 type findingThread struct {
 	reviewerModel string
+	chainRoot     string // the chain's root task id (chain[0].ID), so computeApprovalsWithLaterFix only compares within one chain
 	lastKnownID   string // the id of the most recent report in this thread, for cross-boundary prior_id matching (findCarriedByPriorID)
 
 	firstBlockingGlobalRound int   // 0 if never a blocking finding; else the earliest globalRound it was
@@ -173,6 +174,7 @@ type findingThread struct {
 // computeApprovalsWithLaterFix.
 type scorecardApproval struct {
 	model       string
+	chainRoot   string // the chain's root task id, so the approval only competes against blocking findings raised in the same chain
 	globalRound int
 }
 
@@ -270,6 +272,7 @@ func groupResearchFindingsByChain(allFindings []researchCollectedFinding, chainO
 // rounds or chain members pass, since nothing establishes it was ever revisited.
 func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s *sqliteStore, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, chain []Task) error {
 	openByLineage := make(map[string][]*findingThread)
+	chainRoot := chain[0].ID
 
 	for taskIdx, task := range chain {
 		var maxRound int
@@ -309,7 +312,7 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 				}
 				matchedIn[lineage][thread] = true
 			} else {
-				thread = &findingThread{reviewerModel: first.reviewerModel}
+				thread = &findingThread{reviewerModel: first.reviewerModel, chainRoot: chainRoot}
 				agg.threads = append(agg.threads, thread)
 				ragg.findingsRaised[severity]++
 			}
@@ -354,7 +357,7 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 
 		openByLineage = openOut
 
-		if err := agg.collectVerdicts(ctx, s, allTasks, adjudicationTaskIDs, task.ID, taskIdx); err != nil {
+		if err := agg.collectVerdicts(ctx, s, allTasks, adjudicationTaskIDs, task.ID, taskIdx, chainRoot); err != nil {
 			return err
 		}
 	}
@@ -369,7 +372,7 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 // total rounds. Disputes are collected here, rather than in processChain, because a
 // dispute must be matched against threadByReport, which processChain has already
 // fully populated for this task by the time it calls this method.
-func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, s *sqliteStore, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, taskID string, taskIdx int) error {
+func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, s *sqliteStore, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, taskID string, taskIdx int, chainRoot string) error {
 	events, err := s.ListEvents(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("failed to list events for %s: %w", taskID, err)
@@ -391,7 +394,7 @@ func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, s *sqliteS
 			ragg.tasksReviewed[taskID] = true
 			ragg.totalReviews++
 			if event.Verdict != nil && *event.Verdict == "approve" {
-				agg.approvals = append(agg.approvals, scorecardApproval{model: reviewTask.Model, globalRound: globalRound(taskIdx, reviewTask.ReviewRound)})
+				agg.approvals = append(agg.approvals, scorecardApproval{model: reviewTask.Model, chainRoot: chainRoot, globalRound: globalRound(taskIdx, reviewTask.ReviewRound)})
 			}
 		case "submit":
 			if err := agg.recordDisputes(taskID, event); err != nil {
@@ -473,6 +476,9 @@ func (agg *scorecardAggregation) computeApprovalsWithLaterFix() {
 	for _, appr := range agg.approvals {
 		ragg := agg.reviewerAgg(appr.model)
 		for _, thread := range agg.threads {
+			if thread.chainRoot != appr.chainRoot {
+				continue // a blocking finding on an unrelated chain was never relevant to this approval
+			}
 			if thread.reviewerModel == appr.model {
 				continue
 			}

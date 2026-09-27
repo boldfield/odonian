@@ -777,6 +777,91 @@ func TestGetResearchReviewerScorecards_SupersededChain_ApprovalsWithLaterFix(t *
 	}
 }
 
+// TestGetResearchReviewerScorecards_ApprovalsWithLaterFix_ScopedToChain verifies
+// that computeApprovalsWithLaterFix only matches an approval against a blocking
+// finding raised on the same research chain: a reviewer who never touched a given
+// chain must not be credited (or blamed) for what happened on an unrelated one in
+// the same project.
+func TestGetResearchReviewerScorecards_ApprovalsWithLaterFix_ScopedToChain(t *testing.T) {
+	store, ctx, projID, taskAID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	// Task A: opus approves with no findings. Opus never reviews task B below.
+	opusA, _ := findResearchReviewTasks(t, store, ctx, projID, taskAID, 1)
+	if opusA == nil {
+		t.Fatalf("expected opus review task on task A")
+	}
+	emptyFindings := json.RawMessage(`[]`)
+	submitResearchReview(t, store, ctx, opusA, "opus-reviewer", "approve", emptyFindings)
+
+	// Task B, a second and independent research chain in the same project: sonnet
+	// rejects round 1 with a blocking P2, then resolves it in round 2.
+	doc, err := store.CreateDocument(ctx, projID, "feature_spec", "test-doc-b", "test-b.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	escalate := false
+	tasks, err := store.CreateTasks(ctx, projID, []TaskInput{
+		{
+			Title:        "Verify other claims",
+			Spec:         "Verify the claims in the other doc",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"sonnet"},
+			Track:        "research",
+			Escalate:     &escalate,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task B: %v", err)
+	}
+	taskBID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskBID); err != nil {
+		t.Fatalf("failed to promote task B: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskBID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task B: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskBID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#200"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit task B: %v", err)
+	}
+
+	_, sonnetB1 := findResearchReviewTasks(t, store, ctx, projID, taskBID, 1)
+	if sonnetB1 == nil {
+		t.Fatalf("expected sonnet review task on task B round 1")
+	}
+	blockingFindings := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, sonnetB1, "sonnet-reviewer", "reject", blockingFindings)
+
+	resubmitResearchImplementTask(t, store, ctx, taskBID)
+
+	_, sonnetB2 := findResearchReviewTasks(t, store, ctx, projID, taskBID, 2)
+	if sonnetB2 == nil {
+		t.Fatalf("expected sonnet review task on task B round 2")
+	}
+	resolvedFindings := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"resolved","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, sonnetB2, "sonnet-reviewer", "approve", resolvedFindings)
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	if opusCard == nil {
+		t.Fatalf("expected opus in scorecards")
+	}
+	if opusCard.ApprovalsWithLaterFixedBlockingFindings != 0 {
+		t.Errorf("expected opus 0 approvals with later fix (opus never reviewed task B), got %d", opusCard.ApprovalsWithLaterFixedBlockingFindings)
+	}
+
+	sonnetCard := findScorecardByModel(scorecards.Scorecards, "sonnet")
+	if sonnetCard == nil {
+		t.Fatalf("expected sonnet in scorecards")
+	}
+	if sonnetCard.FindingsHeld != 1 {
+		t.Errorf("expected sonnet 1 held finding, got %d", sonnetCard.FindingsHeld)
+	}
+}
+
 // TestGetResearchReviewerScorecards_AdjudicationOverturned verifies that a finding
 // overturned on adjudication (docs/features/research-track.md section 5) is counted
 // as withdrawn, not held or unresolved, even though it was never independently
