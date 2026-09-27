@@ -3471,6 +3471,18 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 	return t, nil
 }
 
+// extractOriginalAssignment removes any prior compaction blocks from a research spec
+// to recover the original assignment. A compaction block starts with
+// "## Unresolved findings from last review round" and continues to the end.
+func extractOriginalAssignment(spec string) string {
+	marker := "\n## Unresolved findings from last review round"
+	idx := strings.Index(spec, marker)
+	if idx == -1 {
+		return spec
+	}
+	return spec[:idx]
+}
+
 // getUnresolvedFindingsFromLastRound gets findings with status 'new' or 'still_open'
 // from the last review round for a research task. Returns them as a JSON array string
 // suitable for inclusion in a spec, or empty string if none found.
@@ -3534,8 +3546,19 @@ func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx
 		return "", nil
 	}
 
+	// Deduplicate findings by (severity, file, line, summary)
+	seen := make(map[string]bool)
+	var deduplicatedFindings []Finding
+	for _, f := range unresolvedFindings {
+		key := fmt.Sprintf("%s:%s:%d:%s", f.Severity, f.File, f.Line, f.Summary)
+		if !seen[key] {
+			seen[key] = true
+			deduplicatedFindings = append(deduplicatedFindings, f)
+		}
+	}
+
 	// Marshal findings to JSON array string
-	data, err := json.Marshal(unresolvedFindings)
+	data, err := json.Marshal(deduplicatedFindings)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal unresolved findings: %w", err)
 	}
@@ -3579,11 +3602,21 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 
 	// 1b. Gather prior reject feedback (or unresolved findings for research tasks)
 	if oldTask.Track == "research" {
+		// Extract original assignment (strip any prior compaction blocks)
+		originalAssignment := extractOriginalAssignment(oldTask.Spec)
+
 		// For research tasks, attach only unresolved findings from the last round
 		unresolvedJSON, err := s.getUnresolvedFindingsFromLastRound(ctx, tx, taskID)
 		if err != nil {
 			return "", err
 		}
+
+		var newSpec strings.Builder
+		newSpec.WriteString(originalAssignment)
+
+		// Add links to complete event history (link to this task and chain)
+		newSpec.WriteString("\n\n## Research task history\n\n")
+		newSpec.WriteString(fmt.Sprintf("- Superseded task: %s\n", taskID))
 
 		if unresolvedJSON != "" {
 			// Format findings in a readable way for the spec
@@ -3592,18 +3625,17 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 				return "", fmt.Errorf("failed to unmarshal unresolved findings: %w", err)
 			}
 
-			var findingsBlock strings.Builder
-			findingsBlock.WriteString("## Unresolved findings from last review round\n\n")
+			newSpec.WriteString("\n## Unresolved findings from last review round\n\n")
 			for _, f := range findings {
-				findingsBlock.WriteString(fmt.Sprintf("- **%s** (P%s, %s:%d): %s\n",
+				newSpec.WriteString(fmt.Sprintf("- **%s** (P%s, %s:%d): %s\n",
 					f.ID, f.Severity[1:], f.File, f.Line, f.Summary))
 			}
-			findingsBlock.WriteString("\n**Structured findings (JSON):**\n```json\n")
-			findingsBlock.WriteString(unresolvedJSON)
-			findingsBlock.WriteString("\n```\n")
-
-			oldTask.Spec = oldTask.Spec + "\n\n" + findingsBlock.String()
+			newSpec.WriteString("\n**Structured findings (JSON):**\n```json\n")
+			newSpec.WriteString(unresolvedJSON)
+			newSpec.WriteString("\n```\n")
 		}
+
+		oldTask.Spec = newSpec.String()
 	} else {
 		// For non-research tasks (build, design), gather all prior reject feedback
 		rows, err := tx.QueryContext(ctx, `

@@ -15197,3 +15197,162 @@ func TestDesignTaskSupersessionPrependsFeedback(t *testing.T) {
 		t.Errorf("design task should not use research-style findings compaction")
 	}
 }
+
+// TestResearchSpecCompactionHistoryLinks verifies that replacement specs
+// include links to the complete research task history.
+func TestResearchSpecCompactionHistoryLinks(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
+
+	// Round 1: reject with findings
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus1 == nil {
+		t.Fatalf("round 1: expected review task")
+	}
+
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+
+	parent, _ := store.GetTask(ctx, parentID)
+	if parent.State != "ready" {
+		t.Fatalf("round 1: expected ready, got %s", parent.State)
+	}
+
+	// Resubmit for round 2
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Round 2
+	opus2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opus2 == nil {
+		t.Fatalf("round 2: expected review task")
+	}
+
+	findings2 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"still_open","prior_id":"f1"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong page","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", findings2)
+
+	// Supersede the task
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("failed to supersede task: %v", err)
+	}
+
+	// Verify spec contains links to history
+	if !strings.Contains(escalated.Spec, "## Research task history") {
+		t.Errorf("replacement spec should contain research task history section")
+	}
+	if !strings.Contains(escalated.Spec, "Superseded task:") {
+		t.Errorf("replacement spec should contain superseded task link")
+	}
+	if !strings.Contains(escalated.Spec, parentID) {
+		t.Errorf("replacement spec should link to the original task ID: %s", parentID)
+	}
+
+	// Verify original assignment is preserved
+	if !strings.Contains(escalated.Spec, "## Unresolved findings from last review round") {
+		t.Errorf("replacement spec should contain unresolved findings section")
+	}
+
+	// Verify findings are present
+	if !strings.Contains(escalated.Spec, "f1") {
+		t.Errorf("spec should contain unresolved finding f1")
+	}
+	if !strings.Contains(escalated.Spec, "f2") {
+		t.Errorf("spec should contain unresolved finding f2")
+	}
+}
+
+// TestResearchSupersessionOriginalAssignmentPreserved verifies that the
+// original assignment is preserved in the spec when a replacement is superseded.
+func TestResearchSupersessionOriginalAssignmentPreserved(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
+
+	parent, _ := store.GetTask(ctx, parentID)
+	originalSpec := parent.Spec
+
+	// Round 1
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus1 == nil {
+		t.Fatalf("round 1: expected review task")
+	}
+
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+
+	// Supersede the task (without additional rounds to keep test simple)
+	escalated, _ := store.SupersedeTask(ctx, parentID, ptrStr("opus"))
+
+	// Verify the original assignment is at the start of the spec
+	if !strings.Contains(escalated.Spec, originalSpec) {
+		t.Errorf("replacement spec should contain original assignment")
+	}
+
+	// Verify findings are appended after original assignment
+	if !strings.Contains(escalated.Spec, "## Research task history") {
+		t.Errorf("replacement spec should contain research task history section")
+	}
+	if !strings.Contains(escalated.Spec, "## Unresolved findings from last review round") {
+		t.Errorf("replacement spec should contain unresolved findings section")
+	}
+
+	// Verify the original assignment appears before the history section
+	historyIdx := strings.Index(escalated.Spec, "## Research task history")
+	if historyIdx < len(originalSpec) {
+		t.Errorf("research task history section appears before original assignment ends")
+	}
+}
+
+// TestResearchSupersessionPolicyPreservation verifies that task policies
+// (agent_merge, escalate, track, review_models) are preserved during research supersession.
+func TestResearchSupersessionPolicyPreservation(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
+
+	original, _ := store.GetTask(ctx, parentID)
+	originalAgentMerge := original.AgentMerge
+	originalEscalate := original.Escalate
+
+	// Run a review that will result in findings
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus1 == nil {
+		t.Fatalf("expected review task")
+	}
+
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+
+	// Just manually supersede without going through another round
+	// This tests policy preservation without needing a second resubmit
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("failed to supersede task: %v", err)
+	}
+
+	// Verify policies are preserved
+	escalatedTask, _ := store.GetTask(ctx, escalated.ID)
+	if escalatedTask.AgentMerge != originalAgentMerge {
+		t.Errorf("agent_merge should be preserved on supersession: was %v, got %v",
+			originalAgentMerge, escalatedTask.AgentMerge)
+	}
+	if escalatedTask.Escalate != originalEscalate {
+		t.Errorf("escalate flag should be preserved on supersession: was %v, got %v",
+			originalEscalate, escalatedTask.Escalate)
+	}
+
+	// Verify track is preserved
+	if escalatedTask.Track != "research" {
+		t.Errorf("track should be preserved as research, got %s", escalatedTask.Track)
+	}
+
+	// Verify review models are preserved
+	if len(escalatedTask.ReviewModels) != len(original.ReviewModels) {
+		t.Errorf("review models should be preserved: was %v, got %v",
+			original.ReviewModels, escalatedTask.ReviewModels)
+	}
+}
