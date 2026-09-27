@@ -3930,6 +3930,21 @@ func TestResearchAggregation_CircuitBreakerBlocks(t *testing.T) {
 	if parent.State != "blocked" {
 		t.Errorf("round 9: expected blocked (circuit breaker), got %s", parent.State)
 	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var blockedEvent *Event
+	for i := range events {
+		if events[i].Kind == "transition" && events[i].Note != nil && strings.Contains(*events[i].Note, "auto-blocked") {
+			blockedEvent = &events[i]
+			break
+		}
+	}
+	if blockedEvent == nil {
+		t.Errorf("expected auto-blocked transition event")
+	}
 }
 
 // TestResearchAggregation_CircuitBreakerEscalates verifies that with escalate=true,
