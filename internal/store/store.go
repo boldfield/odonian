@@ -72,6 +72,7 @@ type sqliteStore struct {
 	escalationLadder         []string
 	researchDefaultModel     string
 	researchEscalationLadder []string
+	researchAdjudicator      string
 
 	// supersedeCloseHook, when set, is invoked after each background
 	// closeSupersededPR attempt finishes. It exists solely so tests can
@@ -105,6 +106,14 @@ func WithResearchDefaultModel(model string) StoreOption {
 func WithResearchEscalationLadder(ladder []string) StoreOption {
 	return func(s *sqliteStore) {
 		s.researchEscalationLadder = append([]string{}, ladder...) // Copy to avoid external mutation
+	}
+}
+
+// WithResearchAdjudicator sets the adjudicator model for research dispute adjudication.
+// If not provided or empty, adjudication is disabled.
+func WithResearchAdjudicator(model string) StoreOption {
+	return func(s *sqliteStore) {
+		s.researchAdjudicator = model
 	}
 }
 
@@ -3390,6 +3399,164 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 	return createdIDs, nil
 }
 
+// spawnAdjudicationTasks implements docs/features/research-track.md section 5: when a
+// reviewer maintains a worker-disputed finding, spawn an adjudication review task scoped
+// to that finding alone, assigned to ODONIAN_RESEARCH_ADJUDICATOR. The adjudicator model
+// must be in the allowlist and different from both ordinary reviewers. Its ruling is
+// binding for that finding only. Prevents duplicate adjudication on retry or concurrent
+// review completion. If the adjudicator is missing or invalid, the finding remains
+// blocking and the reason is recorded in a parent event.
+func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, parentID, parentProjectID, parentDocumentID, parentTitle, parentModel string, parentReviewRound int, now string) error {
+	// If no adjudicator is configured, there's nothing to do
+	if s.researchAdjudicator == "" {
+		return nil
+	}
+
+	// Get all prior disputes from previous submit events
+	priorDisputes, err := s.priorDisputes(ctx, tx, parentID)
+	if err != nil {
+		return fmt.Errorf("failed to get prior disputes: %w", err)
+	}
+
+	// If no disputes, there's nothing to adjudicate
+	if len(priorDisputes) == 0 {
+		return nil
+	}
+
+	// Get the current round's findings from all review tasks with reviewer tracking
+	currentFindings, findingReviewers, reviewerModels, err := s.getReviewRoundFindingsWithReviewers(ctx, tx, parentID, parentReviewRound)
+	if err != nil {
+		return fmt.Errorf("failed to get review round findings: %w", err)
+	}
+
+	// Validate adjudicator: must be in allowlist and different from both reviewers
+	if !s.allowedModelsM[s.researchAdjudicator] {
+		// Adjudicator not in allowlist - record why and leave finding blocking
+		note := fmt.Sprintf("Research adjudicator %q not in ODONIAN_MODELS allowlist; disputed findings remain blocking", s.researchAdjudicator)
+		if _, err := s.AppendEvent(ctx, tx, parentID, "system", "adjudication_failed", nil, &note); err != nil {
+			return fmt.Errorf("failed to append adjudication_failed event: %w", err)
+		}
+		return nil
+	}
+
+	if len(reviewerModels) > 0 && slices.Contains(reviewerModels, s.researchAdjudicator) {
+		// Adjudicator is same as one of the reviewers - record why and leave finding blocking
+		note := fmt.Sprintf("Research adjudicator %q is same as one of the reviewers; disputed findings remain blocking", s.researchAdjudicator)
+		if _, err := s.AppendEvent(ctx, tx, parentID, "system", "adjudication_failed", nil, &note); err != nil {
+			return fmt.Errorf("failed to append adjudication_failed event: %w", err)
+		}
+		return nil
+	}
+
+	// Build a map of current findings by ID for easy lookup
+	findingsByID := make(map[string]Finding)
+	for _, f := range currentFindings {
+		findingsByID[f.ID] = f
+	}
+
+	// For each prior dispute, check if it's maintained (still_open) in current findings
+	for _, dispute := range priorDisputes {
+		currentFinding, exists := findingsByID[dispute.FindingID]
+		if !exists || currentFinding.Status != "still_open" {
+			// Finding either doesn't exist or was resolved - not a maintained dispute
+			continue
+		}
+
+		// This is a maintained dispute - check if adjudication task already exists
+		var adjudicationExists bool
+		err := tx.QueryRowContext(ctx, `
+			SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END
+			FROM task
+			WHERE target_task_id = ? AND kind = 'review' AND adjudicate_finding = ?
+		`, parentID, dispute.FindingID).Scan(&adjudicationExists)
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("failed to check for existing adjudication: %w", err)
+		}
+
+		if adjudicationExists {
+			// Adjudication task already exists - skip to prevent duplicates
+			continue
+		}
+
+		// Spawn adjudication task for this maintained dispute
+		adjudicationTaskID := GenerateID()
+		adjudicationTitle := fmt.Sprintf("Adjudicate: %s (finding %s)", parentTitle, dispute.FindingID)
+
+		// Find which reviewer raised this finding
+		raisingReviewer := ""
+		if reviewer, ok := findingReviewers[dispute.FindingID]; ok {
+			raisingReviewer = reviewer
+		}
+
+		_, execErr := tx.ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, review_round, track, adjudicate_finding, adjudicated_by_reviewer, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, adjudicationTaskID, parentProjectID, parentDocumentID, adjudicationTitle, "", "ready", s.researchAdjudicator, "review", parentID, parentReviewRound, "research", dispute.FindingID, raisingReviewer, now, now)
+		if execErr != nil {
+			return fmt.Errorf("failed to create adjudication task: %w", execErr)
+		}
+	}
+
+	return nil
+}
+
+// getReviewRoundFindingsWithReviewers collects all findings from all review tasks in the current round
+// and tracks which reviewer model raised each finding. Returns findings, a map of finding ID to reviewer model,
+// and the list of unique reviewer models.
+func (s *sqliteStore) getReviewRoundFindingsWithReviewers(ctx context.Context, tx *sql.Tx, parentID string, round int) ([]Finding, map[string]string, []string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT e.findings, t.model
+		FROM event e
+		JOIN task t ON t.id = e.source_task_id
+		WHERE e.task_id = ? AND e.kind = 'review' AND t.review_round = ? AND e.findings IS NOT NULL
+	`, parentID, round)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to query review findings: %w", err)
+	}
+	defer rows.Close()
+
+	var allFindings []Finding
+	findingReviewers := make(map[string]string)
+	reviewerModels := make(map[string]bool)
+
+	for rows.Next() {
+		var findingsText string
+		var model string
+		if err := rows.Scan(&findingsText, &model); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to scan review findings: %w", err)
+		}
+
+		var findings []Finding
+		if err := json.Unmarshal([]byte(findingsText), &findings); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to parse findings JSON: %w", err)
+		}
+
+		allFindings = append(allFindings, findings...)
+		reviewerModels[model] = true
+
+		// Track which reviewer raised each finding
+		// If multiple reviewers report the same finding ID, we use the first one encountered
+		for _, f := range findings {
+			if _, exists := findingReviewers[f.ID]; !exists {
+				findingReviewers[f.ID] = model
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to iterate review findings: %w", err)
+	}
+
+	// Convert reviewer models map to slice
+	var reviewerList []string
+	for model := range reviewerModels {
+		reviewerList = append(reviewerList, model)
+	}
+	sort.Strings(reviewerList)
+
+	return allFindings, findingReviewers, reviewerList, nil
+}
+
 // aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.
 // It handles: verdict counting, merge task spawning (if approved with agent_merge),
 // escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
@@ -3506,6 +3673,12 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 				if err := s.appendResearchRoundRejectedEvent(ctx, tx, parentID, parentReviewRound, researchRoundFindings); err != nil {
 					return "", err
 				}
+
+				// Section 5: spawn adjudication tasks for maintained disputes
+				if err := s.spawnAdjudicationTasks(ctx, tx, parentID, parentProjectID, parentDocumentID, parentTitle, parentModel, parentReviewRound, now); err != nil {
+					return "", err
+				}
+
 				chainWideRejectedRounds, err := s.countChainWideRejectedRounds(ctx, tx, parentID)
 				if err != nil {
 					return "", err

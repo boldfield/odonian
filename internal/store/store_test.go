@@ -160,8 +160,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 17 {
-		t.Errorf("expected 17 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 18 {
+		t.Errorf("expected 18 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -171,13 +171,13 @@ func TestMigrations(t *testing.T) {
 	}
 	defer store2.Close()
 
-	// Verify that we still have exactly 13 migrations recorded (idempotency)
+	// Verify that we still have exactly 18 migrations recorded (idempotency)
 	err = store2.Conn().QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount)
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 17 {
-		t.Errorf("expected 17 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 18 {
+		t.Errorf("expected 18 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -273,8 +273,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 17 {
-		t.Errorf("expected 17 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 18 {
+		t.Errorf("expected 18 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -16549,5 +16549,38 @@ func TestResearchDisputes_MaintainedFindingCannotBeDisputedAgainUnderNewID(t *te
 	var verr *ValidationError
 	if !errors.As(err, &verr) || verr.Code != "DUPLICATE_DISPUTE" {
 		t.Fatalf("expected DUPLICATE_DISPUTE validation error, got: %v", err)
+	}
+}
+
+// TestResearchAdjudication_ConfigurationAccepted verifies that research adjudicator
+// configuration is properly accepted and stored.
+func TestResearchAdjudication_ConfigurationAccepted(t *testing.T) {
+	// Create store with adjudicator configured
+	store, err := Open("file::memory:?cache=shared", []string{"haiku", "sonnet", "opus"},
+		WithResearchAdjudicator("haiku"))
+	if err != nil {
+		t.Fatalf("failed to open store with adjudicator: %v", err)
+	}
+	defer store.Close()
+
+	// Verify the adjudicator model is set correctly
+	if store.(*sqliteStore).researchAdjudicator != "haiku" {
+		t.Fatalf("expected haiku as adjudicator, got %s", store.(*sqliteStore).researchAdjudicator)
+	}
+}
+
+// TestResearchAdjudication_NoConfigurationAllowed verifies that adjudication handling
+// gracefully handles missing adjudicator configuration.
+func TestResearchAdjudication_NoConfigurationAllowed(t *testing.T) {
+	// Create store without adjudicator
+	store, err := Open("file::memory:?cache=shared", []string{"haiku", "sonnet", "opus"})
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	// Verify no adjudicator is configured
+	if store.(*sqliteStore).researchAdjudicator != "" {
+		t.Fatalf("expected no adjudicator, got %s", store.(*sqliteStore).researchAdjudicator)
 	}
 }

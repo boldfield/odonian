@@ -212,6 +212,12 @@ func runServer() {
 		log.Fatalf("failed to parse ODONIAN_RESEARCH_ROUND_BUDGET: %v", err)
 	}
 
+	// Parse research adjudicator model
+	researchAdjudicator, err := validateResearchAdjudicator(os.Getenv("ODONIAN_RESEARCH_ADJUDICATOR"), allowedModels)
+	if err != nil {
+		log.Fatalf("invalid research adjudicator: %v", err)
+	}
+
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
 	if eventTerminalRetentionDaysStr == "" {
@@ -263,7 +269,8 @@ func runServer() {
 	s, err := store.Open(dbPath, allowedModels,
 		store.WithEscalationLadder(escalationLadder),
 		store.WithResearchDefaultModel(researchDefaultModel),
-		store.WithResearchEscalationLadder(researchEscalationLadder))
+		store.WithResearchEscalationLadder(researchEscalationLadder),
+		store.WithResearchAdjudicator(researchAdjudicator))
 	if err != nil {
 		log.Fatalf("failed to open store: %v", err)
 	}
@@ -1234,6 +1241,28 @@ func parseResearchRoundBudget(budgetStr string) (int, error) {
 }
 
 func validateResearchDefaultModel(modelStr string, allowedModels []string) (string, error) {
+	if modelStr == "" {
+		return "", nil
+	}
+
+	modelStr = strings.TrimSpace(modelStr)
+	if modelStr == "" {
+		return "", nil
+	}
+
+	allowedModelsM := make(map[string]bool)
+	for _, m := range allowedModels {
+		allowedModelsM[m] = true
+	}
+
+	if !allowedModelsM[modelStr] {
+		return "", fmt.Errorf("model %q not in ODONIAN_MODELS allowlist", modelStr)
+	}
+
+	return modelStr, nil
+}
+
+func validateResearchAdjudicator(modelStr string, allowedModels []string) (string, error) {
 	if modelStr == "" {
 		return "", nil
 	}
