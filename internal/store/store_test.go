@@ -145,8 +145,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 14 {
-		t.Errorf("expected 14 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 15 {
+		t.Errorf("expected 15 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -156,13 +156,13 @@ func TestMigrations(t *testing.T) {
 	}
 	defer store2.Close()
 
-	// Verify that we still have exactly 13 migrations recorded (idempotency)
+	// Verify that we still have exactly 15 migrations recorded (idempotency)
 	err = store2.Conn().QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount)
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 14 {
-		t.Errorf("expected 14 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 15 {
+		t.Errorf("expected 15 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -258,8 +258,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 14 {
-		t.Errorf("expected 14 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 15 {
+		t.Errorf("expected 15 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -320,7 +320,7 @@ func TestAppendEventAtomicity(t *testing.T) {
 	// 2. Append an event using AppendEvent
 	actor := "test-agent"
 	kind := "claim"
-	_, err = store.AppendEvent(ctx, tx, taskID, actor, kind, nil, nil)
+	_, err = store.AppendEvent(ctx, tx, taskID, actor, kind, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to append event: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestListEvents(t *testing.T) {
 			t.Fatalf("failed to begin transaction: %v", err)
 		}
 
-		_, err = store.AppendEvent(ctx, tx, taskID, evt.actor, evt.kind, evt.verdict, evt.note)
+		_, err = store.AppendEvent(ctx, tx, taskID, evt.actor, evt.kind, evt.verdict, evt.note, nil)
 		if err != nil {
 			t.Fatalf("failed to append event: %v", err)
 		}
@@ -510,7 +510,7 @@ func TestListEventsRapidOrdering(t *testing.T) {
 			t.Fatalf("begin tx: %v", err)
 		}
 		// kind encodes insertion order; no sleep between appends.
-		if _, err = store.AppendEvent(ctx, tx, taskID, "agent", fmt.Sprintf("evt-%02d", i), nil, nil); err != nil {
+		if _, err = store.AppendEvent(ctx, tx, taskID, "agent", fmt.Sprintf("evt-%02d", i), nil, nil, nil); err != nil {
 			t.Fatalf("append event %d: %v", i, err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -1193,7 +1193,7 @@ func TestMigrationRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to begin transaction: %v", err)
 	}
-	_, err = store.AppendEvent(ctx, tx, tasks1[0].ID, "agent-1", "claim", nil, nil)
+	_, err = store.AppendEvent(ctx, tx, tasks1[0].ID, "agent-1", "claim", nil, nil, nil)
 	if err != nil {
 		tx.Rollback()
 		t.Fatalf("failed to append event: %v", err)
@@ -7364,7 +7364,7 @@ func TestSupersededTaskWithPriorFeedback(t *testing.T) {
 	// Add first reject feedback
 	verdict1 := "reject"
 	note1 := "Found critical bug in line 42"
-	_, err = store.AppendEvent(ctx, tx, oldTask.ID, "reviewer1", "review", &verdict1, &note1)
+	_, err = store.AppendEvent(ctx, tx, oldTask.ID, "reviewer1", "review", &verdict1, &note1, nil)
 	if err != nil {
 		tx.Rollback()
 		t.Fatalf("failed to append event: %v", err)
@@ -7373,7 +7373,7 @@ func TestSupersededTaskWithPriorFeedback(t *testing.T) {
 	// Add second reject feedback
 	verdict2 := "reject"
 	note2 := "Tests are failing"
-	_, err = store.AppendEvent(ctx, tx, oldTask.ID, "reviewer2", "review", &verdict2, &note2)
+	_, err = store.AppendEvent(ctx, tx, oldTask.ID, "reviewer2", "review", &verdict2, &note2, nil)
 	if err != nil {
 		tx.Rollback()
 		t.Fatalf("failed to append event: %v", err)
