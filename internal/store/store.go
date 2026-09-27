@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -2525,13 +2526,13 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 	// of that id existed immediately before the current report, not against a later
 	// instance that happens to reuse the same id (including the current report
 	// itself, if it names its own id as prior_id). And a finding can be carried
-	// forward across several rounds as still_open, reworded each time, before it's
-	// finally reported resolved, so resolving it must suppress every identity in that
-	// whole prior_id chain, not just the one instance the resolved report names
-	// directly. A union-find over identities, built in chronological order, tracks
-	// both: each report unions its own identity with its prior_id's identity (as
-	// resolved from the state before this report), and a chain counts as resolved as
-	// soon as any report in it is.
+	// forward across several rounds as still_open, reworded each time, so every
+	// report in one prior_id chain describes the same underlying finding: resolving
+	// any of them suppresses the whole chain, and an unresolved chain yields at most
+	// one follow-up. A union-find over identities, built in chronological order,
+	// tracks the chains: each report unions its own identity with its prior_id's
+	// identity (as resolved from the state before this report). Identical identities
+	// from different reviewers or rounds are the same node, so they share a chain too.
 	parentOf := make(map[researchFindingIdentity]researchFindingIdentity)
 	var find func(researchFindingIdentity) researchFindingIdentity
 	find = func(x researchFindingIdentity) researchFindingIdentity {
@@ -2550,7 +2551,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		}
 	}
 
-	resolvedRoots := make(map[researchFindingIdentity]bool)
+	var resolvedIdentities []researchFindingIdentity
 	latestIdentityByReviewerAndFindingID := make(map[string]researchFindingIdentity, len(allFindings))
 	for _, cf := range allFindings {
 		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
@@ -2560,7 +2561,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			}
 		}
 		if cf.Status == "resolved" {
-			resolvedRoots[find(identity)] = true
+			resolvedIdentities = append(resolvedIdentities, identity)
 		}
 		// Recorded only after resolving this report's own prior_id against the prior
 		// state, so a report that reuses its own id as prior_id (a self-reference)
@@ -2568,35 +2569,54 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		latestIdentityByReviewerAndFindingID[cf.reviewerModel+"\x00"+cf.ID] = identity
 	}
 
-	candidatesByIdentity := make(map[researchFindingIdentity]researchCollectedFinding)
-	var orderedIdentities []researchFindingIdentity
+	// Roots are only final once every union is done: a later union can re-parent a
+	// root, so marking resolved chains any earlier would depend on report order.
+	resolvedRoots := make(map[researchFindingIdentity]bool, len(resolvedIdentities))
+	for _, identity := range resolvedIdentities {
+		resolvedRoots[find(identity)] = true
+	}
+	membersByRoot := make(map[researchFindingIdentity][]researchFindingIdentity)
+	for _, cf := range allFindings {
+		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
+		root := find(identity)
+		members := membersByRoot[root]
+		if !slices.Contains(members, identity) {
+			membersByRoot[root] = append(members, identity)
+		}
+	}
+
+	// One candidate per unresolved chain. allFindings is in chronological order, so
+	// the last non-blocking report wins and the follow-up describes the finding's
+	// most recent wording.
+	candidatesByRoot := make(map[researchFindingIdentity]researchCollectedFinding)
 	for _, cf := range allFindings {
 		if cf.Status == "resolved" {
 			continue
 		}
-		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
-		if resolvedRoots[find(identity)] {
+		root := find(researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary})
+		if resolvedRoots[root] {
 			continue
 		}
 		// Non-blocking per section 3: P3 findings, and P1/P2 findings in unchanged
-		// text after round 1. A still_open finding is never non-blocking: its
-		// containing round would have failed, so it can't be part of a passing round
-		// unless a later round supersedes it (as "new"/"still_open" again, or
-		// "resolved").
+		// text after round 1.
 		isP1OrP2 := cf.Severity == "P1" || cf.Severity == "P2"
 		nonBlocking := cf.Severity == "P3" || (isP1OrP2 && !cf.InChangedText && cf.round > 1)
 		if !nonBlocking {
 			continue
 		}
-		if _, exists := candidatesByIdentity[identity]; exists {
-			continue
-		}
-		candidatesByIdentity[identity] = cf
-		orderedIdentities = append(orderedIdentities, identity)
+		candidatesByRoot[root] = cf
 	}
 
-	sort.Slice(orderedIdentities, func(i, j int) bool {
-		a, b := orderedIdentities[i], orderedIdentities[j]
+	type followUpCandidate struct {
+		finding researchCollectedFinding
+		members []researchFindingIdentity
+	}
+	candidates := make([]followUpCandidate, 0, len(candidatesByRoot))
+	for root, cf := range candidatesByRoot {
+		candidates = append(candidates, followUpCandidate{finding: cf, members: membersByRoot[root]})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := candidates[i].finding, candidates[j].finding
 		if a.File != b.File {
 			return a.File < b.File
 		}
@@ -2612,26 +2632,40 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 	}
 
 	var createdIDs []string
-	for _, identity := range orderedIdentities {
-		cf := candidatesByIdentity[identity]
+	for _, candidate := range candidates {
+		cf := candidate.finding
 
-		dedupValue, err := json.Marshal(researchFindingDedupKey{ParentID: parentID, File: identity.File, Line: identity.Line, Summary: identity.Summary})
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal dedup key: %w", err)
+		// A chain already has a follow-up if any identity in it was the one recorded
+		// by an earlier aggregation call, even if the chain has since grown a newer
+		// wording (so the representative, and its dedup key, changed).
+		alreadyCreated := false
+		for _, member := range candidate.members {
+			memberKey, err := json.Marshal(researchFindingDedupKey{ParentID: parentID, File: member.File, Line: member.Line, Summary: member.Summary})
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal dedup key: %w", err)
+			}
+			var existingID string
+			err = tx.QueryRowContext(ctx, `
+				SELECT task_id FROM task_link
+				WHERE kind = 'research_finding_dedup' AND value = ? AND tombstoned_at IS NULL
+				LIMIT 1
+			`, string(memberKey)).Scan(&existingID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, fmt.Errorf("failed to check existing follow-up: %w", err)
+			}
+			if err == nil {
+				alreadyCreated = true
+				break
+			}
 		}
-
-		var existingID string
-		err = tx.QueryRowContext(ctx, `
-			SELECT task_id FROM task_link
-			WHERE kind = 'research_finding_dedup' AND value = ? AND tombstoned_at IS NULL
-			LIMIT 1
-		`, string(dedupValue)).Scan(&existingID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("failed to check existing follow-up: %w", err)
-		}
-		if err == nil {
+		if alreadyCreated {
 			// Already created by an earlier aggregation call: reuse, don't recreate.
 			continue
+		}
+
+		dedupValue, err := json.Marshal(researchFindingDedupKey{ParentID: parentID, File: cf.File, Line: cf.Line, Summary: cf.Summary})
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal dedup key: %w", err)
 		}
 
 		followUpID := GenerateID()

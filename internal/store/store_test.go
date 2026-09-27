@@ -4837,6 +4837,123 @@ func TestResearchFollowUps_ResolvedWithReusedFindingID(t *testing.T) {
 	}
 }
 
+// TestResearchFollowUps_StillOpenChainYieldsOneFollowUp verifies that a P3 carried
+// forward as still_open with reworded summaries, and never resolved, produces exactly
+// one follow-up (not one per wording), that the follow-up describes the latest
+// wording, and that re-running aggregation doesn't add a second one.
+func TestResearchFollowUps_StillOpenChainYieldsOneFollowUp(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	round1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong locator","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	round2 := json.RawMessage(`[
+		{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"bad claim, still unresolved","in_changed_text":true,"status":"still_open","prior_id":"f1"},
+		{"id":"f2b","severity":"P3","file":"b.md","line":5,"summary":"locator still wrong","in_changed_text":true,"status":"still_open","prior_id":"f2"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", round2)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus3, sonnet3 := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
+	// Round 3 resolves only the P1 and doesn't mention the P3 again.
+	round3 := json.RawMessage(`[
+		{"id":"f1c","severity":"P1","file":"a.md","line":1,"summary":"bad claim, now fixed","in_changed_text":true,"status":"resolved","prior_id":"f1b"}
+	]`)
+	submitResearchReview(t, store, ctx, opus3, "opus-reviewer", "approve", round3)
+	submitResearchReview(t, store, ctx, sonnet3, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected exactly 1 follow-up for the one unresolved P3 chain, got %d", len(followUps))
+	}
+	if !strings.Contains(followUps[0].Spec, "locator still wrong") {
+		t.Errorf("expected follow-up to describe the latest wording, got spec %q", followUps[0].Spec)
+	}
+	if strings.Contains(followUps[0].Spec, "Finding: wrong locator") {
+		t.Errorf("expected follow-up not to use the superseded wording, got spec %q", followUps[0].Spec)
+	}
+
+	ss := store.(*sqliteStore)
+	tx, err := ss.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin tx: %v", err)
+	}
+	if _, err := ss.aggregateReviewRound(ctx, tx, parentID, 5, map[string]int{}); err != nil {
+		tx.Rollback()
+		t.Fatalf("failed to re-run aggregation: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+	after := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(after) != 1 || after[0].ID != followUps[0].ID {
+		t.Errorf("expected repeated aggregation to keep the single follow-up %s, got %d follow-ups", followUps[0].ID, len(after))
+	}
+}
+
+// TestResearchFollowUps_ResolvedMarkSurvivesLaterUnion verifies that a chain's
+// resolved mark isn't lost when a later report re-parents the chain's root. Here
+// round 2 resolves f2 (reworded to "wrong locator, fixed") and, afterwards in
+// processing order, carries f3 forward as still_open under that exact same
+// identity, which merges f3's chain into f2's resolved one. Marking the resolved
+// root before that union would leave the merged chain looking unresolved and
+// create stale follow-ups for f2 once the parent is approved.
+func TestResearchFollowUps_ResolvedMarkSurvivesLaterUnion(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	round1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong locator","in_changed_text":true,"status":"new"},
+		{"id":"f3","severity":"P3","file":"b.md","line":5,"summary":"locator format","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	round2 := json.RawMessage(`[
+		{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"bad claim, fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"},
+		{"id":"f2b","severity":"P3","file":"b.md","line":5,"summary":"wrong locator, fixed","in_changed_text":true,"status":"resolved","prior_id":"f2"},
+		{"id":"f3b","severity":"P3","file":"b.md","line":5,"summary":"wrong locator, fixed","in_changed_text":true,"status":"still_open","prior_id":"f3"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", round2)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus3, sonnet3 := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
+	submitResearchReview(t, store, ctx, opus3, "opus-reviewer", "approve", json.RawMessage(`[]`))
+	submitResearchReview(t, store, ctx, sonnet3, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	for _, f := range findResearchFollowUps(t, store, ctx, projID, parentID) {
+		if strings.Contains(f.Spec, "Finding: wrong locator\n") {
+			t.Errorf("expected no follow-up for resolved finding f2, got %s: %q", f.ID, f.Spec)
+		}
+	}
+}
+
 // TestBuildDesignAggregationUnchanged is a regression test: research aggregation
 // must not change build/design behavior. It asserts the review event's Note is
 // stored verbatim as the reviewer's result text (no envelope), and that a single
