@@ -2216,7 +2216,8 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 // build and design this is "every reviewer approved"; for research it is "no
 // reviewer reported a blocking finding". It checks for a no-op resolution (which
 // finalizes straight to done), otherwise spawns a merge task when agent_merge is
-// set, otherwise leaves the parent at approved. Returns the new parent state.
+// set, otherwise leaves the parent at approved. For research tasks with non-blocking
+// findings, it creates follow-up tasks. Returns the new parent state.
 func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, parentID, parentModel, parentTrack, parentTitle, parentProjectID, parentDocumentID string, parentAgentMerge bool, now string) (string, error) {
 	newParentState := "approved"
 
@@ -2258,6 +2259,20 @@ func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, paren
 		`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, now, now)
 		if err != nil {
 			return "", fmt.Errorf("failed to create merge task: %w", err)
+		}
+	}
+
+	// For research tasks, create follow-up tasks for non-blocking findings
+	if parentTrack == "research" {
+		// Get the parent's current review round
+		var parentReviewRound int
+		err := tx.QueryRowContext(ctx, `SELECT review_round FROM task WHERE id = ?`, parentID).Scan(&parentReviewRound)
+		if err != nil {
+			return "", fmt.Errorf("failed to fetch parent review_round for follow-up creation: %w", err)
+		}
+
+		if err := s.createResearchFollowUpTasks(ctx, tx, parentID, parentProjectID, parentDocumentID, parentReviewRound, now); err != nil {
+			return "", err
 		}
 	}
 
@@ -2371,6 +2386,171 @@ func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql
 	}
 
 	return false, nil
+}
+
+// createResearchFollowUpTasks collects non-blocking findings from all reviewers in the
+// current round and creates one follow-up task per unique (file, line, summary) combination.
+// Deduplication prevents duplicate follow-ups for the same finding across reviewers or rounds.
+func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.Tx, parentID, projectID, documentID string, round int, now string) error {
+	// Collect all review task IDs for this round
+	taskRows, err := tx.QueryContext(ctx, `
+		SELECT id FROM task WHERE target_task_id = ? AND review_round = ? AND kind = 'review'
+	`, parentID, round)
+	if err != nil {
+		return fmt.Errorf("failed to list round review tasks: %w", err)
+	}
+	reviewTaskIDs := make(map[string]bool)
+	for taskRows.Next() {
+		var id string
+		if err := taskRows.Scan(&id); err != nil {
+			taskRows.Close()
+			return fmt.Errorf("failed to scan review task id: %w", err)
+		}
+		reviewTaskIDs[id] = true
+	}
+	if err := taskRows.Err(); err != nil {
+		taskRows.Close()
+		return fmt.Errorf("failed to iterate review task ids: %w", err)
+	}
+	taskRows.Close()
+
+	if len(reviewTaskIDs) == 0 {
+		return nil
+	}
+
+	// Collect all review events with findings from this round's review tasks
+	evRows, err := tx.QueryContext(ctx, `
+		SELECT source_task_id, findings FROM event
+		WHERE task_id = ? AND kind = 'review' AND source_task_id IS NOT NULL
+	`, parentID)
+	if err != nil {
+		return fmt.Errorf("failed to query review events: %w", err)
+	}
+	defer evRows.Close()
+
+	// Map of (file, line, summary) -> findings to deduplicate
+	findingsByKey := make(map[string]Finding)
+
+	for evRows.Next() {
+		var sourceTaskID string
+		var findingsText sql.NullString
+		if err := evRows.Scan(&sourceTaskID, &findingsText); err != nil {
+			return fmt.Errorf("failed to scan review event: %w", err)
+		}
+		if !reviewTaskIDs[sourceTaskID] {
+			continue
+		}
+
+		if !findingsText.Valid {
+			continue
+		}
+		var findings []Finding
+		if err := json.Unmarshal([]byte(findingsText.String), &findings); err != nil {
+			// Skip malformed findings
+			continue
+		}
+
+		// Collect non-blocking findings (excluding resolved findings, which are already fixed)
+		for _, f := range findings {
+			if !isBlockingResearchFinding(f, round) && f.Status != "resolved" {
+				key := fmt.Sprintf("%s:%d:%s", f.File, f.Line, f.Summary)
+				// Keep the first occurrence (earliest in the event log)
+				if _, exists := findingsByKey[key]; !exists {
+					findingsByKey[key] = f
+				}
+			}
+		}
+	}
+	if err := evRows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate review events: %w", err)
+	}
+
+	if len(findingsByKey) == 0 {
+		return nil
+	}
+
+	// Collect existing follow-up task IDs to avoid duplicates
+	existingFollowups := make(map[string]bool)
+	existingRows, err := tx.QueryContext(ctx, `
+		SELECT id FROM task WHERE project_id = ? AND track = 'research' AND state = 'backlog'
+		AND title LIKE 'Follow-up: Research finding%'
+	`, projectID)
+	if err != nil {
+		return fmt.Errorf("failed to query existing follow-ups: %w", err)
+	}
+	for existingRows.Next() {
+		var id string
+		if err := existingRows.Scan(&id); err != nil {
+			existingRows.Close()
+			return fmt.Errorf("failed to scan existing follow-up id: %w", err)
+		}
+		existingFollowups[id] = true
+	}
+	if err := existingRows.Err(); err != nil {
+		existingRows.Close()
+		return fmt.Errorf("failed to iterate existing follow-ups: %w", err)
+	}
+	existingRows.Close()
+
+	// For each unique non-blocking finding, check if a follow-up task already exists
+	// Deduplicate by checking for existing tasks with the same file:line:summary in their spec
+	createdFollowupIDs := []string{}
+
+	for _, finding := range findingsByKey {
+		// Check if a follow-up task already exists for this finding
+		findingKey := fmt.Sprintf("%s:%d:%s", finding.File, finding.Line, finding.Summary)
+		existsRows, err := tx.QueryContext(ctx, `
+			SELECT id FROM task WHERE project_id = ? AND track = 'research' AND state = 'backlog'
+			AND spec LIKE ?
+		`, projectID, "%"+findingKey+"%")
+		if err != nil {
+			return fmt.Errorf("failed to check for existing follow-up task: %w", err)
+		}
+		var existingID *string
+		if existsRows.Next() {
+			var id string
+			if err := existsRows.Scan(&id); err != nil {
+				existsRows.Close()
+				return fmt.Errorf("failed to scan existing follow-up id: %w", err)
+			}
+			existingID = &id
+		}
+		existsRows.Close()
+
+		// If follow-up already exists, skip creating a new one
+		if existingID != nil {
+			createdFollowupIDs = append(createdFollowupIDs, *existingID)
+			continue
+		}
+
+		// Create follow-up task
+		followupID := GenerateID()
+		followupTitle := fmt.Sprintf("Follow-up: Research finding at %s:%d", finding.File, finding.Line)
+		followupSpec := fmt.Sprintf("Finding: %s\nSeverity: %s\nFile: %s\nLine: %d\nSource: %s\n\nParent task: %s",
+			finding.Summary, finding.Severity, finding.File, finding.Line, finding.ID, parentID)
+
+		if _, execErr := tx.ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, track, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, followupID, projectID, documentID, followupTitle, followupSpec, "backlog", "research", now, now); execErr != nil {
+			return fmt.Errorf("failed to create follow-up task: %w", execErr)
+		}
+		createdFollowupIDs = append(createdFollowupIDs, followupID)
+	}
+
+	// Record follow-up task IDs in a parent event if any were created
+	if len(createdFollowupIDs) > 0 {
+		followupList := json.RawMessage(nil)
+		if data, marshalErr := json.Marshal(createdFollowupIDs); marshalErr == nil {
+			followupList = json.RawMessage(data)
+		}
+		eventNote := fmt.Sprintf("Created %d research follow-up tasks for non-blocking findings", len(createdFollowupIDs))
+		if _, appendErr := s.appendEvent(ctx, tx, parentID, "system", "follow_up_created", nil, &eventNote, nil, followupList); appendErr != nil {
+			return fmt.Errorf("failed to append follow-up event: %w", appendErr)
+		}
+	}
+
+	return nil
 }
 
 // aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.

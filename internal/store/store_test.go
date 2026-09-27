@@ -12385,3 +12385,152 @@ func TestTombstonedNoOpDoesNotFinalize(t *testing.T) {
 		t.Errorf("no merge task should be created for no_op finalization, got %d", len(mergeTasks))
 	}
 }
+
+// TestResearchFollowUpCreation verifies that non-blocking findings create follow-up tasks.
+func TestResearchFollowUpCreation(t *testing.T) {
+	t.Run("non-blocking P3 create follow-ups", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("expected both review tasks to be ready")
+		}
+
+		// Round 1: Both reviewers approve with P3 findings (non-blocking)
+		// Opus finds wrong footnote
+		opusFindings := json.RawMessage(`[{"id":"f1","severity":"P3","file":"source.md","line":5,"summary":"wrong page number","in_changed_text":false,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", opusFindings)
+
+		// Sonnet finds missing citation
+		sonnetFindings := json.RawMessage(`[{"id":"f2","severity":"P3","file":"evidence.md","line":20,"summary":"missing citation","in_changed_text":false,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", sonnetFindings)
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Errorf("expected approved (all non-blocking P3 findings), got %s", parent.State)
+		}
+
+		// Check that follow-up tasks were created
+		allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var followupTasks []Task
+		for _, task := range allTasks {
+			if task.Track == "research" && task.State == "backlog" && task.ID != parentID {
+				followupTasks = append(followupTasks, task)
+			}
+		}
+
+		// Should have 2 follow-up tasks for P3 findings (one from each reviewer)
+		if len(followupTasks) != 2 {
+			t.Errorf("expected 2 follow-up tasks, got %d", len(followupTasks))
+		}
+
+		// Verify follow-up specs contain finding information
+		for _, fu := range followupTasks {
+			if !strings.Contains(fu.Spec, "P3") {
+				t.Errorf("follow-up spec should mention severity, got: %s", fu.Spec)
+			}
+		}
+	})
+
+	t.Run("blocking findings do not create follow-ups", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("expected both review tasks to be ready")
+		}
+
+		// Opus raises blocking P1 finding
+		blockingP1 := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingP1)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "ready" {
+			t.Fatalf("expected round 1 to fail, got %s", parent.State)
+		}
+
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		if opus2 == nil || sonnet2 == nil {
+			t.Fatalf("expected round 2 review tasks")
+		}
+
+		// Round 2: Opus still reports P1 as still_open (blocking)
+		round2OpusFindings := json.RawMessage(`[{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"still fabricated","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", round2OpusFindings)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err = store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "ready" {
+			t.Errorf("expected ready (still_open P1 blocks), got %s", parent.State)
+		}
+
+		// Verify no follow-up tasks were created (blocking findings don't create follow-ups)
+		allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var followupTasks []Task
+		for _, task := range allTasks {
+			if task.Track == "research" && task.State == "backlog" && task.ID != parentID {
+				followupTasks = append(followupTasks, task)
+			}
+		}
+
+		if len(followupTasks) > 0 {
+			t.Errorf("blocking findings should not create follow-ups, got %d", len(followupTasks))
+		}
+	})
+
+	t.Run("deduplication across reviewers", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("expected both review tasks to be ready")
+		}
+
+		// Both reviewers find the same P3 finding
+		commonFinding := json.RawMessage(`[{"id":"f1","severity":"P3","file":"a.md","line":1,"summary":"wrong footnote","in_changed_text":false,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", commonFinding)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", commonFinding)
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Errorf("expected approved, got %s", parent.State)
+		}
+
+		// Verify only one follow-up task was created (deduplication)
+		allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var followupTasks []Task
+		for _, task := range allTasks {
+			if task.Track == "research" && task.State == "backlog" && task.ID != parentID {
+				followupTasks = append(followupTasks, task)
+			}
+		}
+
+		if len(followupTasks) != 1 {
+			t.Errorf("duplicate findings should be deduplicated, expected 1 follow-up, got %d", len(followupTasks))
+		}
+	})
+}
