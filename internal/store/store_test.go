@@ -160,8 +160,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 17 {
-		t.Errorf("expected 17 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 18 {
+		t.Errorf("expected 18 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -176,8 +176,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 17 {
-		t.Errorf("expected 17 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 18 {
+		t.Errorf("expected 18 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -273,8 +273,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 17 {
-		t.Errorf("expected 17 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 18 {
+		t.Errorf("expected 18 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -16549,5 +16549,660 @@ func TestResearchDisputes_MaintainedFindingCannotBeDisputedAgainUnderNewID(t *te
 	var verr *ValidationError
 	if !errors.As(err, &verr) || verr.Code != "DUPLICATE_DISPUTE" {
 		t.Fatalf("expected DUPLICATE_DISPUTE validation error, got: %v", err)
+	}
+}
+
+// newResearchTaskWithAdjudicator is newResearchTaskWithReviewers with
+// ODONIAN_RESEARCH_ADJUDICATOR configured, for docs/features/research-track.md
+// section 5 adjudication tests.
+func newResearchTaskWithAdjudicator(t *testing.T, reviewModels []string, adjudicator string) (Store, context.Context, string, string) {
+	t.Helper()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithResearchAdjudicator(adjudicator))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	escalate := false
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims in the doc",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: reviewModels,
+			Track:        "research",
+			Escalate:     &escalate,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	if _, err = store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err = store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	return store, ctx, proj.ID, taskID
+}
+
+// findAdjudicationTasks returns every section 5 adjudication task targeting parentID,
+// identified by their distinctive title: spawnAdjudicationTask always titles them
+// "Adjudicate disputed finding <id> [...]".
+func findAdjudicationTasks(t *testing.T, store Store, ctx context.Context, projID, parentID string) []Task {
+	t.Helper()
+	allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	var out []Task
+	for _, tk := range allTasks {
+		if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == parentID && strings.HasPrefix(tk.Title, "Adjudicate disputed finding") {
+			out = append(out, tk)
+		}
+	}
+	return out
+}
+
+// submitAdjudication claims and submits an adjudication task with the given verdict:
+// "approve" overturns the disputed finding, "reject" upholds it. Adjudication tasks
+// are track=research review tasks, so submission still requires a findings array, even
+// though it's unused.
+func submitAdjudication(t *testing.T, store Store, ctx context.Context, task *Task, verdict string) {
+	t.Helper()
+	if _, err := store.ClaimTask(ctx, task.ID, "adjudicator-1", task.Model, 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim adjudication task %s: %v", task.ID, err)
+	}
+	v := verdict
+	if _, err := store.SubmitTask(ctx, task.ID, "adjudicator-1", "ruling", &v, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`[]`)); err != nil {
+		t.Fatalf("failed to submit adjudication task %s: %v", task.ID, err)
+	}
+}
+
+// countEventsOfKind counts events of the given kind on taskID.
+func countEventsOfKind(t *testing.T, store Store, ctx context.Context, taskID, kind string) int {
+	t.Helper()
+	events, err := store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	n := 0
+	for _, e := range events {
+		if e.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// TestResearchAdjudication_DefersRoundWhilePending verifies that once a worker-disputed
+// finding is maintained by its reviewer and a valid adjudicator is configured, the
+// server spawns exactly one adjudication task scoped to that finding (with the
+// finding's summary and the worker's evidence in its spec) and leaves the round
+// entirely undecided — no state change on the parent — until the adjudicator rules.
+func TestResearchAdjudication_DefersRoundWhilePending(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("expected round-1 review tasks")
+	}
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"overstates the source","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 1 rejected (parent back to ready), got %s", parent.State)
+	}
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"the cited passage supports the claim as written"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("expected dispute submission to succeed, got: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusR2 == nil || sonnetR2 == nil {
+		t.Fatalf("expected round-2 review tasks")
+	}
+	maintained := json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"overstates the source","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", maintained)
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "review" {
+		t.Fatalf("expected round 2 to be deferred pending adjudication (parent stays in review), got %s", parent.State)
+	}
+
+	adjTasks := findAdjudicationTasks(t, store, ctx, projID, parentID)
+	if len(adjTasks) != 1 {
+		t.Fatalf("expected exactly one adjudication task, got %d", len(adjTasks))
+	}
+	adj := adjTasks[0]
+	if adj.Model != "haiku" {
+		t.Errorf("expected adjudication task assigned to configured adjudicator haiku, got %s", adj.Model)
+	}
+	if adj.State != "ready" {
+		t.Errorf("expected adjudication task ready to claim, got %s", adj.State)
+	}
+	if !strings.Contains(adj.Spec, "overstates the source") || !strings.Contains(adj.Spec, "the cited passage supports the claim as written") {
+		t.Errorf("expected adjudication task spec to carry the finding and the worker's evidence, got: %s", adj.Spec)
+	}
+
+	if n := countEventsOfKind(t, store, ctx, parentID, "research_round_rejected"); n != 1 {
+		t.Errorf("expected round 2 not yet decided (still 1 rejected round from round 1), got %d", n)
+	}
+}
+
+// TestResearchAdjudication_Overturned verifies that when the adjudicator overturns a
+// maintained disputed finding (verdict approve), the finding no longer blocks and,
+// with nothing else blocking, the round is approved.
+func TestResearchAdjudication_Overturned(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"resolves it"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	adjTasks := findAdjudicationTasks(t, store, ctx, projID, parentID)
+	if len(adjTasks) != 1 {
+		t.Fatalf("expected exactly one adjudication task, got %d", len(adjTasks))
+	}
+	submitAdjudication(t, store, ctx, &adjTasks[0], "approve")
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected the overturned finding to no longer block, and nothing else blocking, got %s", parent.State)
+	}
+}
+
+// TestResearchAdjudication_Upheld verifies that when the adjudicator upholds a
+// maintained disputed finding (verdict reject), the finding still blocks and the round
+// is rejected, exactly as an ordinary still_open finding would.
+func TestResearchAdjudication_Upheld(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"does not resolve it"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	adjTasks := findAdjudicationTasks(t, store, ctx, projID, parentID)
+	if len(adjTasks) != 1 {
+		t.Fatalf("expected exactly one adjudication task, got %d", len(adjTasks))
+	}
+	submitAdjudication(t, store, ctx, &adjTasks[0], "reject")
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected the upheld finding to keep blocking (round 2 rejected), got %s", parent.State)
+	}
+	if n := countEventsOfKind(t, store, ctx, parentID, "research_round_rejected"); n != 2 {
+		t.Errorf("expected exactly 2 rejected rounds recorded (round 1 and round 2, no double count), got %d", n)
+	}
+}
+
+// TestResearchAdjudication_MultipleSimultaneousDisputes verifies that two findings
+// disputed in the same round, raised by different reviewers and both maintained, each
+// get their own adjudication task, and the round waits for both rulings before it is
+// decided. A mixed outcome (one overturned, one upheld) still fails the round: an
+// adjudicator's ruling is binding only for the one finding it rules on, and any other
+// blocking finding still determines the round on its own.
+func TestResearchAdjudication_MultipleSimultaneousDisputes(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"fa","severity":"P2","file":"a.md","line":3,"summary":"claim a","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "reject", json.RawMessage(`[{"id":"fb","severity":"P2","file":"b.md","line":9,"summary":"claim b","in_changed_text":true,"status":"new"}]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"fa","evidence":"a resolves"},{"finding_id":"fb","evidence":"b resolves"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"fa2","severity":"P2","file":"a.md","line":3,"summary":"claim a","in_changed_text":false,"status":"still_open","prior_id":"fa"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "reject", json.RawMessage(`[{"id":"fb2","severity":"P2","file":"b.md","line":9,"summary":"claim b","in_changed_text":false,"status":"still_open","prior_id":"fb"}]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "review" {
+		t.Fatalf("expected round 2 deferred pending both adjudications, got %s", parent.State)
+	}
+
+	adjTasks := findAdjudicationTasks(t, store, ctx, projID, parentID)
+	if len(adjTasks) != 2 {
+		t.Fatalf("expected exactly two adjudication tasks, got %d", len(adjTasks))
+	}
+	var adjA, adjB *Task
+	for i := range adjTasks {
+		if strings.Contains(adjTasks[i].Title, "fa2") {
+			adjA = &adjTasks[i]
+		}
+		if strings.Contains(adjTasks[i].Title, "fb2") {
+			adjB = &adjTasks[i]
+		}
+	}
+	if adjA == nil || adjB == nil {
+		t.Fatalf("expected one adjudication task per disputed finding, got titles: %q, %q", adjTasks[0].Title, adjTasks[1].Title)
+	}
+
+	// Resolving only one of the two must not decide the round yet.
+	submitAdjudication(t, store, ctx, adjA, "approve")
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "review" {
+		t.Fatalf("expected round to remain deferred with one adjudication still pending, got %s", parent.State)
+	}
+
+	// The second ruling upholds its finding: the round still fails, on that finding
+	// alone, even though the other was overturned.
+	submitAdjudication(t, store, ctx, adjB, "reject")
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 rejected by the upheld finding alone, got %s", parent.State)
+	}
+	if n := countEventsOfKind(t, store, ctx, parentID, "research_round_rejected"); n != 2 {
+		t.Errorf("expected exactly 2 rejected rounds recorded (round 1 and round 2, no double count), got %d", n)
+	}
+}
+
+// TestResearchAdjudication_DuplicateSpawnPrevention verifies that spawning an
+// adjudication task for the same disputed finding twice — simulating a retried
+// aggregation call — creates exactly one task rather than erroring or duplicating.
+func TestResearchAdjudication_DuplicateSpawnPrevention(t *testing.T) {
+	store, ctx, _, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	ss := store.(*sqliteStore)
+
+	anchor := Dispute{FindingID: "f1", Evidence: "cited source text", Round: 1, Lineage: researchReviewerLineage("opus", 0)}
+	finding := Finding{ID: "f1", Severity: "P2", File: "a.md", Line: 3, Summary: "x", Status: "still_open"}
+
+	tx, err := ss.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	now := nowTimestamp()
+	if err := ss.spawnAdjudicationTask(ctx, tx, parentID, parent.ProjectID, parent.DocumentID, parent.Track, anchor, finding, 2, now); err != nil {
+		t.Fatalf("first spawn failed: %v", err)
+	}
+	if err := ss.spawnAdjudicationTask(ctx, tx, parentID, parent.ProjectID, parent.DocumentID, parent.Track, anchor, finding, 2, now); err != nil {
+		t.Fatalf("retried spawn for the same disputed finding must not error, got: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+
+	var count int
+	if err := ss.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM task WHERE target_task_id = ? AND adjudicate_finding_id = ?`, parentID, "f1").Scan(&count); err != nil {
+		t.Fatalf("failed to count adjudication tasks: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one adjudication task after the retried spawn, got %d", count)
+	}
+}
+
+// TestResearchAdjudication_AbsentAdjudicatorKeepsBlocking verifies that with no
+// ODONIAN_RESEARCH_ADJUDICATOR configured, a maintained disputed finding stays
+// blocking, the round is decided immediately (never deferred), and the parent gets an
+// explicit event recording why adjudication did not run.
+func TestResearchAdjudication_AbsentAdjudicatorKeepsBlocking(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 decided immediately (no adjudicator to wait on), got %s", parent.State)
+	}
+	if got := findAdjudicationTasks(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Errorf("expected no adjudication task without a configured adjudicator, got %d", len(got))
+	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var found bool
+	for _, e := range events {
+		if e.Kind == "research_adjudication_unavailable" && e.Note != nil && strings.Contains(*e.Note, "not configured") && strings.Contains(*e.Note, "f1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an explicit research_adjudication_unavailable event naming the finding, got events: %+v", events)
+	}
+}
+
+// TestResearchAdjudication_InvalidAdjudicatorNotInAllowlist verifies that a configured
+// adjudicator outside the model allowlist is treated as unavailable (defense in depth;
+// ODONIAN_RESEARCH_ADJUDICATOR is also validated against the allowlist at startup).
+func TestResearchAdjudication_InvalidAdjudicatorNotInAllowlist(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "not-a-real-model")
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 decided immediately (adjudicator not allowlisted), got %s", parent.State)
+	}
+	if got := findAdjudicationTasks(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Errorf("expected no adjudication task spawned for a non-allowlisted adjudicator, got %d", len(got))
+	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var found bool
+	for _, e := range events {
+		if e.Kind == "research_adjudication_unavailable" && e.Note != nil && strings.Contains(*e.Note, "not in the model allowlist") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an explicit research_adjudication_unavailable event citing the allowlist, got events: %+v", events)
+	}
+}
+
+// TestResearchAdjudication_AdjudicatorSameAsReviewer verifies that a configured
+// adjudicator equal to one of the task's two reviewers is treated as unavailable
+// (decision 2: the adjudicator must differ from both reviewers).
+func TestResearchAdjudication_AdjudicatorSameAsReviewer(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "opus")
+
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"e"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 decided immediately (adjudicator is one of the reviewers), got %s", parent.State)
+	}
+	if got := findAdjudicationTasks(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Errorf("expected no adjudication task spawned when the adjudicator is one of the reviewers, got %d", len(got))
+	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var found bool
+	for _, e := range events {
+		if e.Kind == "research_adjudication_unavailable" && e.Note != nil && strings.Contains(*e.Note, "one of this task's reviewers") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an explicit research_adjudication_unavailable event citing the reviewer conflict, got events: %+v", events)
+	}
+}
+
+// TestResearchAdjudication_OverturnPersistsAcrossLaterCarriedForwardRounds verifies
+// that once an adjudicator overturns a maintained disputed finding, the ruling stays
+// binding for that finding's chain no matter how many further rounds the same
+// reviewer (unaware of the ruling, since the review prompt itself is unchanged in this
+// milestone) carries it forward under a new id — and that no second adjudication task
+// is ever spawned for it.
+func TestResearchAdjudication_OverturnPersistsAcrossLaterCarriedForwardRounds(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+
+	// Round 1: opus raises f1 (later disputed and overturned); sonnet raises an
+	// unrelated fS that stays open into round 2, so round 2 still fails on its own
+	// merits even after f1 is overturned, giving us a round 3 to carry f1 forward into.
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"claim a","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "reject", json.RawMessage(`[{"id":"fs","severity":"P2","file":"b.md","line":9,"summary":"claim b","in_changed_text":true,"status":"new"}]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"resolves it"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	// Round 2: opus maintains f1 (disputed) as f1b; sonnet's fs is still unresolved.
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1b","severity":"P2","file":"a.md","line":3,"summary":"claim a","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "reject", json.RawMessage(`[{"id":"fsb","severity":"P2","file":"b.md","line":9,"summary":"claim b","in_changed_text":false,"status":"still_open","prior_id":"fs"}]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "review" {
+		t.Fatalf("expected round 2 deferred pending adjudication of f1b, got %s", parent.State)
+	}
+
+	adjTasks := findAdjudicationTasks(t, store, ctx, projID, parentID)
+	if len(adjTasks) != 1 {
+		t.Fatalf("expected exactly one adjudication task, got %d", len(adjTasks))
+	}
+	submitAdjudication(t, store, ctx, &adjTasks[0], "approve")
+
+	// f1b is overturned, but sonnet's fsb is still open on its own: round 2 fails.
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 rejected by fsb alone (f1b overturned), got %s", parent.State)
+	}
+	if n := countEventsOfKind(t, store, ctx, parentID, "research_round_rejected"); n != 2 {
+		t.Errorf("expected exactly 2 rejected rounds recorded, got %d", n)
+	}
+
+	// Round 3: opus (unaware of the ruling) carries f1 forward again as f1c; sonnet
+	// fixes fs and reports it resolved.
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+	opusR3, sonnetR3 := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
+	if opusR3 == nil || sonnetR3 == nil {
+		t.Fatalf("expected round-3 review tasks")
+	}
+	submitResearchReview(t, store, ctx, opusR3, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1c","severity":"P2","file":"a.md","line":3,"summary":"claim a","in_changed_text":false,"status":"still_open","prior_id":"f1b"}]`))
+	submitResearchReview(t, store, ctx, sonnetR3, "sonnet-reviewer", "approve", json.RawMessage(`[{"id":"fsc","severity":"P2","file":"b.md","line":9,"summary":"claim b","in_changed_text":false,"status":"resolved","prior_id":"fsb"}]`))
+
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected round 3 approved: fsb fixed, f1c still covered by the round-2 overturn ruling, got %s", parent.State)
+	}
+	if n := countEventsOfKind(t, store, ctx, parentID, "research_round_rejected"); n != 2 {
+		t.Errorf("expected still exactly 2 rejected rounds (round 3 passed), got %d", n)
+	}
+	if got := findAdjudicationTasks(t, store, ctx, projID, parentID); len(got) != 1 {
+		t.Errorf("expected no new adjudication task for f1c (already ruled on via its chain), got %d total", len(got))
+	}
+}
+
+// TestResearchAdjudication_BuildTrackNeverAdjudicates verifies that a build-track
+// task's review round is unaffected by adjudication logic even when a research
+// adjudicator is configured: build aggregation still uses the plain approve/reject
+// verdict tally, and no adjudication task is ever spawned for it.
+func TestResearchAdjudication_BuildTrackNeverAdjudicates(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithResearchAdjudicator("opus"))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Build feature", Spec: "Do it", DocumentID: doc.ID, Model: "haiku", ReviewModels: []string{"opus", "sonnet"}, Track: "build"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Impl", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	var opusRev, sonnetRev *Task
+	for i := range allTasks {
+		tk := allTasks[i]
+		if tk.Kind != "review" || tk.TargetTaskID == nil || *tk.TargetTaskID != taskID {
+			continue
+		}
+		switch tk.Model {
+		case "opus":
+			t := tk
+			opusRev = &t
+		case "sonnet":
+			t := tk
+			sonnetRev = &t
+		}
+	}
+	if opusRev == nil || sonnetRev == nil {
+		t.Fatalf("expected both build review tasks")
+	}
+
+	if _, err := store.ClaimTask(ctx, opusRev.ID, "opus-reviewer", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	v := "reject"
+	if _, err := store.SubmitTask(ctx, opusRev.ID, "opus-reviewer", "no good", &v, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, sonnetRev.ID, "sonnet-reviewer", "sonnet", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	v2 := "approve"
+	if _, err := store.SubmitTask(ctx, sonnetRev.ID, "sonnet-reviewer", "fine by me", &v2, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	parent, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected plain verdict tally to reject (one reject, one approve), got %s", parent.State)
+	}
+
+	var total int
+	if err := store.(*sqliteStore).conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM task WHERE target_task_id = ?`, taskID).Scan(&total); err != nil {
+		t.Fatalf("failed to count tasks: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("expected exactly the 2 ordinary review tasks and no adjudication task, got %d", total)
 	}
 }

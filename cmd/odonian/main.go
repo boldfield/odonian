@@ -212,6 +212,12 @@ func runServer() {
 		log.Fatalf("failed to parse ODONIAN_RESEARCH_ROUND_BUDGET: %v", err)
 	}
 
+	// Parse research adjudicator (docs/features/research-track.md section 5)
+	researchAdjudicator, err := validateResearchAdjudicator(os.Getenv("ODONIAN_RESEARCH_ADJUDICATOR"), allowedModels)
+	if err != nil {
+		log.Fatalf("invalid research adjudicator: %v", err)
+	}
+
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
 	if eventTerminalRetentionDaysStr == "" {
@@ -263,7 +269,8 @@ func runServer() {
 	s, err := store.Open(dbPath, allowedModels,
 		store.WithEscalationLadder(escalationLadder),
 		store.WithResearchDefaultModel(researchDefaultModel),
-		store.WithResearchEscalationLadder(researchEscalationLadder))
+		store.WithResearchEscalationLadder(researchEscalationLadder),
+		store.WithResearchAdjudicator(researchAdjudicator))
 	if err != nil {
 		log.Fatalf("failed to open store: %v", err)
 	}
@@ -1231,6 +1238,31 @@ func parseResearchRoundBudget(budgetStr string) (int, error) {
 		return 0, fmt.Errorf("research round budget must be positive, got %d", budget)
 	}
 	return budget, nil
+}
+
+// validateResearchAdjudicator validates ODONIAN_RESEARCH_ADJUDICATOR, the model
+// spawnAdjudicationTask assigns to rule on a worker-disputed research finding its
+// raising reviewer maintained (docs/features/research-track.md section 5, decision 2).
+// Empty/unset is valid: it means adjudication never runs, and a maintained dispute
+// stays blocking with an explicit reason recorded on the parent task. Whether the
+// configured model differs from a specific task's two reviewers is checked per task at
+// aggregation time, not here, since that depends on each task's own review_models.
+func validateResearchAdjudicator(modelStr string, allowedModels []string) (string, error) {
+	modelStr = strings.TrimSpace(modelStr)
+	if modelStr == "" {
+		return "", nil
+	}
+
+	allowedModelsM := make(map[string]bool)
+	for _, m := range allowedModels {
+		allowedModelsM[m] = true
+	}
+
+	if !allowedModelsM[modelStr] {
+		return "", fmt.Errorf("model %q not in ODONIAN_MODELS allowlist", modelStr)
+	}
+
+	return modelStr, nil
 }
 
 func validateResearchDefaultModel(modelStr string, allowedModels []string) (string, error) {

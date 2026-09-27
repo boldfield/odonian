@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,7 @@ type sqliteStore struct {
 	escalationLadder         []string
 	researchDefaultModel     string
 	researchEscalationLadder []string
+	researchAdjudicator      string
 
 	// supersedeCloseHook, when set, is invoked after each background
 	// closeSupersededPR attempt finishes. It exists solely so tests can
@@ -105,6 +107,17 @@ func WithResearchDefaultModel(model string) StoreOption {
 func WithResearchEscalationLadder(ladder []string) StoreOption {
 	return func(s *sqliteStore) {
 		s.researchEscalationLadder = append([]string{}, ladder...) // Copy to avoid external mutation
+	}
+}
+
+// WithResearchAdjudicator sets ODONIAN_RESEARCH_ADJUDICATOR, the model spawnAdjudicationTask
+// assigns to adjudicate a worker-disputed research finding that its raising reviewer
+// maintained (docs/features/research-track.md section 5). An empty value (the
+// default) means adjudication never runs: a maintained dispute stays blocking and the
+// server records why on the parent task.
+func WithResearchAdjudicator(model string) StoreOption {
+	return func(s *sqliteStore) {
+		s.researchAdjudicator = model
 	}
 }
 
@@ -2585,39 +2598,55 @@ func isBlockingResearchFinding(f Finding, round int) bool {
 // checkResearchBlockingFindings reports whether any reviewer in the current round
 // raised a blocking finding, per docs/features/research-track.md section 3, and
 // collects every blocking finding raised (used to record the round-rejected event
-// section 6's chain-wide round budget reads). It reads only the review events
-// sourced from this round's own review tasks (via source_task_id), so it is
-// unaffected by unrelated review events on the parent, e.g. a human/API AddReview
-// call. It fails closed: if it cannot account for every review task's findings (a
-// missing or unparseable findings payload, or fewer matching events than review
-// tasks), it reports a blocking finding rather than risk a silent approval; the
-// returned findings list may be empty in that case, since there's nothing valid to
-// report.
-func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql.Tx, parentID string, round int) (bool, []Finding, error) {
+// section 6's chain-wide round budget reads), each tagged with the reviewer lineage
+// (see researchReviewerLineage) that raised it, so callers can trace a blocking
+// finding back to a specific dispute for section 5 adjudication. It reads only the
+// review events sourced from this round's own review tasks (via source_task_id), so
+// it is unaffected by unrelated review events on the parent, e.g. a human/API
+// AddReview call. An adjudication task (adjudicate_finding_id IS NOT NULL) is never
+// one of this round's own review tasks: its ruling is binding only for the one
+// finding it adjudicates and never votes on the round (section 5). It fails closed:
+// if it cannot account for every review task's findings (a missing or unparseable
+// findings payload, or fewer matching events than review tasks), it reports a
+// blocking finding rather than risk a silent approval; the returned findings list may
+// be empty in that case, since there's nothing valid to report.
+func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql.Tx, parentID string, round int) (bool, []Finding, []string, error) {
 	taskRows, err := tx.QueryContext(ctx, `
-		SELECT id FROM task WHERE target_task_id = ? AND review_round = ? AND kind = 'review'
+		SELECT id, model FROM task
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding_id IS NULL
+		ORDER BY rowid
 	`, parentID, round)
 	if err != nil {
-		return false, nil, fmt.Errorf("failed to list round review tasks: %w", err)
+		return false, nil, nil, fmt.Errorf("failed to list round review tasks: %w", err)
 	}
 	reviewTaskIDs := make(map[string]bool)
+	// Lineage mirrors researchReviewerLineage's computation in
+	// collectResearchReviewReports: model plus the task's index among this round's
+	// review tasks for that model, in creation order. Slot is round-local (recomputed
+	// fresh per round), so restricting this query to `round` yields the same lineage
+	// collectResearchReviewReports would compute from the full history.
+	taskLineage := make(map[string]string)
+	slotsTaken := make(map[string]int)
 	for taskRows.Next() {
-		var id string
-		if err := taskRows.Scan(&id); err != nil {
+		var id, model string
+		if err := taskRows.Scan(&id, &model); err != nil {
 			taskRows.Close()
-			return false, nil, fmt.Errorf("failed to scan review task id: %w", err)
+			return false, nil, nil, fmt.Errorf("failed to scan review task id: %w", err)
 		}
 		reviewTaskIDs[id] = true
+		slot := slotsTaken[model]
+		slotsTaken[model] = slot + 1
+		taskLineage[id] = researchReviewerLineage(model, slot)
 	}
 	if err := taskRows.Err(); err != nil {
 		taskRows.Close()
-		return false, nil, fmt.Errorf("failed to iterate review task ids: %w", err)
+		return false, nil, nil, fmt.Errorf("failed to iterate review task ids: %w", err)
 	}
 	taskRows.Close()
 
 	expected := len(reviewTaskIDs)
 	if expected == 0 {
-		return false, nil, nil
+		return false, nil, nil, nil
 	}
 
 	// No LIMIT: an intervening AddReview (or any other) event on the parent must
@@ -2627,18 +2656,19 @@ func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql
 		WHERE task_id = ? AND kind = 'review' AND source_task_id IS NOT NULL
 	`, parentID)
 	if err != nil {
-		return false, nil, fmt.Errorf("failed to query review events: %w", err)
+		return false, nil, nil, fmt.Errorf("failed to query review events: %w", err)
 	}
 	defer evRows.Close()
 
 	seen := make(map[string]bool, expected)
 	failClosed := false
 	var blocking []Finding
+	var blockingLineages []string
 	for evRows.Next() {
 		var sourceTaskID string
 		var findingsText sql.NullString
 		if err := evRows.Scan(&sourceTaskID, &findingsText); err != nil {
-			return false, nil, fmt.Errorf("failed to scan review event: %w", err)
+			return false, nil, nil, fmt.Errorf("failed to scan review event: %w", err)
 		}
 		if !reviewTaskIDs[sourceTaskID] || seen[sourceTaskID] {
 			continue
@@ -2659,11 +2689,12 @@ func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql
 		for _, f := range findings {
 			if isBlockingResearchFinding(f, round) {
 				blocking = append(blocking, f)
+				blockingLineages = append(blockingLineages, taskLineage[sourceTaskID])
 			}
 		}
 	}
 	if err := evRows.Err(); err != nil {
-		return false, nil, fmt.Errorf("failed to iterate review events: %w", err)
+		return false, nil, nil, fmt.Errorf("failed to iterate review events: %w", err)
 	}
 
 	if len(seen) != expected {
@@ -2672,10 +2703,276 @@ func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql
 	}
 
 	if failClosed {
-		return true, blocking, nil
+		return true, blocking, blockingLineages, nil
 	}
 
-	return len(blocking) > 0, blocking, nil
+	return len(blocking) > 0, blocking, blockingLineages, nil
+}
+
+// researchAnchorKey is the stable identity of one disputed research finding: the
+// (round, reviewer lineage, finding id) at which it was first disputed (Dispute.Round
+// / Dispute.Lineage / Dispute.FindingID, resolved once by submitTask). It stays valid
+// across however many further rounds the same reviewer carries the finding forward
+// under a new id, because researchFindingChains links prior_id chains within one
+// lineage and always resolves a chain's union-find root to its earliest member.
+func researchAnchorKey(round int, lineage, findingID string) string {
+	return fmt.Sprintf("%d\x00%s\x00%s", round, lineage, findingID)
+}
+
+// applyResearchAdjudication implements docs/features/research-track.md section 5 for
+// one research round's blocking findings: a blocking finding that is the maintained
+// continuation of a worker-disputed finding is decided by adjudication, not by its raw
+// status, and never votes on the round itself. items and lineages are
+// checkResearchBlockingFindings' returned blocking findings and the reviewer lineage
+// that raised each, for the same round.
+//
+// It returns, parallel to items, whether each must be excluded from the round's
+// blocking findings because an adjudicator overturned it (or an earlier round's
+// adjudicator did, for a finding carried forward since), and whether the round as a
+// whole must be deferred: left entirely undecided, with no rejected-round event, no
+// budget count and no circuit breaker, because at least one relevant adjudication was
+// just spawned or is still pending. A finding whose adjudicator upheld it, or whose
+// dispute has no usable adjudicator at all, is left un-excluded: it blocks under the
+// same rule as any other still_open finding.
+func (s *sqliteStore) applyResearchAdjudication(ctx context.Context, tx *sql.Tx, parentID string, round int, parentReviewModels []string, items []Finding, lineages []string, now string) ([]bool, bool, error) {
+	excluded := make([]bool, len(items))
+	if len(items) == 0 {
+		return excluded, false, nil
+	}
+
+	priorDisputed, err := s.priorDisputes(ctx, tx, parentID)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to collect prior disputes for adjudication: %w", err)
+	}
+	if len(priorDisputed) == 0 {
+		return excluded, false, nil
+	}
+
+	// allFindings covers the parent's full review history through this round, so a
+	// disputed finding's chain can be traced no matter how many further rounds it was
+	// carried forward under a new id since the dispute (or since an earlier ruling).
+	allFindings, _, err := s.collectResearchReviewReports(ctx, tx, parentID, round)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to collect review reports for adjudication: %w", err)
+	}
+	chainOf, _ := researchFindingChains(allFindings)
+
+	byAnchorKey := make(map[string]int, len(allFindings))
+	for i, cf := range allFindings {
+		byAnchorKey[researchAnchorKey(cf.round, cf.lineage, cf.ID)] = i
+	}
+
+	// anchorForRoot maps a chain's union-find root index to the dispute that started
+	// it, for every dispute this task has ever recorded. A blocking item whose own
+	// chain root isn't in this map was never disputed and needs no adjudication.
+	anchorForRoot := make(map[int]Dispute, len(priorDisputed))
+	for _, pd := range priorDisputed {
+		if idx, ok := byAnchorKey[researchAnchorKey(pd.Round, pd.Lineage, pd.FindingID)]; ok {
+			anchorForRoot[chainOf(idx)] = pd
+		}
+	}
+	if len(anchorForRoot) == 0 {
+		return excluded, false, nil
+	}
+
+	var pending bool
+	var parentProjectID, parentDocumentID, parentTrack string
+	fetchedParent := false
+
+	for i, f := range items {
+		idx, ok := byAnchorKey[researchAnchorKey(round, lineages[i], f.ID)]
+		if !ok {
+			// Should never happen: every blocking item comes from a review event in
+			// this exact round, which collectResearchReviewReports also scanned.
+			// Fall through to default (non-excluded) treatment defensively.
+			continue
+		}
+		anchor, isDisputed := anchorForRoot[chainOf(idx)]
+		if !isDisputed {
+			continue
+		}
+
+		_, adjState, adjVerdict, found, err := s.findAdjudicationTask(ctx, tx, parentID, anchor)
+		if err != nil {
+			return nil, false, err
+		}
+
+		if found {
+			// An adjudication task already exists for this exact disputed finding.
+			if adjState != "done" {
+				pending = true
+				continue
+			}
+			if adjVerdict.Valid && adjVerdict.String == "approve" {
+				// Overturned: binding for this finding only, this round and every
+				// later round the same chain is carried forward under.
+				excluded[i] = true
+			}
+			// verdict == "reject": upheld. Default (still_open) treatment stands.
+			continue
+		}
+
+		// No adjudication task yet for this disputed finding: this is the round in
+		// which the raising reviewer's re-evaluation reports it maintained.
+		if reason := s.researchAdjudicatorUnavailableReason(parentReviewModels); reason != "" {
+			noted, err := s.researchAdjudicationAlreadyNoted(ctx, tx, parentID, anchor)
+			if err != nil {
+				return nil, false, err
+			}
+			if !noted {
+				note := fmt.Sprintf(
+					"Adjudicator unavailable for disputed finding %s (raised round %d, reviewer lineage %s): %s. The finding stays blocking.",
+					anchor.FindingID, anchor.Round, anchor.Lineage, reason,
+				)
+				if _, err := s.AppendEvent(ctx, tx, parentID, "system", "research_adjudication_unavailable", nil, &note); err != nil {
+					return nil, false, fmt.Errorf("failed to append adjudication-unavailable event: %w", err)
+				}
+			}
+			// Not excluded: default (still_open) treatment stands, the finding blocks.
+			continue
+		}
+
+		if !fetchedParent {
+			if err := tx.QueryRowContext(ctx, `
+				SELECT project_id, document_id, track FROM task WHERE id = ?
+			`, parentID).Scan(&parentProjectID, &parentDocumentID, &parentTrack); err != nil {
+				return nil, false, fmt.Errorf("failed to fetch parent for adjudication spawn: %w", err)
+			}
+			fetchedParent = true
+		}
+		if err := s.spawnAdjudicationTask(ctx, tx, parentID, parentProjectID, parentDocumentID, parentTrack, anchor, f, round, now); err != nil {
+			return nil, false, err
+		}
+		pending = true
+	}
+
+	return excluded, pending, nil
+}
+
+// researchAdjudicatorUnavailableReason reports why docs/features/research-track.md
+// section 5 adjudication cannot run for this task, or "" if it can: the adjudicator is
+// unconfigured, not in the model allowlist (defense in depth; ODONIAN_RESEARCH_ADJUDICATOR
+// is already validated against the allowlist at startup), or equal to one of the
+// task's two configured reviewers (decision 2: the adjudicator must differ from both).
+func (s *sqliteStore) researchAdjudicatorUnavailableReason(parentReviewModels []string) string {
+	if s.researchAdjudicator == "" {
+		return "ODONIAN_RESEARCH_ADJUDICATOR is not configured"
+	}
+	if !s.allowedModelsM[s.researchAdjudicator] {
+		return fmt.Sprintf("configured adjudicator %q is not in the model allowlist", s.researchAdjudicator)
+	}
+	for _, m := range parentReviewModels {
+		if m == s.researchAdjudicator {
+			return fmt.Sprintf("configured adjudicator %q is one of this task's reviewers", s.researchAdjudicator)
+		}
+	}
+	return ""
+}
+
+// researchAdjudicationAlreadyNoted reports whether a research_adjudication_unavailable
+// event already exists on the parent for this exact dispute anchor, so a redundant
+// aggregation call (e.g. from ReleaseTask) never appends a second one for the same
+// still-undecided round.
+func (s *sqliteStore) researchAdjudicationAlreadyNoted(ctx context.Context, tx *sql.Tx, parentID string, anchor Dispute) (bool, error) {
+	marker := fmt.Sprintf("disputed finding %s (raised round %d, reviewer lineage %s)", anchor.FindingID, anchor.Round, anchor.Lineage)
+	var count int
+	err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM event WHERE task_id = ? AND kind = 'research_adjudication_unavailable' AND note LIKE ?
+	`, parentID, "%"+marker+"%").Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to check for existing adjudication-unavailable event: %w", err)
+	}
+	return count > 0, nil
+}
+
+// adjudicationTaskSpec renders the brief for a section 5 adjudication task, scoped to
+// the one disputed finding it must rule on. Wording is intentionally plain: R12 owns
+// the polished prompt; this only has to carry enough for a model to act on today.
+func adjudicationTaskSpec(parentID string, finding Finding, evidence string) string {
+	return fmt.Sprintf(
+		"Adjudicate one disputed research review finding, per docs/features/research-track.md section 5.\n\n"+
+			"Parent task: %s\n\n"+
+			"## Disputed finding\n\n"+
+			"- id: %s\n- severity: %s\n- file: %s\n- line: %d\n- status: %s\n- summary: %s\n\n"+
+			"## Worker's evidence disputing the finding\n\n%s\n\n"+
+			"## Instructions\n\n"+
+			"The finding's raising reviewer re-evaluated the worker's evidence and maintained the finding. "+
+			"Independently verify the finding against the cited source and the worker's evidence. "+
+			"Your ruling is binding for this finding only; it does not vote on the review round.\n\n"+
+			"Submit verdict \"approve\" if the finding should be OVERTURNED (the evidence resolves it; it must not block).\n"+
+			"Submit verdict \"reject\" if the finding should be UPHELD (it remains a valid blocking finding).\n\n"+
+			"This task does not use the structured findings format: submit with findings: [].",
+		parentID, finding.ID, finding.Severity, finding.File, finding.Line, finding.Status, finding.Summary, evidence,
+	)
+}
+
+// findAdjudicationTask looks up the (at most one, per the migration's unique index)
+// adjudication task for anchor targeting parentID, splitting anchor.Lineage into its
+// stored reviewer-model and reviewer-slot columns (see splitResearchReviewerLineage).
+func (s *sqliteStore) findAdjudicationTask(ctx context.Context, tx *sql.Tx, parentID string, anchor Dispute) (taskID, state string, verdict sql.NullString, found bool, err error) {
+	model, slot, ok := splitResearchReviewerLineage(anchor.Lineage)
+	if !ok {
+		return "", "", sql.NullString{}, false, fmt.Errorf("malformed dispute lineage %q", anchor.Lineage)
+	}
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, state, verdict FROM task
+		WHERE target_task_id = ? AND adjudicate_finding_round = ? AND adjudicate_finding_reviewer_model = ?
+		  AND adjudicate_finding_reviewer_slot = ? AND adjudicate_finding_id = ?
+	`, parentID, anchor.Round, model, slot, anchor.FindingID).Scan(&taskID, &state, &verdict)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", sql.NullString{}, false, nil
+	}
+	if err != nil {
+		return "", "", sql.NullString{}, false, fmt.Errorf("failed to look up adjudication task: %w", err)
+	}
+	return taskID, state, verdict, true, nil
+}
+
+// spawnAdjudicationTask creates the one review-kind task that adjudicates anchor,
+// scoped to that finding alone, assigned to s.researchAdjudicator. It is idempotent: a
+// pre-existing task for the same (target_task_id, anchor) — from an earlier call in
+// this same aggregation, a retried submission, or any other redundant call — is left
+// alone rather than duplicated. Idempotency needs only the check-then-insert below,
+// with the migration's unique index as a backstop: the store's single-writer
+// connection (Open sets MaxOpenConns(1)) means no other transaction can be racing this
+// one, so a real duplicate can only arise across separate, sequential transactions,
+// which the pre-check already catches.
+func (s *sqliteStore) spawnAdjudicationTask(ctx context.Context, tx *sql.Tx, parentID, parentProjectID, parentDocumentID, parentTrack string, anchor Dispute, finding Finding, round int, now string) error {
+	_, _, _, found, err := s.findAdjudicationTask(ctx, tx, parentID, anchor)
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+
+	model, slot, ok := splitResearchReviewerLineage(anchor.Lineage)
+	if !ok {
+		return fmt.Errorf("malformed dispute lineage %q", anchor.Lineage)
+	}
+
+	taskID := GenerateID()
+	title := fmt.Sprintf("Adjudicate disputed finding %s [%s]", finding.ID, finding.Severity)
+	spec := adjudicationTaskSpec(parentID, finding, anchor.Evidence)
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO task (
+			id, project_id, document_id, title, spec, state, model, kind, review_round, target_task_id,
+			agent_merge, track, adjudicate_finding_round, adjudicate_finding_reviewer_model,
+			adjudicate_finding_reviewer_slot, adjudicate_finding_id, created_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, 'ready', ?, 'review', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+	`, taskID, parentProjectID, parentDocumentID, title, spec, s.researchAdjudicator, round, parentID,
+		parentTrack, anchor.Round, model, slot, anchor.FindingID, now, now)
+	if err != nil {
+		return fmt.Errorf("failed to spawn adjudication task: %w", err)
+	}
+
+	eventNote := fmt.Sprintf("Adjudication task %s spawned for disputed finding %s (raised round %d, reviewer lineage %s)", taskID, anchor.FindingID, anchor.Round, anchor.Lineage)
+	if _, err := s.AppendEvent(ctx, tx, parentID, "system", "research_adjudication_spawned", nil, &eventNote); err != nil {
+		return fmt.Errorf("failed to append research_adjudication_spawned event: %w", err)
+	}
+	return nil
 }
 
 // appendResearchRoundRejectedEvent records that a research review round failed,
@@ -2986,6 +3283,24 @@ func researchReviewerLineage(model string, slot int) string {
 	return fmt.Sprintf("%s\x00%d", model, slot)
 }
 
+// splitResearchReviewerLineage reverses researchReviewerLineage, for the one place
+// (spawnAdjudicationTask) that must persist a reviewer identity as SQL columns rather
+// than compare it in memory: task.adjudicate_finding_reviewer_model/_slot are stored
+// separately, rather than as a single "model\x00slot" TEXT value, so the row never
+// holds a value with an embedded NUL byte.
+func splitResearchReviewerLineage(lineage string) (model string, slot int, ok bool) {
+	idx := strings.IndexByte(lineage, 0)
+	if idx < 0 {
+		return "", 0, false
+	}
+	model = lineage[:idx]
+	slot, err := strconv.Atoi(lineage[idx+1:])
+	if err != nil {
+		return "", 0, false
+	}
+	return model, slot, true
+}
+
 // newResearchUnionFind returns a union-find over n indices into an allFindings slice,
 // shared by researchFindingChains (linking prior_id lineages) and
 // createResearchFollowUpTasks (grouping outstanding reports into one follow-up),
@@ -3034,9 +3349,12 @@ func (s *sqliteStore) collectResearchReviewReports(ctx context.Context, tx *sql.
 	// round it belongs to and the model that reviewed it (recorded as the follow-up's
 	// raising reviewer). Ordered by rowid, i.e. creation order, which is what
 	// assigns each review task its reviewer slot below.
+	// adjudicate_finding_id IS NULL excludes section 5 adjudication tasks: their
+	// ruling is binding only for the one finding they adjudicate, so they must never
+	// be assigned a reviewer slot or contribute to a reviewer lineage's findings here.
 	taskRows, err := tx.QueryContext(ctx, `
 		SELECT id, review_round, model FROM task
-		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ?
+		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ? AND adjudicate_finding_id IS NULL
 		ORDER BY review_round, rowid, id
 	`, parentID, throughRound)
 	if err != nil {
@@ -3408,11 +3726,18 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 	var parentDocumentID string
 	var parentTitle string
 	var parentTrack string
+	var parentReviewModelsJSON *string
 	err := tx.QueryRowContext(ctx, `
-		SELECT review_round, state, held, model, escalate, agent_merge, project_id, document_id, title, track FROM task WHERE id = ?
-	`, parentID).Scan(&parentReviewRound, &parentState, &parentHeld, &parentModel, &parentEscalate, &parentAgentMerge, &parentProjectID, &parentDocumentID, &parentTitle, &parentTrack)
+		SELECT review_round, state, held, model, escalate, agent_merge, project_id, document_id, title, track, review_models FROM task WHERE id = ?
+	`, parentID).Scan(&parentReviewRound, &parentState, &parentHeld, &parentModel, &parentEscalate, &parentAgentMerge, &parentProjectID, &parentDocumentID, &parentTitle, &parentTrack, &parentReviewModelsJSON)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch parent task review_round: %w", err)
+	}
+	var parentReviewModels []string
+	if parentReviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*parentReviewModelsJSON), &parentReviewModels); err != nil {
+			return "", fmt.Errorf("failed to unmarshal parent review_models: %w", err)
+		}
 	}
 
 	// If parent is held, skip auto-transition (hold is an operator lock that overrides auto-flow)
@@ -3420,7 +3745,10 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		return "", nil
 	}
 
-	// Count total, done, and approve verdict review tasks for the parent in the current round
+	// Count total, done, and approve verdict review tasks for the parent in the current
+	// round. adjudicate_finding_id IS NULL excludes section 5 adjudication tasks: their
+	// ruling is binding only for the finding they adjudicate and must never vote on
+	// (or otherwise count toward) the round itself.
 	var totalReviewTasks int
 	var doneReviewTasks int
 	var approveReviewTasks int
@@ -3430,7 +3758,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done,
 			SUM(CASE WHEN state='done' AND verdict='approve' THEN 1 ELSE 0 END) as approve
 		FROM task
-		WHERE target_task_id = ? AND review_round = ?
+		WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding_id IS NULL
 	`, parentID, parentReviewRound).Scan(&totalReviewTasks, &doneReviewTasks, &approveReviewTasks)
 	if err != nil {
 		return "", fmt.Errorf("failed to tally review tasks: %w", err)
@@ -3451,10 +3779,35 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		var roundFailed bool
 		var researchRoundFindings []Finding
 		if parentTrack == "research" {
-			hasBlocking, findings, err := s.checkResearchBlockingFindings(ctx, tx, parentID, parentReviewRound)
+			hasBlocking, findings, lineages, err := s.checkResearchBlockingFindings(ctx, tx, parentID, parentReviewRound)
 			if err != nil {
 				return "", err
 			}
+
+			// Section 5: a blocking finding that is the maintained continuation of a
+			// worker-disputed finding is decided by adjudication, not by its raw
+			// status. While any relevant adjudication is still pending, the round is
+			// not decided at all: no rejected-round event, no circuit breaker, no
+			// state change. This keeps a round from ever being decided twice, since
+			// every prior call for this round returns here before recording anything.
+			excluded, pendingAdjudication, err := s.applyResearchAdjudication(ctx, tx, parentID, parentReviewRound, parentReviewModels, findings, lineages, now)
+			if err != nil {
+				return "", err
+			}
+			if pendingAdjudication {
+				return "", nil
+			}
+			if len(excluded) > 0 {
+				filtered := findings[:0]
+				for i, f := range findings {
+					if !excluded[i] {
+						filtered = append(filtered, f)
+					}
+				}
+				findings = filtered
+				hasBlocking = len(findings) > 0
+			}
+
 			roundFailed = hasBlocking
 			researchRoundFindings = findings
 		} else {
@@ -4653,7 +5006,7 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 				COUNT(*) as total,
 				SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done
 			FROM task
-			WHERE target_task_id = ? AND review_round = ?
+			WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding_id IS NULL
 		`, taskID, t.ReviewRound).Scan(&totalReviewTasks, &doneReviewTasks)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to tally review tasks: %w", err)
