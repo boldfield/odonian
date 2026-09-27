@@ -145,8 +145,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 14 {
-		t.Errorf("expected 14 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 15 {
+		t.Errorf("expected 15 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -161,8 +161,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 14 {
-		t.Errorf("expected 14 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 15 {
+		t.Errorf("expected 15 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -258,8 +258,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 14 {
-		t.Errorf("expected 14 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 15 {
+		t.Errorf("expected 15 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -3538,6 +3538,560 @@ func TestSubmitReviewFindingsValidationFailures(t *testing.T) {
 			}
 			if !strings.Contains(verr.Message, tc.wantSubstr) {
 				t.Errorf("expected message to contain %q, got %q", tc.wantSubstr, verr.Message)
+			}
+		})
+	}
+}
+
+// newResearchTask creates a project, document, and a research-track implement task
+// with two independent reviewers (opus and sonnet). The task is promoted, claimed
+// and submitted with a PR link, so its round-1 review tasks are ready to claim.
+func newResearchTask(t *testing.T, escalate bool) (Store, context.Context, string, string) {
+	t.Helper()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims in the doc",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+			Escalate:     &escalate,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	if _, err = store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err = store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	return store, ctx, proj.ID, taskID
+}
+
+// findResearchReviewTasks locates the ready opus and sonnet review tasks for the
+// given parent and review round.
+func findResearchReviewTasks(t *testing.T, store Store, ctx context.Context, projID, parentID string, round int) (opusTask, sonnetTask *Task) {
+	t.Helper()
+	allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	for i := range allTasks {
+		tk := allTasks[i]
+		if tk.Kind != "review" || tk.TargetTaskID == nil || *tk.TargetTaskID != parentID || tk.ReviewRound != round || tk.State != "ready" {
+			continue
+		}
+		switch tk.Model {
+		case "opus":
+			t := tk
+			opusTask = &t
+		case "sonnet":
+			t := tk
+			sonnetTask = &t
+		}
+	}
+	return opusTask, sonnetTask
+}
+
+// submitResearchReview claims and submits a research review task with the given
+// verdict and findings.
+func submitResearchReview(t *testing.T, store Store, ctx context.Context, reviewTask *Task, agent, verdict string, findings json.RawMessage) {
+	t.Helper()
+	if _, err := store.ClaimTask(ctx, reviewTask.ID, agent, reviewTask.Model, 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim review task %s: %v", reviewTask.ID, err)
+	}
+	v := verdict
+	if _, err := store.SubmitTask(ctx, reviewTask.ID, agent, "review notes", &v, []LinkInput{}, 8, nil, findings); err != nil {
+		t.Fatalf("failed to submit review task %s: %v", reviewTask.ID, err)
+	}
+}
+
+// resubmitResearchImplementTask claims and resubmits the parent implement task,
+// spawning the next round's review tasks.
+func resubmitResearchImplementTask(t *testing.T, store Store, ctx context.Context, parentID string) {
+	t.Helper()
+	if _, err := store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim parent for resubmit: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, parentID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil); err != nil {
+		t.Fatalf("failed to resubmit parent: %v", err)
+	}
+}
+
+// TestResearchAggregation_VerdictIndependentOfFindings verifies that research
+// aggregation (docs/features/research-track.md section 3) is driven by structured
+// findings, not the approve/reject verdict: a reject with no findings alongside an
+// approve still passes, and an approve carrying a blocking finding still fails.
+func TestResearchAggregation_VerdictIndependentOfFindings(t *testing.T) {
+	t.Run("reject with no findings plus approve passes", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("expected both review tasks to be ready")
+		}
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", json.RawMessage(`[]`))
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Errorf("expected approved (no blocking findings from either reviewer), got %s", parent.State)
+		}
+	})
+
+	t.Run("approve with a blocking P1 fails", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("expected both review tasks to be ready")
+		}
+		blockingP1 := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", blockingP1)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "ready" {
+			t.Errorf("expected ready (a blocking finding fails the round even though both reviewers approved), got %s", parent.State)
+		}
+	})
+}
+
+// TestResearchAggregation_RoundScopeAndStatus covers the round-scope and status
+// rules from section 3: round 1 blocks on any P1/P2 regardless of in_changed_text;
+// after round 1, a new P1/P2 in unchanged text and P3 findings don't block, a
+// resolved finding never blocks, and a still_open finding always blocks.
+func TestResearchAggregation_RoundScopeAndStatus(t *testing.T) {
+	t.Run("round 1 P2 in unchanged text still blocks", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		f := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":10,"summary":"unsupported claim","in_changed_text":false,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", f)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "ready" {
+			t.Errorf("round 1 P1/P2 must block regardless of in_changed_text, got %s", parent.State)
+		}
+	})
+
+	t.Run("round 2 resolved, unchanged P2, and P3 all pass", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", blocking)
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "ready" {
+			t.Fatalf("expected round 1 to fail, got %s", parent.State)
+		}
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		if opus2 == nil || sonnet2 == nil {
+			t.Fatalf("expected round 2 review tasks")
+		}
+		round2Findings := json.RawMessage(`[
+			{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"bad claim, now fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"},
+			{"id":"f2","severity":"P2","file":"b.md","line":5,"summary":"newly found, but text unchanged","in_changed_text":false,"status":"new"},
+			{"id":"f3","severity":"P3","file":"c.md","line":9,"summary":"wrong footnote","in_changed_text":true,"status":"new"}
+		]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2Findings)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err = store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Errorf("expected approved (resolved/unchanged-P2/P3 findings don't block), got %s", parent.State)
+		}
+	})
+
+	t.Run("still_open finding always blocks", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":1,"summary":"missing qualification","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", blocking)
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		if opus2 == nil || sonnet2 == nil {
+			t.Fatalf("expected round 2 review tasks")
+		}
+		stillOpen := json.RawMessage(`[{"id":"f1c","severity":"P3","file":"a.md","line":1,"summary":"still missing qualification","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", stillOpen)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "ready" {
+			t.Errorf("expected ready (a still_open finding always blocks, regardless of severity), got %s", parent.State)
+		}
+	})
+}
+
+// TestResearchAggregation_NoFindingsApproves verifies that an empty findings array
+// from both reviewers passes the round.
+func TestResearchAggregation_NoFindingsApproves(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", json.RawMessage(`[]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Errorf("expected approved with no findings from either reviewer, got %s", parent.State)
+	}
+}
+
+// TestResearchReviewMissingFindingsRejected verifies that a research review
+// submission without a findings array is rejected with MISSING_FINDINGS: section 3
+// requires reviewers to submit an explicit array, including [] when there are none.
+func TestResearchReviewMissingFindingsRejected(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if _, err := store.ClaimTask(ctx, opus.ID, "opus-reviewer", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	approve := "approve"
+	_, err := store.SubmitTask(ctx, opus.ID, "opus-reviewer", "looks fine", &approve, []LinkInput{}, 8, nil)
+
+	var verr *ValidationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("expected ValidationError, got %v", err)
+	}
+	if verr.Code != "MISSING_FINDINGS" {
+		t.Errorf("expected MISSING_FINDINGS, got %s (%s)", verr.Code, verr.Message)
+	}
+}
+
+// TestResearchReviewMalformedFindingsRejected verifies that malformed or
+// non-array findings on a research review are rejected with INVALID_FINDINGS.
+func TestResearchReviewMalformedFindingsRejected(t *testing.T) {
+	cases := []struct {
+		name     string
+		findings json.RawMessage
+	}{
+		{"object instead of array", json.RawMessage(`{}`)},
+		{"string instead of array", json.RawMessage(`"x"`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, ctx, projID, parentID := newResearchTask(t, false)
+			opus, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+			if _, err := store.ClaimTask(ctx, opus.ID, "opus-reviewer", "opus", 5*time.Minute); err != nil {
+				t.Fatalf("failed to claim: %v", err)
+			}
+			approve := "approve"
+			_, err := store.SubmitTask(ctx, opus.ID, "opus-reviewer", "looks fine", &approve, []LinkInput{}, 8, nil, tc.findings)
+
+			var verr *ValidationError
+			if !errors.As(err, &verr) {
+				t.Fatalf("expected ValidationError, got %v", err)
+			}
+			if verr.Code != "INVALID_FINDINGS" {
+				t.Errorf("expected INVALID_FINDINGS, got %s (%s)", verr.Code, verr.Message)
+			}
+		})
+	}
+}
+
+// TestResearchAggregation_AddReviewNoiseIgnored is a regression test: a human/API
+// AddReview call on the parent (which writes a kind='review' event with no
+// source_task_id and no findings) must never be mistaken for a review task's own
+// submission. Flooding the parent with such events between the two independent
+// reviewers must not spuriously clear, hide, or error out on the first reviewer's
+// blocking finding.
+func TestResearchAggregation_AddReviewNoiseIgnored(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blocking)
+
+	for i := 0; i < 25; i++ {
+		if _, err := store.AddReview(ctx, parentID, "human", "approve", nil); err != nil {
+			t.Fatalf("AddReview %d failed: %v", i, err)
+		}
+	}
+
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Errorf("expected ready (opus's P1 must still block despite AddReview noise), got %s", parent.State)
+	}
+}
+
+// TestResearchAggregation_MissingReviewEventFailsClosed is a regression test for
+// the fail-closed guard: if aggregation can't account for every review task's
+// findings (e.g. a review event that lost its link to its review task), it must
+// report a blocking finding rather than risk a silent approval.
+func TestResearchAggregation_MissingReviewEventFailsClosed(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", json.RawMessage(`[]`))
+
+	if _, err := store.Conn().ExecContext(ctx, `
+		UPDATE event SET source_task_id = NULL WHERE task_id = ? AND kind = 'review' AND source_task_id = ?
+	`, parentID, opus.ID); err != nil {
+		t.Fatalf("failed to corrupt review event: %v", err)
+	}
+
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Errorf("expected fail-closed (ready) when a review task's own event can't be matched, got %s", parent.State)
+	}
+}
+
+// TestResearchAggregation_CircuitBreakerBlocks verifies that repeated failing
+// research rounds hit the existing circuit breaker (reused, not reimplemented):
+// rounds 1-8 return to ready, round 9 blocks (haiku's default threshold is 8).
+func TestResearchAggregation_CircuitBreakerBlocks(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+
+	blockingRound := func(round int) {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, round)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("round %d: expected both review tasks", round)
+		}
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blocking)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	}
+
+	for i := 1; i <= 8; i++ {
+		blockingRound(i)
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent (round %d): %v", i, err)
+		}
+		if parent.State != "ready" {
+			t.Fatalf("round %d: expected ready, got %s", i, parent.State)
+		}
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+	}
+
+	blockingRound(9)
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent (round 9): %v", err)
+	}
+	if parent.State != "blocked" {
+		t.Errorf("round 9: expected blocked (circuit breaker), got %s", parent.State)
+	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var blockedEvent *Event
+	for i := range events {
+		if events[i].Kind == "transition" && events[i].Note != nil && strings.Contains(*events[i].Note, "auto-blocked") {
+			blockedEvent = &events[i]
+			break
+		}
+	}
+	if blockedEvent == nil {
+		t.Errorf("expected auto-blocked transition event")
+	}
+}
+
+// TestResearchAggregation_CircuitBreakerEscalates verifies that with escalate=true,
+// a research task past its threshold escalates to the next model tier exactly like
+// build/design, instead of blocking.
+func TestResearchAggregation_CircuitBreakerEscalates(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, true)
+
+	blockingRound := func(round int) {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, round)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("round %d: expected both review tasks", round)
+		}
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blocking)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	}
+
+	for i := 1; i <= 8; i++ {
+		blockingRound(i)
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent (round %d): %v", i, err)
+		}
+		if parent.State != "ready" {
+			t.Fatalf("round %d: expected ready, got %s", i, parent.State)
+		}
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+	}
+
+	blockingRound(9)
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent (round 9): %v", err)
+	}
+	if parent.State != "superseded" {
+		t.Fatalf("round 9: expected superseded (escalated), got %s", parent.State)
+	}
+	if parent.SupersededBy == nil {
+		t.Fatalf("expected SupersededBy to be set")
+	}
+	escalated, err := store.GetTask(ctx, *parent.SupersededBy)
+	if err != nil {
+		t.Fatalf("failed to get escalated task: %v", err)
+	}
+	if escalated.Model != "sonnet" {
+		t.Errorf("expected escalated task model 'sonnet', got %s", escalated.Model)
+	}
+	if escalated.Track != "research" {
+		t.Errorf("expected escalated task to keep track 'research', got %s", escalated.Track)
+	}
+}
+
+// TestBuildDesignAggregationUnchanged is a regression test: research aggregation
+// must not change build/design behavior. It asserts the review event's Note is
+// stored verbatim as the reviewer's result text (no envelope), and that a single
+// approving reviewer still moves the parent straight to approved.
+func TestBuildDesignAggregationUnchanged(t *testing.T) {
+	for _, track := range []string{"build", "design", ""} {
+		t.Run("track="+track, func(t *testing.T) {
+			store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+			if err != nil {
+				t.Fatalf("failed to open test database: %v", err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+
+			proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+			if err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+			doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+			if err != nil {
+				t.Fatalf("failed to create document: %v", err)
+			}
+			tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+				{
+					Title:        "Implement feature",
+					Spec:         "Do the thing",
+					DocumentID:   doc.ID,
+					Model:        "haiku",
+					ReviewModels: []string{"opus"},
+					Track:        track,
+				},
+			})
+			if err != nil {
+				t.Fatalf("failed to create task: %v", err)
+			}
+			taskID := tasks[0].ID
+
+			if _, err = store.PromoteTask(ctx, taskID); err != nil {
+				t.Fatalf("failed to promote task: %v", err)
+			}
+			if _, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+				t.Fatalf("failed to claim task: %v", err)
+			}
+			if _, err = store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 5, nil); err != nil {
+				t.Fatalf("failed to submit implement task: %v", err)
+			}
+
+			allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+			if err != nil {
+				t.Fatalf("failed to list tasks: %v", err)
+			}
+			var reviewTaskID string
+			for _, task := range allTasks {
+				if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == taskID {
+					reviewTaskID = task.ID
+					break
+				}
+			}
+			if reviewTaskID == "" {
+				t.Fatalf("review task not found")
+			}
+			if _, err = store.ClaimTask(ctx, reviewTaskID, "opus-reviewer", "opus", 5*time.Minute); err != nil {
+				t.Fatalf("failed to claim review task: %v", err)
+			}
+
+			approve := "approve"
+			resultText := "Detailed feedback\nline two, with more detail"
+			if _, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", resultText, &approve, []LinkInput{}, 5, nil); err != nil {
+				t.Fatalf("failed to submit review task: %v", err)
+			}
+
+			parent, err := store.GetTask(ctx, taskID)
+			if err != nil {
+				t.Fatalf("failed to get parent: %v", err)
+			}
+			if parent.State != "approved" {
+				t.Errorf("expected approved (single reviewer approved), got %s", parent.State)
+			}
+
+			events, err := store.ListEvents(ctx, taskID)
+			if err != nil {
+				t.Fatalf("failed to list events: %v", err)
+			}
+			var reviewEvent *Event
+			for i := range events {
+				if events[i].Kind == "review" {
+					reviewEvent = &events[i]
+				}
+			}
+			if reviewEvent == nil {
+				t.Fatalf("review event not found")
+			}
+			if reviewEvent.Note == nil || *reviewEvent.Note != resultText {
+				t.Errorf("expected review event note to be stored verbatim as %q, got %v", resultText, reviewEvent.Note)
 			}
 		})
 	}

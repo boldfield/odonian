@@ -811,8 +811,11 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
 - `agent_id` (required): The ID of the reviewing agent (must match the task's assignee)
 - `verdict` (required): Either `"approve"` or `"reject"`
 - `result` (optional): Review writeup or detailed feedback
-- `findings` (optional): Array of structured findings, only accepted on review-kind tasks. Omitting
-  the field, or sending an explicit `null`, behaves exactly as before. Each finding:
+- `findings` (optional on build/design review tasks; required on research-track review tasks):
+  Array of structured findings, only accepted on review-kind tasks. On build/design review tasks,
+  omitting the field, or sending an explicit `null`, behaves exactly as before. On a research-track
+  review task, the field must be present and must be an array (send `[]` when there are no
+  findings); omitting it or sending `null` returns `400 MISSING_FINDINGS`. Each finding:
   - `id` (required): Non-empty string, unique within the submission.
   - `severity` (required): One of `P1`, `P2`, `P3`.
   - `file` (required): Non-empty string.
@@ -851,6 +854,10 @@ The response includes the review task's own `id` and the parent implement task's
 - All approve → parent moves to `approved`
 - Any reject → parent moves to `ready` for rework
 
+Research-track parents aggregate on findings, not just verdicts: a `reject` verdict with `[]`
+findings can still pass the round, and an `approve` verdict carrying a blocking finding still fails
+it. See docs/features/research-track.md §3 for the full blocking rules.
+
 ---
 
 **Status Codes (both kinds):**
@@ -861,6 +868,7 @@ The response includes the review task's own `id` and the parent implement task's
 - `400 FORBIDDEN_VERDICT`: verdict must not be present for implement tasks
 - `400 MISSING_VERDICT`: verdict is required for review tasks
 - `400 INVALID_FINDINGS`: A findings array is malformed; the message names the first invalid field
+- `400 MISSING_FINDINGS`: findings were omitted (or `null`) on a research-track review task
 - `400 FINDINGS_NOT_ALLOWED`: findings were provided on a non-review-kind task
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `404 NOT_FOUND`: Task not found
@@ -1014,6 +1022,7 @@ curl -H "Authorization: Bearer token" \
     "verdict": null,
     "note": null,
     "findings": null,
+    "source_task_id": null,
     "created_at": "2026-06-05T21:00:00.000000000Z"
   }
 ]
@@ -1021,6 +1030,10 @@ curl -H "Authorization: Bearer token" \
 
 `findings` is non-null only on `review` events for which the reviewer submitted structured
 findings (see `POST /tasks/{id}/submit` above); it is `null` on every other event.
+
+`source_task_id` is non-null only on a `review` event that a review task appended to its parent; it
+holds the id of that review task. It is `null` on events from other sources, such as `POST
+/tasks/{id}/review`.
 
 Returns `[]` when there are no retained events, including for an unknown full-length task UUID.
 An unmatched or too-short prefix returns `404 NOT_FOUND`; an ambiguous prefix returns

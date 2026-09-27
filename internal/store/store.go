@@ -344,6 +344,14 @@ func (s *sqliteStore) Conn() *sql.DB {
 // It must be called within a transaction so that a state change and its event can be
 // committed atomically.
 func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string, findings ...json.RawMessage) (Event, error) {
+	return s.appendEvent(ctx, tx, taskID, actor, kind, verdict, note, nil, findings...)
+}
+
+// appendEvent is the shared implementation behind AppendEvent. sourceTaskID optionally
+// records which review task produced this event (set only for the review event a
+// review task appends on its parent), so research aggregation can identify the
+// current round's own submissions among all review events on the parent.
+func (s *sqliteStore) appendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note, sourceTaskID *string, findings ...json.RawMessage) (Event, error) {
 	eventID := GenerateID()
 	now := nowTimestamp()
 
@@ -356,9 +364,9 @@ func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor
 	}
 
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO event (id, task_id, actor, kind, verdict, note, findings, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, eventID, taskID, actor, kind, verdict, note, findingsText, now)
+		INSERT INTO event (id, task_id, actor, kind, verdict, note, findings, source_task_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, eventID, taskID, actor, kind, verdict, note, findingsText, sourceTaskID, now)
 	if err != nil {
 		return Event{}, fmt.Errorf("failed to append event: %w", err)
 	}
@@ -372,14 +380,15 @@ func (s *sqliteStore) AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor
 	}
 
 	return Event{
-		ID:        eventID,
-		TaskID:    taskID,
-		Actor:     actor,
-		Kind:      kind,
-		Verdict:   verdict,
-		Note:      note,
-		Findings:  findingsRaw,
-		CreatedAt: now,
+		ID:           eventID,
+		TaskID:       taskID,
+		Actor:        actor,
+		Kind:         kind,
+		Verdict:      verdict,
+		Note:         note,
+		Findings:     findingsRaw,
+		SourceTaskID: sourceTaskID,
+		CreatedAt:    now,
 	}, nil
 }
 
@@ -411,7 +420,7 @@ func (s *sqliteStore) setTaskDepends(ctx context.Context, tx *sql.Tx, taskID str
 // ListEvents retrieves all events for a given task, ordered by created_at and id.
 func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, error) {
 	rows, err := s.readConn.QueryContext(ctx, `
-		SELECT id, task_id, actor, kind, verdict, note, findings, created_at
+		SELECT id, task_id, actor, kind, verdict, note, findings, source_task_id, created_at
 		FROM event
 		WHERE task_id = ?
 		ORDER BY created_at, id
@@ -425,13 +434,17 @@ func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, e
 	for rows.Next() {
 		var e Event
 		var findingsText sql.NullString
-		err := rows.Scan(&e.ID, &e.TaskID, &e.Actor, &e.Kind, &e.Verdict, &e.Note, &findingsText, &e.CreatedAt)
+		var sourceTaskID sql.NullString
+		err := rows.Scan(&e.ID, &e.TaskID, &e.Actor, &e.Kind, &e.Verdict, &e.Note, &findingsText, &sourceTaskID, &e.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
 		}
 		if findingsText.Valid {
 			raw := json.RawMessage(findingsText.String)
 			e.Findings = &raw
+		}
+		if sourceTaskID.Valid {
+			e.SourceTaskID = &sourceTaskID.String
 		}
 		events = append(events, e)
 	}
@@ -637,14 +650,15 @@ type ProjectListFilter struct {
 
 // Event represents an audit/event log entry.
 type Event struct {
-	ID        string           `db:"id" json:"id"`
-	TaskID    string           `db:"task_id" json:"task_id"`
-	Actor     string           `db:"actor" json:"actor"`
-	Kind      string           `db:"kind" json:"kind"`
-	Verdict   *string          `db:"verdict" json:"verdict"`   // nullable
-	Note      *string          `db:"note" json:"note"`         // nullable
-	Findings  *json.RawMessage `db:"findings" json:"findings"` // nullable; structured review findings
-	CreatedAt string           `db:"created_at" json:"created_at"`
+	ID           string           `db:"id" json:"id"`
+	TaskID       string           `db:"task_id" json:"task_id"`
+	Actor        string           `db:"actor" json:"actor"`
+	Kind         string           `db:"kind" json:"kind"`
+	Verdict      *string          `db:"verdict" json:"verdict"`               // nullable
+	Note         *string          `db:"note" json:"note"`                     // nullable
+	Findings     *json.RawMessage `db:"findings" json:"findings"`             // nullable; structured review findings
+	SourceTaskID *string          `db:"source_task_id" json:"source_task_id"` // nullable; the review task that produced this event, if any
+	CreatedAt    string           `db:"created_at" json:"created_at"`
 }
 
 // Finding is a single structured review finding, as defined by the research track
@@ -1874,9 +1888,10 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 	// First, determine the task kind before doing any updates
 	var taskKind string
 	var targetTaskID *string
+	var taskTrack string
 	err = tx.QueryRowContext(ctx, `
-		SELECT kind, target_task_id FROM task WHERE id = ? AND state='in_progress' AND assignee=?
-	`, taskID, agentID).Scan(&taskKind, &targetTaskID)
+		SELECT kind, target_task_id, track FROM task WHERE id = ? AND state='in_progress' AND assignee=?
+	`, taskID, agentID).Scan(&taskKind, &targetTaskID, &taskTrack)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Task not found or not submittable
@@ -1914,7 +1929,14 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 
 	// Validate findings based on task kind. A findings payload is optional and
 	// explicit null is treated the same as absent, so submissions without findings
-	// are unaffected. Findings are only accepted on review-kind tasks.
+	// are unaffected. Findings are only accepted on review-kind tasks. Research
+	// review tasks are the exception: section 3 requires an explicit findings
+	// array (submit [] when there are none), since research aggregation below
+	// relies on every review task's findings being present.
+	findingsAbsent := len(findings) == 0 || findings[0] == nil || string(findings[0]) == "null"
+	if taskKind == "review" && taskTrack == "research" && findingsAbsent {
+		return TaskWithDepsAndLinks{}, invalid("MISSING_FINDINGS", "findings are required for research review tasks; submit [] when there are none")
+	}
 	var findingsToStore json.RawMessage
 	if len(findings) > 0 && findings[0] != nil && string(findings[0]) != "null" {
 		if taskKind != "review" {
@@ -2084,8 +2106,10 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			// Update t.ReviewRound for the response
 			t.ReviewRound = newReviewRound
 		} else if t.Kind == "review" && targetTaskID != nil {
-			// This is a review task. Append a review event on the parent task.
-			_, err := s.AppendEvent(ctx, tx, *targetTaskID, agentID, "review", verdict, &result, findingsToStore)
+			// This is a review task. Append a review event on the parent task, tagged
+			// with this review task's own id so research aggregation can identify
+			// the current round's own submissions among all review events on the parent.
+			_, err := s.appendEvent(ctx, tx, *targetTaskID, agentID, "review", verdict, &result, &taskID, findingsToStore)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append review event on parent: %w", err)
 			}
@@ -2188,6 +2212,167 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 	return TaskWithDepsAndLinks{}, ErrConflict
 }
 
+// handleApprovedRound finalizes a review round whose outcome permits merging: for
+// build and design this is "every reviewer approved"; for research it is "no
+// reviewer reported a blocking finding". It checks for a no-op resolution (which
+// finalizes straight to done), otherwise spawns a merge task when agent_merge is
+// set, otherwise leaves the parent at approved. Returns the new parent state.
+func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, parentID, parentModel, parentTrack, parentTitle, parentProjectID, parentDocumentID string, parentAgentMerge bool, now string) (string, error) {
+	newParentState := "approved"
+
+	// Check if parent has a no_op link (and no pr link)
+	var hasNoOp bool
+	var hasPR bool
+	rows, err := tx.QueryContext(ctx, `
+		SELECT kind FROM task_link WHERE task_id = ? AND tombstoned_at IS NULL
+	`, parentID)
+	if err != nil {
+		return "", fmt.Errorf("failed to query active task links: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind string
+		if err := rows.Scan(&kind); err != nil {
+			return "", fmt.Errorf("failed to scan task link kind: %w", err)
+		}
+		if kind == "no_op" {
+			hasNoOp = true
+		} else if kind == "pr" {
+			hasPR = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("failed to iterate task links: %w", err)
+	}
+
+	// If no_op link with no pr link, go straight to done (regardless of agent_merge)
+	if hasNoOp && !hasPR {
+		newParentState = "done"
+	} else if parentAgentMerge && hasPR {
+		// Spawn merge task if approved with agent_merge && pr (not the no_op case)
+		mergeTaskID := GenerateID()
+		mergeTitle := "Merge: " + parentTitle
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, now, now)
+		if err != nil {
+			return "", fmt.Errorf("failed to create merge task: %w", err)
+		}
+	}
+
+	return newParentState, nil
+}
+
+// isBlockingResearchFinding reports whether a single research review finding blocks
+// its round, per docs/features/research-track.md section 3:
+//   - P1/P2 in changed text blocks.
+//   - P1/P2 anywhere blocks during round 1 (round 1 findings are always in changed
+//     text by definition, but this is enforced independently of the reviewer's own
+//     in_changed_text report).
+//   - A still_open finding (a prior finding the reviewer reports as unfixed) blocks.
+//   - A resolved finding never blocks, even if it would otherwise match the rules
+//     above: a reviewer reports it as resolved precisely because the round's changes
+//     fixed the text the finding was raised against.
+func isBlockingResearchFinding(f Finding, round int) bool {
+	if f.Status == "resolved" {
+		return false
+	}
+	isP1OrP2 := f.Severity == "P1" || f.Severity == "P2"
+	if isP1OrP2 && f.InChangedText {
+		return true
+	}
+	if isP1OrP2 && round == 1 {
+		return true
+	}
+	return f.Status == "still_open"
+}
+
+// checkResearchBlockingFindings reports whether any reviewer in the current round
+// raised a blocking finding, per docs/features/research-track.md section 3. It reads
+// only the review events sourced from this round's own review tasks (via
+// source_task_id), so it is unaffected by unrelated review events on the parent,
+// e.g. a human/API AddReview call. It fails closed: if it cannot account for every
+// review task's findings (a missing or unparseable findings payload, or fewer
+// matching events than review tasks), it reports a blocking finding rather than
+// risk a silent approval.
+func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql.Tx, parentID string, round int) (bool, error) {
+	taskRows, err := tx.QueryContext(ctx, `
+		SELECT id FROM task WHERE target_task_id = ? AND review_round = ? AND kind = 'review'
+	`, parentID, round)
+	if err != nil {
+		return false, fmt.Errorf("failed to list round review tasks: %w", err)
+	}
+	reviewTaskIDs := make(map[string]bool)
+	for taskRows.Next() {
+		var id string
+		if err := taskRows.Scan(&id); err != nil {
+			taskRows.Close()
+			return false, fmt.Errorf("failed to scan review task id: %w", err)
+		}
+		reviewTaskIDs[id] = true
+	}
+	if err := taskRows.Err(); err != nil {
+		taskRows.Close()
+		return false, fmt.Errorf("failed to iterate review task ids: %w", err)
+	}
+	taskRows.Close()
+
+	expected := len(reviewTaskIDs)
+	if expected == 0 {
+		return false, nil
+	}
+
+	// No LIMIT: an intervening AddReview (or any other) event on the parent must
+	// never push a review task's own event out of the window we scan.
+	evRows, err := tx.QueryContext(ctx, `
+		SELECT source_task_id, findings FROM event
+		WHERE task_id = ? AND kind = 'review' AND source_task_id IS NOT NULL
+	`, parentID)
+	if err != nil {
+		return false, fmt.Errorf("failed to query review events: %w", err)
+	}
+	defer evRows.Close()
+
+	seen := make(map[string]bool, expected)
+	for evRows.Next() {
+		var sourceTaskID string
+		var findingsText sql.NullString
+		if err := evRows.Scan(&sourceTaskID, &findingsText); err != nil {
+			return false, fmt.Errorf("failed to scan review event: %w", err)
+		}
+		if !reviewTaskIDs[sourceTaskID] || seen[sourceTaskID] {
+			continue
+		}
+		seen[sourceTaskID] = true
+
+		if !findingsText.Valid {
+			// Fail closed: a research review event with no findings recorded.
+			return true, nil
+		}
+		var findings []Finding
+		if err := json.Unmarshal([]byte(findingsText.String), &findings); err != nil {
+			// Fail closed: malformed stored findings.
+			return true, nil
+		}
+		for _, f := range findings {
+			if isBlockingResearchFinding(f, round) {
+				return true, nil
+			}
+		}
+	}
+	if err := evRows.Err(); err != nil {
+		return false, fmt.Errorf("failed to iterate review events: %w", err)
+	}
+
+	if len(seen) != expected {
+		// Fail closed: couldn't account for every review task's findings.
+		return true, nil
+	}
+
+	return false, nil
+}
+
 // aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.
 // It handles: verdict counting, merge task spawning (if approved with agent_merge),
 // escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
@@ -2238,58 +2423,32 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 	var newParentState string
 	isTerminal := parentState == "failed" || parentState == "blocked" || parentState == "abandoned"
 
-	if !isTerminal {
-		// Determine the new parent state based on the tally
-		if doneReviewTasks < totalReviewTasks {
-			// Not all done yet; parent stays in review
-			newParentState = ""
-		} else if doneReviewTasks == totalReviewTasks && approveReviewTasks == totalReviewTasks {
-			// All done and all approved; check for no_op link without pr link
-			newParentState = "approved"
-
-			// Check if parent has a no_op link (and no pr link)
-			var hasNoOp bool
-			var hasPR bool
-			rows, err := tx.QueryContext(ctx, `
-				SELECT kind FROM task_link WHERE task_id = ? AND tombstoned_at IS NULL
-			`, parentID)
+	if !isTerminal && doneReviewTasks == totalReviewTasks {
+		// Determine whether the round failed. Build and design keep the existing
+		// verdict tally. Research aggregation instead uses the structured findings
+		// from section 3: a round fails if any reviewer reported a blocking finding,
+		// regardless of that reviewer's approve/reject verdict.
+		var roundFailed bool
+		if parentTrack == "research" {
+			hasBlocking, err := s.checkResearchBlockingFindings(ctx, tx, parentID, parentReviewRound)
 			if err != nil {
-				return "", fmt.Errorf("failed to query active task links: %w", err)
+				return "", err
 			}
-			defer rows.Close()
-			for rows.Next() {
-				var kind string
-				if err := rows.Scan(&kind); err != nil {
-					return "", fmt.Errorf("failed to scan task link kind: %w", err)
-				}
-				if kind == "no_op" {
-					hasNoOp = true
-				} else if kind == "pr" {
-					hasPR = true
-				}
-			}
-			if err := rows.Err(); err != nil {
-				return "", fmt.Errorf("failed to iterate task links: %w", err)
-			}
+			roundFailed = hasBlocking
+		} else {
+			roundFailed = approveReviewTasks < totalReviewTasks
+		}
 
-			// If no_op link with no pr link, go straight to done (regardless of agent_merge)
-			if hasNoOp && !hasPR {
-				newParentState = "done"
-			} else if parentAgentMerge && hasPR {
-				// Spawn merge task if approved with agent_merge && pr (not the no_op case)
-				mergeTaskID := GenerateID()
-				mergeTitle := "Merge: " + parentTitle
-				_, err := tx.ExecContext(ctx, `
-					INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, created_at, updated_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, now, now)
-				if err != nil {
-					return "", fmt.Errorf("failed to create merge task: %w", err)
-				}
+		if !roundFailed {
+			state, err := s.handleApprovedRound(ctx, tx, parentID, parentModel, parentTrack, parentTitle, parentProjectID, parentDocumentID, parentAgentMerge, now)
+			if err != nil {
+				return "", err
 			}
-		} else if doneReviewTasks == totalReviewTasks && approveReviewTasks < totalReviewTasks {
-			// All done but at least one rejected
-			// Circuit breaker: if review_round > threshold, check escalation vs blocking
+			newParentState = state
+		} else {
+			// Circuit breaker: if review_round > threshold, check escalation vs blocking.
+			// Shared by build/design (verdict rejection) and research (blocking finding),
+			// so the two paths can't drift.
 			threshold := thresholdFor(parentModel, escalationThresholds, maxReviewRounds)
 			if parentReviewRound > threshold {
 				// Threshold exceeded: escalate if enabled and not top tier, else block
