@@ -15795,3 +15795,122 @@ func TestResearchSupersessionCarriedFindingsIgnoreUserContent(t *testing.T) {
 		t.Errorf("C's generated block should not contain the user-authored bogus finding, got: %s", taskC.Spec)
 	}
 }
+
+// setupTwoReviewerResearchRound1 creates a two-reviewer (opus, sonnet) research task
+// whose round 1 is rejected by both reviewers: opus with P1 f1, sonnet with P1 g1.
+func setupTwoReviewerResearchRound1(t *testing.T) (Store, context.Context, string, string) {
+	t.Helper()
+	store, ctx, projID, taskA := newResearchTaskWithEscalationLadder(t, false, []string{"opus", "sonnet"})
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, taskA, 1)
+	if opus1 == nil || sonnet1 == nil {
+		t.Fatalf("round 1: expected both review tasks")
+	}
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`))
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "reject", json.RawMessage(`[
+		{"id":"g1","severity":"P1","file":"b.md","line":2,"summary":"misquoted statistic","in_changed_text":true,"status":"new"}
+	]`))
+	return store, ctx, projID, taskA
+}
+
+// TestResearchSupersessionPartialRoundKeepsPendingReviewersFindings verifies that
+// superseding a research task while its latest round is only partly submitted keeps
+// the pending reviewer's still-open findings from its own last submitted round, while
+// the reviewer who did re-review has its latest report honored. "Last round" is per
+// reviewer lineage, not per task.
+func TestResearchSupersessionPartialRoundKeepsPendingReviewersFindings(t *testing.T) {
+	t.Run("opus resolves f1, sonnet pending", func(t *testing.T) {
+		store, ctx, projID, taskA := setupTwoReviewerResearchRound1(t)
+		resubmitResearchImplementTask(t, store, ctx, taskA)
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, taskA, 2)
+		if opus2 == nil || sonnet2 == nil {
+			t.Fatalf("round 2: expected both review tasks")
+		}
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", json.RawMessage(`[
+			{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"resolved","prior_id":"f1"}
+		]`))
+
+		taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+		if err != nil {
+			t.Fatalf("supersession failed: %v", err)
+		}
+		if !strings.Contains(taskB.Spec, `"id":"g1"`) {
+			t.Errorf("B's spec should carry sonnet's un-re-reviewed finding g1, got: %s", taskB.Spec)
+		}
+		if strings.Contains(taskB.Spec, `"id":"f1"`) {
+			t.Errorf("B's spec should not carry f1, which opus resolved in round 2, got: %s", taskB.Spec)
+		}
+	})
+
+	t.Run("sonnet re-reviews clean, opus pending", func(t *testing.T) {
+		store, ctx, projID, taskA := setupTwoReviewerResearchRound1(t)
+		resubmitResearchImplementTask(t, store, ctx, taskA)
+		_, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, taskA, 2)
+		if sonnet2 == nil {
+			t.Fatalf("round 2: expected sonnet review task")
+		}
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+		if err != nil {
+			t.Fatalf("supersession failed: %v", err)
+		}
+		if !strings.Contains(taskB.Spec, `"id":"f1"`) {
+			t.Errorf("B's spec should carry opus's un-re-reviewed finding f1, got: %s", taskB.Spec)
+		}
+		if strings.Contains(taskB.Spec, `"id":"g1"`) {
+			t.Errorf("B's spec should not carry g1, which sonnet dropped in its round-2 review, got: %s", taskB.Spec)
+		}
+	})
+}
+
+// TestResearchSupersessionPartialRoundReplacementKeepsCarriedFindings is the
+// replacement-side variant: B carries f1 (opus) and g1 (sonnet) from A. B's round 1
+// has opus submit a clean review while sonnet is still pending, and B is superseded
+// again. C must keep g1 (sonnet never re-reviewed it on B) and drop f1 (opus did).
+func TestResearchSupersessionPartialRoundReplacementKeepsCarriedFindings(t *testing.T) {
+	store, ctx, projID, taskA := setupTwoReviewerResearchRound1(t)
+
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("first supersession failed: %v", err)
+	}
+	for _, id := range []string{"f1", "g1"} {
+		if !strings.Contains(taskB.Spec, `"id":"`+id+`"`) {
+			t.Fatalf("B's spec should carry %s, got: %s", id, taskB.Spec)
+		}
+	}
+	if !strings.Contains(taskB.Spec, `"reviewer_model":"sonnet"`) {
+		t.Errorf("B's carried findings should record the raising reviewer, got: %s", taskB.Spec)
+	}
+
+	if _, err := store.PromoteTask(ctx, taskB.ID); err != nil {
+		t.Fatalf("failed to promote B: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskB.ID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim B: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskB.ID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#101"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit B: %v", err)
+	}
+	bOpus1, bSonnet1 := findResearchReviewTasks(t, store, ctx, projID, taskB.ID, 1)
+	if bOpus1 == nil || bSonnet1 == nil {
+		t.Fatalf("expected B's round 1 review tasks")
+	}
+	submitResearchReview(t, store, ctx, bOpus1, "opus-reviewer", "approve", json.RawMessage(`[]`))
+
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("second supersession failed: %v", err)
+	}
+	if !strings.Contains(taskC.Spec, `"id":"g1"`) {
+		t.Errorf("C's spec should still carry g1, which sonnet has not re-reviewed on B, got: %s", taskC.Spec)
+	}
+	if strings.Contains(taskC.Spec, `"id":"f1"`) {
+		t.Errorf("C's spec should not carry f1, which opus re-reviewed clean on B, got: %s", taskC.Spec)
+	}
+	if strings.Count(taskC.Spec, researchHistorySentinel) != 1 {
+		t.Errorf("C's spec should have exactly one generated block, got: %s", taskC.Spec)
+	}
+}
