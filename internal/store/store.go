@@ -2481,28 +2481,51 @@ func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.
 	return total, nil
 }
 
-// describeResearchRoundFindings renders one round-rejected event's findings for the
-// block note, or a placeholder when the round failed closed with nothing valid to
-// report (docs/features/research-track.md section 6: "the block event lists the
-// blocking findings from each round").
-func describeResearchRoundFindings(findingsText sql.NullString) string {
-	if findingsText.Valid && findingsText.String != "" {
-		var findings []Finding
-		if err := json.Unmarshal([]byte(findingsText.String), &findings); err == nil && len(findings) > 0 {
-			parts := make([]string, 0, len(findings))
-			for _, f := range findings {
-				parts = append(parts, fmt.Sprintf("%s[%s:%d]: %s", f.Severity, f.File, f.Line, f.Summary))
-			}
-			return strings.Join(parts, "; ")
+// describeOutstandingResearchRoundFindings renders one rejected round's findings for
+// the decompose note, or a placeholder when the round failed closed with nothing
+// valid to report (docs/features/research-track.md section 6: "the block event lists
+// the blocking findings from each round"). A stored finding whose lineage chain was
+// later reported resolved, per findOutstanding, is dropped: the note should only
+// carry what's still unresolved so the owner can decompose around the real gap, not
+// findings the worker already fixed in a later round. findOutstanding matches a
+// stored finding back to its live report to look up that status; a lookup miss
+// (which should not normally happen, since every stored finding was itself once a
+// parsed review report) keeps the finding, so a matching failure can never hide a
+// real blocker.
+func describeOutstandingResearchRoundFindings(findingsText sql.NullString, round int, findOutstanding func(int, Finding) (matched, outstanding bool)) string {
+	if !findingsText.Valid || findingsText.String == "" {
+		return "review data incomplete or malformed"
+	}
+	var findings []Finding
+	if err := json.Unmarshal([]byte(findingsText.String), &findings); err != nil || len(findings) == 0 {
+		return "review data incomplete or malformed"
+	}
+	kept := make([]Finding, 0, len(findings))
+	for _, f := range findings {
+		if matched, outstanding := findOutstanding(round, f); !matched || outstanding {
+			kept = append(kept, f)
 		}
 	}
-	return "review data incomplete or malformed"
+	if len(kept) == 0 {
+		return "all findings resolved in a later round"
+	}
+	parts := make([]string, 0, len(kept))
+	for _, f := range kept {
+		parts = append(parts, fmt.Sprintf("%s[%s:%d]: %s", f.Severity, f.File, f.Line, f.Summary))
+	}
+	return strings.Join(parts, "; ")
 }
 
-// describeChainWideBlockingFindings renders every rejected round's findings across
-// taskID's supersede chain, oldest first, numbered chain-wide so the owner can see
-// whether findings were shrinking or recurring across the whole history, not just
-// the current task (docs/features/research-track.md section 6).
+// describeChainWideBlockingFindings renders the still-unresolved blocking findings
+// from every rejected round across taskID's supersede chain, oldest first, numbered
+// chain-wide so the owner can see whether findings were shrinking or recurring across
+// the whole history, not just the current task (docs/features/research-track.md
+// section 6). A finding that failed a round but was later reported resolved by the
+// same reviewer lineage, in a later round of the same task, is left out: it re-derives
+// resolution status from every review report on each task, the same way
+// createResearchFollowUpTasks does for non-blocking findings, since the
+// research_round_rejected snapshot only ever holds a round's blocking findings at the
+// moment it failed and never learns about a later round's resolution.
 func (s *sqliteStore) describeChainWideBlockingFindings(ctx context.Context, tx *sql.Tx, taskID string) (string, error) {
 	chain, err := s.supersedeChain(ctx, tx, taskID)
 	if err != nil {
@@ -2511,6 +2534,37 @@ func (s *sqliteStore) describeChainWideBlockingFindings(ctx context.Context, tx 
 	var rounds []string
 	chainRound := 0
 	for _, id := range chain {
+		var maxRound int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MAX(review_round), 0) FROM task WHERE target_task_id = ? AND kind = 'review'
+		`, id).Scan(&maxRound); err != nil {
+			return "", fmt.Errorf("failed to find max review round for %s: %w", id, err)
+		}
+		allFindings, err := s.collectResearchReviewFindings(ctx, tx, id, maxRound)
+		if err != nil {
+			return "", fmt.Errorf("failed to collect review findings for %s: %w", id, err)
+		}
+		_, isOutstanding := researchFindingChains(allFindings)
+
+		// Matches a finding stored in a research_round_rejected event back to its
+		// live report at the same round, by exact field equality (the stored copy is
+		// a direct serialization of that report, so every field matches). used[]
+		// prevents two identical stored findings from both matching the same report.
+		used := make([]bool, len(allFindings))
+		findOutstanding := func(round int, f Finding) (matched, outstanding bool) {
+			for i, cf := range allFindings {
+				if used[i] || cf.round != round {
+					continue
+				}
+				if cf.ID == f.ID && cf.Severity == f.Severity && cf.File == f.File && cf.Line == f.Line &&
+					cf.Summary == f.Summary && cf.InChangedText == f.InChangedText && cf.Status == f.Status {
+					used[i] = true
+					return true, isOutstanding(i)
+				}
+			}
+			return false, false
+		}
+
 		rows, err := tx.QueryContext(ctx, `
 			SELECT findings FROM event
 			WHERE task_id = ? AND kind = 'research_round_rejected'
@@ -2519,14 +2573,20 @@ func (s *sqliteStore) describeChainWideBlockingFindings(ctx context.Context, tx 
 		if err != nil {
 			return "", fmt.Errorf("failed to query rejected-round events for %s: %w", id, err)
 		}
+		// research_round_rejected events are appended in round order, one per
+		// actually-rejected round with no gaps (a research task that passes a round
+		// moves to a terminal state instead of continuing), so the Nth event for this
+		// task is exactly local round N.
+		localRound := 0
 		for rows.Next() {
 			var findingsText sql.NullString
 			if err := rows.Scan(&findingsText); err != nil {
 				rows.Close()
 				return "", fmt.Errorf("failed to scan rejected-round event: %w", err)
 			}
+			localRound++
 			chainRound++
-			rounds = append(rounds, fmt.Sprintf("Round %d: %s", chainRound, describeResearchRoundFindings(findingsText)))
+			rounds = append(rounds, fmt.Sprintf("Round %d: %s", chainRound, describeOutstandingResearchRoundFindings(findingsText, localRound, findOutstanding)))
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -2638,21 +2698,36 @@ type researchCollectedFinding struct {
 	lineage       string
 }
 
-// createResearchFollowUpTasks implements docs/features/research-track.md section 4:
-// one backlog follow-up task per non-blocking research finding, deduplicated by file,
-// line and summary across reviewers, rounds and repeated aggregation. It is called
-// whenever a research-track parent's review round passes, and looks across every
-// round up to and including the current one: a non-blocking finding raised in an
-// earlier round that failed for an unrelated reason, and never resolved, still needs
-// a follow-up once the parent is finally approved — it would otherwise be silently
-// dropped once that round's review events stop being the ones aggregation inspects.
-//
-// Returns only the IDs of follow-ups newly created by this call. Findings that
-// already have a follow-up (from an earlier aggregation call) are matched via the
-// research_finding_dedup task_link and skipped, so the caller can update the parent's
-// result and event exactly once per new follow-up and repeated aggregation stays
-// idempotent.
-func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.Tx, parentID, parentProjectID, parentDocumentID string, throughRound int, now string) ([]string, error) {
+// newResearchUnionFind returns a union-find over n indices into an allFindings slice,
+// shared by researchFindingChains (linking prior_id lineages) and
+// createResearchFollowUpTasks (grouping outstanding reports into one follow-up),
+// which each need their own independent partition of the same indices.
+func newResearchUnionFind(n int) (find func(int) int, union func(int, int)) {
+	parent := make([]int, n)
+	for i := range parent {
+		parent[i] = i
+	}
+	find = func(x int) int {
+		if parent[x] != x {
+			parent[x] = find(parent[x])
+		}
+		return parent[x]
+	}
+	union = func(a, b int) {
+		if ra, rb := find(a), find(b); ra != rb {
+			parent[ra] = rb
+		}
+	}
+	return find, union
+}
+
+// collectResearchReviewFindings gathers every finding reported on parentID's own
+// review tasks through round throughRound, tagged with the round, review task and
+// reviewer lineage it came from, sorted by round then review task then finding id.
+// Shared by createResearchFollowUpTasks, which groups non-blocking findings into
+// follow-ups, and describeChainWideBlockingFindings, which uses it to tell whether a
+// round's blocking finding was later reported resolved.
+func (s *sqliteStore) collectResearchReviewFindings(ctx context.Context, tx *sql.Tx, parentID string, throughRound int) ([]researchCollectedFinding, error) {
 	if throughRound < 1 {
 		return nil, nil
 	}
@@ -2757,27 +2832,16 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		return allFindings[i].ID < allFindings[j].ID
 	})
 
-	// Union-find over report indices into allFindings.
-	newUnionFind := func() (func(int) int, func(int, int)) {
-		parent := make([]int, len(allFindings))
-		for i := range parent {
-			parent[i] = i
-		}
-		var find func(int) int
-		find = func(x int) int {
-			if parent[x] != x {
-				parent[x] = find(parent[x])
-			}
-			return parent[x]
-		}
-		union := func(a, b int) {
-			if ra, rb := find(a), find(b); ra != rb {
-				parent[ra] = rb
-			}
-		}
-		return find, union
-	}
+	return allFindings, nil
+}
 
+// researchFindingChains links each report in allFindings, which must already be
+// sorted by round, into its prior_id lineage chain within one reviewer, per
+// docs/features/research-track.md section 3. It returns chainOf, the root index of a
+// report's lineage chain, and isOutstanding, a predicate reporting whether a given
+// report index is still outstanding: not itself resolved, and not settled by a later
+// resolved report in its chain.
+func researchFindingChains(allFindings []researchCollectedFinding) (chainOf func(int) int, isOutstanding func(int) bool) {
 	// Chains: a finding carried forward across rounds as still_open, reworded each
 	// time, and finally resolved, is one chain of reports linked by prior_id within
 	// one reviewer lineage. Ids are only unique within a single submission (section
@@ -2787,7 +2851,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 	// report in the same round's submission (reviewers commonly renumber each
 	// round, so a same-round id can collide with the prior_id) and never against
 	// the current report itself, if it names its own id as prior_id.
-	chainOf, linkChain := newUnionFind()
+	chainOf, linkChain := newResearchUnionFind(len(allFindings))
 	latestIndexByLineageAndID := make(map[string]int, len(allFindings))
 	for start := 0; start < len(allFindings); {
 		// allFindings is sorted by round: [start, end) is one round's reports.
@@ -2821,16 +2885,42 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			}
 		}
 	}
-	isOutstanding := func(i int) bool {
+	isOutstanding = func(i int) bool {
 		cf := allFindings[i]
 		return cf.Status != "resolved" && cf.round > lastResolvedRound[chainOf(i)]
 	}
+	return chainOf, isOutstanding
+}
+
+// createResearchFollowUpTasks implements docs/features/research-track.md section 4:
+// one backlog follow-up task per non-blocking research finding, deduplicated by file,
+// line and summary across reviewers, rounds and repeated aggregation. It is called
+// whenever a research-track parent's review round passes, and looks across every
+// round up to and including the current one: a non-blocking finding raised in an
+// earlier round that failed for an unrelated reason, and never resolved, still needs
+// a follow-up once the parent is finally approved — it would otherwise be silently
+// dropped once that round's review events stop being the ones aggregation inspects.
+//
+// Returns only the IDs of follow-ups newly created by this call. Findings that
+// already have a follow-up (from an earlier aggregation call) are matched via the
+// research_finding_dedup task_link and skipped, so the caller can update the parent's
+// result and event exactly once per new follow-up and repeated aggregation stays
+// idempotent.
+func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.Tx, parentID, parentProjectID, parentDocumentID string, throughRound int, now string) ([]string, error) {
+	allFindings, err := s.collectResearchReviewFindings(ctx, tx, parentID, throughRound)
+	if err != nil {
+		return nil, err
+	}
+	if len(allFindings) == 0 {
+		return nil, nil
+	}
+	chainOf, isOutstanding := researchFindingChains(allFindings)
 
 	// Groups: outstanding reports of the same chain, plus outstanding reports with
 	// identical file, line and summary (the same finding raised by several
 	// reviewers, or in several rounds), describe one finding and yield at most one
 	// follow-up.
-	groupOf, linkGroup := newUnionFind()
+	groupOf, linkGroup := newResearchUnionFind(len(allFindings))
 	firstIndexByIdentity := make(map[researchFindingIdentity]int)
 	for i, cf := range allFindings {
 		if !isOutstanding(i) {
