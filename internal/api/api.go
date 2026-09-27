@@ -45,31 +45,33 @@ func taskToSummary(task store.Task) map[string]interface{} {
 
 // Server wraps the HTTP server with its dependencies: store, auth token, and lease TTL.
 type Server struct {
-	mux                    *http.ServeMux
-	store                  store.Store
-	authToken              string
-	leaseTTL               time.Duration
-	maxReviewRounds        int
-	escalationThresholds   map[string]int
-	slowRequestThresholdMs int
-	logger                 *slog.Logger
+	mux                          *http.ServeMux
+	store                        store.Store
+	authToken                    string
+	leaseTTL                     time.Duration
+	maxReviewRounds              int
+	escalationThresholds         map[string]int
+	researchEscalationThresholds map[string]int
+	slowRequestThresholdMs       int
+	logger                       *slog.Logger
 }
 
 // New creates a new API server with the given store, auth token, lease TTL, max review rounds,
-// escalation thresholds, whether pprof debug endpoints should be registered, slow request threshold,
-// and logger.
-func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, pprofEnabled bool, slowRequestThresholdMs int, logger *slog.Logger) *Server {
+// escalation thresholds, research escalation thresholds, whether pprof debug endpoints should be registered,
+// slow request threshold, and logger.
+func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, pprofEnabled bool, slowRequestThresholdMs int, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
 
 	server := &Server{
-		mux:                    mux,
-		store:                  s,
-		authToken:              authToken,
-		leaseTTL:               leaseTTL,
-		maxReviewRounds:        maxReviewRounds,
-		escalationThresholds:   escalationThresholds,
-		slowRequestThresholdMs: slowRequestThresholdMs,
-		logger:                 logger,
+		mux:                          mux,
+		store:                        s,
+		authToken:                    authToken,
+		leaseTTL:                     leaseTTL,
+		maxReviewRounds:              maxReviewRounds,
+		escalationThresholds:         escalationThresholds,
+		researchEscalationThresholds: researchEscalationThresholds,
+		slowRequestThresholdMs:       slowRequestThresholdMs,
+		logger:                       logger,
 	}
 
 	// Helper to compose auth middleware and latency logging
@@ -756,7 +758,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Submit the task
-	task, err := s.store.SubmitTask(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, payload.Findings)
+	task, err := s.store.SubmitTask(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, payload.Findings)
 	if err != nil {
 		// Check if it's a ValidationError (invalid link kind)
 		var validationErr *store.ValidationError
@@ -1135,7 +1137,7 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, err := s.store.ReleaseTask(r.Context(), taskID, s.maxReviewRounds, s.escalationThresholds)
+	task, err := s.store.ReleaseTask(r.Context(), taskID, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds)
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 		return

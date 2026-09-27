@@ -194,6 +194,18 @@ func runServer() {
 		log.Fatalf("invalid research default model: %v", err)
 	}
 
+	// Parse research escalation thresholds
+	researchEscalationThresholds, err := parseResearchEscalationThresholds(os.Getenv("ODONIAN_RESEARCH_ESCALATION_THRESHOLDS"), allowedModels)
+	if err != nil {
+		log.Fatalf("failed to parse ODONIAN_RESEARCH_ESCALATION_THRESHOLDS: %v", err)
+	}
+
+	// Parse research escalation ladder
+	researchEscalationLadder, err := parseResearchEscalationLadder(os.Getenv("ODONIAN_RESEARCH_ESCALATION_LADDER"), allowedModels)
+	if err != nil {
+		log.Fatalf("failed to parse ODONIAN_RESEARCH_ESCALATION_LADDER: %v", err)
+	}
+
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
 	if eventTerminalRetentionDaysStr == "" {
@@ -244,7 +256,8 @@ func runServer() {
 	// Open the store
 	s, err := store.Open(dbPath, allowedModels,
 		store.WithEscalationLadder(escalationLadder),
-		store.WithResearchDefaultModel(researchDefaultModel))
+		store.WithResearchDefaultModel(researchDefaultModel),
+		store.WithResearchEscalationLadder(researchEscalationLadder))
 	if err != nil {
 		log.Fatalf("failed to open store: %v", err)
 	}
@@ -261,7 +274,7 @@ func runServer() {
 	}
 
 	// Create API server
-	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, pprofEnabled, slowRequestThresholdMs, logger)
+	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, researchEscalationThresholds, pprofEnabled, slowRequestThresholdMs, logger)
 
 	// Set up graceful shutdown with signal handling
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1078,6 +1091,35 @@ func parseEscalationLadder(ladderStr string, allowedModels []string) []string {
 	return result
 }
 
+func parseResearchEscalationLadder(ladderStr string, allowedModels []string) ([]string, error) {
+	// Empty/unset research ladder means no model escalation for research tasks
+	if ladderStr == "" {
+		return []string{}, nil
+	}
+
+	allowedModelsM := make(map[string]bool)
+	for _, m := range allowedModels {
+		allowedModelsM[m] = true
+	}
+
+	seen := make(map[string]bool)
+	var result []string
+	for _, model := range strings.Split(ladderStr, ",") {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if !allowedModelsM[model] {
+			return nil, fmt.Errorf("research escalation ladder contains model %q not in ODONIAN_MODELS allowlist", model)
+		}
+		if !seen[model] {
+			seen[model] = true
+			result = append(result, model)
+		}
+	}
+	return result, nil
+}
+
 func parseEscalationThresholds(thresholdsStr string) map[string]int {
 	defaults := map[string]int{"haiku": 8, "sonnet": 6, "opus": 4}
 	if thresholdsStr == "" {
@@ -1102,6 +1144,47 @@ func parseEscalationThresholds(thresholdsStr string) map[string]int {
 		result[model] = threshold
 	}
 	return result
+}
+
+func parseResearchEscalationThresholds(thresholdsStr string, allowedModels []string) (map[string]int, error) {
+	if thresholdsStr == "" {
+		return map[string]int{}, nil
+	}
+
+	allowedModelsM := make(map[string]bool)
+	for _, m := range allowedModels {
+		allowedModelsM[m] = true
+	}
+
+	result := make(map[string]int)
+	for _, pair := range strings.Split(thresholdsStr, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid threshold format %q", pair)
+		}
+		model := strings.TrimSpace(parts[0])
+		thresholdStr := strings.TrimSpace(parts[1])
+
+		if !allowedModelsM[model] {
+			return nil, fmt.Errorf("threshold model %q not in ODONIAN_MODELS allowlist", model)
+		}
+
+		threshold, err := strconv.Atoi(thresholdStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid threshold value %q: %w", thresholdStr, err)
+		}
+
+		if threshold < 0 {
+			return nil, fmt.Errorf("threshold value must be non-negative, got %d", threshold)
+		}
+
+		result[model] = threshold
+	}
+	return result, nil
 }
 
 func validateResearchDefaultModel(modelStr string, allowedModels []string) (string, error) {

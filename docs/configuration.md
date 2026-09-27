@@ -13,29 +13,34 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_MODELS` | `haiku,sonnet,opus` | Allowlist of model names that may be pinned to a task or named as a reviewer. |
 | `ODONIAN_RESEARCH_DEFAULT_MODEL` | unset | Default model for research tasks created without an explicit model. Must be in `ODONIAN_MODELS` if set. Recommended: `claude-opus-5-5`. When unset, research tasks without an explicit model use the default fallback (prefers `haiku`). |
 | `ODONIAN_ESCALATION_LADDER` | same as `ODONIAN_MODELS` | Ordered tiers for the review circuit breaker's escalation path. Every entry must be in `ODONIAN_MODELS`. A model can be a valid reviewer without being on the ladder; `gpt-5.5` via Codex is the usual example. |
-| `ODONIAN_ESCALATION_THRESHOLDS` | `haiku=8,sonnet=6,opus=4` | Per-model review-round threshold. A rejection that pushes a task past its threshold trips the circuit breaker. A malformed value logs a warning and falls back to the defaults. |
-| `ODONIAN_MAX_REVIEW_ROUNDS` | `5` | Threshold for models with no entry in `ODONIAN_ESCALATION_THRESHOLDS`. This is also the effective round budget for a research task whose model is not on the ladder (see below). |
+| `ODONIAN_ESCALATION_THRESHOLDS` | `haiku=8,sonnet=6,opus=4` | Per-model review-round threshold for build and design tasks. A rejection that pushes a task past its threshold trips the circuit breaker. A malformed value logs a warning and falls back to the defaults. |
+| `ODONIAN_RESEARCH_ESCALATION_LADDER` | unset | Ordered tiers for the review circuit breaker's escalation path for research tasks. Empty or unset means research tasks never change tier on rejection. Every entry must be in `ODONIAN_MODELS`. A configured research ladder operates independently of the build/design ladder. |
+| `ODONIAN_RESEARCH_ESCALATION_THRESHOLDS` | unset (treated as empty map) | Per-model review-round threshold for research tasks. Only applies if `ODONIAN_RESEARCH_ESCALATION_LADDER` is configured. When a research task's model is not on the research ladder, falls back to `ODONIAN_MAX_REVIEW_ROUNDS`. Build and design tasks use `ODONIAN_ESCALATION_THRESHOLDS` exclusively. |
+| `ODONIAN_MAX_REVIEW_ROUNDS` | `5` | Threshold fallback for models with no entry in their respective escalation thresholds. |
 | `ODONIAN_LEASE_TTL` | `5m` | Lease granted on claim and extended by each heartbeat. A task whose lease has lapsed is claimable again, so a session that outlives its lease loses the task to another worker. Kept generous in production because renewal is agent-driven. |
 | `ODONIAN_EVENT_TERMINAL_RETENTION_DAYS` | `1` | At startup, audit events for tasks in terminal states older than this are pruned. Events for live tasks are never pruned. |
 | `ODONIAN_PPROF` | unset | Enable Go runtime profiling on `/debug/pprof/` when set to exactly `true`. All pprof endpoints require the same bearer-token auth as every other protected route. When unset or any other value, `/debug/pprof/` returns 404. See [Runtime profiling with pprof](#runtime-profiling-with-pprof). |
 | `ODONIAN_SLOW_REQUEST_MS` | `500` | Per-request latency logging threshold in milliseconds. Requests at or above this threshold log at INFO level; below it log at DEBUG. `/healthz` is never logged. A non-integer or negative value logs one warning at startup and falls back to the default. |
 | `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by PR-watch, supersession PR cleanup, and `odonian merge`. See [Forge tokens](#forge-tokens). |
 
-### Research tasks and escalation (until the research ladder ships)
+### Research tasks and escalation
 
-A research task typically runs on a pinned model id such as `claude-opus-5-5`, which is not on
-`ODONIAN_ESCALATION_LADDER` and has no entry in `ODONIAN_ESCALATION_THRESHOLDS` or the built-in
-defaults. The current behavior follows from that:
+Research tasks use a dedicated escalation ladder and thresholds, separate from the build/design path:
 
-- **It never escalates.** A model that is not on the ladder has no next tier, so the circuit breaker
-  treats it as the top tier.
-- **It blocks after `ODONIAN_MAX_REVIEW_ROUNDS` rejected rounds** (default `5`), because that is the
-  threshold fallback for a model with no entry. Set the variable explicitly to choose the budget.
+- **No escalation by default.** `ODONIAN_RESEARCH_ESCALATION_LADDER` is empty by default, so research
+  tasks keep their assigned model tier. Escalation can be enabled by setting the research ladder.
+- **Independent configuration.** A configured research ladder and thresholds operate independently of
+  the build/design `ODONIAN_ESCALATION_LADDER` and `ODONIAN_ESCALATION_THRESHOLDS`.
+- **Explicit task opt-out still applies.** A research task with `escalate=false` never escalates,
+  even when a research ladder is configured.
+- **Round budget via threshold fallback.** When no research ladder is configured, or a research task's
+  model is not on the configured research ladder, its threshold falls back to `ODONIAN_MAX_REVIEW_ROUNDS`
+  (default `5`), which acts as a round budget that blocks for decomposition when exceeded. This differs
+  from build/design tasks, whose fallback (for `haiku`, `sonnet`, and `opus`) is the built-in
+  `ODONIAN_ESCALATION_THRESHOLDS` default of `haiku=8,sonnet=6,opus=4`, not `ODONIAN_MAX_REVIEW_ROUNDS`.
 
-This matches the research-track spec's intent (no escalation by default, a round budget that blocks
-for decomposition) by coincidence of fallbacks, not by design. The dedicated research ladder,
-thresholds and chain-wide budget are milestone 2 of `docs/features/research-track.md` and will
-replace this behavior.
+The chain-wide round budget (which counts across a task's entire supersede chain) is deferred to
+R8, a future task in `docs/features/research-track.md` milestone 2.
 
 ### Runtime profiling with pprof
 
