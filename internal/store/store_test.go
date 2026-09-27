@@ -16455,3 +16455,99 @@ func TestResearchDisputes_StaleDisputeDoesNotLeakIntoLaterRound(t *testing.T) {
 		t.Errorf("expected no stale dispute context in round-3 spec (round 3 submitted no disputes), got: %s", opusR3.Spec)
 	}
 }
+
+// TestResearchDisputes_DifferentReviewerReusingIDIsNotADuplicate verifies that
+// disputing a finding_id is scoped to the specific reviewer lineage and prior_id
+// chain it resolved against, not the bare finding_id string: a different reviewer's
+// unrelated finding that happens to reuse an already-disputed id is a genuinely new
+// finding and must not be rejected as DUPLICATE_DISPUTE.
+func TestResearchDisputes_DifferentReviewerReusingIDIsNotADuplicate(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("expected both review tasks to be ready")
+	}
+
+	// Round 1: opus raises f1 and it's disputed; sonnet has nothing to report.
+	opusF1 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"overstates source","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", opusF1)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"the source supports the claim as written"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("expected round-1 dispute to succeed, got: %v", err)
+	}
+
+	// Round 2: opus reports its finding resolved under a new id (r1, prior_id f1).
+	// sonnet raises its OWN, unrelated finding, and happens to reuse the id "f1" —
+	// reviewers pick their own ids independently, so this collision is expected.
+	opusR2, sonnetR2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusR2 == nil || sonnetR2 == nil {
+		t.Fatalf("expected round-2 review tasks")
+	}
+	opusResolved := json.RawMessage(`[{"id":"r1","severity":"P2","file":"a.md","line":3,"summary":"overstates source","in_changed_text":false,"status":"resolved","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "approve", opusResolved)
+	sonnetF1 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"b.md","line":9,"summary":"a different, unrelated defect","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, sonnetR2, "sonnet-reviewer", "reject", sonnetF1)
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 to be rejected (sonnet's new finding blocks), got %s", parent.State)
+	}
+
+	// Disputing sonnet's round-2 "f1" must succeed: it is a different reviewer's
+	// different finding, never disputed before, even though the raw id matches
+	// opus's already-disputed round-1 "f1".
+	disputesAgain := json.RawMessage(`[{"finding_id":"f1","evidence":"b.md line 9 is unrelated to a.md"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputesAgain); err != nil {
+		t.Fatalf("expected sonnet's new finding to be disputable, got: %v", err)
+	}
+}
+
+// TestResearchDisputes_MaintainedFindingCannotBeDisputedAgainUnderNewID verifies
+// that once a finding has been disputed, the same finding carried forward under a new
+// id in a later round (still_open, linked by prior_id) cannot be disputed again: the
+// duplicate check must follow the reviewer's prior_id chain, not just the bare id.
+func TestResearchDisputes_MaintainedFindingCannotBeDisputedAgainUnderNewID(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+	opus, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil {
+		t.Fatalf("expected round-1 opus review task")
+	}
+
+	blockingFinding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blockingFinding)
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"first"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("expected round-1 dispute to succeed, got: %v", err)
+	}
+
+	// Round 2: opus maintains the same finding under a new id, linked by prior_id.
+	opusR2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusR2 == nil {
+		t.Fatalf("expected round-2 opus review task")
+	}
+	maintained := json.RawMessage(`[{"id":"f2","severity":"P2","file":"a.md","line":3,"summary":"x","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusR2, "opus-reviewer", "reject", maintained)
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 2 to be rejected (still_open blocks), got %s", parent.State)
+	}
+
+	// Disputing "f2" must fail: it is the same finding chain as the already-disputed
+	// "f1", just carried forward under a new id.
+	disputesAgain := json.RawMessage(`[{"finding_id":"f2","evidence":"second attempt"}]`)
+	_, err = resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputesAgain)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != "DUPLICATE_DISPUTE" {
+		t.Fatalf("expected DUPLICATE_DISPUTE validation error, got: %v", err)
+	}
+}

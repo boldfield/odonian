@@ -839,17 +839,27 @@ func validateFindings(raw json.RawMessage) ([]Finding, error) {
 // docs/features/research-track.md section 5. A dispute never alters the finding it
 // names: the reviewer who raised it re-evaluates it, in its next round, against the
 // evidence.
+//
+// Round and Lineage are resolved and filled in server-side (by submitTask, not the
+// client) once FindingID has been matched to exactly one reviewer's finding in the
+// round being reworked. They are what let a later submission tell whether it is
+// re-disputing the same finding lineage: FindingID alone is not enough, since
+// reviewers choose their own ids and commonly reuse them across rounds (see
+// priorDisputes and its caller in submitTask).
 type Dispute struct {
 	FindingID string `json:"finding_id"`
 	Evidence  string `json:"evidence"`
+	Round     int    `json:"round,omitempty"`
+	Lineage   string `json:"lineage,omitempty"`
 }
 
 // validateDisputes parses and validates a raw JSON disputes payload: an array of
 // objects, each naming a finding_id and citing non-empty evidence, with no
 // finding_id repeated within one submission. It does not check that a finding_id was
-// actually raised by a reviewer, or resolve which reviewer raised it — that requires
-// the task's review history and is done by the caller, which also rejects a
-// finding_id disputed a second time in a later round.
+// actually raised by a reviewer, resolve which reviewer raised it, or reject a
+// finding already disputed in an earlier round — that requires the task's review
+// history (to resolve each finding_id's reviewer lineage and prior_id chain) and is
+// done by the caller.
 func validateDisputes(raw json.RawMessage) ([]Dispute, error) {
 	var rawDisputes []json.RawMessage
 	if err := json.Unmarshal(raw, &rawDisputes); err != nil {
@@ -911,11 +921,19 @@ type disputeContextEntry struct {
 	Evidence string
 }
 
-// priorDisputedFindingIDs collects every finding_id already disputed on an earlier
-// submit event of this implement task, across every prior rework round, so a finding
-// cannot be disputed a second time (docs/features/research-track.md section 5: the
-// raising reviewer's next re-evaluation of a dispute is what decides it, once).
-func (s *sqliteStore) priorDisputedFindingIDs(ctx context.Context, tx *sql.Tx, taskID string) (map[string]bool, error) {
+// priorDisputes collects every dispute recorded on an earlier submit event of this
+// implement task, across every prior rework round, each carrying the Round and
+// Lineage it was resolved against at the time it was stored. The caller uses these to
+// locate each prior dispute's target finding within the current round's collected
+// findings and chain them, so a finding already disputed cannot be disputed again
+// under a later id in the same reviewer's prior_id chain (docs/features/
+// research-track.md section 5: the raising reviewer's next re-evaluation of a dispute
+// is what decides it, once). Comparing by bare FindingID would be both too strict (two
+// reviewers commonly reuse the same id) and too loose (a reviewer's carried-forward
+// finding gets a new id each round), so Round and Lineage — resolved once, at dispute
+// time, never re-derived from the bare id alone — are what keep this scoped to one
+// reviewer's one finding lineage.
+func (s *sqliteStore) priorDisputes(ctx context.Context, tx *sql.Tx, taskID string) ([]Dispute, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT disputes FROM event WHERE task_id = ? AND kind = 'submit' AND disputes IS NOT NULL
 	`, taskID)
@@ -924,7 +942,7 @@ func (s *sqliteStore) priorDisputedFindingIDs(ctx context.Context, tx *sql.Tx, t
 	}
 	defer rows.Close()
 
-	seen := make(map[string]bool)
+	var all []Dispute
 	for rows.Next() {
 		var disputesText string
 		if err := rows.Scan(&disputesText); err != nil {
@@ -934,14 +952,12 @@ func (s *sqliteStore) priorDisputedFindingIDs(ctx context.Context, tx *sql.Tx, t
 		if err := json.Unmarshal([]byte(disputesText), &priorDisputes); err != nil {
 			continue
 		}
-		for _, d := range priorDisputes {
-			seen[d.FindingID] = true
-		}
+		all = append(all, priorDisputes...)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate prior disputes: %w", err)
 	}
-	return seen, nil
+	return all, nil
 }
 
 // ErrNotFound is returned when a resource is not found.
@@ -2139,24 +2155,42 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			return TaskWithDepsAndLinks{}, derr
 		}
 
-		roundFindings, _, cerr := s.collectResearchReviewReports(ctx, tx, taskID, currentReviewRound)
+		// allFindings covers every round through currentReviewRound, so it has both
+		// this round's candidate targets and any earlier round's already-disputed
+		// findings, in one index space researchFindingChains can link by prior_id
+		// within each reviewer's lineage.
+		allFindings, _, cerr := s.collectResearchReviewReports(ctx, tx, taskID, currentReviewRound)
 		if cerr != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to collect review findings for dispute validation: %w", cerr)
 		}
-		byID := make(map[string][]researchCollectedFinding)
-		for _, cf := range roundFindings {
-			if cf.round != currentReviewRound {
-				continue
+		byID := make(map[string][]int)
+		byRoundLineageID := make(map[string]int, len(allFindings))
+		for i, cf := range allFindings {
+			byRoundLineageID[fmt.Sprintf("%d\x00%s\x00%s", cf.round, cf.lineage, cf.ID)] = i
+			if cf.round == currentReviewRound {
+				byID[cf.ID] = append(byID[cf.ID], i)
 			}
-			byID[cf.ID] = append(byID[cf.ID], cf)
 		}
+		chainOf, _ := researchFindingChains(allFindings)
 
-		priorDisputed, perr := s.priorDisputedFindingIDs(ctx, tx, taskID)
+		priorDisputed, perr := s.priorDisputes(ctx, tx, taskID)
 		if perr != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to collect prior disputes: %w", perr)
 		}
+		// A prior dispute blocks a new one only if the new target's finding chain —
+		// linked by prior_id within one reviewer's lineage — was already disputed,
+		// not merely if the raw finding_id string matches: reviewers pick their own
+		// ids, so a bare-id match is both too strict (a different reviewer, or a
+		// genuinely new finding, can reuse an old id) and too loose (a maintained
+		// finding gets a new id each round it's carried forward).
+		priorDisputedChainRoots := make(map[int]bool, len(priorDisputed))
+		for _, pd := range priorDisputed {
+			if idx, ok := byRoundLineageID[fmt.Sprintf("%d\x00%s\x00%s", pd.Round, pd.Lineage, pd.FindingID)]; ok {
+				priorDisputedChainRoots[chainOf(idx)] = true
+			}
+		}
 
-		for _, d := range parsedDisputes {
+		for i, d := range parsedDisputes {
 			targets := byID[d.FindingID]
 			if len(targets) == 0 {
 				return TaskWithDepsAndLinks{}, invalid("UNKNOWN_FINDING_ID", fmt.Sprintf("disputes: finding_id %q was not raised by any reviewer in round %d", d.FindingID, currentReviewRound))
@@ -2164,11 +2198,14 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			if len(targets) > 1 {
 				return TaskWithDepsAndLinks{}, invalid("AMBIGUOUS_FINDING_ID", fmt.Sprintf("disputes: finding_id %q was raised by more than one reviewer in round %d and cannot be disputed unambiguously", d.FindingID, currentReviewRound))
 			}
-			if priorDisputed[d.FindingID] {
+			idx := targets[0]
+			if priorDisputedChainRoots[chainOf(idx)] {
 				return TaskWithDepsAndLinks{}, invalid("DUPLICATE_DISPUTE", fmt.Sprintf("disputes: finding_id %q was already disputed in an earlier round", d.FindingID))
 			}
-			target := targets[0]
+			target := allFindings[idx]
 			disputesByLineage[target.lineage] = append(disputesByLineage[target.lineage], disputeContextEntry{Finding: target.Finding, Evidence: d.Evidence})
+			parsedDisputes[i].Round = currentReviewRound
+			parsedDisputes[i].Lineage = target.lineage
 		}
 
 		marshaled, merr := json.Marshal(parsedDisputes)

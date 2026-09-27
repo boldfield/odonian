@@ -751,8 +751,12 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
   A dispute never alters the finding it names. It is recorded on the submission's own event and
   delivered, in the next round, to the review task of the reviewer who raised that finding — the
   raising reviewer re-evaluates the finding against the evidence and either withdraws it (reports
-  it `resolved`) or maintains it (reports it `still_open`). A `finding_id` already disputed on an
-  earlier rework round cannot be disputed again.
+  it `resolved`) or maintains it (reports it `still_open`). The same finding cannot be disputed a
+  second time, even if the raising reviewer carries it forward under a new id in a later round
+  (`still_open` with `prior_id` linking back to it): this is checked by the finding's identity —
+  the raising reviewer plus its `prior_id` chain — not by the bare `finding_id` string, since
+  reviewers choose ids independently and two reviewers may reuse the same id for unrelated
+  findings.
 
 **Link Types:**
 - `pr`: Pull request reference (e.g., `#123` or `owner/repo#123`)
