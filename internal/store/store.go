@@ -2604,7 +2604,7 @@ func isBlockingResearchFinding(f Finding, round int) bool {
 // report.
 func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql.Tx, parentID string, round int) (bool, []Finding, error) {
 	taskRows, err := tx.QueryContext(ctx, `
-		SELECT id FROM task WHERE target_task_id = ? AND review_round = ? AND kind = 'review'
+		SELECT id FROM task WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding IS NULL
 	`, parentID, round)
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to list round review tasks: %w", err)
@@ -2684,7 +2684,50 @@ func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql
 		return true, blocking, nil
 	}
 
-	return len(blocking) > 0, blocking, nil
+	// Check for adjudication task verdicts. If an adjudicator has completed
+	// a task with "approve" verdict, the finding is overturned and no longer blocking.
+	// If verdict is "reject", the finding stands as blocking.
+	// Adjudication verdicts only apply to still_open findings that they adjudicate.
+	adjudicationRows, err := tx.QueryContext(ctx, `
+		SELECT adjudicate_finding, verdict
+		FROM task
+		WHERE target_task_id = ? AND kind = 'review' AND adjudicate_finding IS NOT NULL AND state = 'done'
+	`, parentID)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to query adjudication verdicts: %w", err)
+	}
+	defer adjudicationRows.Close()
+
+	overriddenFindings := make(map[string]bool)
+	for adjudicationRows.Next() {
+		var findingID string
+		var verdict sql.NullString
+		if err := adjudicationRows.Scan(&findingID, &verdict); err != nil {
+			return false, nil, fmt.Errorf("failed to scan adjudication verdict: %w", err)
+		}
+		if !verdict.Valid {
+			// Adjudication task has no verdict yet (shouldn't happen for done state, but be safe)
+			continue
+		}
+		if verdict.String == "approve" {
+			// Adjudicator approved (overturned the finding), so it's no longer blocking
+			overriddenFindings[findingID] = true
+		}
+		// If verdict is "reject", the finding stands as is (still blocking if it was)
+	}
+	if err := adjudicationRows.Err(); err != nil {
+		return false, nil, fmt.Errorf("failed to iterate adjudication verdicts: %w", err)
+	}
+
+	// Remove findings that have been overturned by adjudication
+	var finalBlocking []Finding
+	for _, f := range blocking {
+		if !overriddenFindings[f.ID] {
+			finalBlocking = append(finalBlocking, f)
+		}
+	}
+
+	return len(finalBlocking) > 0, finalBlocking, nil
 }
 
 // appendResearchRoundRejectedEvent records that a research review round failed,
@@ -3407,11 +3450,6 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 // review completion. If the adjudicator is missing or invalid, the finding remains
 // blocking and the reason is recorded in a parent event.
 func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, parentID, parentProjectID, parentDocumentID, parentTitle, parentModel string, parentReviewRound int, now string) error {
-	// If no adjudicator is configured, there's nothing to do
-	if s.researchAdjudicator == "" {
-		return nil
-	}
-
 	// Get all prior disputes from previous submit events
 	priorDisputes, err := s.priorDisputes(ctx, tx, parentID)
 	if err != nil {
@@ -3429,6 +3467,15 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 		return fmt.Errorf("failed to get review round findings: %w", err)
 	}
 
+	// If no adjudicator is configured, record an event and keep findings blocking
+	if s.researchAdjudicator == "" {
+		note := "ODONIAN_RESEARCH_ADJUDICATOR is not configured; disputed findings remain blocking and must be manually adjudicated"
+		if _, err := s.AppendEvent(ctx, tx, parentID, "system", "adjudication_failed", nil, &note); err != nil {
+			return fmt.Errorf("failed to append adjudication_failed event: %w", err)
+		}
+		return nil
+	}
+
 	// Validate adjudicator: must be in allowlist and different from both reviewers
 	if !s.allowedModelsM[s.researchAdjudicator] {
 		// Adjudicator not in allowlist - record why and leave finding blocking
@@ -3441,7 +3488,7 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 
 	if len(reviewerModels) > 0 && slices.Contains(reviewerModels, s.researchAdjudicator) {
 		// Adjudicator is same as one of the reviewers - record why and leave finding blocking
-		note := fmt.Sprintf("Research adjudicator %q is same as one of the reviewers; disputed findings remain blocking", s.researchAdjudicator)
+		note := fmt.Sprintf("Research adjudicator %q is same as one of the reviewers (%s); disputed findings remain blocking", s.researchAdjudicator, strings.Join(reviewerModels, ", "))
 		if _, err := s.AppendEvent(ctx, tx, parentID, "system", "adjudication_failed", nil, &note); err != nil {
 			return fmt.Errorf("failed to append adjudication_failed event: %w", err)
 		}
@@ -3454,9 +3501,15 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 		findingsByID[f.ID] = f
 	}
 
+	// Build a map of disputes by finding ID for easy lookup
+	disputesByID := make(map[string]Dispute)
+	for _, d := range priorDisputes {
+		disputesByID[d.FindingID] = d
+	}
+
 	// For each prior dispute, check if it's maintained (still_open) in current findings
-	for _, dispute := range priorDisputes {
-		currentFinding, exists := findingsByID[dispute.FindingID]
+	for findingID, dispute := range disputesByID {
+		currentFinding, exists := findingsByID[findingID]
 		if !exists || currentFinding.Status != "still_open" {
 			// Finding either doesn't exist or was resolved - not a maintained dispute
 			continue
@@ -3467,8 +3520,8 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 		err := tx.QueryRowContext(ctx, `
 			SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END
 			FROM task
-			WHERE target_task_id = ? AND kind = 'review' AND adjudicate_finding = ?
-		`, parentID, dispute.FindingID).Scan(&adjudicationExists)
+			WHERE target_task_id = ? AND adjudicate_finding = ?
+		`, parentID, findingID).Scan(&adjudicationExists)
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("failed to check for existing adjudication: %w", err)
 		}
@@ -3480,18 +3533,42 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 
 		// Spawn adjudication task for this maintained dispute
 		adjudicationTaskID := GenerateID()
-		adjudicationTitle := fmt.Sprintf("Adjudicate: %s (finding %s)", parentTitle, dispute.FindingID)
+		adjudicationTitle := fmt.Sprintf("Adjudicate: %s (finding %s)", parentTitle, findingID)
 
 		// Find which reviewer raised this finding
 		raisingReviewer := ""
-		if reviewer, ok := findingReviewers[dispute.FindingID]; ok {
+		if reviewer, ok := findingReviewers[findingID]; ok {
 			raisingReviewer = reviewer
 		}
+
+		// Create spec containing finding details and dispute evidence
+		spec := fmt.Sprintf(`## Finding
+
+**ID**: %s
+**Severity**: %s
+**File**: %s
+**Line**: %d
+**Status**: %s
+**Summary**: %s
+
+## Original Finding Report
+
+%s
+
+## Worker's Dispute Evidence
+
+%s
+
+## Task
+
+Rule on whether this finding is valid (uphold it) or whether the worker's evidence supports overturning it. Your ruling is binding for this finding alone and does not vote on the parent task's overall review round.`,
+			currentFinding.ID, currentFinding.Severity, currentFinding.File, currentFinding.Line, currentFinding.Status, currentFinding.Summary,
+			currentFinding.Summary, dispute.Evidence)
 
 		_, execErr := tx.ExecContext(ctx, `
 			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, review_round, track, adjudicate_finding, adjudicated_by_reviewer, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, adjudicationTaskID, parentProjectID, parentDocumentID, adjudicationTitle, "", "ready", s.researchAdjudicator, "review", parentID, parentReviewRound, "research", dispute.FindingID, raisingReviewer, now, now)
+		`, adjudicationTaskID, parentProjectID, parentDocumentID, adjudicationTitle, spec, "ready", s.researchAdjudicator, "review", parentID, parentReviewRound, "research", findingID, raisingReviewer, now, now)
 		if execErr != nil {
 			return fmt.Errorf("failed to create adjudication task: %w", execErr)
 		}
@@ -3501,14 +3578,39 @@ func (s *sqliteStore) spawnAdjudicationTasks(ctx context.Context, tx *sql.Tx, pa
 }
 
 // getReviewRoundFindingsWithReviewers collects all findings from all review tasks in the current round
-// and tracks which reviewer model raised each finding. Returns findings, a map of finding ID to reviewer model,
-// and the list of unique reviewer models.
+// and tracks which reviewer model raised each finding. Also returns the list of all reviewer models
+// (including those who approved with no findings). This is needed for adjudicator validation:
+// the adjudicator must differ from BOTH ordinary reviewers, not just those who raised findings.
 func (s *sqliteStore) getReviewRoundFindingsWithReviewers(ctx context.Context, tx *sql.Tx, parentID string, round int) ([]Finding, map[string]string, []string, error) {
+	// First, get all ordinary review tasks (not adjudication tasks) and their models
+	reviewerRows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT model FROM task
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding IS NULL
+	`, parentID, round)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to query reviewer models: %w", err)
+	}
+	reviewerModels := make(map[string]bool)
+	for reviewerRows.Next() {
+		var model string
+		if err := reviewerRows.Scan(&model); err != nil {
+			reviewerRows.Close()
+			return nil, nil, nil, fmt.Errorf("failed to scan reviewer model: %w", err)
+		}
+		reviewerModels[model] = true
+	}
+	if err := reviewerRows.Err(); err != nil {
+		reviewerRows.Close()
+		return nil, nil, nil, fmt.Errorf("failed to iterate reviewer models: %w", err)
+	}
+	reviewerRows.Close()
+
+	// Now get all findings from review events
 	rows, err := tx.QueryContext(ctx, `
 		SELECT e.findings, t.model
 		FROM event e
 		JOIN task t ON t.id = e.source_task_id
-		WHERE e.task_id = ? AND e.kind = 'review' AND t.review_round = ? AND e.findings IS NOT NULL
+		WHERE e.task_id = ? AND e.kind = 'review' AND t.review_round = ? AND t.adjudicate_finding IS NULL AND e.findings IS NOT NULL
 	`, parentID, round)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to query review findings: %w", err)
@@ -3517,7 +3619,6 @@ func (s *sqliteStore) getReviewRoundFindingsWithReviewers(ctx context.Context, t
 
 	var allFindings []Finding
 	findingReviewers := make(map[string]string)
-	reviewerModels := make(map[string]bool)
 
 	for rows.Next() {
 		var findingsText string
@@ -3532,7 +3633,6 @@ func (s *sqliteStore) getReviewRoundFindingsWithReviewers(ctx context.Context, t
 		}
 
 		allFindings = append(allFindings, findings...)
-		reviewerModels[model] = true
 
 		// Track which reviewer raised each finding
 		// If multiple reviewers report the same finding ID, we use the first one encountered
@@ -3587,7 +3687,9 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		return "", nil
 	}
 
-	// Count total, done, and approve verdict review tasks for the parent in the current round
+	// Count total, done, and approve verdict review tasks for the parent in the current round.
+	// Exclude adjudication tasks (those with adjudicate_finding IS NOT NULL), which are
+	// scoped to individual findings and do not vote on the round.
 	var totalReviewTasks int
 	var doneReviewTasks int
 	var approveReviewTasks int
@@ -3597,7 +3699,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done,
 			SUM(CASE WHEN state='done' AND verdict='approve' THEN 1 ELSE 0 END) as approve
 		FROM task
-		WHERE target_task_id = ? AND review_round = ?
+		WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding IS NULL
 	`, parentID, parentReviewRound).Scan(&totalReviewTasks, &doneReviewTasks, &approveReviewTasks)
 	if err != nil {
 		return "", fmt.Errorf("failed to tally review tasks: %w", err)
