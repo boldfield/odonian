@@ -94,6 +94,9 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("POST /projects/{id}/documents", wrapProtected("POST /projects/{id}/documents", server.handleCreateDocument))
 	mux.HandleFunc("GET /projects/{id}/documents", wrapProtected("GET /projects/{id}/documents", server.handleListDocuments))
 
+	// Research endpoints (protected)
+	mux.HandleFunc("GET /projects/{id}/research/reviewers", wrapProtected("GET /projects/{id}/research/reviewers", server.handleGetResearchReviewerScorecards))
+
 	// Task endpoints (protected)
 	mux.HandleFunc("POST /projects/{id}/tasks", wrapProtected("POST /projects/{id}/tasks", server.handleCreateTasks))
 	mux.HandleFunc("GET /projects/{id}/tasks", wrapProtected("GET /projects/{id}/tasks", server.handleListTasks))
@@ -485,6 +488,19 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.encodeJSON(w, http.StatusOK, docs)
+}
+
+// handleGetResearchReviewerScorecards handles GET /projects/{id}/research/reviewers to retrieve reviewer scorecards.
+func (s *Server) handleGetResearchReviewerScorecards(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+
+	scorecards, err := s.store.GetResearchReviewerScorecards(r.Context(), projectID)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "GET_ERROR", "Failed to get reviewer scorecards")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, scorecards)
 }
 
 // handleCreateTasks handles POST /projects/{id}/tasks to bulk-create tasks.
