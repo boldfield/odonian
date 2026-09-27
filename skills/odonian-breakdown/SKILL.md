@@ -118,45 +118,41 @@ Non-negotiable decomposition rules:
 
 ### Sizing research tasks
 
-Research tasks verify factual claims against primary sources. Unlike build tasks, they are sized by
-claim count and source diversity, not by code volume. Apply these rules when decomposing a research
-design into tasks:
+Research tasks verify factual claims against primary sources and are tracked separately from build tasks. Unlike build tasks (which are Haiku-sized and start on Haiku with optional escalation), research tasks **start on their configured default model** (recommended: `claude-opus-5-5`), do not use the build escalation ladder, and are not Haiku-sized — their sizing is by claim count and source diversity, not by code volume. Sizing rules ensure each research task is reviewable within the research round budget. Apply these rules when decomposing a research design into tasks:
 
 - **Claim row limit: six independently checkable rows maximum.** Each row is one verifiable claim
   (e.g., "function X was added in version Y", "vendor Z's CVE-2024-1234 affects this library").
   Cap at six rows per task. This default responds to a documented 13-row task that took 13 review
-  rounds with recurring P1/P2 findings. At six rows, a task is reviewable in one or two rounds.
-  If a design requires more than six claims, split it into separate tasks, each with its own scope
-  and acceptance criteria.
+  rounds with 11 of those rounds containing real P1 or P2 defects. If a design requires more than
+  six claims, split it into separate tasks, each with its own scope and acceptance criteria.
 
 - **Primary sources: four distinct sources maximum.** A research task should cite at most four
-  distinct primary sources (e.g., an RFC, a GitHub issue, a vendor advisory, a Wikipedia article).
-  More sources mean reviewers must retrieve and cross-check more evidence, which compounds review
-  difficulty. When a design requires many sources, group them by domain (see next rule) and create
-  one task per domain.
+  distinct primary sources. Primary source examples include court opinions, statutes, court filings,
+  vendor security advisories, and RFCs. Secondary or tertiary sources (e.g., news articles, Wikipedia)
+  are not primary sources and do not count toward this cap. More primary sources mean reviewers must
+  retrieve and cross-check more evidence, which compounds review difficulty. When a design requires
+  many sources, group them by domain (see next rule) and create one task per domain.
 
 - **Complex opinions or records: one case per task.** If a claim requires weighing conflicting
   evidence, prior precedent, or domain expertise (e.g., "interpret this vendor's security stance
-  over time" or "evaluate the architectural trade-off here"), include only one such complex case
-  per task. Pair it with simpler, direct-lookup claims to keep the task's total complexity bounded.
-  If a design has multiple complex cases, make them separate tasks.
+  over time"), include only one such complex case per task. If a design has multiple complex cases,
+  make them separate tasks.
 
 - **Cross-file mappings: split by item domain, not by file.** When mapping items across files
   (e.g., "list all deprecated APIs in the codebase" or "inventory all subsystems that import X"),
   decompose by the *origin domain* of the items, not by their file locations. For example, if a
-  task is "audit security advisories in go.mod and package.json", split it into one research task
-  for Go ecosystem advisories and one for JavaScript ecosystem advisories — not "audit go.mod" and
-  "audit package.json". This keeps related items together and makes findings reusable.
+  task is "audit a mapping file that lists legal compliance requirements for jurisdictions A, B
+  and C", split it into one research task per jurisdiction — not "audit file part 1" and "audit
+  file part 2". This keeps related items together and makes findings reusable.
 
-- **After budget block: decompose for independent verification.** When a research task reaches its
-  round budget without passing (marked `blocked` with reason `decompose`), the owner decomposes it
-  into smaller tasks before resubmitting any of them. Decompose by claim independence: if you can
-  verify claims A and B separately and both are correct, they are independent. Group independent
-  claims into new tasks such that each is reviewable in two rounds. This is not a retry of the same
-  task; it is a redesign into tasks that reviewers can pass. If individual claims from the blocked
-  task are correct but the task as a whole failed, new tasks for the passing claims can be marked
-  as dependencies of a reworked task that addresses only the failing claims, allowing partial
-  progress to land.
+- **After budget block: decompose, not unblock or escalate.** When a research task reaches its round
+  budget without passing (marked `blocked` with reason `decompose`), decompose it into smaller tasks
+  rather than releasing, unblocking, or escalating the original. The round budget counts across a
+  task's entire supersede chain, so a replacement task created by superseding the blocked one would
+  inherit its exhausted budget and would immediately hit the block again. Decompose by claim
+  independence: if you can verify claims A and B separately and both are correct, they are
+  independent. Create fresh tasks (not superseding the blocked task) from these independent claims.
+  This redesigns the work into tasks that reviewers can pass.
 
 ## Phase 5 — Register + hand off
 
