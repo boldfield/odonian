@@ -4302,6 +4302,255 @@ func TestResearchAggregation_IndependentLadders(t *testing.T) {
 	}
 }
 
+// TestResearchAggregation_TopTierBlocks verifies that a research task at the top
+// tier of a configured research ladder blocks instead of escalating when its
+// threshold is exceeded.
+func TestResearchAggregation_TopTierBlocks(t *testing.T) {
+	// Research ladder: sonnet -> opus (opus is top tier)
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithResearchEscalationLadder([]string{"sonnet", "opus"}),
+		WithResearchEscalationThresholds(map[string]int{"sonnet": 1, "opus": 1}))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+	proj, err := store.CreateProject(ctx, "test", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create research task starting at opus (top tier)
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research task",
+			Spec:         "research",
+			DocumentID:   doc.ID,
+			Model:        "opus",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+			Escalate:     ptrBool(true),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	taskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	// Use maxReviewRounds=0 so any review triggers the circuit breaker
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Impl", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 0, nil, nil); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	// Get and reject reviews to exceed threshold
+	opusRev, sonnetRev := findResearchReviewTasks(t, store, ctx, proj.ID, taskID, 1)
+	if opusRev == nil {
+		t.Fatalf("no opus review task")
+	}
+	if sonnetRev == nil {
+		t.Fatalf("no sonnet review task")
+	}
+
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+	submitResearchReviewWithThresholds(t, store, ctx, opusRev, "opus-reviewer", "reject", blocking, 0, nil, nil)
+	submitResearchReviewWithThresholds(t, store, ctx, sonnetRev, "sonnet-reviewer", "reject", blocking, 0, nil, nil)
+
+	// Check that task blocked (not escalated)
+	final, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if final.State != "blocked" {
+		t.Errorf("top-tier research task should block, got state %s", final.State)
+	}
+	if final.SupersededBy != nil {
+		t.Errorf("top-tier research task should not escalate, but was superseded by %s", *final.SupersededBy)
+	}
+}
+
+// TestResearchAggregation_EscalateFalseBlocks verifies that a research task with
+// escalate=false blocks instead of escalating, even when a research ladder is configured.
+func TestResearchAggregation_EscalateFalseBlocks(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithResearchEscalationLadder([]string{"sonnet", "opus"}))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+	proj, err := store.CreateProject(ctx, "test", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create research task with escalate=false
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research task",
+			Spec:         "research",
+			DocumentID:   doc.ID,
+			Model:        "sonnet",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+			Escalate:     ptrBool(false), // Explicitly disabled
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	taskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "sonnet", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	// Use maxReviewRounds=0 so any review triggers the circuit breaker
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Impl", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 0, nil, nil); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	// Get and reject reviews to exceed threshold
+	opusRev, sonnetRev := findResearchReviewTasks(t, store, ctx, proj.ID, taskID, 1)
+	if opusRev == nil {
+		t.Fatalf("no opus review task")
+	}
+	if sonnetRev == nil {
+		t.Fatalf("no sonnet review task")
+	}
+
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+	submitResearchReviewWithThresholds(t, store, ctx, opusRev, "opus-reviewer", "reject", blocking, 0, nil, nil)
+	submitResearchReviewWithThresholds(t, store, ctx, sonnetRev, "sonnet-reviewer", "reject", blocking, 0, nil, nil)
+
+	// Check that task blocked (not escalated) even though it's below top tier
+	final, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if final.State != "blocked" {
+		t.Errorf("escalate=false research task should block, got state %s", final.State)
+	}
+	if final.SupersededBy != nil {
+		t.Errorf("escalate=false research task should not escalate, but was superseded by %s", *final.SupersededBy)
+	}
+}
+
+// TestResearchAggregation_BuildTasksUnchanged verifies that build/design tasks
+// continue to escalate via the build ladder and thresholds even when a different
+// research ladder and thresholds are configured.
+func TestResearchAggregation_BuildTasksUnchanged(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithEscalationLadder([]string{"haiku", "sonnet"}),
+		WithEscalationThresholds(map[string]int{"haiku": 1}),
+		WithResearchEscalationLadder([]string{"sonnet", "opus"}),
+		WithResearchEscalationThresholds(map[string]int{"sonnet": 10}))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+	proj, err := store.CreateProject(ctx, "test", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a build task (not research)
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Build task",
+			Spec:         "build something",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"sonnet"},
+			Track:        "build",
+			Escalate:     ptrBool(true),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	buildTaskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, buildTaskID); err != nil {
+		t.Fatalf("failed to promote: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, buildTaskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	// Submit with haiku threshold of 0 so escalation triggers immediately on rejection
+	if _, err := store.SubmitTask(ctx, buildTaskID, "agent-1", "Impl", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 5, map[string]int{"haiku": 0}, nil); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	// Get review task and reject it
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	var buildRev *Task
+	for i := range allTasks {
+		tk := allTasks[i]
+		if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == buildTaskID && tk.State == "ready" {
+			buildRev = &tk
+			break
+		}
+	}
+	if buildRev == nil {
+		t.Fatalf("no build review task")
+	}
+
+	if _, err := store.ClaimTask(ctx, buildRev.ID, "sonnet-reviewer", "sonnet", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim build review: %v", err)
+	}
+
+	reject := "reject"
+	if _, err := store.SubmitTask(ctx, buildRev.ID, "sonnet-reviewer", "Needs work", &reject, []LinkInput{}, 5, map[string]int{"haiku": 0}, nil); err != nil {
+		t.Fatalf("failed to submit build review: %v", err)
+	}
+
+	// Check that build task escalated (not blocked)
+	buildFinal, err := store.GetTask(ctx, buildTaskID)
+	if err != nil {
+		t.Fatalf("failed to get build task: %v", err)
+	}
+	if buildFinal.State != "superseded" {
+		t.Errorf("build task should escalate, got state %s", buildFinal.State)
+	}
+	if buildFinal.SupersededBy == nil {
+		t.Fatalf("build task should have been superseded")
+	}
+	escalatedBuild, err := store.GetTask(ctx, *buildFinal.SupersededBy)
+	if err != nil {
+		t.Fatalf("failed to get escalated build task: %v", err)
+	}
+	if escalatedBuild.Model != "sonnet" {
+		t.Errorf("build task should escalate to sonnet, got %s", escalatedBuild.Model)
+	}
+}
+
 // findResearchFollowUps returns every backlog follow-up task linked (via a
 // research_parent task_link) to the given research parent.
 func findResearchFollowUps(t *testing.T, store Store, ctx context.Context, projID, parentID string) []Task {
@@ -4757,7 +5006,7 @@ func TestResearchFollowUps_Idempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to begin tx: %v", err)
 	}
-	if _, err := ss.aggregateReviewRound(ctx, tx, parentID, 5, map[string]int{}, map[string]int{}); err != nil {
+	if _, err := ss.aggregateReviewRound(ctx, tx, parentID, 5, map[string]int{}, []string{}, map[string]int{}); err != nil {
 		tx.Rollback()
 		t.Fatalf("failed to re-run aggregation: %v", err)
 	}
@@ -5200,7 +5449,7 @@ func TestResearchFollowUps_StillOpenChainYieldsOneFollowUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to begin tx: %v", err)
 	}
-	if _, err := ss.aggregateReviewRound(ctx, tx, parentID, 5, map[string]int{}, map[string]int{}); err != nil {
+	if _, err := ss.aggregateReviewRound(ctx, tx, parentID, 5, map[string]int{}, []string{}, map[string]int{}); err != nil {
 		tx.Rollback()
 		t.Fatalf("failed to re-run aggregation: %v", err)
 	}

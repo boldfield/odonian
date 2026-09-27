@@ -1890,12 +1890,18 @@ func thresholdFor(model string, escalationThresholds map[string]int, maxReviewRo
 	return maxReviewRounds
 }
 
-func researchThresholdFor(model string, researchThresholds map[string]int, maxReviewRounds int) int {
-	if len(researchThresholds) > 0 {
+func researchThresholdFor(model string, researchLadder []string, researchThresholds map[string]int, maxReviewRounds int) int {
+	// Research thresholds only apply if a research ladder is configured
+	if len(researchLadder) == 0 {
+		return maxReviewRounds
+	}
+	// If model is on the research ladder, use its threshold if configured
+	if slices.Contains(researchLadder, model) {
 		if threshold, ok := researchThresholds[model]; ok {
 			return threshold
 		}
 	}
+	// Model not on ladder, or no threshold configured for it: use max rounds
 	return maxReviewRounds
 }
 
@@ -2158,7 +2164,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			}
 
 			// Aggregate review verdicts and update parent state as needed
-			_, err = s.aggregateReviewRound(ctx, tx, *targetTaskID, maxReviewRounds, escalationThresholds, researchEscalationThresholds)
+			_, err = s.aggregateReviewRound(ctx, tx, *targetTaskID, maxReviewRounds, escalationThresholds, s.researchEscalationLadder, researchEscalationThresholds)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, err
 			}
@@ -2816,7 +2822,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 // escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
 // A return value of "" means no state change needed. Caller must apply the returned state.
 // All state updates and event appending happen within this function.
-func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, parentID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (string, error) {
+func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, parentID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationLadder []string, researchEscalationThresholds map[string]int) (string, error) {
 	now := nowTimestamp()
 
 	var parentReviewRound int
@@ -2924,7 +2930,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 
 			if parentTrack == "research" {
 				// Research tasks use research-specific escalation
-				threshold = researchThresholdFor(parentModel, researchEscalationThresholds, maxReviewRounds)
+				threshold = researchThresholdFor(parentModel, researchEscalationLadder, researchEscalationThresholds, maxReviewRounds)
 				isTopTier = s.isResearchTopTier(parentModel)
 				if parentEscalate && !isTopTier {
 					nextModel, hasNextTier = s.researchNextTier(parentModel)
@@ -3902,7 +3908,7 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 
 		// If all review tasks are done, aggregate the round
 		if totalReviewTasks > 0 && doneReviewTasks == totalReviewTasks {
-			_, err = s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds, researchEscalationThresholds)
+			_, err = s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds, s.researchEscalationLadder, researchEscalationThresholds)
 			if err != nil {
 				return Task{}, err
 			}
