@@ -3471,6 +3471,111 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 	return t, nil
 }
 
+// researchHistorySentinel marks the start of a generated research-compaction block in
+// a task's spec. It is an HTML comment rather than a plain heading so it can never
+// collide with a heading a human happens to write in a research assignment (unlike a
+// plain "## Research task history" marker, which a user could write by accident and
+// have silently truncated).
+const researchHistorySentinel = "<!-- odonian:research-compaction -->"
+
+// extractOriginalAssignment recovers a research task's original assignment by
+// stripping any generated compaction block (history and unresolved-findings sections)
+// appended by a prior supersession. It cuts at researchHistorySentinel, which
+// supersedeTaskTx always writes immediately before that block, so a spec without the
+// sentinel (the true original assignment, or user content that merely mentions
+// "research task history" in prose) is returned unchanged. Trailing newlines are
+// trimmed so re-attaching a fresh block is idempotent across repeated supersessions.
+func extractOriginalAssignment(spec string) string {
+	idx := strings.Index(spec, researchHistorySentinel)
+	if idx == -1 {
+		return spec
+	}
+	return strings.TrimRight(spec[:idx], "\n")
+}
+
+// getUnresolvedFindingsFromLastRound returns the findings from taskID's last review
+// round that are still outstanding, per docs/features/research-track.md section 7:
+// the replacement spec on supersession attaches only these, not the task's full
+// review history. It reuses collectResearchReviewFindings and researchFindingChains,
+// the same prior_id lineage tracking createResearchFollowUpTasks and
+// describeChainWideBlockingFindings use, so "unresolved" here has the same meaning
+// everywhere in the research track: not itself resolved, and not settled by a later
+// resolved report in its chain. Findings are deduplicated by (severity, file, line,
+// summary) so the same finding raised by two reviewers in the same round is listed
+// once. Returns nil if the task has no review rounds yet or every finding from the
+// last round is resolved.
+func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx *sql.Tx, taskID string) ([]Finding, error) {
+	var maxRound int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(review_round), 0) FROM task WHERE target_task_id = ? AND kind = 'review'
+	`, taskID).Scan(&maxRound); err != nil {
+		return nil, fmt.Errorf("failed to find max review round: %w", err)
+	}
+	if maxRound == 0 {
+		return nil, nil
+	}
+
+	allFindings, err := s.collectResearchReviewFindings(ctx, tx, taskID, maxRound)
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect review findings: %w", err)
+	}
+	_, isOutstanding := researchFindingChains(allFindings)
+
+	seen := make(map[string]bool, len(allFindings))
+	var unresolved []Finding
+	for i, cf := range allFindings {
+		if cf.round != maxRound || !isOutstanding(i) {
+			continue
+		}
+		key := fmt.Sprintf("%s\x00%s\x00%d\x00%s", cf.Severity, cf.File, cf.Line, cf.Summary)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		unresolved = append(unresolved, cf.Finding)
+	}
+	return unresolved, nil
+}
+
+// buildResearchSupersessionSpec implements docs/features/research-track.md section 7
+// for research tasks: the replacement keeps the original assignment and attaches only
+// the last round's unresolved findings, in structured form, plus a link to the
+// predecessor task. The full round-by-round history is never inlined; it stays in the
+// task's events and in each predecessor's own spec (which itself links further back),
+// so the chain is reconstructible without the spec growing on every supersession.
+func (s *sqliteStore) buildResearchSupersessionSpec(ctx context.Context, tx *sql.Tx, taskID, spec string) (string, error) {
+	originalAssignment := extractOriginalAssignment(spec)
+
+	unresolved, err := s.getUnresolvedFindingsFromLastRound(ctx, tx, taskID)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString(originalAssignment)
+	b.WriteString("\n\n")
+	b.WriteString(researchHistorySentinel)
+	b.WriteString("\n## Research task history\n\n")
+	b.WriteString(fmt.Sprintf("- Predecessor task (superseded): %s\n", taskID))
+	b.WriteString("- The complete round-by-round history lives in the predecessor's events and its own history section; follow the predecessor link back through the chain to see every round.\n")
+
+	if len(unresolved) > 0 {
+		b.WriteString("\n## Unresolved findings from last review round\n\n")
+		for _, f := range unresolved {
+			b.WriteString(fmt.Sprintf("- **%s** (%s, %s:%d): %s\n", f.ID, f.Severity, f.File, f.Line, f.Summary))
+		}
+		data, err := json.Marshal(unresolved)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal unresolved findings: %w", err)
+		}
+		b.WriteString("\n**Structured findings (JSON):**\n```json\n")
+		b.Write(data)
+		b.WriteString("\n```\n")
+	}
+
+	return b.String(), nil
+}
+
 // supersedeTaskTx is the core implementation of task supersession.
 // It creates a replacement task with copied fields and dependencies,
 // re-points all dependents, and marks the old task as superseded.
@@ -3505,46 +3610,55 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 		}
 	}
 
-	// 1b. Gather prior reject feedback
-	rows, err := tx.QueryContext(ctx, `
-		SELECT actor, verdict, note FROM event
-		WHERE task_id = ? AND kind IN ('review', 'submit') AND verdict = 'reject'
-		ORDER BY created_at ASC
-	`, taskID)
-	if err != nil {
-		return "", fmt.Errorf("failed to query feedback events: %w", err)
-	}
-	defer rows.Close()
+	// 1b. Gather prior reject feedback (research tasks instead get a compacted spec:
+	// docs/features/research-track.md section 7).
+	if oldTask.Track == "research" {
+		newSpec, err := s.buildResearchSupersessionSpec(ctx, tx, taskID, oldTask.Spec)
+		if err != nil {
+			return "", err
+		}
+		oldTask.Spec = newSpec
+	} else {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT actor, verdict, note FROM event
+			WHERE task_id = ? AND kind IN ('review', 'submit') AND verdict = 'reject'
+			ORDER BY created_at ASC
+		`, taskID)
+		if err != nil {
+			return "", fmt.Errorf("failed to query feedback events: %w", err)
+		}
+		defer rows.Close()
 
-	var feedbackBlock strings.Builder
-	var hasFeedback bool
-	for rows.Next() {
-		var actor string
-		var verdict *string
-		var note *string
-		if err := rows.Scan(&actor, &verdict, &note); err != nil {
-			return "", fmt.Errorf("failed to scan feedback event: %w", err)
+		var feedbackBlock strings.Builder
+		var hasFeedback bool
+		for rows.Next() {
+			var actor string
+			var verdict *string
+			var note *string
+			if err := rows.Scan(&actor, &verdict, &note); err != nil {
+				return "", fmt.Errorf("failed to scan feedback event: %w", err)
+			}
+
+			if !hasFeedback {
+				feedbackBlock.WriteString("## Prior attempt feedback\n\n")
+				hasFeedback = true
+			}
+
+			feedbackBlock.WriteString(fmt.Sprintf("**%s (verdict: %s)**\n", actor, *verdict))
+			if note != nil && *note != "" {
+				feedbackBlock.WriteString(fmt.Sprintf("%s\n", *note))
+			}
+			feedbackBlock.WriteString("\n")
 		}
 
-		if !hasFeedback {
-			feedbackBlock.WriteString("## Prior attempt feedback\n\n")
-			hasFeedback = true
+		if err := rows.Err(); err != nil {
+			return "", fmt.Errorf("failed to iterate feedback events: %w", err)
 		}
 
-		feedbackBlock.WriteString(fmt.Sprintf("**%s (verdict: %s)**\n", actor, *verdict))
-		if note != nil && *note != "" {
-			feedbackBlock.WriteString(fmt.Sprintf("%s\n", *note))
+		// Append feedback to spec if any was found
+		if hasFeedback {
+			oldTask.Spec = oldTask.Spec + "\n\n" + feedbackBlock.String()
 		}
-		feedbackBlock.WriteString("\n")
-	}
-
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("failed to iterate feedback events: %w", err)
-	}
-
-	// Prepend feedback to spec if any was found
-	if hasFeedback {
-		oldTask.Spec = oldTask.Spec + "\n\n" + feedbackBlock.String()
 	}
 
 	// 2. Create replacement task
