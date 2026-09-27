@@ -52,12 +52,15 @@ func (m *BoardModel) buildScorecardContent(scorecards tuiclient.ReviewerScorecar
 
 		b.WriteString(fmt.Sprintf("Reviewer: %s\n", sc.Model))
 		b.WriteString(fmt.Sprintf("Sample Size: %d distinct tasks reviewed\n", sc.SampleSize))
+		if sc.SampleSize < 5 {
+			b.WriteString("⚠ Small sample size — not a reliable comparison\n")
+		}
 		b.WriteString(fmt.Sprintf("Total Review Rounds: %d\n", sc.TotalReviewRounds))
 		b.WriteString("\n")
 
 		// Findings raised by severity
 		b.WriteString("Findings Raised:\n")
-		if sc.FindingsRaised != nil && len(sc.FindingsRaised) > 0 {
+		if len(sc.FindingsRaised) > 0 {
 			for _, severity := range []string{"p1", "p2", "p3"} {
 				if count, ok := sc.FindingsRaised[severity]; ok {
 					b.WriteString(fmt.Sprintf("  %s: %d\n", strings.ToUpper(severity), count))
@@ -78,11 +81,7 @@ func (m *BoardModel) buildScorecardContent(scorecards tuiclient.ReviewerScorecar
 		b.WriteString("\n")
 
 		// Approval quality
-		if sc.ApprovalsWithLaterFixedBlockingFindings > 0 {
-			b.WriteString(fmt.Sprintf("Rounds Approved With Later Fixed Blocking Findings: %d\n", sc.ApprovalsWithLaterFixedBlockingFindings))
-		} else {
-			b.WriteString("Rounds Approved With Later Fixed Blocking Findings: 0\n")
-		}
+		b.WriteString(fmt.Sprintf("Rounds Approved With Later Fixed Blocking Findings: %d\n", sc.ApprovalsWithLaterFixedBlockingFindings))
 
 		b.WriteString("\n")
 		b.WriteString(strings.Repeat("─", m.width))
@@ -93,6 +92,7 @@ func (m *BoardModel) buildScorecardContent(scorecards tuiclient.ReviewerScorecar
 
 // initScorecardViewport initializes the scrollable viewport for the scorecard view.
 func (m *BoardModel) initScorecardViewport(scorecards tuiclient.ReviewerScorecards) {
+	m.lastScorecards = &scorecards
 	content := m.buildScorecardContent(scorecards)
 
 	const reservedLines = 3
@@ -114,7 +114,12 @@ func (m *BoardModel) renderScorecardView() string {
 		b.WriteString(fmt.Sprintf("» %s\n", m.scorecardMessage))
 	}
 
-	b.WriteString(m.scorecardViewport.View())
+	vpContent := m.scorecardViewport.View()
+	if vpContent == "" && m.scorecardMessage == "" {
+		b.WriteString("Loading scorecards…")
+	} else {
+		b.WriteString(vpContent)
+	}
 
 	return b.String()
 }
@@ -145,6 +150,8 @@ func (m *BoardModel) updateScorecardMode(msg tea.KeyMsg) (*BoardModel, tea.Cmd) 
 
 	case "r":
 		m.scorecardMessage = ""
+		m.scorecardViewport.SetContent("")
+		m.lastScorecards = nil
 		return m, m.fetchScorecardCmd()
 
 	case "P":
@@ -156,6 +163,8 @@ func (m *BoardModel) updateScorecardMode(msg tea.KeyMsg) (*BoardModel, tea.Cmd) 
 				break
 			}
 		}
+		m.scorecardViewport.SetContent("")
+		m.lastScorecards = nil
 		return m, m.fetchProjects()
 
 	case "q", "ctrl+c":

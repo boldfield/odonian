@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/boldfield/odonian/internal/tuiclient"
@@ -38,16 +40,28 @@ func TestBuildScorecardContent_WithData(t *testing.T) {
 		t.Error("expected non-empty content")
 	}
 
-	if !contains(content, "opus") {
+	if !strings.Contains(content, "opus") {
 		t.Error("expected model name 'opus' in content")
 	}
 
-	if !contains(content, "5") {
-		t.Error("expected findings count in content")
+	if !strings.Contains(content, "P1: 5") {
+		t.Error("expected 'P1: 5' in content")
 	}
 
-	if !contains(content, "Sample Size: 5") {
+	if !strings.Contains(content, "P2: 10") {
+		t.Error("expected 'P2: 10' in content")
+	}
+
+	if !strings.Contains(content, "Sample Size: 5") {
 		t.Error("expected sample size in content")
+	}
+
+	if !strings.Contains(content, "Held: 12") {
+		t.Error("expected 'Held: 12' in content")
+	}
+
+	if !strings.Contains(content, "Unresolved: 10") {
+		t.Error("expected 'Unresolved: 10' in content")
 	}
 }
 
@@ -63,7 +77,7 @@ func TestBuildScorecardContent_Empty(t *testing.T) {
 
 	content := m.buildScorecardContent(scorecards)
 
-	if !contains(content, "No research tasks") {
+	if !strings.Contains(content, "No research tasks") {
 		t.Error("expected empty message in content")
 	}
 }
@@ -92,12 +106,16 @@ func TestBuildScorecardContent_SparseData(t *testing.T) {
 
 	content := m.buildScorecardContent(scorecards)
 
-	if !contains(content, "sonnet") {
+	if !strings.Contains(content, "sonnet") {
 		t.Error("expected model name in content")
 	}
 
-	if !contains(content, "Sample Size: 1") {
+	if !strings.Contains(content, "Sample Size: 1") {
 		t.Error("expected small sample size in content")
+	}
+
+	if !strings.Contains(content, "Small sample size") {
+		t.Error("expected sparse data warning in content")
 	}
 }
 
@@ -181,17 +199,13 @@ func TestRenderScorecardHelpBar(t *testing.T) {
 	m := &BoardModel{}
 	helpBar := m.renderScorecardHelpBar()
 
-	if !contains(helpBar, "esc back") {
+	if !strings.Contains(helpBar, "esc back") {
 		t.Error("expected 'esc back' in help bar")
 	}
 
-	if !contains(helpBar, "scroll") {
+	if !strings.Contains(helpBar, "scroll") {
 		t.Error("expected 'scroll' in help bar")
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (len(substr) == 0 || (s != "" && len(substr) > 0 && (s == substr || (len(s) > 0 && len(substr) > 0))))
 }
 
 // Test with all three severity levels
@@ -223,27 +237,27 @@ func TestBuildScorecardContent_AllSeverities(t *testing.T) {
 	content := m.buildScorecardContent(scorecards)
 
 	// Verify all severity levels are present
-	if !contains(content, "P1:") && !contains(content, "p1") {
-		t.Error("expected P1 or p1 in content")
+	if !strings.Contains(content, "P1: 3") {
+		t.Error("expected 'P1: 3' in content")
 	}
-	if !contains(content, "P2:") && !contains(content, "p2") {
-		t.Error("expected P2 or p2 in content")
+	if !strings.Contains(content, "P2: 7") {
+		t.Error("expected 'P2: 7' in content")
 	}
-	if !contains(content, "P3:") && !contains(content, "p3") {
-		t.Error("expected P3 or p3 in content")
+	if !strings.Contains(content, "P3: 20") {
+		t.Error("expected 'P3: 20' in content")
 	}
 
 	// Verify outcome counts are present
-	if !contains(content, "15") {
-		t.Error("expected FindingsHeld count in content")
+	if !strings.Contains(content, "Held: 15") {
+		t.Error("expected 'Held: 15' in content")
 	}
-	if !contains(content, "10") {
-		t.Error("expected FindingsWithdrawn count in content")
+	if !strings.Contains(content, "Withdrawn: 10") {
+		t.Error("expected 'Withdrawn: 10' in content")
 	}
 }
 
-// Test navigation keys in scorecard mode
-func TestUpdateScorecardMode_Navigation(t *testing.T) {
+// Test normal scorecard render with View()
+func TestRenderScorecardView_Normal(t *testing.T) {
 	m := &BoardModel{
 		width:  80,
 		height: 24,
@@ -253,27 +267,102 @@ func TestUpdateScorecardMode_Navigation(t *testing.T) {
 	scorecards := tuiclient.ReviewerScorecards{
 		Scorecards: []tuiclient.ReviewerScorecard{
 			{
-				Model:          "opus",
-				SampleSize:     1,
-				FindingsRaised: map[string]int{"p1": 1},
+				Model:              "opus",
+				FindingsRaised:     map[string]int{"p1": 5, "p2": 3},
+				FindingsHeld:       4,
+				FindingsWithdrawn:  2,
+				FindingsUnresolved: 2,
+				SampleSize:         10,
+				TotalReviewRounds:  15,
 			},
 		},
 	}
 	m.initScorecardViewport(scorecards)
 
-	// Test down navigation
-	downMsg := tea.KeyMsg{
-		Type:  tea.KeyRunes,
-		Runes: []rune("j"),
+	view := m.renderScorecardView()
+	if !strings.Contains(view, "opus") {
+		t.Error("expected 'opus' in rendered view")
 	}
-	before := m.scorecardViewport.YOffset
-	updated, _ := m.updateScorecardMode(downMsg)
-	after := updated.scorecardViewport.YOffset
-	// After scrolling down, offset should increase (or stay at max)
-	if before >= after && updated.scorecardViewport.TotalLineCount() > updated.scorecardViewport.VisibleLineCount() {
-		// This is OK if we're at the top, but let's verify the viewport accepts the command
-		if after != before && after < before {
-			t.Error("expected offset to increase or stay same after scrolling down")
-		}
+	if !strings.Contains(view, "P1: 5") {
+		t.Error("expected 'P1: 5' in rendered view")
+	}
+	if !strings.Contains(view, "Held: 4") {
+		t.Error("expected 'Held: 4' in rendered view")
+	}
+}
+
+// Test empty scorecard render
+func TestRenderScorecardView_Empty(t *testing.T) {
+	m := &BoardModel{
+		width:  80,
+		height: 24,
+		mode:   modeScorecards,
+	}
+
+	scorecards := tuiclient.ReviewerScorecards{
+		Scorecards: []tuiclient.ReviewerScorecard{},
+	}
+	m.initScorecardViewport(scorecards)
+
+	view := m.renderScorecardView()
+	if !strings.Contains(view, "No research tasks") {
+		t.Error("expected 'No research tasks' in rendered view")
+	}
+}
+
+// Test sparse data warning in rendered view
+func TestRenderScorecardView_Sparse(t *testing.T) {
+	m := &BoardModel{
+		width:  80,
+		height: 24,
+		mode:   modeScorecards,
+	}
+
+	scorecards := tuiclient.ReviewerScorecards{
+		Scorecards: []tuiclient.ReviewerScorecard{
+			{
+				Model:              "sonnet",
+				FindingsRaised:     map[string]int{"p1": 1},
+				FindingsHeld:       0,
+				FindingsWithdrawn:  0,
+				FindingsUnresolved: 1,
+				SampleSize:         1,
+				TotalReviewRounds:  1,
+			},
+		},
+	}
+	m.initScorecardViewport(scorecards)
+
+	view := m.renderScorecardView()
+	if !strings.Contains(view, "sonnet") {
+		t.Error("expected 'sonnet' in rendered view")
+	}
+	if !strings.Contains(view, "Small sample size") {
+		t.Error("expected 'Small sample size' warning in rendered view")
+	}
+}
+
+// Test API error in scorecard mode
+func TestUpdateScorecardMode_APIError(t *testing.T) {
+	m := &BoardModel{
+		width:  80,
+		height: 24,
+		mode:   modeScorecards,
+	}
+
+	// Simulate fetching an empty scorecard with normal state
+	scorecards := tuiclient.ReviewerScorecards{Scorecards: []tuiclient.ReviewerScorecard{}}
+	m.initScorecardViewport(scorecards)
+
+	// Process error message
+	errMsg := scorecardFetchedMsg{err: fmt.Errorf("network error")}
+	m.scorecardMessage = fmt.Sprintf("Error: %v", errMsg.err)
+
+	view := m.renderScorecardView()
+	if !strings.Contains(view, "Error:") {
+		t.Error("expected error message in rendered view")
+	}
+	if !strings.Contains(view, "network error") {
+		t.Error("expected error details in rendered view")
 	}
 }

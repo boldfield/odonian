@@ -105,6 +105,7 @@ type BoardModel struct {
 	// Scorecard view state
 	scorecardViewport viewport.Model
 	scorecardMessage  string
+	lastScorecards    *tuiclient.ReviewerScorecards // cached for rebuild on resize
 
 	// Project switcher state
 	projects           []tuiclient.Project // cached list of all projects
@@ -772,16 +773,8 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.initDetailViewport(m.detailTask)
 		}
 		// Reinitialize the scorecard viewport if we're in scorecard mode.
-		if m.mode == modeScorecards {
-			// Create a minimal scorecard object for resizing (content stays the same)
-			// The viewport is already initialized; just resize it
-			if m.scorecardViewport.Width > 0 {
-				m.scorecardViewport.Width = m.width
-				m.scorecardViewport.Height = m.height - 3 // Account for help bar
-				if m.scorecardViewport.Height < 3 {
-					m.scorecardViewport.Height = 3
-				}
-			}
+		if m.mode == modeScorecards && m.lastScorecards != nil {
+			m.initScorecardViewport(*m.lastScorecards)
 		}
 		return m, nil
 
@@ -1004,6 +997,8 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			m.mode = modeScorecards
 			m.scorecardMessage = ""
+			m.scorecardViewport.SetContent("")
+			m.lastScorecards = nil
 			return m, m.fetchScorecardCmd()
 
 		// Help (stub for TUI-3+)
@@ -1029,10 +1024,13 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			// Stay in scorecard mode but show error message.
 			m.scorecardMessage = fmt.Sprintf("Error: %v", msg.err)
+			m.scorecardViewport.SetContent("")
+			m.lastScorecards = nil
 			return m, nil
 		}
 		// Initialize the viewport with the scorecard content.
 		m.initScorecardViewport(msg.scorecards)
+		m.scorecardMessage = ""
 		return m, nil
 
 	case openerResultMsg:
