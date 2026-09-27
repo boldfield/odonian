@@ -206,6 +206,19 @@ func runServer() {
 		log.Fatalf("failed to parse ODONIAN_RESEARCH_ESCALATION_LADDER: %v", err)
 	}
 
+	// Parse research round budget
+	researchRoundBudgetStr := os.Getenv("ODONIAN_RESEARCH_ROUND_BUDGET")
+	if researchRoundBudgetStr == "" {
+		researchRoundBudgetStr = "6"
+	}
+	researchRoundBudget, err := strconv.Atoi(researchRoundBudgetStr)
+	if err != nil {
+		log.Fatalf("failed to parse ODONIAN_RESEARCH_ROUND_BUDGET: %v", err)
+	}
+	if researchRoundBudget <= 0 {
+		log.Fatalf("ODONIAN_RESEARCH_ROUND_BUDGET must be positive, got %d", researchRoundBudget)
+	}
+
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
 	if eventTerminalRetentionDaysStr == "" {
@@ -274,7 +287,7 @@ func runServer() {
 	}
 
 	// Create API server
-	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, researchEscalationThresholds, pprofEnabled, slowRequestThresholdMs, logger)
+	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, pprofEnabled, slowRequestThresholdMs, logger)
 
 	// Set up graceful shutdown with signal handling
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

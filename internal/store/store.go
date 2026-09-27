@@ -48,13 +48,13 @@ type Store interface {
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error)
 	PromoteTask(ctx context.Context, taskID string) (Task, error)
-	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error)
+	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
-	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (Task, error)
+	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error)
 	ArchiveTask(ctx context.Context, taskID string) (Task, error)
 	UnarchiveTask(ctx context.Context, taskID string) (Task, error)
 	ArchiveProject(ctx context.Context, projectID string) (Project, error)
@@ -1887,7 +1887,7 @@ func researchThresholdFor(model string, researchLadder []string, researchThresho
 // Returns ValidationError if a link kind is invalid or verdict is missing/invalid.
 // Returns ErrNotFound if the task doesn't exist.
 // Returns ErrConflict if the task is not in_progress or not assigned to the given agentID.
-func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error) {
+func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error) {
 	// Validate link kinds first (before mutating anything).
 	// "no_op" marks a review-verified no-op resolution: a worker that finds the
 	// acceptance criteria already satisfied on main with no diff submits with a
@@ -2140,7 +2140,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			}
 
 			// Aggregate review verdicts and update parent state as needed
-			_, err = s.aggregateReviewRound(ctx, tx, *targetTaskID, maxReviewRounds, escalationThresholds, s.researchEscalationLadder, researchEscalationThresholds)
+			_, err = s.aggregateReviewRound(ctx, tx, *targetTaskID, maxReviewRounds, escalationThresholds, s.researchEscalationLadder, researchEscalationThresholds, researchRoundBudget)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, err
 			}
@@ -2793,12 +2793,76 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 	return createdIDs, nil
 }
 
+// countChainWideRejectedRounds counts the total number of rejected review rounds
+// across a research task and all its predecessors in the supersede chain.
+// Each task's review_round counts as one rejected round for research tracks.
+// Walks backward from the current task to its predecessors using the superseded_by relationship.
+func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.Tx, taskID string) (int, error) {
+	count := 0
+	seen := make(map[string]bool)
+
+	var toVisit []string
+	toVisit = append(toVisit, taskID)
+
+	for len(toVisit) > 0 {
+		currentID := toVisit[0]
+		toVisit = toVisit[1:]
+
+		if seen[currentID] {
+			continue
+		}
+		seen[currentID] = true
+
+		var reviewRound int
+		var track string
+		err := tx.QueryRowContext(ctx, `
+			SELECT review_round, track FROM task WHERE id = ?
+		`, currentID).Scan(&reviewRound, &track)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
+			return 0, fmt.Errorf("failed to fetch task for chain count: %w", err)
+		}
+
+		// Only count rejected rounds for research tasks
+		if track == "research" && reviewRound > 0 {
+			count += reviewRound
+		}
+
+		// Find predecessors: tasks where superseded_by = currentID
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id FROM task WHERE superseded_by = ?
+		`, currentID)
+		if err != nil {
+			return 0, fmt.Errorf("failed to find predecessors: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var predID string
+			if err := rows.Scan(&predID); err != nil {
+				return 0, fmt.Errorf("failed to scan predecessor: %w", err)
+			}
+			if !seen[predID] {
+				toVisit = append(toVisit, predID)
+			}
+		}
+
+		if err := rows.Err(); err != nil {
+			return 0, fmt.Errorf("failed to iterate predecessors: %w", err)
+		}
+	}
+
+	return count, nil
+}
+
 // aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.
 // It handles: verdict counting, merge task spawning (if approved with agent_merge),
 // escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
 // A return value of "" means no state change needed. Caller must apply the returned state.
 // All state updates and event appending happen within this function.
-func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, parentID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationLadder []string, researchEscalationThresholds map[string]int) (string, error) {
+func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, parentID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationLadder []string, researchEscalationThresholds map[string]int, researchRoundBudget int) (string, error) {
 	now := nowTimestamp()
 
 	var parentReviewRound int
@@ -2811,6 +2875,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 	var parentDocumentID string
 	var parentTitle string
 	var parentTrack string
+	var parentBlockReason *string
 	err := tx.QueryRowContext(ctx, `
 		SELECT review_round, state, held, model, escalate, agent_merge, project_id, document_id, title, track FROM task WHERE id = ?
 	`, parentID).Scan(&parentReviewRound, &parentState, &parentHeld, &parentModel, &parentEscalate, &parentAgentMerge, &parentProjectID, &parentDocumentID, &parentTitle, &parentTrack)
@@ -2896,67 +2961,118 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 				}
 			}
 		} else {
-			// Circuit breaker: if review_round > threshold, check escalation vs blocking.
-			// Shared by build/design (verdict rejection) and research (blocking finding),
-			// so the two paths can't drift.
-			var threshold int
-			var isTopTier bool
-			var nextModel string
-			var hasNextTier bool
-
+			// For research tasks, check the chain-wide round budget before escalation.
+			// The budget takes precedence and must not reset on supersession.
+			var shouldBlockForBudget bool
+			var chainWideRejectedRounds int
 			if parentTrack == "research" {
-				// Research tasks use research-specific escalation
-				threshold = researchThresholdFor(parentModel, researchEscalationLadder, researchEscalationThresholds, maxReviewRounds)
-				isTopTier = s.isResearchTopTier(parentModel)
-				if parentEscalate && !isTopTier {
-					nextModel, hasNextTier = s.researchNextTier(parentModel)
+				chainWideRejectedRounds, err = s.countChainWideRejectedRounds(ctx, tx, parentID)
+				if err != nil {
+					return "", err
 				}
-			} else {
-				// Build and design tasks use standard escalation
-				threshold = thresholdFor(parentModel, escalationThresholds, maxReviewRounds)
-				isTopTier = s.isTopTier(parentModel)
-				if parentEscalate && !isTopTier {
-					nextModel, hasNextTier = s.nextTier(parentModel)
+				if chainWideRejectedRounds > researchRoundBudget {
+					shouldBlockForBudget = true
 				}
 			}
 
-			if parentReviewRound > threshold {
-				// Threshold exceeded: escalate if enabled and not top tier, else block
-				if parentEscalate && !isTopTier && hasNextTier {
-					// Escalate to next tier via supersession
-					escalatedTaskID, err := s.supersedeTaskTx(ctx, tx, parentID, &nextModel)
+			if shouldBlockForBudget {
+				// Budget exceeded: block with reason decompose
+				newParentState = "blocked"
+				// Collect blocking findings from all rounds for the event note
+				var findings []string
+				for round := 1; round <= parentReviewRound; round++ {
+					rowsFind, err := tx.QueryContext(ctx, `
+						SELECT DISTINCT findings FROM event
+						WHERE task_id IN (
+							SELECT id FROM task WHERE target_task_id = ? AND review_round = ?
+						)
+						AND kind = 'review' AND findings IS NOT NULL
+						ORDER BY created_at ASC
+					`, parentID, round)
 					if err != nil {
-						return "", fmt.Errorf("failed to escalate task: %w", err)
+						return "", fmt.Errorf("failed to fetch findings for round %d: %w", round, err)
 					}
-					// Promote the escalated task from backlog to ready so the higher-tier worker can claim it immediately
-					_, err = tx.ExecContext(ctx, `
+					for rowsFind.Next() {
+						var findingsJSON *string
+						if err := rowsFind.Scan(&findingsJSON); err != nil {
+							rowsFind.Close()
+							return "", fmt.Errorf("failed to scan findings: %w", err)
+						}
+						if findingsJSON != nil && *findingsJSON != "" {
+							findings = append(findings, *findingsJSON)
+						}
+					}
+					rowsFind.Close()
+				}
+				eventNote := fmt.Sprintf("Chain-wide budget exhausted at %d rounds (threshold: %d); needs decomposition", chainWideRejectedRounds, researchRoundBudget)
+				if len(findings) > 0 {
+					eventNote += "; unresolved blocking findings: " + strings.Join(findings, "; ")
+				}
+				// We'll append the event after the state update at the end
+				parentBlockReason = &eventNote
+			} else {
+				// Circuit breaker: if review_round > threshold, check escalation vs blocking.
+				// Shared by build/design (verdict rejection) and research (blocking finding),
+				// so the two paths can't drift.
+				var threshold int
+				var isTopTier bool
+				var nextModel string
+				var hasNextTier bool
+
+				if parentTrack == "research" {
+					// Research tasks use research-specific escalation
+					threshold = researchThresholdFor(parentModel, researchEscalationLadder, researchEscalationThresholds, maxReviewRounds)
+					isTopTier = s.isResearchTopTier(parentModel)
+					if parentEscalate && !isTopTier {
+						nextModel, hasNextTier = s.researchNextTier(parentModel)
+					}
+				} else {
+					// Build and design tasks use standard escalation
+					threshold = thresholdFor(parentModel, escalationThresholds, maxReviewRounds)
+					isTopTier = s.isTopTier(parentModel)
+					if parentEscalate && !isTopTier {
+						nextModel, hasNextTier = s.nextTier(parentModel)
+					}
+				}
+
+				if parentReviewRound > threshold {
+					// Threshold exceeded: escalate if enabled and not top tier, else block
+					if parentEscalate && !isTopTier && hasNextTier {
+						// Escalate to next tier via supersession
+						escalatedTaskID, err := s.supersedeTaskTx(ctx, tx, parentID, &nextModel)
+						if err != nil {
+							return "", fmt.Errorf("failed to escalate task: %w", err)
+						}
+						// Promote the escalated task from backlog to ready so the higher-tier worker can claim it immediately
+						_, err = tx.ExecContext(ctx, `
 						UPDATE task
 						SET state='ready', updated_at=?
 						WHERE id=?
 					`, now, escalatedTaskID)
-					if err != nil {
-						return "", fmt.Errorf("failed to promote escalated task: %w", err)
+						if err != nil {
+							return "", fmt.Errorf("failed to promote escalated task: %w", err)
+						}
+						// Append transition event for the escalated task
+						escalationNote := "backlog->ready (auto-promoted via escalation)"
+						_, err = s.AppendEvent(ctx, tx, escalatedTaskID, "system", "transition", nil, &escalationNote)
+						if err != nil {
+							return "", fmt.Errorf("failed to append escalation transition event: %w", err)
+						}
+						// Emit escalation event on the old (now superseded) task
+						eventNote := fmt.Sprintf("%s→%s round %d, superseded by %s", parentModel, nextModel, parentReviewRound, escalatedTaskID)
+						_, err = s.AppendEvent(ctx, tx, parentID, "system", "escalation", nil, &eventNote)
+						if err != nil {
+							return "", fmt.Errorf("failed to append escalation event: %w", err)
+						}
+						// Parent was superseded by supersedeTaskTx, so skip state update logic below
+						newParentState = ""
+					} else {
+						// Escalation disabled or already top tier or no next tier: block
+						newParentState = "blocked"
 					}
-					// Append transition event for the escalated task
-					escalationNote := "backlog->ready (auto-promoted via escalation)"
-					_, err = s.AppendEvent(ctx, tx, escalatedTaskID, "system", "transition", nil, &escalationNote)
-					if err != nil {
-						return "", fmt.Errorf("failed to append escalation transition event: %w", err)
-					}
-					// Emit escalation event on the old (now superseded) task
-					eventNote := fmt.Sprintf("%s→%s round %d, superseded by %s", parentModel, nextModel, parentReviewRound, escalatedTaskID)
-					_, err = s.AppendEvent(ctx, tx, parentID, "system", "escalation", nil, &eventNote)
-					if err != nil {
-						return "", fmt.Errorf("failed to append escalation event: %w", err)
-					}
-					// Parent was superseded by supersedeTaskTx, so skip state update logic below
-					newParentState = ""
 				} else {
-					// Escalation disabled or already top tier or no next tier: block
-					newParentState = "blocked"
+					newParentState = "ready"
 				}
-			} else {
-				newParentState = "ready"
 			}
 		}
 	}
@@ -2979,7 +3095,11 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		} else if newParentState == "ready" {
 			eventNote = "Aggregation: at least one reviewer rejected"
 		} else if newParentState == "blocked" {
-			eventNote = fmt.Sprintf("auto-blocked: %d consecutive review rounds without approval — needs human attention", parentReviewRound)
+			if parentBlockReason != nil {
+				eventNote = *parentBlockReason
+			} else {
+				eventNote = fmt.Sprintf("auto-blocked: %d consecutive review rounds without approval — needs human attention", parentReviewRound)
+			}
 		}
 		_, err = s.AppendEvent(ctx, tx, parentID, "system", "transition", nil, &eventNote)
 		if err != nil {
@@ -3824,7 +3944,7 @@ func (s *sqliteStore) HoldTask(ctx context.Context, taskID string) (Task, error)
 // If the task is in review and all review tasks targeting it are done, aggregates the review round.
 // Returns the updated Task on success.
 // Returns ErrNotFound if the task doesn't exist.
-func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (Task, error) {
+func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
@@ -3884,7 +4004,7 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 
 		// If all review tasks are done, aggregate the round
 		if totalReviewTasks > 0 && doneReviewTasks == totalReviewTasks {
-			_, err = s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds, s.researchEscalationLadder, researchEscalationThresholds)
+			_, err = s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds, s.researchEscalationLadder, researchEscalationThresholds, researchRoundBudget)
 			if err != nil {
 				return Task{}, err
 			}
