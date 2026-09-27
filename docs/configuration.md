@@ -16,6 +16,7 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_ESCALATION_THRESHOLDS` | `haiku=8,sonnet=6,opus=4` | Per-model review-round threshold for build and design tasks. A rejection that pushes a task past its threshold trips the circuit breaker. A malformed value logs a warning and falls back to the defaults. |
 | `ODONIAN_RESEARCH_ESCALATION_LADDER` | unset | Ordered tiers for the review circuit breaker's escalation path for research tasks. Empty or unset means research tasks never change tier on rejection. Every entry must be in `ODONIAN_MODELS`. A configured research ladder operates independently of the build/design ladder. |
 | `ODONIAN_RESEARCH_ESCALATION_THRESHOLDS` | unset (treated as empty map) | Per-model review-round threshold for research tasks. Only applies if `ODONIAN_RESEARCH_ESCALATION_LADDER` is configured. When a research task's model is not on the research ladder, falls back to `ODONIAN_MAX_REVIEW_ROUNDS`. Build and design tasks use `ODONIAN_ESCALATION_THRESHOLDS` exclusively. |
+| `ODONIAN_RESEARCH_ROUND_BUDGET` | `6` | Chain-wide rejected-review-round budget for research tasks (docs/features/research-track.md section 6). Counts rejected rounds across a research task's entire supersede chain — automatic escalation and manual `SupersedeTask` both count, and neither resets it. When the chain-wide count reaches the budget, the task is blocked with reason `decompose` instead of continuing or escalating, whatever its tier. The budget always takes precedence over research escalation: a rejection that would otherwise trip the per-tier circuit breaker blocks instead of escalating if it also reaches the budget. Must be a positive integer; the server refuses to start otherwise. Never applies to build or design tasks. |
 | `ODONIAN_MAX_REVIEW_ROUNDS` | `5` | Threshold fallback for models with no entry in their respective escalation thresholds. |
 | `ODONIAN_LEASE_TTL` | `5m` | Lease granted on claim and extended by each heartbeat. A task whose lease has lapsed is claimable again, so a session that outlives its lease loses the task to another worker. Kept generous in production because renewal is agent-driven. |
 | `ODONIAN_EVENT_TERMINAL_RETENTION_DAYS` | `1` | At startup, audit events for tasks in terminal states older than this are pruned. Events for live tasks are never pruned. |
@@ -35,12 +36,16 @@ Research tasks use a dedicated escalation ladder and thresholds, separate from t
   even when a research ladder is configured.
 - **Round budget via threshold fallback.** When no research ladder is configured, or a research task's
   model is not on the configured research ladder, its threshold falls back to `ODONIAN_MAX_REVIEW_ROUNDS`
-  (default `5`), which acts as a round budget that blocks for decomposition when exceeded. This differs
-  from build/design tasks, whose fallback (for `haiku`, `sonnet`, and `opus`) is the built-in
-  `ODONIAN_ESCALATION_THRESHOLDS` default of `haiku=8,sonnet=6,opus=4`, not `ODONIAN_MAX_REVIEW_ROUNDS`.
-
-The chain-wide round budget (which counts across a task's entire supersede chain) is deferred to
-R8, a future task in `docs/features/research-track.md` milestone 2.
+  (default `5`). This differs from build/design tasks, whose fallback (for `haiku`, `sonnet`, and `opus`)
+  is the built-in `ODONIAN_ESCALATION_THRESHOLDS` default of `haiku=8,sonnet=6,opus=4`, not
+  `ODONIAN_MAX_REVIEW_ROUNDS`.
+- **Chain-wide round budget takes precedence.** Independent of the per-tier threshold above,
+  `ODONIAN_RESEARCH_ROUND_BUDGET` (default `6`) counts rejected review rounds across a research task's
+  entire supersede chain — every escalation and every manual supersession — and never resets. Once the
+  chain-wide count reaches the budget, the task blocks with reason `decompose` instead of escalating or
+  continuing, even if the per-tier threshold hasn't been reached yet. The block event lists the blocking
+  findings from every round in the chain, oldest first, so the owner can see whether they were shrinking
+  or recurring.
 
 ### Runtime profiling with pprof
 

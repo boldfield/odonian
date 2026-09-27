@@ -52,14 +52,15 @@ type Server struct {
 	maxReviewRounds              int
 	escalationThresholds         map[string]int
 	researchEscalationThresholds map[string]int
+	researchRoundBudget          int
 	slowRequestThresholdMs       int
 	logger                       *slog.Logger
 }
 
 // New creates a new API server with the given store, auth token, lease TTL, max review rounds,
-// escalation thresholds, research escalation thresholds, whether pprof debug endpoints should be registered,
-// slow request threshold, and logger.
-func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, pprofEnabled bool, slowRequestThresholdMs int, logger *slog.Logger) *Server {
+// escalation thresholds, research escalation thresholds, research round budget, whether pprof
+// debug endpoints should be registered, slow request threshold, and logger.
+func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, pprofEnabled bool, slowRequestThresholdMs int, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
 
 	server := &Server{
@@ -70,6 +71,7 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 		maxReviewRounds:              maxReviewRounds,
 		escalationThresholds:         escalationThresholds,
 		researchEscalationThresholds: researchEscalationThresholds,
+		researchRoundBudget:          researchRoundBudget,
 		slowRequestThresholdMs:       slowRequestThresholdMs,
 		logger:                       logger,
 	}
@@ -758,7 +760,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Submit the task
-	task, err := s.store.SubmitTask(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, payload.Findings)
+	task, err := s.store.SubmitTask(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget, payload.Findings)
 	if err != nil {
 		// Check if it's a ValidationError (invalid link kind)
 		var validationErr *store.ValidationError
@@ -1137,7 +1139,7 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, err := s.store.ReleaseTask(r.Context(), taskID, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds)
+	task, err := s.store.ReleaseTask(r.Context(), taskID, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget)
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 		return
