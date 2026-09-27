@@ -16003,3 +16003,280 @@ func TestResearchSupersessionDedupedFindingKeepsAllReviewerLineages(t *testing.T
 		t.Errorf("D should carry nothing once both reviewers re-reviewed clean, got: %s", taskD.Spec)
 	}
 }
+
+// TestDisputesValidFindingID verifies that disputes can only reference finding IDs from prior reviews.
+func TestDisputesValidFindingID(t *testing.T) {
+	store, ctx, projID, taskID := newResearchTaskWithEscalationLadder(t, false, []string{"opus"})
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	// Submit initial implementation
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Initial", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, nil); err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskID, 1)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"test finding","in_changed_text":true,"status":"new"}
+	]`))
+
+	// After rejection, task goes back to ready
+	taskAfterReject, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if taskAfterReject.State != "ready" {
+		t.Errorf("after rejection, task should be ready, got: %s", taskAfterReject.State)
+	}
+
+	// Promote and claim for rework
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Valid dispute for finding that exists
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"See page 5 of the source"}]`)
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Rework with dispute", nil, []LinkInput{{Kind: "pr", Value: "#2"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes); err != nil {
+		t.Fatalf("valid dispute should succeed: %v", err)
+	}
+
+	// Now test invalid dispute - finding ID that doesn't exist
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-2", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	invalidDisputes := json.RawMessage(`[{"finding_id":"nonexistent","evidence":"Evidence"}]`)
+	_, err = store.SubmitTask(ctx, taskID, "agent-2", "Another rework", nil, []LinkInput{{Kind: "pr", Value: "#3"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, invalidDisputes)
+	if err == nil {
+		t.Fatal("should reject dispute with nonexistent finding ID")
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Code != "INVALID_FINDING_ID" {
+		t.Errorf("expected INVALID_FINDING_ID error, got: %v", err)
+	}
+}
+
+// TestDisputesDuplicateCheck verifies that a finding cannot be disputed twice.
+func TestDisputesDuplicateCheck(t *testing.T) {
+	store, ctx, projID, taskID := newResearchTaskWithEscalationLadder(t, false, []string{"opus"})
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Initial", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, nil); err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskID, 1)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"test finding","in_changed_text":true,"status":"new"}
+	]`))
+
+	// First rework with dispute
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	disputes1 := json.RawMessage(`[{"finding_id":"f1","evidence":"Evidence for first dispute"}]`)
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Rework with dispute", nil, []LinkInput{{Kind: "pr", Value: "#2"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes1); err != nil {
+		t.Fatalf("first dispute should succeed: %v", err)
+	}
+
+	// Get reviewer task and submit
+	opus2, _ := findResearchReviewTasks(t, store, ctx, projID, taskID, 2)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"test finding","in_changed_text":true,"status":"still_open","prior_id":"f1"}
+	]`))
+
+	// Second rework - trying to dispute the same finding again should fail
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-2", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	disputes2 := json.RawMessage(`[{"finding_id":"f1","evidence":"Different evidence"}]`)
+	_, err := store.SubmitTask(ctx, taskID, "agent-2", "Another rework", nil, []LinkInput{{Kind: "pr", Value: "#3"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes2)
+	if err == nil {
+		t.Fatal("should reject duplicate dispute for same finding")
+	}
+	var validationErr2 *ValidationError
+	if !errors.As(err, &validationErr2) || validationErr2.Code != "DUPLICATE_DISPUTE" {
+		t.Errorf("expected DUPLICATE_DISPUTE error, got: %v", err)
+	}
+}
+
+// TestDisputesEmptyEvidence verifies that disputes with empty evidence are rejected.
+func TestDisputesEmptyEvidence(t *testing.T) {
+	store, ctx, projID, taskID := newResearchTaskWithEscalationLadder(t, false, []string{"opus"})
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Initial", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, nil); err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskID, 1)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"test finding","in_changed_text":true,"status":"new"}
+	]`))
+
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Test empty evidence
+	emptyEvidence := json.RawMessage(`[{"finding_id":"f1","evidence":""}]`)
+	_, err := store.SubmitTask(ctx, taskID, "agent-1", "Rework", nil, []LinkInput{{Kind: "pr", Value: "#2"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, emptyEvidence)
+	if err == nil {
+		t.Fatal("should reject dispute with empty evidence")
+	}
+	var validationErr3 *ValidationError
+	if !errors.As(err, &validationErr3) || validationErr3.Code != "INVALID_DISPUTES" {
+		t.Errorf("expected INVALID_DISPUTES error, got: %v", err)
+	}
+}
+
+// TestDisputesNotAllowedOnNonResearch verifies that disputes are only allowed on research tasks.
+func TestDisputesNotAllowedOnNonResearch(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a build task (track: build)
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Build task", Spec: "Build something", DocumentID: doc.ID, Track: "build"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Promote and claim
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit initial
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Initial", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, nil); err != nil {
+		t.Fatalf("failed to submit initial build task: %v", err)
+	}
+
+	// Get task and verify it went to review
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+
+	// Promote and claim again for rework
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Try to submit with disputes - should fail
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"Evidence"}]`)
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Rework", nil, []LinkInput{{Kind: "pr", Value: "#2"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes)
+	if err == nil {
+		t.Fatal("should reject disputes on non-research tasks")
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Code != "DISPUTES_NOT_ALLOWED" {
+		t.Errorf("expected DISPUTES_NOT_ALLOWED error, got: %v", err)
+	}
+	_ = task
+}
+
+// TestDisputesStoragePersistence verifies that disputes are stored and retrieved correctly.
+func TestDisputesStoragePersistence(t *testing.T) {
+	store, ctx, projID, taskID := newResearchTaskWithEscalationLadder(t, false, []string{"opus"})
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Initial", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, nil); err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskID, 1)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"test finding","in_changed_text":true,"status":"new"}
+	]`))
+
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"Evidence about the source"}]`)
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Rework with dispute", nil, []LinkInput{{Kind: "pr", Value: "#2"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes); err != nil {
+		t.Fatalf("failed to submit with disputes: %v", err)
+	}
+
+	// Verify disputes are stored in events
+	events, err := store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	found := false
+	for _, e := range events {
+		if e.Kind == "submit" && e.Disputes != nil {
+			var ds []Dispute
+			if err := json.Unmarshal(*e.Disputes, &ds); err != nil {
+				t.Fatalf("failed to unmarshal disputes: %v", err)
+			}
+			if len(ds) == 1 && ds[0].FindingID == "f1" && ds[0].Evidence == "Evidence about the source" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("disputes not found in stored events")
+	}
+}

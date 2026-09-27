@@ -572,6 +572,7 @@ type submitTaskRequest struct {
 	Verdict  *string         `json:"verdict,omitempty"`
 	Links    []LinkInput     `json:"links"`
 	Findings json.RawMessage `json:"findings,omitempty"`
+	Disputes json.RawMessage `json:"disputes,omitempty"`
 }
 
 // SubmitTask submits a task result with optional verdict and links.
@@ -581,12 +582,18 @@ func (c *HTTPClient) SubmitTask(ctx context.Context, id, agentID, result string,
 
 // SubmitTaskWithFindings submits a task result with optional verdict, links, and findings.
 func (c *HTTPClient) SubmitTaskWithFindings(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage) error {
+	return c.SubmitTaskWithDisputesAndFindings(ctx, id, agentID, result, verdict, links, findings, nil)
+}
+
+// SubmitTaskWithDisputesAndFindings submits a task result with optional verdict, links, findings, and disputes.
+func (c *HTTPClient) SubmitTaskWithDisputesAndFindings(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage) error {
 	body := submitTaskRequest{
 		AgentID:  agentID,
 		Result:   result,
 		Verdict:  verdict,
 		Links:    links,
 		Findings: findings,
+		Disputes: disputes,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/submit", id), body)

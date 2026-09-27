@@ -853,6 +853,146 @@ type Dispute struct {
 	Evidence  string `json:"evidence"`
 }
 
+// validateDisputeFindingIdentities checks that each disputed finding ID exists in
+// prior review events and hasn't been disputed already in prior submissions.
+// Returns ValidationError if any finding ID is invalid or duplicated.
+func (s *sqliteStore) validateDisputeFindingIdentities(ctx context.Context, tx *sql.Tx, taskID string, disputes []Dispute) error {
+	if len(disputes) == 0 {
+		return nil
+	}
+
+	// Get all review and submit events for this task
+	rows, err := tx.QueryContext(ctx, `
+		SELECT kind, findings, disputes FROM event WHERE task_id = ? ORDER BY created_at, id
+	`, taskID)
+	if err != nil {
+		return fmt.Errorf("failed to query events: %w", err)
+	}
+	defer rows.Close()
+
+	// Collect all finding IDs from review events
+	validFindingIDs := make(map[string]bool)
+	// Collect all disputed finding IDs from prior submissions
+	priorDisputedIDs := make(map[string]bool)
+
+	for rows.Next() {
+		var kind string
+		var findingsText sql.NullString
+		var disputesText sql.NullString
+		if err := rows.Scan(&kind, &findingsText, &disputesText); err != nil {
+			return fmt.Errorf("failed to scan event: %w", err)
+		}
+
+		// Extract finding IDs from review events
+		if kind == "review" && findingsText.Valid {
+			var findings []Finding
+			if err := json.Unmarshal([]byte(findingsText.String), &findings); err == nil {
+				for _, f := range findings {
+					validFindingIDs[f.ID] = true
+				}
+			}
+		}
+
+		// Extract disputed finding IDs from prior submit events
+		if kind == "submit" && disputesText.Valid {
+			var priorDisputes []Dispute
+			if err := json.Unmarshal([]byte(disputesText.String), &priorDisputes); err == nil {
+				for _, d := range priorDisputes {
+					priorDisputedIDs[d.FindingID] = true
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate events: %w", err)
+	}
+
+	// Validate each dispute
+	for i, d := range disputes {
+		// Check if finding ID exists in prior reviews
+		if !validFindingIDs[d.FindingID] {
+			return invalid("INVALID_FINDING_ID", fmt.Sprintf("disputes[%d].finding_id: finding %q not found in prior review events", i, d.FindingID))
+		}
+
+		// Check if this finding has already been disputed
+		if priorDisputedIDs[d.FindingID] {
+			return invalid("DUPLICATE_DISPUTE", fmt.Sprintf("disputes[%d].finding_id: finding %q was already disputed in a prior submission", i, d.FindingID))
+		}
+	}
+
+	return nil
+}
+
+// buildResearchReworkContext builds the prior review findings and disputes section
+// for the research review spec on rework rounds (round > 1).
+func (s *sqliteStore) buildResearchReworkContext(ctx context.Context, tx *sql.Tx, taskID string) string {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT kind, findings, disputes FROM event WHERE task_id = ? ORDER BY created_at DESC LIMIT 100
+	`, taskID)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	// Collect findings from last review round and disputes from last submit
+	var lastFindings []Finding
+	var lastDisputes []Dispute
+
+	for rows.Next() {
+		var kind string
+		var findingsText sql.NullString
+		var disputesText sql.NullString
+		if err := rows.Scan(&kind, &findingsText, &disputesText); err != nil {
+			continue
+		}
+
+		// Get findings from review event (most recent)
+		if kind == "review" && findingsText.Valid && len(lastFindings) == 0 {
+			if err := json.Unmarshal([]byte(findingsText.String), &lastFindings); err == nil {
+				// Once we have findings, stop looking
+				if len(lastDisputes) > 0 {
+					break
+				}
+			}
+		}
+
+		// Get disputes from submit event (most recent)
+		if kind == "submit" && disputesText.Valid && len(lastDisputes) == 0 {
+			if err := json.Unmarshal([]byte(disputesText.String), &lastDisputes); err == nil {
+				// Once we have disputes, stop looking
+				if len(lastFindings) > 0 {
+					break
+				}
+			}
+		}
+	}
+
+	if len(lastFindings) == 0 && len(lastDisputes) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("## Prior Review Round\n\n")
+
+	if len(lastFindings) > 0 {
+		b.WriteString("**Findings from last review:**\n")
+		for _, f := range lastFindings {
+			b.WriteString(fmt.Sprintf("- **%s** (%s, %s:%d): %s\n", f.ID, f.Severity, f.File, f.Line, f.Summary))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(lastDisputes) > 0 {
+		b.WriteString("**Worker disputes (with evidence):**\n")
+		for _, d := range lastDisputes {
+			b.WriteString(fmt.Sprintf("- **Finding %s**: %s\n", d.FindingID, d.Evidence))
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
 // validateDisputes parses and validates a raw JSON disputes payload.
 // Each dispute is validated completely, field by field. Disputes are only
 // accepted on implement-kind task submissions for research tasks during rework.
@@ -2086,7 +2226,10 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 		if derr != nil {
 			return TaskWithDepsAndLinks{}, derr
 		}
-		// TODO: validate that disputed finding IDs exist in prior review events (deferred to adjudication round)
+		// Validate that disputed finding IDs exist in prior review events and weren't already disputed
+		if validateErr := s.validateDisputeFindingIdentities(ctx, tx, taskID, parsedDisputes); validateErr != nil {
+			return TaskWithDepsAndLinks{}, validateErr
+		}
 		marshaled, merr := json.Marshal(parsedDisputes)
 		if merr != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to marshal disputes: %w", merr)
@@ -2220,6 +2363,12 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 					reviewSpec += "## NO-OP submission (verify, do not auto-reject)\n\n"
 					reviewSpec += "The implementer reports the parent's acceptance criteria are ALREADY satisfied on `main` with no code changes, so there is NO PR. Do NOT reject merely because a PR is missing. VERIFY the claim against current `main`: if the parent's acceptance criteria genuinely hold in the repo, approve; if work is actually needed, reject with the specific gap.\n\n"
 				}
+
+				// For research tasks on rework rounds, include prior findings and disputes
+				if t.Track == "research" && newReviewRound > 1 {
+					reviewSpec += s.buildResearchReworkContext(ctx, tx, taskID)
+				}
+
 				reviewSpec += "## Instructions\n\n"
 				reviewSpec += "Examine the submitted implementation and provide approval or rejection with written feedback.\n\n"
 				reviewSpec += "Approve if:\n"
