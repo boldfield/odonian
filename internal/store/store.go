@@ -2705,7 +2705,16 @@ type researchCollectedFinding struct {
 	round         int
 	reviewTaskID  string
 	reviewerModel string
+	reviewerSlot  int
 	lineage       string
+}
+
+// researchReviewerLineage names one reviewer across rounds and across a supersede
+// chain: its model plus its slot among that model's review tasks in a round (see
+// collectResearchReviewReports). Replacements copy review_models, so the same lineage
+// names the same reviewer on a predecessor and its replacement.
+func researchReviewerLineage(model string, slot int) string {
+	return fmt.Sprintf("%s\x00%d", model, slot)
 }
 
 // newResearchUnionFind returns a union-find over n indices into an allFindings slice,
@@ -2738,8 +2747,18 @@ func newResearchUnionFind(n int) (find func(int) int, union func(int, int)) {
 // follow-ups, and describeChainWideBlockingFindings, which uses it to tell whether a
 // round's blocking finding was later reported resolved.
 func (s *sqliteStore) collectResearchReviewFindings(ctx context.Context, tx *sql.Tx, parentID string, throughRound int) ([]researchCollectedFinding, error) {
+	allFindings, _, err := s.collectResearchReviewReports(ctx, tx, parentID, throughRound)
+	return allFindings, err
+}
+
+// collectResearchReviewReports is collectResearchReviewFindings plus, for each
+// reviewer lineage, the latest round in which that lineage actually submitted a
+// review (with or without findings). Supersession compaction needs the latter to tell
+// a reviewer who re-reviewed and reported nothing outstanding apart from one whose
+// review task is still pending.
+func (s *sqliteStore) collectResearchReviewReports(ctx context.Context, tx *sql.Tx, parentID string, throughRound int) ([]researchCollectedFinding, map[string]int, error) {
 	if throughRound < 1 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Every review task this parent has had, across every round so far, with the
@@ -2752,11 +2771,12 @@ func (s *sqliteStore) collectResearchReviewFindings(ctx context.Context, tx *sql
 		ORDER BY review_round, rowid, id
 	`, parentID, throughRound)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list parent's review tasks: %w", err)
+		return nil, nil, fmt.Errorf("failed to list parent's review tasks: %w", err)
 	}
 	type reviewTaskInfo struct {
 		round   int
 		model   string
+		slot    int
 		lineage string
 	}
 	reviewTasks := make(map[string]reviewTaskInfo)
@@ -2766,7 +2786,7 @@ func (s *sqliteStore) collectResearchReviewFindings(ctx context.Context, tx *sql
 		var round int
 		if err := taskRows.Scan(&id, &round, &model); err != nil {
 			taskRows.Close()
-			return nil, fmt.Errorf("failed to scan review task: %w", err)
+			return nil, nil, fmt.Errorf("failed to scan review task: %w", err)
 		}
 		// A reviewer's lineage is its model plus its slot: the index of its review
 		// task among the same round's review tasks for that model, in creation
@@ -2779,16 +2799,16 @@ func (s *sqliteStore) collectResearchReviewFindings(ctx context.Context, tx *sql
 		slotKey := fmt.Sprintf("%d\x00%s", round, model)
 		slot := slotsTaken[slotKey]
 		slotsTaken[slotKey] = slot + 1
-		reviewTasks[id] = reviewTaskInfo{round: round, model: model, lineage: fmt.Sprintf("%s\x00%d", model, slot)}
+		reviewTasks[id] = reviewTaskInfo{round: round, model: model, slot: slot, lineage: researchReviewerLineage(model, slot)}
 	}
 	if err := taskRows.Err(); err != nil {
 		taskRows.Close()
-		return nil, fmt.Errorf("failed to iterate review tasks: %w", err)
+		return nil, nil, fmt.Errorf("failed to iterate review tasks: %w", err)
 	}
 	taskRows.Close()
 
 	if len(reviewTasks) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Each review task's own findings, from the review event it produced. Matches
@@ -2800,19 +2820,28 @@ func (s *sqliteStore) collectResearchReviewFindings(ctx context.Context, tx *sql
 		WHERE task_id = ? AND kind = 'review' AND source_task_id IS NOT NULL
 	`, parentID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query review events: %w", err)
+		return nil, nil, fmt.Errorf("failed to query review events: %w", err)
 	}
 	var allFindings []researchCollectedFinding
 	seen := make(map[string]bool, len(reviewTasks))
+	latestSubmittedRound := make(map[string]int)
 	for evRows.Next() {
 		var sourceTaskID string
 		var findingsText sql.NullString
 		if err := evRows.Scan(&sourceTaskID, &findingsText); err != nil {
 			evRows.Close()
-			return nil, fmt.Errorf("failed to scan review event: %w", err)
+			return nil, nil, fmt.Errorf("failed to scan review event: %w", err)
 		}
 		info, ok := reviewTasks[sourceTaskID]
-		if !ok || seen[sourceTaskID] || !findingsText.Valid {
+		if !ok {
+			continue
+		}
+		// Any review event from the review task means its reviewer submitted this
+		// round, even one that carries no findings array.
+		if info.round > latestSubmittedRound[info.lineage] {
+			latestSubmittedRound[info.lineage] = info.round
+		}
+		if seen[sourceTaskID] || !findingsText.Valid {
 			continue
 		}
 		seen[sourceTaskID] = true
@@ -2821,12 +2850,12 @@ func (s *sqliteStore) collectResearchReviewFindings(ctx context.Context, tx *sql
 			continue
 		}
 		for _, f := range findings {
-			allFindings = append(allFindings, researchCollectedFinding{Finding: f, round: info.round, reviewTaskID: sourceTaskID, reviewerModel: info.model, lineage: info.lineage})
+			allFindings = append(allFindings, researchCollectedFinding{Finding: f, round: info.round, reviewTaskID: sourceTaskID, reviewerModel: info.model, reviewerSlot: info.slot, lineage: info.lineage})
 		}
 	}
 	if err := evRows.Err(); err != nil {
 		evRows.Close()
-		return nil, fmt.Errorf("failed to iterate review events: %w", err)
+		return nil, nil, fmt.Errorf("failed to iterate review events: %w", err)
 	}
 	evRows.Close()
 
@@ -2842,7 +2871,7 @@ func (s *sqliteStore) collectResearchReviewFindings(ctx context.Context, tx *sql
 		return allFindings[i].ID < allFindings[j].ID
 	})
 
-	return allFindings, nil
+	return allFindings, latestSubmittedRound, nil
 }
 
 // researchFindingChains links each report in allFindings, which must already be
@@ -3471,6 +3500,198 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 	return t, nil
 }
 
+// researchHistorySentinel marks the start of a generated research-compaction block in
+// a task's spec. It is an HTML comment rather than a plain heading so it can never
+// collide with a heading a human happens to write in a research assignment (unlike a
+// plain "## Research task history" marker, which a user could write by accident and
+// have silently truncated).
+const researchHistorySentinel = "<!-- odonian:research-compaction -->"
+
+// extractOriginalAssignment recovers a research task's original assignment by
+// stripping any generated compaction block (history and unresolved-findings sections)
+// appended by a prior supersession. It cuts at researchHistorySentinel, which
+// supersedeTaskTx always writes immediately before that block, so a spec without the
+// sentinel (the true original assignment, or user content that merely mentions
+// "research task history" in prose) is returned unchanged. Trailing newlines are
+// trimmed so re-attaching a fresh block is idempotent across repeated supersessions.
+func extractOriginalAssignment(spec string) string {
+	idx := strings.Index(spec, researchHistorySentinel)
+	if idx == -1 {
+		return spec
+	}
+	return strings.TrimRight(spec[:idx], "\n")
+}
+
+// researchReviewerRef identifies one reviewer lineage (model and slot) that raised a
+// carried finding.
+type researchReviewerRef struct {
+	Model string `json:"model"`
+	Slot  int    `json:"slot"`
+}
+
+func (r researchReviewerRef) lineage() string {
+	return researchReviewerLineage(r.Model, r.Slot)
+}
+
+// carriedResearchFinding is one unresolved finding carried forward into a research
+// replacement's spec, tagged with every reviewer lineage that raised it (a finding
+// deduplicated across reviewers keeps all of them) so a later supersession can tell
+// which of those reviewers have since re-reviewed.
+type carriedResearchFinding struct {
+	Finding
+	Reviewers []researchReviewerRef `json:"reviewers,omitempty"`
+}
+
+// unresolvedResearchFindings returns the findings a research replacement must carry
+// forward per docs/features/research-track.md section 7: each reviewer's last
+// submitted round's unresolved findings, not the task's full review history.
+//
+// "Last round" is evaluated per reviewer lineage, not per task: with several review
+// models, one reviewer can submit round N while another is still pending (the usual
+// reason to re-route a task with `odonian supersede`). A lineage's latest submitted
+// round on taskID is authoritative for that reviewer: its outstanding findings there
+// are carried, and anything the reviewer reported earlier and did not restate is
+// treated as settled. A lineage that has not submitted any review on taskID yet
+// (review tasks spawned but pending, or none at all) keeps whatever taskID's own spec
+// was already carrying for it from the predecessor, so a pending reviewer's open
+// findings are never dropped. Carried findings without a recorded lineage are always
+// kept, since no reviewer on taskID can be shown to have re-reviewed them.
+//
+// "Unresolved" reuses collectResearchReviewReports and researchFindingChains, the
+// same prior_id lineage tracking createResearchFollowUpTasks and
+// describeChainWideBlockingFindings use. Findings are deduplicated by (severity, file,
+// line, summary) so one finding raised by two reviewers is listed once; the deduplicated
+// record keeps the union of their lineages.
+func (s *sqliteStore) unresolvedResearchFindings(ctx context.Context, tx *sql.Tx, taskID, spec string) ([]carriedResearchFinding, error) {
+	var maxRound int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(review_round), 0) FROM task WHERE target_task_id = ? AND kind = 'review'
+	`, taskID).Scan(&maxRound); err != nil {
+		return nil, fmt.Errorf("failed to find max review round: %w", err)
+	}
+	allFindings, latestSubmittedRound, err := s.collectResearchReviewReports(ctx, tx, taskID, maxRound)
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect review findings: %w", err)
+	}
+	_, isOutstanding := researchFindingChains(allFindings)
+
+	var candidates []carriedResearchFinding
+	for _, c := range extractCarriedFindings(spec) {
+		if len(c.Reviewers) == 0 {
+			candidates = append(candidates, c)
+			continue
+		}
+		var pending []researchReviewerRef
+		for _, r := range c.Reviewers {
+			if _, reReviewed := latestSubmittedRound[r.lineage()]; !reReviewed {
+				pending = append(pending, r)
+			}
+		}
+		if len(pending) > 0 {
+			c.Reviewers = pending
+			candidates = append(candidates, c)
+		}
+	}
+	for i, cf := range allFindings {
+		if cf.round != latestSubmittedRound[cf.lineage] || !isOutstanding(i) {
+			continue
+		}
+		candidates = append(candidates, carriedResearchFinding{
+			Finding:   cf.Finding,
+			Reviewers: []researchReviewerRef{{Model: cf.reviewerModel, Slot: cf.reviewerSlot}},
+		})
+	}
+
+	index := make(map[string]int, len(candidates))
+	var unresolved []carriedResearchFinding
+	for _, c := range candidates {
+		key := fmt.Sprintf("%s\x00%s\x00%d\x00%s", c.Severity, c.File, c.Line, c.Summary)
+		i, ok := index[key]
+		if !ok {
+			index[key] = len(unresolved)
+			unresolved = append(unresolved, c)
+			continue
+		}
+		for _, r := range c.Reviewers {
+			if !slices.Contains(unresolved[i].Reviewers, r) {
+				unresolved[i].Reviewers = append(unresolved[i].Reviewers, r)
+			}
+		}
+	}
+	return unresolved, nil
+}
+
+// extractCarriedFindings recovers the findings a research task's own spec is already
+// carrying forward from its predecessor (the "Structured findings (JSON)" block
+// buildResearchSupersessionSpec writes), so unresolvedResearchFindings can keep the
+// ones whose reviewer has not re-reviewed yet; extractOriginalAssignment strips the
+// whole generated block, so without this they would be silently dropped. Returns nil
+// if spec has no such block. The search starts after researchHistorySentinel, not the
+// whole spec, so a coincidental "Structured findings (JSON):" fenced block in the
+// user-authored original assignment can never be parsed as carried findings.
+func extractCarriedFindings(spec string) []carriedResearchFinding {
+	sentinelIdx := strings.Index(spec, researchHistorySentinel)
+	if sentinelIdx == -1 {
+		return nil
+	}
+	block := spec[sentinelIdx:]
+
+	const marker = "**Structured findings (JSON):**\n```json\n"
+	idx := strings.Index(block, marker)
+	if idx == -1 {
+		return nil
+	}
+	rest := block[idx+len(marker):]
+	end := strings.Index(rest, "\n```")
+	if end == -1 {
+		return nil
+	}
+	var findings []carriedResearchFinding
+	if err := json.Unmarshal([]byte(rest[:end]), &findings); err != nil {
+		return nil
+	}
+	return findings
+}
+
+// buildResearchSupersessionSpec implements docs/features/research-track.md section 7
+// for research tasks: the replacement keeps the original assignment and attaches only
+// the last round's unresolved findings, in structured form, plus a link to the
+// predecessor task. The full round-by-round history is never inlined; it stays in the
+// task's events and in each predecessor's own spec (which itself links further back),
+// so the chain is reconstructible without the spec growing on every supersession.
+func (s *sqliteStore) buildResearchSupersessionSpec(ctx context.Context, tx *sql.Tx, taskID, spec string) (string, error) {
+	originalAssignment := extractOriginalAssignment(spec)
+
+	unresolved, err := s.unresolvedResearchFindings(ctx, tx, taskID, spec)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString(originalAssignment)
+	b.WriteString("\n\n")
+	b.WriteString(researchHistorySentinel)
+	b.WriteString("\n## Research task history\n\n")
+	b.WriteString(fmt.Sprintf("- Predecessor task (superseded): %s\n", taskID))
+	b.WriteString("- The complete round-by-round history lives in the predecessor's events and its own history section; follow the predecessor link back through the chain to see every round.\n")
+
+	if len(unresolved) > 0 {
+		b.WriteString("\n## Unresolved findings from last review round\n\n")
+		for _, f := range unresolved {
+			b.WriteString(fmt.Sprintf("- **%s** (%s, %s:%d): %s\n", f.ID, f.Severity, f.File, f.Line, f.Summary))
+		}
+		data, err := json.Marshal(unresolved)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal unresolved findings: %w", err)
+		}
+		b.WriteString("\n**Structured findings (JSON):**\n```json\n")
+		b.Write(data)
+		b.WriteString("\n```\n")
+	}
+
+	return b.String(), nil
+}
+
 // supersedeTaskTx is the core implementation of task supersession.
 // It creates a replacement task with copied fields and dependencies,
 // re-points all dependents, and marks the old task as superseded.
@@ -3505,46 +3726,55 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 		}
 	}
 
-	// 1b. Gather prior reject feedback
-	rows, err := tx.QueryContext(ctx, `
-		SELECT actor, verdict, note FROM event
-		WHERE task_id = ? AND kind IN ('review', 'submit') AND verdict = 'reject'
-		ORDER BY created_at ASC
-	`, taskID)
-	if err != nil {
-		return "", fmt.Errorf("failed to query feedback events: %w", err)
-	}
-	defer rows.Close()
+	// 1b. Gather prior reject feedback (research tasks instead get a compacted spec:
+	// docs/features/research-track.md section 7).
+	if oldTask.Track == "research" {
+		newSpec, err := s.buildResearchSupersessionSpec(ctx, tx, taskID, oldTask.Spec)
+		if err != nil {
+			return "", err
+		}
+		oldTask.Spec = newSpec
+	} else {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT actor, verdict, note FROM event
+			WHERE task_id = ? AND kind IN ('review', 'submit') AND verdict = 'reject'
+			ORDER BY created_at ASC
+		`, taskID)
+		if err != nil {
+			return "", fmt.Errorf("failed to query feedback events: %w", err)
+		}
+		defer rows.Close()
 
-	var feedbackBlock strings.Builder
-	var hasFeedback bool
-	for rows.Next() {
-		var actor string
-		var verdict *string
-		var note *string
-		if err := rows.Scan(&actor, &verdict, &note); err != nil {
-			return "", fmt.Errorf("failed to scan feedback event: %w", err)
+		var feedbackBlock strings.Builder
+		var hasFeedback bool
+		for rows.Next() {
+			var actor string
+			var verdict *string
+			var note *string
+			if err := rows.Scan(&actor, &verdict, &note); err != nil {
+				return "", fmt.Errorf("failed to scan feedback event: %w", err)
+			}
+
+			if !hasFeedback {
+				feedbackBlock.WriteString("## Prior attempt feedback\n\n")
+				hasFeedback = true
+			}
+
+			feedbackBlock.WriteString(fmt.Sprintf("**%s (verdict: %s)**\n", actor, *verdict))
+			if note != nil && *note != "" {
+				feedbackBlock.WriteString(fmt.Sprintf("%s\n", *note))
+			}
+			feedbackBlock.WriteString("\n")
 		}
 
-		if !hasFeedback {
-			feedbackBlock.WriteString("## Prior attempt feedback\n\n")
-			hasFeedback = true
+		if err := rows.Err(); err != nil {
+			return "", fmt.Errorf("failed to iterate feedback events: %w", err)
 		}
 
-		feedbackBlock.WriteString(fmt.Sprintf("**%s (verdict: %s)**\n", actor, *verdict))
-		if note != nil && *note != "" {
-			feedbackBlock.WriteString(fmt.Sprintf("%s\n", *note))
+		// Append feedback to spec if any was found
+		if hasFeedback {
+			oldTask.Spec = oldTask.Spec + "\n\n" + feedbackBlock.String()
 		}
-		feedbackBlock.WriteString("\n")
-	}
-
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("failed to iterate feedback events: %w", err)
-	}
-
-	// Prepend feedback to spec if any was found
-	if hasFeedback {
-		oldTask.Spec = oldTask.Spec + "\n\n" + feedbackBlock.String()
 	}
 
 	// 2. Create replacement task
