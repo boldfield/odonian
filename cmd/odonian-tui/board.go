@@ -26,6 +26,8 @@ const (
 	modeNormal boardMode = iota
 	// modeDetail is the full-screen task detail view.
 	modeDetail
+	// modeScorecards is the research reviewer scorecard view.
+	modeScorecards
 	// modeApproveNote is the optional note input step for an approve action.
 	modeApproveNote
 	// modeApproveConfirm is the "Approve → done? [y/N]" confirmation step.
@@ -99,6 +101,10 @@ type BoardModel struct {
 	// ghMerger is called to merge a PR via `gh pr merge`.
 	// In production it is defaultGHMerger; tests inject a mock to avoid shell execution.
 	ghMerger func(ctx context.Context, prURL string) error
+
+	// Scorecard view state
+	scorecardViewport viewport.Model
+	scorecardMessage  string
 
 	// Project switcher state
 	projects           []tuiclient.Project // cached list of all projects
@@ -765,12 +771,29 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeDetail {
 			m.initDetailViewport(m.detailTask)
 		}
+		// Reinitialize the scorecard viewport if we're in scorecard mode.
+		if m.mode == modeScorecards {
+			// Create a minimal scorecard object for resizing (content stays the same)
+			// The viewport is already initialized; just resize it
+			if m.scorecardViewport.Width > 0 {
+				m.scorecardViewport.Width = m.width
+				m.scorecardViewport.Height = m.height - 3 // Account for help bar
+				if m.scorecardViewport.Height < 3 {
+					m.scorecardViewport.Height = 3
+				}
+			}
+		}
 		return m, nil
 
 	case tea.KeyMsg:
 		// Detail mode: all keys go to the detail handler — board nav must not fire.
 		if m.mode == modeDetail {
 			return m.updateDetailMode(msg)
+		}
+
+		// Scorecard mode: all keys go to the scorecard handler.
+		if m.mode == modeScorecards {
+			return m.updateScorecardMode(msg)
 		}
 
 		// Project switcher mode: all keys go to the switcher handler.
@@ -977,6 +1000,12 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		// Scorecards: show research reviewer scorecards
+		case "c":
+			m.mode = modeScorecards
+			m.scorecardMessage = ""
+			return m, m.fetchScorecardCmd()
+
 		// Help (stub for TUI-3+)
 		case "?":
 			// TODO: show help overlay
@@ -994,6 +1023,16 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detailEvents = msg.events
 		// (Re)initialize the viewport with the full detail content.
 		m.initDetailViewport(msg.task)
+		return m, nil
+
+	case scorecardFetchedMsg:
+		if msg.err != nil {
+			// Stay in scorecard mode but show error message.
+			m.scorecardMessage = fmt.Sprintf("Error: %v", msg.err)
+			return m, nil
+		}
+		// Initialize the viewport with the scorecard content.
+		m.initScorecardViewport(msg.scorecards)
 		return m, nil
 
 	case openerResultMsg:
@@ -1679,6 +1718,17 @@ func (m *BoardModel) View() string {
 		return b.String()
 	}
 
+	// Full-screen scorecard view.
+	if m.mode == modeScorecards {
+		var b strings.Builder
+		b.WriteString(m.renderScorecardView())
+		b.WriteString("\n")
+		b.WriteString(strings.Repeat("─", m.width))
+		b.WriteString("\n")
+		b.WriteString(m.renderScorecardHelpBar())
+		return b.String()
+	}
+
 	// Project switcher overlay.
 	if m.mode == modeProjectSwitch {
 		var b strings.Builder
@@ -1985,14 +2035,14 @@ func (m *BoardModel) renderHelpBar() string {
 	}
 	switch m.selectedColumn {
 	case 0: // backlog
-		return "←/→ column   ↑/↓ select   enter detail   p promote   t hold/release   z archive   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   p promote   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
 	case 3: // review
-		return "←/→ column   ↑/↓ select   enter detail   a approve   x reject   t hold/release   z archive   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   a approve   x reject   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
 	case 4: // approved
-		return "←/→ column   ↑/↓ select   enter detail   b bounce   t hold/release   z archive   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   b bounce   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
 	case 6: // blocked
-		return "←/→ column   ↑/↓ select   enter detail   u unblock   f fail   t hold/release   z archive   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   u unblock   f fail   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
 	default:
-		return "←/→ column   ↑/↓ select   enter detail   t hold/release   z archive   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
 	}
 }

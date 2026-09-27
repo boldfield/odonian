@@ -6,23 +6,24 @@ import (
 
 // MockClient is a mock implementation of the Client interface for testing.
 type MockClient struct {
-	ListProjectsFunc   func(ctx context.Context, options ...ProjectListOption) ([]Project, error)
-	GetProjectFunc     func(ctx context.Context, id string) (Project, error)
-	ListTasksFunc      func(ctx context.Context, projectID string, options ...TaskListOption) ([]Task, error)
-	GetTaskFunc        func(ctx context.Context, id string) (TaskDetail, error)
-	ListEventsFunc     func(ctx context.Context, taskID string) ([]Event, error)
-	ListDocumentsFunc  func(ctx context.Context, projectID string) ([]Document, error)
-	PromoteTaskFunc    func(ctx context.Context, id string) error
-	ClaimTaskFunc      func(ctx context.Context, id, agentID, model string) error
-	ReviewTaskFunc     func(ctx context.Context, id, actor, verdict string, note *string) error
-	TransitionTaskFunc func(ctx context.Context, id, to string, note *string) error
-	HeartbeatTaskFunc  func(ctx context.Context, id, agentID string) error
-	SubmitTaskFunc     func(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput) error
-	HoldTaskFunc       func(ctx context.Context, id string) error
-	ReleaseTaskFunc    func(ctx context.Context, id string) error
-	ArchiveTaskFunc    func(ctx context.Context, id string) error
-	ArchiveProjectFunc func(ctx context.Context, id string) error
-	Tasks              []Task // for simple test data
+	ListProjectsFunc                  func(ctx context.Context, options ...ProjectListOption) ([]Project, error)
+	GetProjectFunc                    func(ctx context.Context, id string) (Project, error)
+	ListTasksFunc                     func(ctx context.Context, projectID string, options ...TaskListOption) ([]Task, error)
+	GetTaskFunc                       func(ctx context.Context, id string) (TaskDetail, error)
+	ListEventsFunc                    func(ctx context.Context, taskID string) ([]Event, error)
+	ListDocumentsFunc                 func(ctx context.Context, projectID string) ([]Document, error)
+	PromoteTaskFunc                   func(ctx context.Context, id string) error
+	ClaimTaskFunc                     func(ctx context.Context, id, agentID, model string) error
+	ReviewTaskFunc                    func(ctx context.Context, id, actor, verdict string, note *string) error
+	TransitionTaskFunc                func(ctx context.Context, id, to string, note *string) error
+	HeartbeatTaskFunc                 func(ctx context.Context, id, agentID string) error
+	SubmitTaskFunc                    func(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput) error
+	HoldTaskFunc                      func(ctx context.Context, id string) error
+	ReleaseTaskFunc                   func(ctx context.Context, id string) error
+	ArchiveTaskFunc                   func(ctx context.Context, id string) error
+	ArchiveProjectFunc                func(ctx context.Context, id string) error
+	GetResearchReviewerScorecardsFunc func(ctx context.Context, projectID string) (ReviewerScorecards, error)
+	Tasks                             []Task // for simple test data
 }
 
 func (m *MockClient) ListProjects(ctx context.Context, options ...ProjectListOption) ([]Project, error) {
@@ -126,4 +127,11 @@ func (m *MockClient) ArchiveProject(ctx context.Context, id string) error {
 		return m.ArchiveProjectFunc(ctx, id)
 	}
 	return nil
+}
+
+func (m *MockClient) GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error) {
+	if m.GetResearchReviewerScorecardsFunc != nil {
+		return m.GetResearchReviewerScorecardsFunc(ctx, projectID)
+	}
+	return ReviewerScorecards{}, nil
 }

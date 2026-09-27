@@ -31,6 +31,7 @@ type Client interface {
 	ReleaseTask(ctx context.Context, id string) error
 	ArchiveTask(ctx context.Context, id string) error
 	ArchiveProject(ctx context.Context, id string) error
+	GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error)
 }
 
 // Response structs for the TUI client (distinct from internal/store)
@@ -134,6 +135,21 @@ type Event struct {
 	Findings  *[]Finding `json:"findings"`
 	Disputes  *[]Dispute `json:"disputes"`
 	CreatedAt string     `json:"created_at"`
+}
+
+type ReviewerScorecard struct {
+	Model                                   string         `json:"model"`
+	FindingsRaised                          map[string]int `json:"findings_raised"`
+	FindingsHeld                            int            `json:"findings_held"`
+	FindingsWithdrawn                       int            `json:"findings_withdrawn"`
+	FindingsUnresolved                      int            `json:"findings_unresolved"`
+	ApprovalsWithLaterFixedBlockingFindings int            `json:"approvals_with_later_fixed_blocking_findings"`
+	TotalReviewRounds                       int            `json:"total_review_rounds"`
+	SampleSize                              int            `json:"sample_size"`
+}
+
+type ReviewerScorecards struct {
+	Scorecards []ReviewerScorecard `json:"reviewer_scorecards"`
 }
 
 // HTTPClient implements the Client interface.
@@ -657,4 +673,20 @@ func (c *HTTPClient) ReleaseTask(ctx context.Context, id string) error {
 	defer resp.Body.Close()
 
 	return nil
+}
+
+// GetResearchReviewerScorecards fetches reviewer scorecards for a project.
+func (c *HTTPClient) GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error) {
+	resp, err := c.do(ctx, "GET", fmt.Sprintf("/projects/%s/research/reviewers", projectID), nil)
+	if err != nil {
+		return ReviewerScorecards{}, err
+	}
+	defer resp.Body.Close()
+
+	var scorecards ReviewerScorecards
+	if err := json.NewDecoder(resp.Body).Decode(&scorecards); err != nil {
+		return ReviewerScorecards{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return scorecards, nil
 }
