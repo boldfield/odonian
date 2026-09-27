@@ -2517,33 +2517,55 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		return allFindings[i].ID < allFindings[j].ID
 	})
 
-	// Findings are only unique within a task, so prior_id is resolved against the same
-	// reviewer's own earlier findings (finding ids from different review tasks can
-	// collide).
-	identityByReviewerAndFindingID := make(map[string]researchFindingIdentity, len(allFindings))
-	for _, cf := range allFindings {
-		identityByReviewerAndFindingID[cf.reviewerModel+"\x00"+cf.ID] = researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
+	// Findings are only unique within a single review submission, not across a
+	// reviewer's rounds (docs/features/research-track.md section 3 asks for ids
+	// "unique within the task", but validation only enforces uniqueness within one
+	// submitted findings array), so a later round's report can reuse an earlier
+	// round's finding id. prior_id must therefore resolve against whichever instance
+	// of that id existed immediately before the current report, not against a later
+	// instance that happens to reuse the same id (including the current report
+	// itself, if it names its own id as prior_id). And a finding can be carried
+	// forward across several rounds as still_open, reworded each time, before it's
+	// finally reported resolved, so resolving it must suppress every identity in that
+	// whole prior_id chain, not just the one instance the resolved report names
+	// directly. A union-find over identities, built in chronological order, tracks
+	// both: each report unions its own identity with its prior_id's identity (as
+	// resolved from the state before this report), and a chain counts as resolved as
+	// soon as any report in it is.
+	parentOf := make(map[researchFindingIdentity]researchFindingIdentity)
+	var find func(researchFindingIdentity) researchFindingIdentity
+	find = func(x researchFindingIdentity) researchFindingIdentity {
+		p, ok := parentOf[x]
+		if !ok || p == x {
+			return x
+		}
+		root := find(p)
+		parentOf[x] = root
+		return root
+	}
+	union := func(a, b researchFindingIdentity) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parentOf[ra] = rb
+		}
 	}
 
-	// A finding is no longer outstanding once any reviewer, in any round, reports it
-	// resolved: that means the worker's changes fixed the text the finding was raised
-	// against. Resolution is tracked by prior_id back to the original finding's
-	// identity, not by the resolving report's own file/line/summary, because a
-	// reviewer is not required to repeat the original summary verbatim when marking it
-	// resolved (docs/features/research-track.md section 3 defines prior_id for exactly
-	// this: "the id of the earlier finding").
-	resolved := make(map[researchFindingIdentity]bool)
+	resolvedRoots := make(map[researchFindingIdentity]bool)
+	latestIdentityByReviewerAndFindingID := make(map[string]researchFindingIdentity, len(allFindings))
 	for _, cf := range allFindings {
-		if cf.Status != "resolved" {
-			continue
-		}
+		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
 		if cf.PriorID != nil {
-			if identity, ok := identityByReviewerAndFindingID[cf.reviewerModel+"\x00"+*cf.PriorID]; ok {
-				resolved[identity] = true
-				continue
+			if priorIdentity, ok := latestIdentityByReviewerAndFindingID[cf.reviewerModel+"\x00"+*cf.PriorID]; ok {
+				union(identity, priorIdentity)
 			}
 		}
-		resolved[researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}] = true
+		if cf.Status == "resolved" {
+			resolvedRoots[find(identity)] = true
+		}
+		// Recorded only after resolving this report's own prior_id against the prior
+		// state, so a report that reuses its own id as prior_id (a self-reference)
+		// still resolves against the earlier instance rather than against itself.
+		latestIdentityByReviewerAndFindingID[cf.reviewerModel+"\x00"+cf.ID] = identity
 	}
 
 	candidatesByIdentity := make(map[researchFindingIdentity]researchCollectedFinding)
@@ -2553,7 +2575,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			continue
 		}
 		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
-		if resolved[identity] {
+		if resolvedRoots[find(identity)] {
 			continue
 		}
 		// Non-blocking per section 3: P3 findings, and P1/P2 findings in unchanged

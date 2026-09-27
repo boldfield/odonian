@@ -4745,6 +4745,98 @@ func TestResearchFollowUps_ResolvedByPriorIDDespiteRewording(t *testing.T) {
 	}
 }
 
+// TestResearchFollowUps_ResolvedThroughStillOpenChain verifies that a finding
+// carried forward across several rounds as still_open, reworded each time before
+// finally being reported resolved, doesn't produce a follow-up. prior_id only names
+// the immediately preceding report, so resolving the chain's last link must
+// transitively suppress every earlier identity in it (docs/features/research-track.md
+// section 3's prior_id chains through still_open, not just through a single resolved
+// report).
+func TestResearchFollowUps_ResolvedThroughStillOpenChain(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	round1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong locator","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	// Both findings are carried forward as still_open, reworded, which blocks round 2.
+	round2 := json.RawMessage(`[
+		{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"bad claim, still unresolved","in_changed_text":true,"status":"still_open","prior_id":"f1"},
+		{"id":"f2b","severity":"P3","file":"b.md","line":5,"summary":"locator still wrong","in_changed_text":true,"status":"still_open","prior_id":"f2"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", round2)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus3, sonnet3 := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
+	// Round 3 finally resolves both, each report's prior_id pointing at round 2's
+	// (already reworded) instance, not at the original round-1 finding.
+	round3 := json.RawMessage(`[
+		{"id":"f1c","severity":"P1","file":"a.md","line":1,"summary":"bad claim, now fixed","in_changed_text":true,"status":"resolved","prior_id":"f1b"},
+		{"id":"f2c","severity":"P3","file":"b.md","line":5,"summary":"locator now correct","in_changed_text":true,"status":"resolved","prior_id":"f2b"}
+	]`)
+	submitResearchReview(t, store, ctx, opus3, "opus-reviewer", "approve", round3)
+	submitResearchReview(t, store, ctx, sonnet3, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	if got := findResearchFollowUps(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Errorf("expected no follow-ups: the P3 was resolved through a still_open->resolved chain spanning three rounds, got %d", len(got))
+	}
+}
+
+// TestResearchFollowUps_ResolvedWithReusedFindingID verifies that a resolved report
+// which reuses its finding's own earlier id as prior_id (a self-reference, which
+// current validation permits since ids are only required to be unique within one
+// submission, not across a reviewer's rounds) still resolves against that earlier
+// instance rather than against itself. A naive "one id -> one identity" map would
+// have the resolved report's own (reworded) identity overwrite the entry it's trying
+// to resolve, so the original identity would never be looked up correctly.
+func TestResearchFollowUps_ResolvedWithReusedFindingID(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	round1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong locator","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	// Round 2 resolves both findings, reusing the same finding ids as their own
+	// prior_id (a valid, if unusual, input shape) with reworded summaries.
+	round2 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim, fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong locator, fixed","in_changed_text":true,"status":"resolved","prior_id":"f2"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	if got := findResearchFollowUps(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Errorf("expected no follow-ups: the P3 was resolved via a self-referential prior_id reusing its own finding id, got %d", len(got))
+	}
+}
+
 // TestBuildDesignAggregationUnchanged is a regression test: research aggregation
 // must not change build/design behavior. It asserts the review event's Note is
 // stored verbatim as the reviewer's result text (no envelope), and that a single
