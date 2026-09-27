@@ -2373,6 +2373,264 @@ func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql
 	return false, nil
 }
 
+// researchFindingDedupKey is the structured, parent-scoped identity of a non-blocking
+// research finding, persisted as a task_link value to make follow-up creation
+// idempotent across reviewers, rounds and repeated aggregation (docs/features/
+// research-track.md section 4). It is JSON-encoded rather than joined with a
+// delimiter: a delimiter like ":" is ambiguous when a file path or summary contains
+// it, so two distinct findings could otherwise collide onto the same key. JSON
+// escaping keeps each field's boundary unambiguous.
+type researchFindingDedupKey struct {
+	ParentID string `json:"parent_id"`
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Summary  string `json:"summary"`
+}
+
+// researchFindingSourceValue links a follow-up task's research_finding_source
+// task_link back to the specific review task and finding id it was raised on.
+type researchFindingSourceValue struct {
+	ReviewTaskID string `json:"review_task_id"`
+	FindingID    string `json:"finding_id"`
+}
+
+// researchFindingIdentity groups findings describing the same underlying defect: same
+// file, line and summary text. It's only ever compared in memory, so a plain
+// comparable struct works as a map key without any string encoding.
+type researchFindingIdentity struct {
+	File    string
+	Line    int
+	Summary string
+}
+
+// researchCollectedFinding is a Finding annotated with which review task and round it
+// came from, so createResearchFollowUpTasks can attribute it to a reviewer and decide
+// whether it's still outstanding.
+type researchCollectedFinding struct {
+	Finding
+	round         int
+	reviewTaskID  string
+	reviewerModel string
+}
+
+// createResearchFollowUpTasks implements docs/features/research-track.md section 4:
+// one backlog follow-up task per non-blocking research finding, deduplicated by file,
+// line and summary across reviewers, rounds and repeated aggregation. It is called
+// whenever a research-track parent's review round passes, and looks across every
+// round up to and including the current one: a non-blocking finding raised in an
+// earlier round that failed for an unrelated reason, and never resolved, still needs
+// a follow-up once the parent is finally approved — it would otherwise be silently
+// dropped once that round's review events stop being the ones aggregation inspects.
+//
+// Returns only the IDs of follow-ups newly created by this call. Findings that
+// already have a follow-up (from an earlier aggregation call) are matched via the
+// research_finding_dedup task_link and skipped, so the caller can update the parent's
+// result and event exactly once per new follow-up and repeated aggregation stays
+// idempotent.
+func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.Tx, parentID, parentProjectID, parentDocumentID string, throughRound int, now string) ([]string, error) {
+	if throughRound < 1 {
+		return nil, nil
+	}
+
+	// Every review task this parent has had, across every round so far, with the
+	// round it belongs to and the model that reviewed it (recorded as the follow-up's
+	// raising reviewer).
+	taskRows, err := tx.QueryContext(ctx, `
+		SELECT id, review_round, model FROM task
+		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ?
+	`, parentID, throughRound)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list parent's review tasks: %w", err)
+	}
+	type reviewTaskInfo struct {
+		round int
+		model string
+	}
+	reviewTasks := make(map[string]reviewTaskInfo)
+	for taskRows.Next() {
+		var id, model string
+		var round int
+		if err := taskRows.Scan(&id, &round, &model); err != nil {
+			taskRows.Close()
+			return nil, fmt.Errorf("failed to scan review task: %w", err)
+		}
+		reviewTasks[id] = reviewTaskInfo{round: round, model: model}
+	}
+	if err := taskRows.Err(); err != nil {
+		taskRows.Close()
+		return nil, fmt.Errorf("failed to iterate review tasks: %w", err)
+	}
+	taskRows.Close()
+
+	if len(reviewTasks) == 0 {
+		return nil, nil
+	}
+
+	// Each review task's own findings, from the review event it produced. Matches
+	// checkResearchBlockingFindings: keyed by source_task_id, first matching event
+	// wins, so an intervening AddReview (or other) event on the parent can't push a
+	// review task's own event out of the window scanned.
+	evRows, err := tx.QueryContext(ctx, `
+		SELECT source_task_id, findings FROM event
+		WHERE task_id = ? AND kind = 'review' AND source_task_id IS NOT NULL
+	`, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query review events: %w", err)
+	}
+	var allFindings []researchCollectedFinding
+	seen := make(map[string]bool, len(reviewTasks))
+	for evRows.Next() {
+		var sourceTaskID string
+		var findingsText sql.NullString
+		if err := evRows.Scan(&sourceTaskID, &findingsText); err != nil {
+			evRows.Close()
+			return nil, fmt.Errorf("failed to scan review event: %w", err)
+		}
+		info, ok := reviewTasks[sourceTaskID]
+		if !ok || seen[sourceTaskID] || !findingsText.Valid {
+			continue
+		}
+		seen[sourceTaskID] = true
+		var findings []Finding
+		if err := json.Unmarshal([]byte(findingsText.String), &findings); err != nil {
+			continue
+		}
+		for _, f := range findings {
+			allFindings = append(allFindings, researchCollectedFinding{Finding: f, round: info.round, reviewTaskID: sourceTaskID, reviewerModel: info.model})
+		}
+	}
+	if err := evRows.Err(); err != nil {
+		evRows.Close()
+		return nil, fmt.Errorf("failed to iterate review events: %w", err)
+	}
+	evRows.Close()
+
+	// Sort for deterministic candidate selection: by round, then review task, then
+	// finding id.
+	sort.Slice(allFindings, func(i, j int) bool {
+		if allFindings[i].round != allFindings[j].round {
+			return allFindings[i].round < allFindings[j].round
+		}
+		if allFindings[i].reviewTaskID != allFindings[j].reviewTaskID {
+			return allFindings[i].reviewTaskID < allFindings[j].reviewTaskID
+		}
+		return allFindings[i].ID < allFindings[j].ID
+	})
+
+	// A finding is no longer outstanding once any reviewer, in any round, reports the
+	// same file/line/summary as resolved: that means the worker's changes fixed the
+	// text the finding was raised against.
+	resolved := make(map[researchFindingIdentity]bool)
+	for _, cf := range allFindings {
+		if cf.Status == "resolved" {
+			resolved[researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}] = true
+		}
+	}
+
+	candidatesByIdentity := make(map[researchFindingIdentity]researchCollectedFinding)
+	var orderedIdentities []researchFindingIdentity
+	for _, cf := range allFindings {
+		if cf.Status == "resolved" {
+			continue
+		}
+		identity := researchFindingIdentity{File: cf.File, Line: cf.Line, Summary: cf.Summary}
+		if resolved[identity] {
+			continue
+		}
+		// Non-blocking per section 3: P3 findings, and P1/P2 findings in unchanged
+		// text after round 1. A still_open finding is never non-blocking: its
+		// containing round would have failed, so it can't be part of a passing round
+		// unless a later round supersedes it (as "new"/"still_open" again, or
+		// "resolved").
+		isP1OrP2 := cf.Severity == "P1" || cf.Severity == "P2"
+		nonBlocking := cf.Severity == "P3" || (isP1OrP2 && !cf.InChangedText && cf.round > 1)
+		if !nonBlocking {
+			continue
+		}
+		if _, exists := candidatesByIdentity[identity]; exists {
+			continue
+		}
+		candidatesByIdentity[identity] = cf
+		orderedIdentities = append(orderedIdentities, identity)
+	}
+
+	sort.Slice(orderedIdentities, func(i, j int) bool {
+		a, b := orderedIdentities[i], orderedIdentities[j]
+		if a.File != b.File {
+			return a.File < b.File
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.Summary < b.Summary
+	})
+
+	model := s.researchDefaultModel
+	if model == "" {
+		model = s.getDefaultModel()
+	}
+
+	var createdIDs []string
+	for _, identity := range orderedIdentities {
+		cf := candidatesByIdentity[identity]
+
+		dedupValue, err := json.Marshal(researchFindingDedupKey{ParentID: parentID, File: identity.File, Line: identity.Line, Summary: identity.Summary})
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal dedup key: %w", err)
+		}
+
+		var existingID string
+		err = tx.QueryRowContext(ctx, `
+			SELECT task_id FROM task_link
+			WHERE kind = 'research_finding_dedup' AND value = ? AND tombstoned_at IS NULL
+			LIMIT 1
+		`, string(dedupValue)).Scan(&existingID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("failed to check existing follow-up: %w", err)
+		}
+		if err == nil {
+			// Already created by an earlier aggregation call: reuse, don't recreate.
+			continue
+		}
+
+		followUpID := GenerateID()
+		title := fmt.Sprintf("Research follow-up: %s (%s:%d)", cf.Severity, cf.File, cf.Line)
+		spec := fmt.Sprintf(
+			"Follow-up for a non-blocking research finding. Not a rewrite of the parent's assignment.\n\nSeverity: %s\nFile: %s\nLine: %d\nRaised by: %s\nParent task: %s\n\nFinding: %s\n",
+			cf.Severity, cf.File, cf.Line, cf.reviewerModel, parentID, cf.Summary,
+		)
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, track, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'backlog', ?, 'implement', ?, 'research', ?, ?)
+		`, followUpID, parentProjectID, parentDocumentID, title, spec, model, parentID, now, now); err != nil {
+			return nil, fmt.Errorf("failed to create follow-up task: %w", err)
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO task_link (id, task_id, kind, value)
+			VALUES (?, ?, 'research_finding_dedup', ?)
+		`, GenerateID(), followUpID, string(dedupValue)); err != nil {
+			return nil, fmt.Errorf("failed to insert dedup link: %w", err)
+		}
+
+		sourceValue, err := json.Marshal(researchFindingSourceValue{ReviewTaskID: cf.reviewTaskID, FindingID: cf.ID})
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal source finding value: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO task_link (id, task_id, kind, value)
+			VALUES (?, ?, 'research_finding_source', ?)
+		`, GenerateID(), followUpID, string(sourceValue)); err != nil {
+			return nil, fmt.Errorf("failed to insert source finding link: %w", err)
+		}
+
+		createdIDs = append(createdIDs, followUpID)
+	}
+
+	return createdIDs, nil
+}
+
 // aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.
 // It handles: verdict counting, merge task spawning (if approved with agent_merge),
 // escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
@@ -2445,6 +2703,36 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 				return "", err
 			}
 			newParentState = state
+
+			// Section 4: when a research round passes, create one backlog follow-up
+			// task per non-blocking finding (deduplicated). Only newly created
+			// follow-ups update the parent's result and event, so repeated
+			// aggregation for the same round stays idempotent.
+			if parentTrack == "research" {
+				createdIDs, err := s.createResearchFollowUpTasks(ctx, tx, parentID, parentProjectID, parentDocumentID, parentReviewRound, now)
+				if err != nil {
+					return "", err
+				}
+				if len(createdIDs) > 0 {
+					var currentResult sql.NullString
+					if err := tx.QueryRowContext(ctx, "SELECT result FROM task WHERE id = ?", parentID).Scan(&currentResult); err != nil {
+						return "", fmt.Errorf("failed to fetch parent result: %w", err)
+					}
+					resultLine := fmt.Sprintf("Follow-up tasks created: %s", strings.Join(createdIDs, ", "))
+					newResult := resultLine
+					if currentResult.Valid && currentResult.String != "" {
+						newResult = currentResult.String + "\n" + resultLine
+					}
+					if _, err := tx.ExecContext(ctx, "UPDATE task SET result = ?, updated_at = ? WHERE id = ?", newResult, now, parentID); err != nil {
+						return "", fmt.Errorf("failed to update parent result with follow-ups: %w", err)
+					}
+
+					eventNote := fmt.Sprintf("Created %d follow-up task(s): %s", len(createdIDs), strings.Join(createdIDs, ", "))
+					if _, err := s.AppendEvent(ctx, tx, parentID, "system", "follow_up_created", nil, &eventNote); err != nil {
+						return "", fmt.Errorf("failed to append follow_up_created event: %w", err)
+					}
+				}
+			}
 		} else {
 			// Circuit breaker: if review_round > threshold, check escalation vs blocking.
 			// Shared by build/design (verdict rejection) and research (blocking finding),

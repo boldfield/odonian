@@ -145,8 +145,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 15 {
-		t.Errorf("expected 15 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 16 {
+		t.Errorf("expected 16 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -161,8 +161,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 15 {
-		t.Errorf("expected 15 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 16 {
+		t.Errorf("expected 16 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -258,8 +258,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 15 {
-		t.Errorf("expected 15 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 16 {
+		t.Errorf("expected 16 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -3996,6 +3996,605 @@ func TestResearchAggregation_CircuitBreakerEscalates(t *testing.T) {
 	if escalated.Track != "research" {
 		t.Errorf("expected escalated task to keep track 'research', got %s", escalated.Track)
 	}
+}
+
+// findResearchFollowUps returns every backlog follow-up task linked (via
+// target_task_id) to the given research parent.
+func findResearchFollowUps(t *testing.T, store Store, ctx context.Context, projID, parentID string) []Task {
+	t.Helper()
+	allTasks, err := store.ListTasks(ctx, projID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	var followUps []Task
+	for _, tk := range allTasks {
+		if tk.Kind == "implement" && tk.Track == "research" && tk.TargetTaskID != nil && *tk.TargetTaskID == parentID {
+			followUps = append(followUps, tk)
+		}
+	}
+	sort.Slice(followUps, func(i, j int) bool { return followUps[i].Title < followUps[j].Title })
+	return followUps
+}
+
+// taskLinkValues returns the task_link.value for every row of the given kind on taskID.
+func taskLinkValues(t *testing.T, store Store, ctx context.Context, taskID, kind string) []string {
+	t.Helper()
+	rows, err := store.Conn().QueryContext(ctx, `SELECT value FROM task_link WHERE task_id = ? AND kind = ?`, taskID, kind)
+	if err != nil {
+		t.Fatalf("failed to query task_link: %v", err)
+	}
+	defer rows.Close()
+	var values []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("failed to scan task_link value: %v", err)
+		}
+		values = append(values, v)
+	}
+	return values
+}
+
+// TestResearchFollowUps_NonBlockingCreatesFollowUp covers acceptance criterion 3
+// (P3 findings) and criterion 4 (a P2 in unchanged text after round 1) from
+// docs/features/research-track.md section 4: a round that passes with non-blocking
+// findings creates one follow-up task per finding, in backlog state, on the research
+// track, in the parent's project and document, linked to the parent.
+func TestResearchFollowUps_NonBlockingCreatesFollowUp(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	findings := json.RawMessage(`[
+		{"id":"f1","severity":"P3","file":"a.md","line":10,"summary":"wrong footnote","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", findings)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up task, got %d", len(followUps))
+	}
+	fu := followUps[0]
+	if fu.State != "backlog" {
+		t.Errorf("expected follow-up in backlog, got %s", fu.State)
+	}
+	if fu.Track != "research" {
+		t.Errorf("expected follow-up track 'research', got %s", fu.Track)
+	}
+	if fu.ProjectID != projID {
+		t.Errorf("expected follow-up project %s, got %s", projID, fu.ProjectID)
+	}
+	if fu.DocumentID != parent.DocumentID {
+		t.Errorf("expected follow-up document %s, got %s", parent.DocumentID, fu.DocumentID)
+	}
+	if fu.TargetTaskID == nil || *fu.TargetTaskID != parentID {
+		t.Errorf("expected follow-up linked to parent %s via target_task_id, got %v", parentID, fu.TargetTaskID)
+	}
+	if !strings.Contains(fu.Spec, "wrong footnote") || !strings.Contains(fu.Spec, "a.md") || !strings.Contains(fu.Spec, "P3") {
+		t.Errorf("expected follow-up spec to carry finding text/file/severity, got %q", fu.Spec)
+	}
+}
+
+// TestResearchFollowUps_UnchangedTextP2AfterRoundOne covers acceptance criterion 4:
+// after round 1, a P2 finding in unchanged text doesn't fail the round, and it
+// creates a follow-up task.
+func TestResearchFollowUps_UnchangedTextP2AfterRoundOne(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", blocking)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	round2 := json.RawMessage(`[
+		{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"bad claim, now fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"},
+		{"id":"f2","severity":"P2","file":"b.md","line":5,"summary":"overstated but unchanged","in_changed_text":false,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up for the unchanged-text P2 (the resolved P1 must not get one), got %d", len(followUps))
+	}
+	if !strings.Contains(followUps[0].Spec, "overstated but unchanged") {
+		t.Errorf("expected the follow-up to be for the P2 finding, got spec %q", followUps[0].Spec)
+	}
+}
+
+// TestResearchFollowUps_BlockingFindingsNoFollowUp verifies that a round that fails
+// on a blocking finding never creates follow-ups for that finding, even once the task
+// is eventually approved in a later round with no other findings raised again.
+func TestResearchFollowUps_BlockingFindingsNoFollowUp(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	blockingP1 := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", blockingP1)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("expected round 1 to fail, got %s", parent.State)
+	}
+	if got := findResearchFollowUps(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Fatalf("expected no follow-ups while the round is failing, got %d", len(got))
+	}
+
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	resolved := json.RawMessage(`[{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"fabricated source, fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", resolved)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+	if got := findResearchFollowUps(t, store, ctx, projID, parentID); len(got) != 0 {
+		t.Errorf("expected no follow-ups: the only finding raised was blocking and was resolved, got %d", len(got))
+	}
+}
+
+// TestResearchFollowUps_DedupAcrossReviewers verifies that when both reviewers
+// independently raise the same finding (same file, line and summary) in the same
+// round, exactly one follow-up task is created.
+func TestResearchFollowUps_DedupAcrossReviewers(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	sameFinding := json.RawMessage(`[{"id":"f1","severity":"P3","file":"a.md","line":10,"summary":"wrong footnote","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", sameFinding)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve",
+		json.RawMessage(`[{"id":"g1","severity":"P3","file":"a.md","line":10,"summary":"wrong footnote","in_changed_text":true,"status":"new"}]`))
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up deduplicated across both reviewers, got %d", len(followUps))
+	}
+}
+
+// TestResearchFollowUps_DedupAcrossRounds covers the "repeated rounds" half of the
+// parent acceptance criterion, and the round-scope bug found in review: a non-blocking
+// finding raised in a round that failed for an unrelated (blocking) reason, and never
+// mentioned again, must still get a follow-up once the parent is finally approved —
+// it must not be silently dropped just because the passing round's own review events
+// don't repeat it. It also proves the same finding raised again in the later round
+// still yields exactly one follow-up (dedup across rounds).
+func TestResearchFollowUps_DedupAcrossRounds(t *testing.T) {
+	t.Run("non-blocking finding from a failed round is not dropped", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		round1 := json.RawMessage(`[
+			{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"},
+			{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"typo","in_changed_text":true,"status":"new"}
+		]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "ready" {
+			t.Fatalf("expected round 1 to fail, got %s", parent.State)
+		}
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		// Round 2 only reports the P1 as resolved; the round-1 P3 is not repeated,
+		// as required by the spec (a reviewer isn't asked about it here).
+		round2 := json.RawMessage(`[{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"fabricated source, fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"}]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err = store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Fatalf("expected approved, got %s", parent.State)
+		}
+
+		followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+		if len(followUps) != 1 {
+			t.Fatalf("expected 1 follow-up for the round-1 P3 (must not be dropped), got %d", len(followUps))
+		}
+		if !strings.Contains(followUps[0].Spec, "typo") {
+			t.Errorf("expected the follow-up to be for the round-1 P3, got spec %q", followUps[0].Spec)
+		}
+	})
+
+	t.Run("same finding raised in two rounds yields one follow-up", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		round1 := json.RawMessage(`[
+			{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"},
+			{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"typo","in_changed_text":true,"status":"new"}
+		]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		// Round 2 resolves the P1 and repeats the same P3 (still_open would block, so
+		// the reviewer reports it again as "new" against the same file/line/summary,
+		// e.g. re-raised independently since it was never fixed).
+		round2 := json.RawMessage(`[
+			{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"fabricated source, fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"},
+			{"id":"f2b","severity":"P3","file":"b.md","line":5,"summary":"typo","in_changed_text":true,"status":"new"}
+		]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Fatalf("expected approved, got %s", parent.State)
+		}
+
+		followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+		if len(followUps) != 1 {
+			t.Fatalf("expected the same finding raised in rounds 1 and 2 to dedup to 1 follow-up, got %d", len(followUps))
+		}
+	})
+}
+
+// TestResearchFollowUps_StructuredLinks verifies the data-model requirement in
+// docs/features/research-track.md ("A link from a follow-up task to the parent task
+// and finding it came from"): the follow-up's target_task_id points at the parent,
+// and a research_finding_source task_link points at the specific review task and
+// finding id it was raised on.
+func TestResearchFollowUps_StructuredLinks(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve",
+		json.RawMessage(`[{"id":"finding-123","severity":"P3","file":"a.md","line":10,"summary":"wrong footnote","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up, got %d", len(followUps))
+	}
+	fu := followUps[0]
+
+	if fu.TargetTaskID == nil || *fu.TargetTaskID != parentID {
+		t.Fatalf("expected target_task_id to link the follow-up to the parent, got %v", fu.TargetTaskID)
+	}
+
+	sourceValues := taskLinkValues(t, store, ctx, fu.ID, "research_finding_source")
+	if len(sourceValues) != 1 {
+		t.Fatalf("expected 1 research_finding_source link, got %d", len(sourceValues))
+	}
+	if !strings.Contains(sourceValues[0], "finding-123") || !strings.Contains(sourceValues[0], opus.ID) {
+		t.Errorf("expected source link to reference the review task and finding id, got %q", sourceValues[0])
+	}
+	var source researchFindingSourceValue
+	if err := json.Unmarshal([]byte(sourceValues[0]), &source); err != nil {
+		t.Fatalf("failed to unmarshal research_finding_source value: %v", err)
+	}
+	if source.FindingID != "finding-123" || source.ReviewTaskID != opus.ID {
+		t.Errorf("expected source link {%s, %s}, got %+v", opus.ID, "finding-123", source)
+	}
+
+	dedupValues := taskLinkValues(t, store, ctx, fu.ID, "research_finding_dedup")
+	if len(dedupValues) != 1 {
+		t.Fatalf("expected 1 research_finding_dedup link, got %d", len(dedupValues))
+	}
+	var dedup researchFindingDedupKey
+	if err := json.Unmarshal([]byte(dedupValues[0]), &dedup); err != nil {
+		t.Fatalf("failed to unmarshal research_finding_dedup value: %v", err)
+	}
+	if dedup.ParentID != parentID || dedup.File != "a.md" || dedup.Line != 10 || dedup.Summary != "wrong footnote" {
+		t.Errorf("expected dedup key scoped to parent %s at a.md:10, got %+v", parentID, dedup)
+	}
+}
+
+// TestResearchFollowUps_ParentScopedDedup verifies that the dedup key is scoped per
+// parent task, not global: two different research parents that each independently
+// raise a finding with the same file, line and summary must each get their own
+// follow-up, not share one.
+func TestResearchFollowUps_ParentScopedDedup(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	escalate := false
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Verify claims A", Spec: "Verify A", DocumentID: doc.ID, Model: "haiku", ReviewModels: []string{"opus", "sonnet"}, Track: "research", Escalate: &escalate},
+		{Title: "Verify claims B", Spec: "Verify B", DocumentID: doc.ID, Model: "haiku", ReviewModels: []string{"opus", "sonnet"}, Track: "research", Escalate: &escalate},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+	parentA, parentB := tasks[0].ID, tasks[1].ID
+
+	for _, id := range []string{parentA, parentB} {
+		if _, err := store.PromoteTask(ctx, id); err != nil {
+			t.Fatalf("failed to promote %s: %v", id, err)
+		}
+		if _, err := store.ClaimTask(ctx, id, "agent-1", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim %s: %v", id, err)
+		}
+		if _, err := store.SubmitTask(ctx, id, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil); err != nil {
+			t.Fatalf("failed to submit %s: %v", id, err)
+		}
+	}
+
+	sameFinding := json.RawMessage(`[{"id":"f1","severity":"P3","file":"README.md","line":1,"summary":"typo","in_changed_text":true,"status":"new"}]`)
+	for _, parentID := range []string{parentA, parentB} {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, 1)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("expected review tasks for %s", parentID)
+		}
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", sameFinding)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	}
+
+	followUpsA := findResearchFollowUps(t, store, ctx, proj.ID, parentA)
+	followUpsB := findResearchFollowUps(t, store, ctx, proj.ID, parentB)
+	if len(followUpsA) != 1 {
+		t.Fatalf("expected parent A to get its own follow-up, got %d", len(followUpsA))
+	}
+	if len(followUpsB) != 1 {
+		t.Fatalf("expected parent B to get its own follow-up, got %d", len(followUpsB))
+	}
+	if followUpsA[0].ID == followUpsB[0].ID {
+		t.Errorf("expected distinct follow-up tasks per parent, got the same task %s for both", followUpsA[0].ID)
+	}
+	if *followUpsA[0].TargetTaskID != parentA {
+		t.Errorf("expected parent A's follow-up to target parent A, got %s", *followUpsA[0].TargetTaskID)
+	}
+	if *followUpsB[0].TargetTaskID != parentB {
+		t.Errorf("expected parent B's follow-up to target parent B, got %s", *followUpsB[0].TargetTaskID)
+	}
+}
+
+// TestResearchFollowUps_DedupKeyUnambiguous verifies that the persisted dedup key is
+// JSON-encoded rather than delimiter-joined, so two distinct findings whose fields
+// happen to contain the delimiter don't collapse onto the same key. Naively joining
+// with ":" would make file="a", line=1, summary="b:2:c" collide with file="a:1:b",
+// line=2, summary="c".
+func TestResearchFollowUps_DedupKeyUnambiguous(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	findings := json.RawMessage(`[
+		{"id":"f1","severity":"P3","file":"a","line":1,"summary":"b:2:c","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P3","file":"a:1:b","line":2,"summary":"c","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", findings)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 2 {
+		t.Fatalf("expected 2 distinct follow-ups (colon-ambiguous keys must not collapse), got %d", len(followUps))
+	}
+}
+
+// TestResearchFollowUps_Idempotency verifies that re-running aggregation for the same
+// already-approved round doesn't create duplicate follow-up tasks, doesn't append to
+// the parent's result again, and doesn't append another follow_up_created event.
+func TestResearchFollowUps_Idempotency(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	findings := json.RawMessage(`[{"id":"f1","severity":"P3","file":"a.md","line":10,"summary":"wrong footnote","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", findings)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up after round 1, got %d", len(followUps))
+	}
+	parentBefore, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	eventsBefore, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	followUpEventsBefore := 0
+	for _, e := range eventsBefore {
+		if e.Kind == "follow_up_created" {
+			followUpEventsBefore++
+		}
+	}
+	if followUpEventsBefore != 1 {
+		t.Fatalf("expected exactly 1 follow_up_created event, got %d", followUpEventsBefore)
+	}
+
+	// Re-run aggregation for the same (already-approved) round directly, as would
+	// happen if aggregation were retried or triggered twice for the same submission.
+	ss := store.(*sqliteStore)
+	tx, err := ss.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin tx: %v", err)
+	}
+	if _, err := ss.aggregateReviewRound(ctx, tx, parentID, 5, map[string]int{}); err != nil {
+		tx.Rollback()
+		t.Fatalf("failed to re-run aggregation: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit: %v", err)
+	}
+
+	followUpsAfter := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUpsAfter) != 1 {
+		t.Fatalf("expected repeated aggregation to stay at 1 follow-up, got %d", len(followUpsAfter))
+	}
+	if followUpsAfter[0].ID != followUps[0].ID {
+		t.Errorf("expected the same follow-up task to be reused, got a different id")
+	}
+
+	parentAfter, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parentAfter.Result == nil || parentBefore.Result == nil || *parentAfter.Result != *parentBefore.Result {
+		t.Errorf("expected parent result to be unchanged by repeated aggregation, before=%v after=%v", parentBefore.Result, parentAfter.Result)
+	}
+
+	eventsAfter, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	followUpEventsAfter := 0
+	for _, e := range eventsAfter {
+		if e.Kind == "follow_up_created" {
+			followUpEventsAfter++
+		}
+	}
+	if followUpEventsAfter != 1 {
+		t.Errorf("expected follow_up_created event count to stay at 1 after repeated aggregation, got %d", followUpEventsAfter)
+	}
+}
+
+// TestResearchFollowUps_ParentResultAndEvent verifies that follow-up IDs are recorded
+// both in the parent's final result and in a follow_up_created event whose note names
+// the actual created task ids (not just a filler string).
+func TestResearchFollowUps_ParentResultAndEvent(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	findings := json.RawMessage(`[{"id":"f1","severity":"P3","file":"a.md","line":10,"summary":"wrong footnote","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", findings)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up, got %d", len(followUps))
+	}
+	followUpID := followUps[0].ID
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.Result == nil || !strings.Contains(*parent.Result, followUpID) {
+		t.Errorf("expected parent result to name the follow-up id %s, got %v", followUpID, parent.Result)
+	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var followUpEvent *Event
+	for i := range events {
+		if events[i].Kind == "follow_up_created" {
+			followUpEvent = &events[i]
+			break
+		}
+	}
+	if followUpEvent == nil {
+		t.Fatalf("expected a follow_up_created event")
+	}
+	if followUpEvent.Note == nil || !strings.Contains(*followUpEvent.Note, followUpID) {
+		t.Errorf("expected follow_up_created event note to name the follow-up id %s, got %v", followUpID, followUpEvent.Note)
+	}
+}
+
+// TestResearchFollowUps_Model verifies that a follow-up task's model resolves the
+// same way a research task's does at creation (docs/features/research-track.md
+// section 6): the deployment's research default model if configured, else the
+// store's general default. It must not inherit the parent's own model, and must not
+// fall back to the task table's raw column default.
+func TestResearchFollowUps_Model(t *testing.T) {
+	t.Run("uses configured research default model", func(t *testing.T) {
+		store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(), WithResearchDefaultModel("opus"))
+		if err != nil {
+			t.Fatalf("failed to open test database: %v", err)
+		}
+		t.Cleanup(func() { store.Close() })
+		ctx := context.Background()
+
+		proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+		if err != nil {
+			t.Fatalf("failed to create project: %v", err)
+		}
+		doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+		if err != nil {
+			t.Fatalf("failed to create document: %v", err)
+		}
+		escalate := false
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{Title: "Verify claims", Spec: "Verify", DocumentID: doc.ID, Model: "sonnet", ReviewModels: []string{"opus", "sonnet"}, Track: "research", Escalate: &escalate},
+		})
+		if err != nil {
+			t.Fatalf("failed to create task: %v", err)
+		}
+		parentID := tasks[0].ID
+		if _, err := store.PromoteTask(ctx, parentID); err != nil {
+			t.Fatalf("failed to promote: %v", err)
+		}
+		if _, err := store.ClaimTask(ctx, parentID, "agent-1", "sonnet", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim: %v", err)
+		}
+		if _, err := store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil); err != nil {
+			t.Fatalf("failed to submit: %v", err)
+		}
+
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, parentID, 1)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve",
+			json.RawMessage(`[{"id":"f1","severity":"P3","file":"a.md","line":1,"summary":"typo","in_changed_text":true,"status":"new"}]`))
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		followUps := findResearchFollowUps(t, store, ctx, proj.ID, parentID)
+		if len(followUps) != 1 {
+			t.Fatalf("expected 1 follow-up, got %d", len(followUps))
+		}
+		if followUps[0].Model != "opus" {
+			t.Errorf("expected follow-up model 'opus' (research default), got %q (parent model was 'sonnet')", followUps[0].Model)
+		}
+	})
+
+	t.Run("falls back to the store default without a research default configured", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve",
+			json.RawMessage(`[{"id":"f1","severity":"P3","file":"a.md","line":1,"summary":"typo","in_changed_text":true,"status":"new"}]`))
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+		if len(followUps) != 1 {
+			t.Fatalf("expected 1 follow-up, got %d", len(followUps))
+		}
+		if followUps[0].Model != "haiku" {
+			t.Errorf("expected follow-up model to fall back to the store default 'haiku', got %q", followUps[0].Model)
+		}
+	})
 }
 
 // TestBuildDesignAggregationUnchanged is a regression test: research aggregation
