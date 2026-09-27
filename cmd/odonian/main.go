@@ -194,6 +194,12 @@ func runServer() {
 		log.Fatalf("invalid research default model: %v", err)
 	}
 
+	// Parse research escalation thresholds
+	researchEscalationThresholds := parseEscalationThresholds(os.Getenv("ODONIAN_RESEARCH_ESCALATION_THRESHOLDS"))
+
+	// Parse research escalation ladder
+	researchEscalationLadder := parseResearchEscalationLadder(os.Getenv("ODONIAN_RESEARCH_ESCALATION_LADDER"), allowedModels)
+
 	// Parse event retention configuration
 	eventTerminalRetentionDaysStr := os.Getenv("ODONIAN_EVENT_TERMINAL_RETENTION_DAYS")
 	if eventTerminalRetentionDaysStr == "" {
@@ -244,7 +250,8 @@ func runServer() {
 	// Open the store
 	s, err := store.Open(dbPath, allowedModels,
 		store.WithEscalationLadder(escalationLadder),
-		store.WithResearchDefaultModel(researchDefaultModel))
+		store.WithResearchDefaultModel(researchDefaultModel),
+		store.WithResearchEscalationLadder(researchEscalationLadder))
 	if err != nil {
 		log.Fatalf("failed to open store: %v", err)
 	}
@@ -261,7 +268,7 @@ func runServer() {
 	}
 
 	// Create API server
-	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, pprofEnabled, slowRequestThresholdMs, logger)
+	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, researchEscalationThresholds, pprofEnabled, slowRequestThresholdMs, logger)
 
 	// Set up graceful shutdown with signal handling
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1069,6 +1076,35 @@ func parseEscalationLadder(ladderStr string, allowedModels []string) []string {
 		}
 		if !allowedModelsM[model] {
 			log.Fatalf("escalation ladder contains model %q not in ODONIAN_MODELS allowlist", model)
+		}
+		if !seen[model] {
+			seen[model] = true
+			result = append(result, model)
+		}
+	}
+	return result
+}
+
+func parseResearchEscalationLadder(ladderStr string, allowedModels []string) []string {
+	// Empty/unset research ladder means no model escalation for research tasks
+	if ladderStr == "" {
+		return []string{}
+	}
+
+	allowedModelsM := make(map[string]bool)
+	for _, m := range allowedModels {
+		allowedModelsM[m] = true
+	}
+
+	seen := make(map[string]bool)
+	var result []string
+	for _, model := range strings.Split(ladderStr, ",") {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if !allowedModelsM[model] {
+			log.Fatalf("research escalation ladder contains model %q not in ODONIAN_MODELS allowlist", model)
 		}
 		if !seen[model] {
 			seen[model] = true

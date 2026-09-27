@@ -48,13 +48,13 @@ type Store interface {
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error)
 	PromoteTask(ctx context.Context, taskID string) (Task, error)
-	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error)
+	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
-	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int) (Task, error)
+	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (Task, error)
 	ArchiveTask(ctx context.Context, taskID string) (Task, error)
 	UnarchiveTask(ctx context.Context, taskID string) (Task, error)
 	ArchiveProject(ctx context.Context, projectID string) (Project, error)
@@ -64,12 +64,13 @@ type Store interface {
 
 // sqliteStore wraps a SQLite database connection and provides migration functionality.
 type sqliteStore struct {
-	conn                 *sql.DB
-	readConn             *sql.DB
-	allowedModels        []string
-	allowedModelsM       map[string]bool
-	escalationLadder     []string
-	researchDefaultModel string
+	conn                     *sql.DB
+	readConn                 *sql.DB
+	allowedModels            []string
+	allowedModelsM           map[string]bool
+	escalationLadder         []string
+	researchDefaultModel     string
+	researchEscalationLadder []string
 
 	// supersedeCloseHook, when set, is invoked after each background
 	// closeSupersededPR attempt finishes. It exists solely so tests can
@@ -95,6 +96,14 @@ func WithEscalationLadder(ladder []string) StoreOption {
 func WithResearchDefaultModel(model string) StoreOption {
 	return func(s *sqliteStore) {
 		s.researchDefaultModel = model
+	}
+}
+
+// WithResearchEscalationLadder sets the escalation ladder for research tasks.
+// An empty ladder means no model escalation for research tasks.
+func WithResearchEscalationLadder(ladder []string) StoreOption {
+	return func(s *sqliteStore) {
+		s.researchEscalationLadder = append([]string{}, ladder...) // Copy to avoid external mutation
 	}
 }
 
@@ -1863,7 +1872,7 @@ func thresholdFor(model string, escalationThresholds map[string]int, maxReviewRo
 // Returns ValidationError if a link kind is invalid or verdict is missing/invalid.
 // Returns ErrNotFound if the task doesn't exist.
 // Returns ErrConflict if the task is not in_progress or not assigned to the given agentID.
-func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error) {
+func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error) {
 	// Validate link kinds first (before mutating anything).
 	// "no_op" marks a review-verified no-op resolution: a worker that finds the
 	// acceptance criteria already satisfied on main with no diff submits with a
@@ -2116,7 +2125,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			}
 
 			// Aggregate review verdicts and update parent state as needed
-			_, err = s.aggregateReviewRound(ctx, tx, *targetTaskID, maxReviewRounds, escalationThresholds)
+			_, err = s.aggregateReviewRound(ctx, tx, *targetTaskID, maxReviewRounds, escalationThresholds, researchEscalationThresholds)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, err
 			}
@@ -2774,7 +2783,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 // escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
 // A return value of "" means no state change needed. Caller must apply the returned state.
 // All state updates and event appending happen within this function.
-func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, parentID string, maxReviewRounds int, escalationThresholds map[string]int) (string, error) {
+func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, parentID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (string, error) {
 	now := nowTimestamp()
 
 	var parentReviewRound int
@@ -2875,46 +2884,60 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			// Circuit breaker: if review_round > threshold, check escalation vs blocking.
 			// Shared by build/design (verdict rejection) and research (blocking finding),
 			// so the two paths can't drift.
-			threshold := thresholdFor(parentModel, escalationThresholds, maxReviewRounds)
+			var threshold int
+			var isTopTier bool
+			var nextModel string
+			var hasNextTier bool
+
+			if parentTrack == "research" {
+				// Research tasks use research-specific escalation
+				threshold = thresholdFor(parentModel, researchEscalationThresholds, maxReviewRounds)
+				isTopTier = s.isResearchTopTier(parentModel)
+				if parentEscalate && !isTopTier {
+					nextModel, hasNextTier = s.researchNextTier(parentModel)
+				}
+			} else {
+				// Build and design tasks use standard escalation
+				threshold = thresholdFor(parentModel, escalationThresholds, maxReviewRounds)
+				isTopTier = s.isTopTier(parentModel)
+				if parentEscalate && !isTopTier {
+					nextModel, hasNextTier = s.nextTier(parentModel)
+				}
+			}
+
 			if parentReviewRound > threshold {
 				// Threshold exceeded: escalate if enabled and not top tier, else block
-				if parentEscalate && !s.isTopTier(parentModel) {
-					nextModel, ok := s.nextTier(parentModel)
-					if ok {
-						// Escalate to next tier via supersession
-						escalatedTaskID, err := s.supersedeTaskTx(ctx, tx, parentID, &nextModel)
-						if err != nil {
-							return "", fmt.Errorf("failed to escalate task: %w", err)
-						}
-						// Promote the escalated task from backlog to ready so the higher-tier worker can claim it immediately
-						_, err = tx.ExecContext(ctx, `
-							UPDATE task
-							SET state='ready', updated_at=?
-							WHERE id=?
-						`, now, escalatedTaskID)
-						if err != nil {
-							return "", fmt.Errorf("failed to promote escalated task: %w", err)
-						}
-						// Append transition event for the escalated task
-						escalationNote := "backlog->ready (auto-promoted via escalation)"
-						_, err = s.AppendEvent(ctx, tx, escalatedTaskID, "system", "transition", nil, &escalationNote)
-						if err != nil {
-							return "", fmt.Errorf("failed to append escalation transition event: %w", err)
-						}
-						// Emit escalation event on the old (now superseded) task
-						eventNote := fmt.Sprintf("%s→%s round %d, superseded by %s", parentModel, nextModel, parentReviewRound, escalatedTaskID)
-						_, err = s.AppendEvent(ctx, tx, parentID, "system", "escalation", nil, &eventNote)
-						if err != nil {
-							return "", fmt.Errorf("failed to append escalation event: %w", err)
-						}
-						// Parent was superseded by supersedeTaskTx, so skip state update logic below
-						newParentState = ""
-					} else {
-						// nextTier returned false despite !isTopTier (shouldn't happen), fall back to blocking
-						newParentState = "blocked"
+				if parentEscalate && !isTopTier && hasNextTier {
+					// Escalate to next tier via supersession
+					escalatedTaskID, err := s.supersedeTaskTx(ctx, tx, parentID, &nextModel)
+					if err != nil {
+						return "", fmt.Errorf("failed to escalate task: %w", err)
 					}
+					// Promote the escalated task from backlog to ready so the higher-tier worker can claim it immediately
+					_, err = tx.ExecContext(ctx, `
+						UPDATE task
+						SET state='ready', updated_at=?
+						WHERE id=?
+					`, now, escalatedTaskID)
+					if err != nil {
+						return "", fmt.Errorf("failed to promote escalated task: %w", err)
+					}
+					// Append transition event for the escalated task
+					escalationNote := "backlog->ready (auto-promoted via escalation)"
+					_, err = s.AppendEvent(ctx, tx, escalatedTaskID, "system", "transition", nil, &escalationNote)
+					if err != nil {
+						return "", fmt.Errorf("failed to append escalation transition event: %w", err)
+					}
+					// Emit escalation event on the old (now superseded) task
+					eventNote := fmt.Sprintf("%s→%s round %d, superseded by %s", parentModel, nextModel, parentReviewRound, escalatedTaskID)
+					_, err = s.AppendEvent(ctx, tx, parentID, "system", "escalation", nil, &eventNote)
+					if err != nil {
+						return "", fmt.Errorf("failed to append escalation event: %w", err)
+					}
+					// Parent was superseded by supersedeTaskTx, so skip state update logic below
+					newParentState = ""
 				} else {
-					// Escalation disabled or already top tier: block
+					// Escalation disabled or already top tier or no next tier: block
 					newParentState = "blocked"
 				}
 			} else {
@@ -3786,7 +3809,7 @@ func (s *sqliteStore) HoldTask(ctx context.Context, taskID string) (Task, error)
 // If the task is in review and all review tasks targeting it are done, aggregates the review round.
 // Returns the updated Task on success.
 // Returns ErrNotFound if the task doesn't exist.
-func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int) (Task, error) {
+func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
@@ -3846,7 +3869,7 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 
 		// If all review tasks are done, aggregate the round
 		if totalReviewTasks > 0 && doneReviewTasks == totalReviewTasks {
-			_, err = s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds)
+			_, err = s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds, researchEscalationThresholds)
 			if err != nil {
 				return Task{}, err
 			}

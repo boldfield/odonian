@@ -26,7 +26,7 @@ func setupTestServer(t *testing.T, authToken string) *Server {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, false, 500, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, nil, false, 500, nil)
 }
 
 func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds map[string]int) *Server {
@@ -35,7 +35,7 @@ func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds ma
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, thresholds, false, 500, nil)
+	return New(s, authToken, 5*time.Minute, 5, thresholds, nil, false, 500, nil)
 }
 
 func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool) *Server {
@@ -44,7 +44,7 @@ func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool)
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, pprofEnabled, 500, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, nil, pprofEnabled, 500, nil)
 }
 
 // TestHealthzWithoutAuth verifies GET /healthz returns 200 without auth.
@@ -3641,7 +3641,7 @@ func TestListProjectsReturnsEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 500, nil)
 	authHeader := "Bearer test-token"
 
 	// List projects without creating any
@@ -3675,7 +3675,7 @@ func TestListProjectsWithClaimableFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 500, nil)
 	authHeader := "Bearer test-token"
 
 	// Create project 1 with a claimable haiku implement task
@@ -3781,7 +3781,7 @@ func TestListProjectsClaimableWithMultipleFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 500, nil)
 	authHeader := "Bearer test-token"
 
 	// Create a project with two tasks: one haiku, one sonnet
@@ -3887,7 +3887,7 @@ func TestListProjectsClaimableUnchangedWithoutFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 500, nil)
 	authHeader := "Bearer test-token"
 
 	// Create two projects
@@ -6795,7 +6795,7 @@ func TestLatencyLoggingSlowRequest(t *testing.T) {
 		t.Fatalf("failed to open test store: %v", err)
 	}
 	// Use threshold 0ms so all requests are considered slow
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 0, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 0, logger)
 
 	// Create a project first
 	ctx := context.Background()
@@ -6875,7 +6875,7 @@ func TestLatencyLoggingFastRequest(t *testing.T) {
 		t.Fatalf("failed to open test store: %v", err)
 	}
 	// Use very high threshold (10 seconds) so normal requests are fast
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 10000, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 10000, logger)
 
 	// Create a project first
 	ctx := context.Background()
@@ -6913,7 +6913,7 @@ func TestLatencyLoggingHealthzExcluded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 500, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 500, logger)
 
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -6951,7 +6951,7 @@ func TestLatencyLoggingQueryParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 0, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 0, logger)
 
 	// Create a project first
 	ctx := context.Background()
@@ -7476,7 +7476,7 @@ func TestLatencyLoggingAuthNotLogged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 0, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 0, logger)
 
 	// Create a project first
 	ctx := context.Background()
@@ -7534,7 +7534,7 @@ func TestLatencyLoggingResponseSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, false, 0, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, false, 0, logger)
 
 	req := httptest.NewRequest("GET", "/projects", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
