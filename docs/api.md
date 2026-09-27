@@ -260,6 +260,61 @@ curl -H "Authorization: Bearer token" \
 
 ---
 
+### Research reviewer scorecards
+
+#### `GET /projects/{id}/research/reviewers`
+
+Read-only reviewer scorecards for a project's research-track tasks, per
+docs/features/research-track.md §8. Findings are aggregated by reviewer model and severity across
+every research `implement`/`design` task, spanning supersede chains without counting a finding
+carried across a supersession twice. Build- and design-track review data is never included, and
+adjudicator rulings are applied to the finding they rule on rather than counted as review rounds.
+The endpoint does not rank reviewers or infer accuracy for unresolved findings.
+
+**Request:**
+```bash
+curl -H "Authorization: Bearer token" \
+  https://api.example.com/projects/550e8400-e29b-41d4-a716-446655440000/research/reviewers
+```
+
+**Response (200 OK):**
+```json
+{
+  "reviewer_scorecards": [
+    {
+      "model": "opus",
+      "findings_raised": {"p1": 1, "p2": 3, "p3": 2},
+      "findings_held": 2,
+      "findings_withdrawn": 1,
+      "findings_unresolved": 3,
+      "approvals_with_later_fixed_blocking_findings": 1,
+      "total_review_rounds": 7,
+      "sample_size": 4
+    }
+  ]
+}
+```
+
+- `findings_raised`: distinct findings raised, by severity.
+- `findings_held`: fixed by the worker, or upheld on adjudication.
+- `findings_withdrawn`: withdrawn by the reviewer after a dispute, or overturned on adjudication.
+- `findings_unresolved`: neither held nor withdrawn yet.
+- `approvals_with_later_fixed_blocking_findings`: rounds this reviewer approved while another
+  reviewer's blocking finding in the same chain was outstanding and later fixed (withdrawn or
+  overturned findings never count).
+- `total_review_rounds`: review rounds this reviewer submitted (approve or reject).
+- `sample_size`: distinct tasks this reviewer reviewed.
+
+Scorecards are sorted by model. An unknown project id, or a project with no research reviews,
+returns `200` with an empty `reviewer_scorecards` array rather than `404`.
+
+**Status Codes:**
+- `200 OK`: Scorecards computed
+- `401`: Missing or invalid bearer token (see [Authentication](#authentication))
+- `500 GET_ERROR`: Server error computing scorecards
+
+---
+
 ### Tasks
 
 #### Task ID Conventions

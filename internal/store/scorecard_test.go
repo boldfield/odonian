@@ -721,6 +721,50 @@ func TestGetResearchReviewerScorecards_DisputeWithdrawnWithoutAdjudication(t *te
 	}
 }
 
+// TestGetResearchReviewerScorecards_WithdrawnFindingNotCountedAsLaterFix verifies that
+// a blocking finding the worker disputes and its reviewer then withdraws does not
+// credit another reviewer's approval of that round as one "whose blocking finding was
+// subsequently fixed": the finding was withdrawn, so nothing was fixed and the
+// approving reviewer was right.
+func TestGetResearchReviewerScorecards_WithdrawnFindingNotCountedAsLaterFix(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "sonnet"})
+
+	opusTask1, sonnetTask1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil || sonnetTask1 == nil {
+		t.Fatalf("expected both round 1 review tasks")
+	}
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnetTask1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"already covered elsewhere"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	opusTask2, sonnetTask2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusTask2 == nil || sonnetTask2 == nil {
+		t.Fatalf("expected both round 2 review tasks")
+	}
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "approve", json.RawMessage(`[{"id":"f2","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":false,"status":"resolved","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetTask2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	sonnetCard := findScorecardByModel(scorecards.Scorecards, "sonnet")
+	if opusCard == nil || sonnetCard == nil {
+		t.Fatalf("expected both reviewers in scorecards")
+	}
+	if opusCard.FindingsWithdrawn != 1 || opusCard.FindingsHeld != 0 {
+		t.Errorf("expected opus withdrawn=1 held=0, got withdrawn=%d held=%d", opusCard.FindingsWithdrawn, opusCard.FindingsHeld)
+	}
+	if sonnetCard.ApprovalsWithLaterFixedBlockingFindings != 0 {
+		t.Errorf("expected sonnet 0 approvals with later fixed (finding was withdrawn), got %d", sonnetCard.ApprovalsWithLaterFixedBlockingFindings)
+	}
+}
+
 // TestGetResearchReviewerScorecards_SupersededChain_ApprovalsWithLaterFix verifies
 // that approvals-with-later-fix compares rounds by their position across the whole
 // supersede chain, not by each chain member's own review_round (which restarts at 1

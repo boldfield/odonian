@@ -466,12 +466,32 @@ func (agg *scorecardAggregation) applyAdjudications(ctx context.Context, tx *sql
 	return rows.Err()
 }
 
+// classify decides a thread's final classification — an adjudication ruling wins if
+// one applies; otherwise a thread that ended outstanding is unresolved, and one that
+// settled naturally (per processChain) is held, unless the worker disputed it and the
+// reviewer never maintained it into adjudication, per section 5 ("if it withdraws the
+// finding, the finding is resolved") — that settlement is a withdrawal, not a fix.
+func (t *findingThread) classify() string {
+	switch {
+	case t.adjudicated != "":
+		return t.adjudicated
+	case t.finalOutstanding:
+		return "unresolved"
+	case t.disputed:
+		return "withdrawn"
+	default:
+		return "held"
+	}
+}
+
 // computeApprovalsWithLaterFix implements the fourth section 8 metric: for each
 // reviewer's approval of a round, whether another reviewer's blocking finding —
 // already raised as of that round — was fixed in a later round, anywhere in the same
-// chain. "Fixed" here means naturally resolved, not merely adjudicated: an
-// overturned finding was never valid, so nothing was fixed, and an upheld finding
-// still blocks, so it was not fixed either.
+// chain. Only a thread classified held can have been fixed: a withdrawn or overturned
+// finding was never valid, so its later settlement fixed nothing and the approving
+// reviewer was right, and an unresolved one has not been fixed yet. A held thread
+// counts only if it actually settled after the approval (resolvedGlobalRounds), so a
+// finding upheld on adjudication but still outstanding does not count either.
 func (agg *scorecardAggregation) computeApprovalsWithLaterFix() {
 	for _, appr := range agg.approvals {
 		ragg := agg.reviewerAgg(appr.model)
@@ -480,6 +500,9 @@ func (agg *scorecardAggregation) computeApprovalsWithLaterFix() {
 				continue // a blocking finding on an unrelated chain was never relevant to this approval
 			}
 			if thread.reviewerModel == appr.model {
+				continue
+			}
+			if thread.classify() != "held" {
 				continue
 			}
 			if thread.firstBlockingGlobalRound == 0 || thread.firstBlockingGlobalRound > appr.globalRound {
@@ -500,24 +523,16 @@ func (agg *scorecardAggregation) computeApprovalsWithLaterFix() {
 	}
 }
 
-// buildScorecards decides each thread's final classification — an adjudication
-// ruling wins if one applies; otherwise a thread that ended outstanding is unresolved,
-// and one that settled naturally (per processChain) is held, unless the worker
-// disputed it and the reviewer never maintained it into adjudication, per section 5
-// ("if it withdraws the finding, the finding is resolved") — that settlement is a
-// withdrawal, not a fix — then renders every reviewer's counters, sorted by model for
-// a deterministic response.
+// buildScorecards classifies every thread (findingThread.classify), computes the
+// approvals-with-later-fix metric from those classifications, then renders every
+// reviewer's counters, sorted by model for a deterministic response.
 func (agg *scorecardAggregation) buildScorecards() []ReviewerScorecard {
 	for _, thread := range agg.threads {
 		ragg := agg.reviewerAgg(thread.reviewerModel)
-		switch {
-		case thread.adjudicated == "withdrawn":
+		switch thread.classify() {
+		case "withdrawn":
 			ragg.withdrawn++
-		case thread.adjudicated == "held":
-			ragg.held++
-		case !thread.finalOutstanding && thread.disputed:
-			ragg.withdrawn++
-		case !thread.finalOutstanding:
+		case "held":
 			ragg.held++
 		default:
 			ragg.unresolved++
