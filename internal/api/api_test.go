@@ -3120,6 +3120,137 @@ func TestSubmitRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestSubmitWithDisputesOnResearchTask verifies that submit accepts disputes for research tasks.
+func TestSubmitWithDisputesOnResearchTask(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Setup: project, document
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a research task
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Research task",
+			Spec:         "Verify sources",
+			DocumentID:   docID,
+			Track:        "research",
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Promote, claim, and submit initial
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "agent-1", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	// Submit initial implementation
+	submitPayload := map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Initial implementation",
+		"links": []map[string]string{
+			{"kind": "pr", "value": "#1"},
+		},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	if submitW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d; body: %s", submitW.Code, submitW.Body.String())
+	}
+
+	// Get the review task and submit a review with findings
+	kindReview := "review"
+	reviewTasks, _ := server.store.ListTasks(context.Background(), projectID, store.TaskListFilter{Kind: &kindReview})
+	var reviewTaskID string
+	for _, rt := range reviewTasks {
+		if rt.TargetTaskID != nil && *rt.TargetTaskID == taskID {
+			reviewTaskID = rt.ID
+			break
+		}
+	}
+
+	claimReviewPayload := map[string]string{"agent_id": "reviewer-1", "model": "opus"}
+	claimReviewBody, _ := json.Marshal(claimReviewPayload)
+	claimReviewReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/claim", bytes.NewReader(claimReviewBody))
+	claimReviewReq.Header.Set("Authorization", authHeader)
+	claimReviewReq.Header.Set("Content-Type", "application/json")
+	claimReviewW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimReviewW, claimReviewReq)
+
+	reviewPayload := map[string]interface{}{
+		"agent_id": "reviewer-1",
+		"verdict":  "reject",
+		"findings": json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"test finding","in_changed_text":true,"status":"new"}]`),
+	}
+	reviewBody, _ := json.Marshal(reviewPayload)
+	reviewReq := httptest.NewRequest("POST", "/tasks/"+reviewTaskID+"/submit", bytes.NewReader(reviewBody))
+	reviewReq.Header.Set("Authorization", authHeader)
+	reviewReq.Header.Set("Content-Type", "application/json")
+	reviewW := httptest.NewRecorder()
+	server.mux.ServeHTTP(reviewW, reviewReq)
+
+	// Claim task again for rework (after rejection, task goes back to ready)
+	claimPayload2 := map[string]string{"agent_id": "agent-1", "model": "haiku"}
+	claimBody2, _ := json.Marshal(claimPayload2)
+	claimReq2 := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody2))
+	claimReq2.Header.Set("Authorization", authHeader)
+	claimReq2.Header.Set("Content-Type", "application/json")
+	claimW2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW2, claimReq2)
+
+	// Now submit rework with disputes
+	disputePayload := map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "Rework with dispute",
+		"disputes": json.RawMessage(`[{"finding_id":"f1","evidence":"Evidence page 5"}]`),
+		"links": []map[string]string{
+			{"kind": "pr", "value": "#2"},
+		},
+	}
+	disputeBody, _ := json.Marshal(disputePayload)
+	disputeReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(disputeBody))
+	disputeReq.Header.Set("Authorization", authHeader)
+	disputeReq.Header.Set("Content-Type", "application/json")
+	disputeW := httptest.NewRecorder()
+	server.mux.ServeHTTP(disputeW, disputeReq)
+
+	if disputeW.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for disputes submit, got %d; body: %s", disputeW.Code, disputeW.Body.String())
+	}
+
+	var submittedTask store.TaskWithDepsAndLinks
+	json.NewDecoder(disputeW.Body).Decode(&submittedTask)
+
+	if submittedTask.State != "review" {
+		t.Errorf("expected state 'review', got %q", submittedTask.State)
+	}
+}
+
 // Helper to set up a task in review state (for review and transition tests).
 func setupTaskInReview(t *testing.T, server *Server, authHeader string) string {
 	projectID, docID := setupProjectAndDocument(t, server, authHeader)

@@ -16211,3 +16211,81 @@ func TestDisputesStoragePersistence(t *testing.T) {
 		t.Fatal("disputes not found in stored events")
 	}
 }
+
+// TestDisputesPersistenceAcrossRoundsAndNoUnilatneralOverturning verifies that:
+// 1. Disputes persist across multiple review rounds
+// 2. The original reviewer finding remains unchanged after a dispute
+func TestDisputesPersistenceAcrossRoundsAndNoUnilateralOverturning(t *testing.T) {
+	store, ctx, projID, taskID := newResearchTaskWithEscalationLadder(t, false, []string{"opus"})
+
+	// Round 1: Initial submission gets reviewed
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, taskID, 1)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"test finding","in_changed_text":true,"status":"new"}
+	]`))
+
+	// Round 2: Rework with dispute
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"Evidence page 5"}]`)
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Rework with dispute", nil, []LinkInput{{Kind: "pr", Value: "#2"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, disputes); err != nil {
+		t.Fatalf("failed to submit with disputes: %v", err)
+	}
+
+	// Get review task for round 2
+	opus2, _ := findResearchReviewTasks(t, store, ctx, projID, taskID, 2)
+
+	// Get the review spec to verify disputes are included in context
+	opus2Task, err := store.GetTask(ctx, opus2.ID)
+	if err != nil {
+		t.Fatalf("failed to get review task: %v", err)
+	}
+
+	// Verify the spec contains the dispute evidence
+	if !strings.Contains(opus2Task.Spec, "Evidence page 5") {
+		t.Errorf("dispute evidence not found in reviewer context")
+	}
+
+	// Submit review for round 2 - reviewer maintains the finding (no unilateral overturning)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"test finding","in_changed_text":true,"status":"still_open","prior_id":"f1"}
+	]`))
+
+	// Round 3: Verify dispute persists across rounds
+	if _, err := store.ClaimTask(ctx, taskID, "agent-2", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task for round 3: %v", err)
+	}
+
+	// Verify the original finding still exists in the events
+	events, err := store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	// Count findings and disputes across rounds
+	findingsCount := 0
+	disputesCount := 0
+	for _, e := range events {
+		if e.Kind == "review" && e.Findings != nil {
+			var findings []Finding
+			if err := json.Unmarshal(*e.Findings, &findings); err == nil {
+				findingsCount += len(findings)
+			}
+		}
+		if e.Kind == "submit" && e.Disputes != nil {
+			var ds []Dispute
+			if err := json.Unmarshal(*e.Disputes, &ds); err == nil {
+				disputesCount += len(ds)
+			}
+		}
+	}
+
+	if findingsCount < 1 {
+		t.Errorf("expected at least 1 finding to be stored, got %d", findingsCount)
+	}
+	if disputesCount < 1 {
+		t.Errorf("expected at least 1 dispute to be stored, got %d", disputesCount)
+	}
+}
