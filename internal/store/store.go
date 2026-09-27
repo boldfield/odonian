@@ -3472,15 +3472,25 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 }
 
 // extractOriginalAssignment removes any prior compaction blocks from a research spec
-// to recover the original assignment. A compaction block starts with
-// "## Unresolved findings from last review round" and continues to the end.
+// to recover the original assignment. Compaction blocks (research history and unresolved
+// findings sections) start with "\n## Research task history" and continue to the end.
+// Trailing newlines are removed to ensure spec idempotency across supersessions.
+// Note: this implementation uses a plain-text marker; if a legitimate research assignment
+// contains "## Research task history", it will be truncated. A more robust solution would
+// persist or derive the base assignment structurally.
 func extractOriginalAssignment(spec string) string {
 	historyMarker := "\n## Research task history"
 	idx := strings.Index(spec, historyMarker)
+	var assignment string
 	if idx == -1 {
-		return spec
+		assignment = spec
+	} else {
+		assignment = spec[:idx]
 	}
-	return spec[:idx]
+	// Trim trailing newlines to ensure idempotency:
+	// each supersession's spec builder adds "\n\n##", so extracted assignment
+	// should end without trailing newlines to avoid accumulation.
+	return strings.TrimRight(assignment, "\n")
 }
 
 // getUnresolvedFindingsFromLastRound gets findings with status 'new' or 'still_open'
