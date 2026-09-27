@@ -3475,8 +3475,8 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 // to recover the original assignment. A compaction block starts with
 // "## Unresolved findings from last review round" and continues to the end.
 func extractOriginalAssignment(spec string) string {
-	marker := "\n## Unresolved findings from last review round"
-	idx := strings.Index(spec, marker)
+	historyMarker := "\n## Research task history"
+	idx := strings.Index(spec, historyMarker)
 	if idx == -1 {
 		return spec
 	}
