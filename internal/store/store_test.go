@@ -3554,11 +3554,9 @@ func newResearchTask(t *testing.T, escalate bool) (Store, context.Context, strin
 // newResearchTaskWithReviewers is newResearchTask with an explicit review_models list.
 func newResearchTaskWithReviewers(t *testing.T, escalate bool, reviewModels []string) (Store, context.Context, string, string) {
 	t.Helper()
-	// For backwards compatibility, this helper creates a store with research escalation
-	// configured to use the build escalation ladder, so existing tests that expect
-	// research escalation to work continue to work.
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
-		WithResearchEscalationLadder([]string{"haiku", "sonnet", "opus"}))
+	// Uses the default empty research escalation ladder (no escalation).
+	// Tests that need escalation should create their own store with an explicit ladder.
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open test database: %v", err)
 	}
@@ -3957,11 +3955,60 @@ func TestResearchAggregation_CircuitBreakerBlocks(t *testing.T) {
 	}
 }
 
+// newResearchTaskWithEscalationLadder creates a research task with an escalation ladder configured.
+func newResearchTaskWithEscalationLadder(t *testing.T, escalate bool, reviewModels []string) (Store, context.Context, string, string) {
+	t.Helper()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithResearchEscalationLadder([]string{"haiku", "sonnet", "opus"}))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Verify claims",
+			Spec:         "Verify the claims in the doc",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: reviewModels,
+			Track:        "research",
+			Escalate:     &escalate,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	if _, err = store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	if _, err = store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil); err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	return store, ctx, proj.ID, taskID
+}
+
 // TestResearchAggregation_CircuitBreakerEscalates verifies that with escalate=true,
 // a research task past its threshold escalates to the next model tier exactly like
 // build/design, instead of blocking.
 func TestResearchAggregation_CircuitBreakerEscalates(t *testing.T) {
-	store, ctx, projID, parentID := newResearchTask(t, true)
+	store, ctx, projID, parentID := newResearchTaskWithEscalationLadder(t, true, []string{"opus", "sonnet"})
 
 	blockingRound := func(round int) {
 		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, round)
@@ -4005,6 +4052,107 @@ func TestResearchAggregation_CircuitBreakerEscalates(t *testing.T) {
 	}
 	if escalated.Track != "research" {
 		t.Errorf("expected escalated task to keep track 'research', got %s", escalated.Track)
+	}
+}
+
+// TestResearchAggregation_NoEscalationLadder verifies that research tasks with no escalation
+// ladder (the default) never escalate on rejection.
+func TestResearchAggregation_NoEscalationLadder(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, true)
+
+	blockingRound := func(round int) {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, round)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("round %d: expected both review tasks", round)
+		}
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", blocking)
+		submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	}
+
+	// With no escalation ladder (default), the task should not escalate even after
+	// multiple rejections. The model tier stays "haiku".
+	for i := 1; i <= 5; i++ {
+		blockingRound(i)
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent (round %d): %v", i, parent)
+		}
+		if parent.State != "ready" {
+			t.Fatalf("round %d: expected ready, got %s", i, parent.State)
+		}
+		if parent.Model != "haiku" {
+			t.Errorf("round %d: expected model haiku, got %s", i, parent.Model)
+		}
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+	}
+
+	blockingRound(6)
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent after round 6: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("round 6: expected ready (not escalated), got %s", parent.State)
+	}
+	if parent.Model != "haiku" {
+		t.Errorf("round 6: expected model haiku (not escalated), got %s", parent.Model)
+	}
+}
+
+// TestResearchAggregation_IndependentLadders verifies that research and build escalation
+// ladders can be configured independently without interfering with each other.
+func TestResearchAggregation_IndependentLadders(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithEscalationLadder([]string{"haiku", "sonnet", "opus"}),
+		WithResearchEscalationLadder([]string{"sonnet", "opus"}))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create both a research and build task to verify they're independent
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research task",
+			Spec:         "research something",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"sonnet", "opus"},
+			Track:        "research",
+		},
+		{
+			Title:      "Build task",
+			Spec:       "build something",
+			DocumentID: doc.ID,
+			Model:      "haiku",
+			Track:      "build",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	researchTask := tasks[0]
+	buildTask := tasks[1]
+
+	if researchTask.Track != "research" {
+		t.Errorf("research task track should be 'research', got %s", researchTask.Track)
+	}
+	if buildTask.Track != "build" {
+		t.Errorf("build task track should be 'build', got %s", buildTask.Track)
 	}
 }
 

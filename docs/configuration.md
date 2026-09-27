@@ -39,7 +39,7 @@ Research tasks use a dedicated escalation ladder and thresholds, separate from t
   identical to build/design tasks.
 
 The chain-wide round budget (which counts across a task's entire supersede chain) is deferred to
-milestone 2 of `docs/features/research-track.md`.
+R8, a future task in `docs/features/research-track.md` milestone 2.
 
 ### Runtime profiling with pprof
 
