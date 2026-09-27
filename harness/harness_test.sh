@@ -276,14 +276,18 @@ for _f in "$_build_implement" "$_build_review" "$_design_implement" "$_design_re
   fi
 done
 if [ "$_all_exist" -eq 1 ]; then
-  # Check that build prompts retain their essential markers and don't leak research-specific content
+  # Check that build/design prompts retain their essential markers and don't leak research-specific content
   if grep -q "make check" "$_build_implement" && \
      grep -q "verdict" "$_build_review" && \
      ! grep -q '3-adjudicate\|in_changed_text\|Scoped re-review' "$_build_implement" && \
-     ! grep -q '3-adjudicate\|in_changed_text\|Scoped re-review' "$_build_review"; then
+     ! grep -q '3-adjudicate\|in_changed_text\|Scoped re-review' "$_build_review" && \
+     grep -q "make check" "$_design_implement" && \
+     grep -q "verdict" "$_design_review" && \
+     ! grep -q '3-adjudicate\|in_changed_text\|Scoped re-review' "$_design_implement" && \
+     ! grep -q '3-adjudicate\|in_changed_text\|Scoped re-review' "$_design_review"; then
     test_pass "build/design prompts remain unchanged"
   else
-    test_fail "build prompts accidentally contain research-specific content or lost essential markers"
+    test_fail "build/design prompts accidentally contain research-specific content or lost essential markers"
   fi
 else
   test_fail "one or more build/design prompts missing"

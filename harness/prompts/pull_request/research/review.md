@@ -22,9 +22,10 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
    "nothing claimable" → print "nothing to review" and STOP. Otherwise claim it: `odonian claim <id>`;
    exit code 3 / "already claimed" → another reviewer took it, STOP. (These are auto-spawned
    `review`-kind tasks; `target_task_id` is the implement task under review.)
-2. **Read the brief.** `odonian show <id>` — its `spec` contains the **Implementation PR** URL and
-   the **Parent task** id (also in `target_task_id`). Then `odonian show <target_task_id>` (the
-   **parent**): its `spec` is the real acceptance criteria you review against, its `pr` link is the
+2. **Read the brief and detect your role.** `odonian show <id>` — its `spec` contains the **Implementation PR** URL and
+   the **Parent task** id (also in `target_task_id`). First, check whether this task adjudicates one disputed finding: if the spec begins with "Adjudicate one disputed research review finding", this is an **adjudication task** — skip to the adjudication path (step 3-adjudicate). Otherwise, this is a **regular review task** — continue below.
+   
+   Then `odonian show <target_task_id>` (the **parent**): its `spec` is the real acceptance criteria you review against, its `pr` link is the
    PR you review, and its `links` may carry a `no_op` marker. The parent's spec (and any project task
    contract it points at) also names the claims to check and any evidence tools you must re-run.
    **No-PR handling — distinguish three cases:**
@@ -46,11 +47,10 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
      exactly one OPEN PR, use that PR's URL and proceed to step 3. If it returns zero or multiple
      PRs, submit a `reject` verdict with note "no PR link and branch-based resolution failed;
      resubmit with the pr link" and STOP. **NEVER approve a task you couldn't actually review**.
-2.5 **Detect your role: regular review or adjudication.** Check whether this task adjudicates one disputed finding. If the spec begins with "Adjudicate one disputed research review finding", this is an **adjudication task** — skip to the adjudication path (step 3-adjudicate). Otherwise, this is a **regular review task** — proceed to step 3 below.
 
 **3-adjudicate. Adjudicate one disputed finding (adjudication path only).** This path applies ONLY when the spec begins with "Adjudicate one disputed research review finding".
 
-First, **validate the PR link and fetch the PR code**, exactly as in step 3 (see step 3 below): verify the PR link resolves to a real OPEN PR, then fetch the PR head. Do NOT merge with main; evaluate the disputed finding against the exact PR code, which is what the original review was about. (If you need the state as-merged for context, fetch and inspect it separately, but adjudicate the finding itself on the PR head alone.) If the PR link does not resolve or the PR head cannot be fetched, transition this task to `blocked` with note "PR link does not resolve or PR head is unavailable" and STOP — do NOT submit a verdict for an infrastructure failure.
+First, **validate the PR link and fetch the PR code**, exactly as in step 3 below: verify the PR link resolves to a real OPEN PR, then fetch the PR head. Do NOT merge with main; evaluate the disputed finding against the exact PR code, which is what the original review was about. (If you need the state as-merged for context, fetch and inspect it separately, but adjudicate the finding itself on the PR head alone.) If the PR link does not resolve or the PR head cannot be fetched, transition this task to `blocked` with note "PR link does not resolve or PR head is unavailable" and STOP — do NOT submit a verdict for an infrastructure failure.
 
 The spec contains the disputed finding's details (id, severity, file, line, summary, status) and the **Worker's evidence disputing the finding**. Independently verify the finding against the cited source, the worker's evidence, and the exact code in the parent task's PR head.
 
@@ -58,7 +58,7 @@ Your ruling is binding for this finding only — it does not vote on the review 
 - **Verdict `approve`** if the finding should be **OVERTURNED** — the worker's evidence resolves the dispute; the defect does not block and is not a valid finding.
 - **Verdict `reject`** if the finding should be **UPHELD** — it remains a valid blocking finding despite the worker's evidence.
 
-Submit with an empty findings array. Write your decision reasoning in a short prose comment and submit it with `odonian submit <task-id> --result "<your reasoning>" --verdict approve --findings-file <file>` (or `--verdict reject --findings-file <file>`), where `<file>` contains `[]`.
+Submit with an empty findings array. Write your decision reasoning in a short prose comment and proceed to step 6-adjudicate below to submit your verdict.
 
 3. **Validate the PR link, THEN reproduce AS MERGED WITH MAIN.** This step is for PR cases
    (recorded link from step 2 or branch-resolved from step 2) — the no-op path from step 2 is
@@ -89,7 +89,7 @@ Submit with an empty findings array. Write your decision reasoning in a short pr
      **blocking finding** — the worker cannot pass an unverifiable citation as confirmed. If a claim
      is already marked `pending`, with a record of the access attempt, inaccessibility alone is NOT a
      finding — the worker downgraded it honestly.
-   - **Re-evaluating disputed findings (round 2+).** If a prior finding from your earlier review has been disputed by the worker (section 5, "Disputes and adjudication" of docs/features/research-track.md), you will see the dispute evidence in the prior events. Re-evaluate the finding against that evidence. If the evidence resolves the dispute, report the finding as `resolved`. If the dispute does not persuade you and the finding remains valid, report it as `still_open` — the server will then spawn an adjudication task if the adjudicator is configured. Never drop a finding just because it has been disputed; carefully weigh the worker's evidence and decide whether the finding holds.
+   - **Re-evaluating disputed findings (round 2+).** If a prior finding from your earlier review has been disputed by the worker (section 5, "Disputes and adjudication" of docs/features/research-track.md), you will see the dispute evidence in the review task spec under `## Prior Review Round: Disputed Finding(s)`. Re-evaluate the finding against that evidence. If the evidence resolves the dispute, report the finding as `resolved`. If the dispute does not persuade you and the finding remains valid, report it as `still_open` — the server will then spawn an adjudication task if the adjudicator is configured. Never drop a finding just because it has been disputed; carefully weigh the worker's evidence and decide whether the finding holds.
    - **Re-run every tool the project's task contract names**, on the merged result, exactly as
      specified. Compare your output to what the worker included verbatim. **Any difference is a P1
      finding** — a stale or fabricated tool output is a false claim about the evidence.
@@ -115,8 +115,7 @@ Submit with an empty findings array. Write your decision reasoning in a short pr
    and mark them as addressed. (Adjudication tasks do not use inline comments — skip this step for adjudication.)
 
 6. **Decide the verdict, then submit it on the REVIEW task (regular review path only).** (For adjudication, see step 6-adjudicate below.)
-   - **Reject if any P1 or P2 finding exists** (including a still-open finding from an earlier
-     round, or an unreachable source behind a `confirmed` claim). **Otherwise approve**, and list any
+   - **Reject if any P1 or P2 finding blocks**: in round 1, all are blocking; from round 2 on, a P1/P2 blocks only if in changed text or if `status: still_open`. **Otherwise approve**, and list any
      P3 findings in your writeup — P3s never block a round.
    - **Always end your writeup with a `Findings` heading followed by a fenced `json` block**, in
      addition to your prose, listing every finding you raised or re-evaluated this round (empty array
@@ -159,6 +158,7 @@ Submit with an empty findings array. Write your decision reasoning in a short pr
    - Write a brief summary of your reasoning: whether the finding is valid and blocks despite the worker's evidence, or whether it should be overturned.
    - Submit: `odonian submit <review-task-id> --result "<your reasoning>" --verdict approve --findings-file <file>` (if the finding should be overturned, with `<file>` containing `[]`) or `--verdict reject --findings-file <file>` (if it should be upheld, with `<file>` containing `[]`).
    - The server records your verdict and it is **binding** for this finding alone. It does not vote on the review round.
+   - **Then STOP — do not proceed to steps 3-6 or any other regular review steps.** Your work on the adjudication is complete.
 
 7. **Do NOT merge — ever.** After submitting your verdict you are DONE with this task. Never merge a
    PR (no `gh pr merge`, no `gh api .../merge`), and never transition the parent task. The server
@@ -188,7 +188,7 @@ Submit with an empty findings array. Write your decision reasoning in a short pr
   record that reports only some of its hits is a false claim about the evidence.
 - **A finished correction task does not establish its claim.** Treat "task X corrected this" as a
   pointer to evidence, not as evidence. Check what the corrected file actually says.
-- **Reject on any P1 or P2 finding; otherwise approve.** In round 1, all text is changed text, so a P1 or P2 finding in any text blocks. From round 2 on, a P1 or P2 finding blocks only if in changed text; findings in unchanged text become follow-up tasks. P3 findings never block, in any round or text state. List all findings in your writeup, with the blocked and unblocked status clear.
+- **Reject on any P1 or P2 finding that blocks; otherwise approve.** In round 1, all text is changed text, so a P1 or P2 finding in any text blocks. From round 2 on, a P1 or P2 finding blocks only if in changed text or if `status: still_open`; findings in unchanged text (unless `still_open`) become follow-up tasks. P3 findings never block, in any round or text state. List all findings in your writeup, with the blocked and unblocked status clear.
 - **Round scope drives review scope.** Round 1 is a full review; round 2+ is a scoped re-review of your prior findings and changes since your last review.
 - **Re-evaluating disputed findings.** If a finding from your earlier review has been disputed by the worker, weigh the evidence and decide whether to resolve it or maintain it. Maintained disputes go to adjudication.
 - **Every verdict ends with a `Findings` heading followed by a fenced `json` block containing only
