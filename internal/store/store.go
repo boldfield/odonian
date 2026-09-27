@@ -3522,17 +3522,24 @@ func extractOriginalAssignment(spec string) string {
 	return strings.TrimRight(spec[:idx], "\n")
 }
 
-// carriedResearchFinding is one unresolved finding carried forward into a research
-// replacement's spec, tagged with the reviewer lineage (model and slot) that raised it
-// so a later supersession can tell whether that reviewer has since re-reviewed.
-type carriedResearchFinding struct {
-	Finding
-	ReviewerModel string `json:"reviewer_model,omitempty"`
-	ReviewerSlot  int    `json:"reviewer_slot"`
+// researchReviewerRef identifies one reviewer lineage (model and slot) that raised a
+// carried finding.
+type researchReviewerRef struct {
+	Model string `json:"model"`
+	Slot  int    `json:"slot"`
 }
 
-func (c carriedResearchFinding) lineage() string {
-	return researchReviewerLineage(c.ReviewerModel, c.ReviewerSlot)
+func (r researchReviewerRef) lineage() string {
+	return researchReviewerLineage(r.Model, r.Slot)
+}
+
+// carriedResearchFinding is one unresolved finding carried forward into a research
+// replacement's spec, tagged with every reviewer lineage that raised it (a finding
+// deduplicated across reviewers keeps all of them) so a later supersession can tell
+// which of those reviewers have since re-reviewed.
+type carriedResearchFinding struct {
+	Finding
+	Reviewers []researchReviewerRef `json:"reviewers,omitempty"`
 }
 
 // unresolvedResearchFindings returns the findings a research replacement must carry
@@ -3553,7 +3560,8 @@ func (c carriedResearchFinding) lineage() string {
 // "Unresolved" reuses collectResearchReviewReports and researchFindingChains, the
 // same prior_id lineage tracking createResearchFollowUpTasks and
 // describeChainWideBlockingFindings use. Findings are deduplicated by (severity, file,
-// line, summary) so one finding raised by two reviewers is listed once.
+// line, summary) so one finding raised by two reviewers is listed once; the deduplicated
+// record keeps the union of their lineages.
 func (s *sqliteStore) unresolvedResearchFindings(ctx context.Context, tx *sql.Tx, taskID, spec string) ([]carriedResearchFinding, error) {
 	var maxRound int
 	if err := tx.QueryRowContext(ctx, `
@@ -3569,7 +3577,18 @@ func (s *sqliteStore) unresolvedResearchFindings(ctx context.Context, tx *sql.Tx
 
 	var candidates []carriedResearchFinding
 	for _, c := range extractCarriedFindings(spec) {
-		if _, reReviewed := latestSubmittedRound[c.lineage()]; !reReviewed {
+		if len(c.Reviewers) == 0 {
+			candidates = append(candidates, c)
+			continue
+		}
+		var pending []researchReviewerRef
+		for _, r := range c.Reviewers {
+			if _, reReviewed := latestSubmittedRound[r.lineage()]; !reReviewed {
+				pending = append(pending, r)
+			}
+		}
+		if len(pending) > 0 {
+			c.Reviewers = pending
 			candidates = append(candidates, c)
 		}
 	}
@@ -3577,18 +3596,27 @@ func (s *sqliteStore) unresolvedResearchFindings(ctx context.Context, tx *sql.Tx
 		if cf.round != latestSubmittedRound[cf.lineage] || !isOutstanding(i) {
 			continue
 		}
-		candidates = append(candidates, carriedResearchFinding{Finding: cf.Finding, ReviewerModel: cf.reviewerModel, ReviewerSlot: cf.reviewerSlot})
+		candidates = append(candidates, carriedResearchFinding{
+			Finding:   cf.Finding,
+			Reviewers: []researchReviewerRef{{Model: cf.reviewerModel, Slot: cf.reviewerSlot}},
+		})
 	}
 
-	seen := make(map[string]bool, len(candidates))
+	index := make(map[string]int, len(candidates))
 	var unresolved []carriedResearchFinding
 	for _, c := range candidates {
 		key := fmt.Sprintf("%s\x00%s\x00%d\x00%s", c.Severity, c.File, c.Line, c.Summary)
-		if seen[key] {
+		i, ok := index[key]
+		if !ok {
+			index[key] = len(unresolved)
+			unresolved = append(unresolved, c)
 			continue
 		}
-		seen[key] = true
-		unresolved = append(unresolved, c)
+		for _, r := range c.Reviewers {
+			if !slices.Contains(unresolved[i].Reviewers, r) {
+				unresolved[i].Reviewers = append(unresolved[i].Reviewers, r)
+			}
+		}
 	}
 	return unresolved, nil
 }

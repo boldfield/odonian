@@ -15881,7 +15881,7 @@ func TestResearchSupersessionPartialRoundReplacementKeepsCarriedFindings(t *test
 			t.Fatalf("B's spec should carry %s, got: %s", id, taskB.Spec)
 		}
 	}
-	if !strings.Contains(taskB.Spec, `"reviewer_model":"sonnet"`) {
+	if !strings.Contains(taskB.Spec, `"reviewers":[{"model":"sonnet","slot":`) {
 		t.Errorf("B's carried findings should record the raising reviewer, got: %s", taskB.Spec)
 	}
 
@@ -15912,5 +15912,94 @@ func TestResearchSupersessionPartialRoundReplacementKeepsCarriedFindings(t *test
 	}
 	if strings.Count(taskC.Spec, researchHistorySentinel) != 1 {
 		t.Errorf("C's spec should have exactly one generated block, got: %s", taskC.Spec)
+	}
+}
+
+// TestResearchSupersessionDedupedFindingKeepsAllReviewerLineages verifies that a
+// finding raised identically by two reviewers, deduplicated into one carried record,
+// keeps both reviewer lineages. When only one of those reviewers re-reviews the
+// replacement clean while the other is still pending, the finding must still be
+// carried forward, since the pending reviewer has not re-reviewed it.
+func TestResearchSupersessionDedupedFindingKeepsAllReviewerLineages(t *testing.T) {
+	store, ctx, projID, taskA := newResearchTaskWithEscalationLadder(t, false, []string{"opus", "sonnet"})
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, taskA, 1)
+	if opus1 == nil || sonnet1 == nil {
+		t.Fatalf("round 1: expected both review tasks")
+	}
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`))
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "reject", json.RawMessage(`[
+		{"id":"g1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`))
+
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("first supersession failed: %v", err)
+	}
+	if n := strings.Count(taskB.Spec, "- **"); n != 1 {
+		t.Errorf("B's spec should list the duplicated finding once, got %d bullets: %s", n, taskB.Spec)
+	}
+	carried := extractCarriedFindings(taskB.Spec)
+	if len(carried) != 1 {
+		t.Fatalf("B should carry exactly one deduplicated finding, got %d: %s", len(carried), taskB.Spec)
+	}
+	models := map[string]bool{}
+	for _, r := range carried[0].Reviewers {
+		models[r.Model] = true
+	}
+	if !models["opus"] || !models["sonnet"] || len(carried[0].Reviewers) != 2 {
+		t.Fatalf("deduplicated finding should keep both reviewer lineages, got %+v", carried[0].Reviewers)
+	}
+
+	if _, err := store.PromoteTask(ctx, taskB.ID); err != nil {
+		t.Fatalf("failed to promote B: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskB.ID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim B: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskB.ID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#101"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit B: %v", err)
+	}
+	bOpus1, bSonnet1 := findResearchReviewTasks(t, store, ctx, projID, taskB.ID, 1)
+	if bOpus1 == nil || bSonnet1 == nil {
+		t.Fatalf("expected B's round 1 review tasks")
+	}
+	submitResearchReview(t, store, ctx, bOpus1, "opus-reviewer", "approve", json.RawMessage(`[]`))
+
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("second supersession failed: %v", err)
+	}
+	carriedC := extractCarriedFindings(taskC.Spec)
+	if len(carriedC) != 1 || carriedC[0].Summary != "fabricated source" {
+		t.Fatalf("C should still carry the finding sonnet has not re-reviewed, got: %s", taskC.Spec)
+	}
+	if len(carriedC[0].Reviewers) != 1 || carriedC[0].Reviewers[0].Model != "sonnet" {
+		t.Errorf("C's carried finding should keep only the pending sonnet lineage, got %+v", carriedC[0].Reviewers)
+	}
+
+	// Once sonnet also re-reviews clean on C, the finding is settled and dropped.
+	if _, err := store.PromoteTask(ctx, taskC.ID); err != nil {
+		t.Fatalf("failed to promote C: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskC.ID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim C: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskC.ID, "agent-1", "Reworked again", nil, []LinkInput{{Kind: "pr", Value: "#102"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit C: %v", err)
+	}
+	_, cSonnet1 := findResearchReviewTasks(t, store, ctx, projID, taskC.ID, 1)
+	if cSonnet1 == nil {
+		t.Fatalf("expected C's round 1 sonnet review task")
+	}
+	submitResearchReview(t, store, ctx, cSonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	taskD, err := store.SupersedeTask(ctx, taskC.ID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("third supersession failed: %v", err)
+	}
+	if carriedD := extractCarriedFindings(taskD.Spec); len(carriedD) != 0 {
+		t.Errorf("D should carry nothing once both reviewers re-reviewed clean, got: %s", taskD.Spec)
 	}
 }
