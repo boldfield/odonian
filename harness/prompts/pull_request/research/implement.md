@@ -121,8 +121,13 @@ more than a minute. Pin heartbeats to those points; do not rely on sensing elaps
    An empty `odonian pr-feedback list` alone does NOT establish completion — you MUST ensure your
    diff addresses the recorded review findings. If a reviewer's earlier finding is not repeated in
    current PR comments, it still applies unless you've resolved it in this rework. If you believe a
-   finding is wrong, you may dispute it in your resubmission by naming the finding's id and the
-   source evidence it relies on — do not silently drop it.
+   finding is wrong, you may dispute it in your resubmission instead of (or in addition to) fixing
+   it: write a JSON array of `{"finding_id": "...", "evidence": "..."}` objects — `finding_id` names
+   the exact id the reviewer assigned in the round you're reworking, and `evidence` cites the
+   specific source evidence the dispute relies on — to a file and pass it with `--disputes-file` on
+   `odonian submit`. Do not silently drop a finding you disagree with. A dispute never overturns the
+   finding by itself: the reviewer who raised it re-evaluates it against your evidence next round,
+   and a finding already disputed once cannot be disputed again in a later round.
 
    Then address all feedback:
    - Run `odonian pr-feedback list <pr-url>` to enumerate EVERY unaddressed item — both inline

@@ -821,6 +821,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	messageFlag := fs.String("message", "", "commit message override (local_commit mode)")
 	agentFlag := fs.String("agent", "", "agent ID")
 	findingsFileFlag := fs.String("findings-file", "", "path to JSON file with structured findings")
+	disputesFileFlag := fs.String("disputes-file", "", "path to JSON file with finding disputes (research-track rework only)")
 	skipFeedbackGateFlag := fs.Bool("skip-feedback-gate", false, "bypass the mechanical PR-feedback rework gate (humans/emergencies only)")
 	positionals, err := parseFlagsWithPositionals(fs, args)
 	if err != nil {
@@ -866,6 +867,26 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		}
 
 		findings = fileData
+	}
+
+	// Validate disputes file early, before any HTTP requests
+	var disputes []byte
+	if *disputesFileFlag != "" {
+		fileData, err := os.ReadFile(*disputesFileFlag)
+		if err != nil {
+			return fmt.Errorf("failed to read disputes file: %w", err)
+		}
+
+		var d interface{}
+		if err := json.Unmarshal(fileData, &d); err != nil {
+			return fmt.Errorf("disputes file is not valid JSON: %w", err)
+		}
+
+		if _, isArray := d.([]interface{}); !isArray {
+			return fmt.Errorf("disputes file must be a JSON array")
+		}
+
+		disputes = fileData
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
@@ -984,7 +1005,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		verdict = verdictFlag
 	}
 
-	if err := client.SubmitTaskWithFindings(ctx, taskID, agentID, *resultFlag, verdict, links, findings); err != nil {
+	if err := client.SubmitTaskWithDisputesAndFindings(ctx, taskID, agentID, *resultFlag, verdict, links, findings, disputes); err != nil {
 		return fmt.Errorf("failed to submit task: %w", err)
 	}
 

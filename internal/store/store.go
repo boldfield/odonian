@@ -49,6 +49,7 @@ type Store interface {
 	HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error)
 	PromoteTask(ctx context.Context, taskID string) (Task, error)
 	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error)
+	SubmitTaskWithDisputes(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
@@ -430,7 +431,7 @@ func (s *sqliteStore) setTaskDepends(ctx context.Context, tx *sql.Tx, taskID str
 // ListEvents retrieves all events for a given task, ordered by created_at and id.
 func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, error) {
 	rows, err := s.readConn.QueryContext(ctx, `
-		SELECT id, task_id, actor, kind, verdict, note, findings, source_task_id, created_at
+		SELECT id, task_id, actor, kind, verdict, note, findings, source_task_id, disputes, created_at
 		FROM event
 		WHERE task_id = ?
 		ORDER BY created_at, id
@@ -445,7 +446,8 @@ func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, e
 		var e Event
 		var findingsText sql.NullString
 		var sourceTaskID sql.NullString
-		err := rows.Scan(&e.ID, &e.TaskID, &e.Actor, &e.Kind, &e.Verdict, &e.Note, &findingsText, &sourceTaskID, &e.CreatedAt)
+		var disputesText sql.NullString
+		err := rows.Scan(&e.ID, &e.TaskID, &e.Actor, &e.Kind, &e.Verdict, &e.Note, &findingsText, &sourceTaskID, &disputesText, &e.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan event: %w", err)
 		}
@@ -455,6 +457,10 @@ func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, e
 		}
 		if sourceTaskID.Valid {
 			e.SourceTaskID = &sourceTaskID.String
+		}
+		if disputesText.Valid {
+			raw := json.RawMessage(disputesText.String)
+			e.Disputes = &raw
 		}
 		events = append(events, e)
 	}
@@ -668,6 +674,7 @@ type Event struct {
 	Note         *string          `db:"note" json:"note"`                     // nullable
 	Findings     *json.RawMessage `db:"findings" json:"findings"`             // nullable; structured review findings
 	SourceTaskID *string          `db:"source_task_id" json:"source_task_id"` // nullable; the review task that produced this event, if any
+	Disputes     *json.RawMessage `db:"disputes" json:"disputes"`             // nullable; worker disputes of review findings, set on a research rework's submit event
 	CreatedAt    string           `db:"created_at" json:"created_at"`
 }
 
@@ -825,6 +832,116 @@ func validateFindings(raw json.RawMessage) ([]Finding, error) {
 	}
 
 	return findings, nil
+}
+
+// Dispute is a worker's dispute of one prior-round review finding, submitted with
+// cited source evidence during research-track rework, per
+// docs/features/research-track.md section 5. A dispute never alters the finding it
+// names: the reviewer who raised it re-evaluates it, in its next round, against the
+// evidence.
+type Dispute struct {
+	FindingID string `json:"finding_id"`
+	Evidence  string `json:"evidence"`
+}
+
+// validateDisputes parses and validates a raw JSON disputes payload: an array of
+// objects, each naming a finding_id and citing non-empty evidence, with no
+// finding_id repeated within one submission. It does not check that a finding_id was
+// actually raised by a reviewer, or resolve which reviewer raised it — that requires
+// the task's review history and is done by the caller, which also rejects a
+// finding_id disputed a second time in a later round.
+func validateDisputes(raw json.RawMessage) ([]Dispute, error) {
+	var rawDisputes []json.RawMessage
+	if err := json.Unmarshal(raw, &rawDisputes); err != nil {
+		return nil, invalid("INVALID_DISPUTES", "disputes: must be an array")
+	}
+
+	disputes := make([]Dispute, 0, len(rawDisputes))
+	seenIDs := make(map[string]bool, len(rawDisputes))
+
+	for i, rd := range rawDisputes {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(rd, &m); err != nil {
+			return nil, invalid("INVALID_DISPUTES", fmt.Sprintf("disputes[%d]: must be an object", i))
+		}
+
+		var d Dispute
+
+		idRaw, ok := m["finding_id"]
+		if !ok {
+			return nil, invalid("INVALID_DISPUTES", fmt.Sprintf("disputes[%d].finding_id: must be non-empty", i))
+		}
+		var id string
+		if err := json.Unmarshal(idRaw, &id); err != nil {
+			return nil, invalid("INVALID_DISPUTES", fmt.Sprintf("disputes[%d].finding_id: must be a string", i))
+		}
+		if id == "" {
+			return nil, invalid("INVALID_DISPUTES", fmt.Sprintf("disputes[%d].finding_id: must be non-empty", i))
+		}
+		if seenIDs[id] {
+			return nil, invalid("INVALID_DISPUTES", fmt.Sprintf("disputes[%d].finding_id: duplicate finding_id %q in this submission", i, id))
+		}
+		seenIDs[id] = true
+		d.FindingID = id
+
+		evRaw, ok := m["evidence"]
+		if !ok {
+			return nil, invalid("INVALID_DISPUTES", fmt.Sprintf("disputes[%d].evidence: must be non-empty", i))
+		}
+		var evidence string
+		if err := json.Unmarshal(evRaw, &evidence); err != nil {
+			return nil, invalid("INVALID_DISPUTES", fmt.Sprintf("disputes[%d].evidence: must be a string", i))
+		}
+		if strings.TrimSpace(evidence) == "" {
+			return nil, invalid("INVALID_DISPUTES", fmt.Sprintf("disputes[%d].evidence: must be non-empty", i))
+		}
+		d.Evidence = evidence
+
+		disputes = append(disputes, d)
+	}
+
+	return disputes, nil
+}
+
+// disputeContextEntry is a disputed finding paired with the worker's evidence,
+// grouped by the raising reviewer's lineage so submitTask can hand each reviewer's
+// next-round review task exactly the disputes it needs to re-evaluate.
+type disputeContextEntry struct {
+	Finding  Finding
+	Evidence string
+}
+
+// priorDisputedFindingIDs collects every finding_id already disputed on an earlier
+// submit event of this implement task, across every prior rework round, so a finding
+// cannot be disputed a second time (docs/features/research-track.md section 5: the
+// raising reviewer's next re-evaluation of a dispute is what decides it, once).
+func (s *sqliteStore) priorDisputedFindingIDs(ctx context.Context, tx *sql.Tx, taskID string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT disputes FROM event WHERE task_id = ? AND kind = 'submit' AND disputes IS NOT NULL
+	`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query prior disputes: %w", err)
+	}
+	defer rows.Close()
+
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var disputesText string
+		if err := rows.Scan(&disputesText); err != nil {
+			return nil, fmt.Errorf("failed to scan prior disputes: %w", err)
+		}
+		var priorDisputes []Dispute
+		if err := json.Unmarshal([]byte(disputesText), &priorDisputes); err != nil {
+			continue
+		}
+		for _, d := range priorDisputes {
+			seen[d.FindingID] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate prior disputes: %w", err)
+	}
+	return seen, nil
 }
 
 // ErrNotFound is returned when a resource is not found.
@@ -1887,7 +2004,27 @@ func researchThresholdFor(model string, researchLadder []string, researchThresho
 // Returns ValidationError if a link kind is invalid or verdict is missing/invalid.
 // Returns ErrNotFound if the task doesn't exist.
 // Returns ErrConflict if the task is not in_progress or not assigned to the given agentID.
+// SubmitTask submits a task result, with optional structured review findings
+// (review-kind tasks only). It is a thin wrapper over submitTask for callers with no
+// disputes to submit; the variadic findings parameter keeps its existing call sites
+// (of which there are many, across the store, API and CLI) unchanged.
 func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error) {
+	var f json.RawMessage
+	if len(findings) > 0 {
+		f = findings[0]
+	}
+	return s.submitTask(ctx, taskID, agentID, result, verdict, links, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, f, nil)
+}
+
+// SubmitTaskWithDisputes submits a task result along with a disputes payload: a
+// worker's dispute, on a research-track rework submission, of specific findings from
+// the round it is reworking, per docs/features/research-track.md section 5. See
+// submitTask for the full behavior.
+func (s *sqliteStore) SubmitTaskWithDisputes(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage) (TaskWithDepsAndLinks, error) {
+	return s.submitTask(ctx, taskID, agentID, result, verdict, links, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, findings, disputes)
+}
+
+func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage) (TaskWithDepsAndLinks, error) {
 	// Validate link kinds first (before mutating anything).
 	// "no_op" marks a review-verified no-op resolution: a worker that finds the
 	// acceptance criteria already satisfied on main with no diff submits with a
@@ -1914,9 +2051,10 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 	var taskKind string
 	var targetTaskID *string
 	var taskTrack string
+	var currentReviewRound int
 	err = tx.QueryRowContext(ctx, `
-		SELECT kind, target_task_id, track FROM task WHERE id = ? AND state='in_progress' AND assignee=?
-	`, taskID, agentID).Scan(&taskKind, &targetTaskID, &taskTrack)
+		SELECT kind, target_task_id, track, review_round FROM task WHERE id = ? AND state='in_progress' AND assignee=?
+	`, taskID, agentID).Scan(&taskKind, &targetTaskID, &taskTrack, &currentReviewRound)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Task not found or not submittable
@@ -1958,16 +2096,16 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 	// review tasks are the exception: section 3 requires an explicit findings
 	// array (submit [] when there are none), since research aggregation below
 	// relies on every review task's findings being present.
-	findingsAbsent := len(findings) == 0 || findings[0] == nil || string(findings[0]) == "null"
+	findingsAbsent := findings == nil || string(findings) == "null"
 	if taskKind == "review" && taskTrack == "research" && findingsAbsent {
 		return TaskWithDepsAndLinks{}, invalid("MISSING_FINDINGS", "findings are required for research review tasks; submit [] when there are none")
 	}
 	var findingsToStore json.RawMessage
-	if len(findings) > 0 && findings[0] != nil && string(findings[0]) != "null" {
+	if !findingsAbsent {
 		if taskKind != "review" {
 			return TaskWithDepsAndLinks{}, invalid("FINDINGS_NOT_ALLOWED", "findings are only allowed on review-kind tasks")
 		}
-		parsedFindings, ferr := validateFindings(findings[0])
+		parsedFindings, ferr := validateFindings(findings)
 		if ferr != nil {
 			return TaskWithDepsAndLinks{}, ferr
 		}
@@ -1976,6 +2114,68 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to marshal findings: %w", merr)
 		}
 		findingsToStore = marshaled
+	}
+
+	// Validate disputes based on task kind/track. A disputes payload is optional and
+	// explicit null is treated the same as absent, so ordinary research rework and
+	// every build/design submission are unaffected. Disputes are only accepted on
+	// research-track implement (rework) submissions that have a prior review round
+	// to dispute a finding from, per docs/features/research-track.md section 5.
+	// Disputes never alter the finding they name; they are matched here only to
+	// confirm the finding was actually raised, and by exactly one reviewer, so it can
+	// be routed to that reviewer's next round unambiguously.
+	disputesAbsent := disputes == nil || string(disputes) == "null"
+	var disputesToStore json.RawMessage
+	disputesByLineage := make(map[string][]disputeContextEntry)
+	if !disputesAbsent {
+		if taskKind != "implement" || taskTrack != "research" {
+			return TaskWithDepsAndLinks{}, invalid("DISPUTES_NOT_ALLOWED", "disputes are only allowed on research-track implement (rework) submissions")
+		}
+		if currentReviewRound == 0 {
+			return TaskWithDepsAndLinks{}, invalid("NO_PRIOR_ROUND", "disputes require a prior review round to dispute a finding from")
+		}
+		parsedDisputes, derr := validateDisputes(disputes)
+		if derr != nil {
+			return TaskWithDepsAndLinks{}, derr
+		}
+
+		roundFindings, _, cerr := s.collectResearchReviewReports(ctx, tx, taskID, currentReviewRound)
+		if cerr != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to collect review findings for dispute validation: %w", cerr)
+		}
+		byID := make(map[string][]researchCollectedFinding)
+		for _, cf := range roundFindings {
+			if cf.round != currentReviewRound {
+				continue
+			}
+			byID[cf.ID] = append(byID[cf.ID], cf)
+		}
+
+		priorDisputed, perr := s.priorDisputedFindingIDs(ctx, tx, taskID)
+		if perr != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to collect prior disputes: %w", perr)
+		}
+
+		for _, d := range parsedDisputes {
+			targets := byID[d.FindingID]
+			if len(targets) == 0 {
+				return TaskWithDepsAndLinks{}, invalid("UNKNOWN_FINDING_ID", fmt.Sprintf("disputes: finding_id %q was not raised by any reviewer in round %d", d.FindingID, currentReviewRound))
+			}
+			if len(targets) > 1 {
+				return TaskWithDepsAndLinks{}, invalid("AMBIGUOUS_FINDING_ID", fmt.Sprintf("disputes: finding_id %q was raised by more than one reviewer in round %d and cannot be disputed unambiguously", d.FindingID, currentReviewRound))
+			}
+			if priorDisputed[d.FindingID] {
+				return TaskWithDepsAndLinks{}, invalid("DUPLICATE_DISPUTE", fmt.Sprintf("disputes: finding_id %q was already disputed in an earlier round", d.FindingID))
+			}
+			target := targets[0]
+			disputesByLineage[target.lineage] = append(disputesByLineage[target.lineage], disputeContextEntry{Finding: target.Finding, Evidence: d.Evidence})
+		}
+
+		marshaled, merr := json.Marshal(parsedDisputes)
+		if merr != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to marshal disputes: %w", merr)
+		}
+		disputesToStore = marshaled
 	}
 
 	// Determine the next state based on task kind
@@ -2028,9 +2228,22 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 		}
 
 		// Append submit event in the same transaction
-		_, err := s.AppendEvent(ctx, tx, taskID, agentID, "submit", nil, nil)
+		submitEvent, err := s.AppendEvent(ctx, tx, taskID, agentID, "submit", nil, nil)
 		if err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append submit event: %w", err)
+		}
+
+		// Record this submission's disputes on its own submit event. Disputes ride
+		// alongside AppendEvent's shared findings column rather than through it,
+		// since findings and disputes are mutually exclusive by task kind (findings on
+		// review-kind submissions, disputes on implement-kind rework) and never occur
+		// on the same event.
+		if disputesToStore != nil {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE event SET disputes = ? WHERE id = ?
+			`, string(disputesToStore), submitEvent.ID); err != nil {
+				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to record disputes on submit event: %w", err)
+			}
 		}
 
 		// Fetch the submitted task to check if it's an implement task
@@ -2085,9 +2298,19 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			}
 
 			// Create a review task for each reviewer
+			reviewerSlotsTaken := make(map[string]int)
 			for _, reviewerModel := range reviewers {
 				reviewTaskID := GenerateID()
 				reviewTitle := "Review: " + t.Title + " [" + reviewerModel + "]"
+
+				// This reviewer's lineage among this round's review tasks (see
+				// researchReviewerLineage): the same lineage computation
+				// collectResearchReviewReports uses when it later reads this round's
+				// review tasks back, so a dispute resolved against a lineage above is
+				// routed to the matching reviewer's spec below.
+				slot := reviewerSlotsTaken[reviewerModel]
+				reviewerSlotsTaken[reviewerModel] = slot + 1
+				lineage := researchReviewerLineage(reviewerModel, slot)
 
 				// Build the spec for the review task: a strict-review brief pointing at the parent's PR link
 				reviewSpec := "Review the implementation:\n\n"
@@ -2098,6 +2321,15 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 				if isNoOp {
 					reviewSpec += "## NO-OP submission (verify, do not auto-reject)\n\n"
 					reviewSpec += "The implementer reports the parent's acceptance criteria are ALREADY satisfied on `main` with no code changes, so there is NO PR. Do NOT reject merely because a PR is missing. VERIFY the claim against current `main`: if the parent's acceptance criteria genuinely hold in the repo, approve; if work is actually needed, reject with the specific gap.\n\n"
+				}
+				if disputed := disputesByLineage[lineage]; len(disputed) > 0 {
+					reviewSpec += "## Prior Review Round: Disputed Finding(s)\n\n"
+					reviewSpec += fmt.Sprintf("The worker disputes the following finding(s) you raised in round %d, citing source evidence. Re-evaluate each against the evidence: withdraw it (report it resolved) if the evidence resolves it, or maintain it (report it still_open) if not. This does not change the finding on record; your re-evaluation is what decides it.\n\n", currentReviewRound)
+					for _, entry := range disputed {
+						reviewSpec += fmt.Sprintf("- Finding %s [%s] at %s:%d: %s\n", entry.Finding.ID, entry.Finding.Severity, entry.Finding.File, entry.Finding.Line, entry.Finding.Summary)
+						reviewSpec += fmt.Sprintf("  Worker's evidence: %s\n", entry.Evidence)
+					}
+					reviewSpec += "\n"
 				}
 				reviewSpec += "## Instructions\n\n"
 				reviewSpec += "Examine the submitted implementation and provide approval or rejection with written feedback.\n\n"
