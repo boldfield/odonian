@@ -1871,12 +1871,13 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 
 	now := nowTimestamp()
 
-	// First, determine the task kind before doing any updates
+	// First, determine the task kind and track before doing any updates
 	var taskKind string
 	var targetTaskID *string
+	var taskTrack string
 	err = tx.QueryRowContext(ctx, `
-		SELECT kind, target_task_id FROM task WHERE id = ? AND state='in_progress' AND assignee=?
-	`, taskID, agentID).Scan(&taskKind, &targetTaskID)
+		SELECT kind, target_task_id, track FROM task WHERE id = ? AND state='in_progress' AND assignee=?
+	`, taskID, agentID).Scan(&taskKind, &targetTaskID, &taskTrack)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Task not found or not submittable
@@ -1904,6 +1905,11 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 		// Validate verdict value
 		if *verdict != "approve" && *verdict != "reject" {
 			return TaskWithDepsAndLinks{}, invalid("INVALID_VERDICT", "verdict must be 'approve' or 'reject'")
+		}
+
+		// For research track reviews, findings are mandatory
+		if taskTrack == "research" && (len(findings) == 0 || findings[0] == nil || string(findings[0]) == "null") {
+			return TaskWithDepsAndLinks{}, invalid("MISSING_FINDINGS", "findings are required for research track reviews (provide empty array [] if no findings)")
 		}
 	} else if taskKind == "implement" {
 		// Verdict is forbidden for implement tasks
@@ -2188,6 +2194,78 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 	return TaskWithDepsAndLinks{}, ErrConflict
 }
 
+// isBlockingFinding determines if a finding blocks a research review round.
+// A finding blocks if:
+// - It is P1 or P2 and in changed text, OR
+// - It is P1 or P2 during round 1 (any text), OR
+// - Its status is "still_open"
+func isBlockingFinding(f Finding, isRound1 bool) bool {
+	severity := f.Severity
+	if severity != "P1" && severity != "P2" && severity != "P3" {
+		return false
+	}
+
+	if f.Status == "still_open" {
+		return true
+	}
+
+	if (severity == "P1" || severity == "P2") && f.InChangedText {
+		return true
+	}
+
+	if (severity == "P1" || severity == "P2") && isRound1 {
+		return true
+	}
+
+	return false
+}
+
+// checkResearchBlockingFindings checks if any review task in the current round raised
+// a blocking finding. Returns true if blocking findings exist, false otherwise.
+// It queries 'review' events (appended when review tasks submit) on the parent task.
+func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql.Tx, parentID string, reviewRound int, expectedReviewCount int) (bool, error) {
+	isRound1 := reviewRound == 1
+
+	// Get the most recent review events. Since review events are appended to the parent
+	// when review tasks submit, and we expect exactly expectedReviewCount events from
+	// the current round, we query the most recent events of kind='review' on the parent.
+	rows, err := tx.QueryContext(ctx, `
+		SELECT findings FROM event
+		WHERE task_id = ? AND kind = 'review' AND verdict IS NOT NULL
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, parentID, expectedReviewCount)
+	if err != nil {
+		return false, fmt.Errorf("failed to query review events: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var findingsText sql.NullString
+		if err := rows.Scan(&findingsText); err != nil {
+			return false, fmt.Errorf("failed to scan findings: %w", err)
+		}
+
+		if !findingsText.Valid {
+			continue
+		}
+
+		var findingsRaw json.RawMessage = json.RawMessage(findingsText.String)
+		var findings []Finding
+		if err := json.Unmarshal(findingsRaw, &findings); err != nil {
+			continue
+		}
+
+		for _, f := range findings {
+			if isBlockingFinding(f, isRound1) {
+				return true, nil
+			}
+		}
+	}
+
+	return false, rows.Err()
+}
+
 // aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.
 // It handles: verdict counting, merge task spawning (if approved with agent_merge),
 // escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
@@ -2239,8 +2317,69 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 	isTerminal := parentState == "failed" || parentState == "blocked" || parentState == "abandoned"
 
 	if !isTerminal {
-		// Determine the new parent state based on the tally
-		if doneReviewTasks < totalReviewTasks {
+		// Research track uses findings-based aggregation; build/design use verdict counting
+		if parentTrack == "research" {
+			if doneReviewTasks < totalReviewTasks {
+				// Not all reviewers submitted yet; stay in review
+				newParentState = ""
+			} else {
+				// All reviewers submitted; check for blocking findings
+				hasBlockingFindings, err := s.checkResearchBlockingFindings(ctx, tx, parentID, parentReviewRound, totalReviewTasks)
+				if err != nil {
+					return "", err
+				}
+
+				if hasBlockingFindings {
+					// Blocking finding exists; round fails
+					newParentState = "ready"
+				} else {
+					// No blocking findings; round passes
+					newParentState = "approved"
+
+					// Check if parent has a no_op link (and no pr link)
+					var hasNoOp bool
+					var hasPR bool
+					rows, err := tx.QueryContext(ctx, `
+						SELECT kind FROM task_link WHERE task_id = ? AND tombstoned_at IS NULL
+					`, parentID)
+					if err != nil {
+						return "", fmt.Errorf("failed to query active task links: %w", err)
+					}
+					defer rows.Close()
+					for rows.Next() {
+						var kind string
+						if err := rows.Scan(&kind); err != nil {
+							return "", fmt.Errorf("failed to scan task link kind: %w", err)
+						}
+						if kind == "no_op" {
+							hasNoOp = true
+						} else if kind == "pr" {
+							hasPR = true
+						}
+					}
+					if err := rows.Err(); err != nil {
+						return "", fmt.Errorf("failed to iterate task links: %w", err)
+					}
+
+					// If no_op link with no pr link, go straight to done (regardless of agent_merge)
+					if hasNoOp && !hasPR {
+						newParentState = "done"
+					} else if parentAgentMerge && hasPR {
+						// Spawn merge task if approved with agent_merge && pr (not the no_op case)
+						mergeTaskID := GenerateID()
+						mergeTitle := "Merge: " + parentTitle
+						_, err := tx.ExecContext(ctx, `
+							INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, created_at, updated_at)
+							VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+						`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, now, now)
+						if err != nil {
+							return "", fmt.Errorf("failed to create merge task: %w", err)
+						}
+					}
+				}
+			}
+		} else if doneReviewTasks < totalReviewTasks {
+			// Determine the new parent state based on the tally
 			// Not all done yet; parent stays in review
 			newParentState = ""
 		} else if doneReviewTasks == totalReviewTasks && approveReviewTasks == totalReviewTasks {
@@ -2350,11 +2489,19 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		// Append transition event for audit trail
 		var eventNote string
 		if newParentState == "approved" {
-			eventNote = "Aggregation: all reviewers approved"
+			if parentTrack == "research" {
+				eventNote = "Aggregation: no blocking findings in any reviewer's findings"
+			} else {
+				eventNote = "Aggregation: all reviewers approved"
+			}
 		} else if newParentState == "done" {
 			eventNote = "auto-finalized: no-op task approved by all reviewers"
 		} else if newParentState == "ready" {
-			eventNote = "Aggregation: at least one reviewer rejected"
+			if parentTrack == "research" {
+				eventNote = "Aggregation: blocking finding(s) found in reviewer findings"
+			} else {
+				eventNote = "Aggregation: at least one reviewer rejected"
+			}
 		} else if newParentState == "blocked" {
 			eventNote = fmt.Sprintf("auto-blocked: %d consecutive review rounds without approval — needs human attention", parentReviewRound)
 		}

@@ -11831,3 +11831,568 @@ func TestTombstonedNoOpDoesNotFinalize(t *testing.T) {
 		t.Errorf("no merge task should be created for no_op finalization, got %d", len(mergeTasks))
 	}
 }
+
+// TestResearchAggregation_NoBlockingFindings tests that a research round passes when no blocking findings exist
+func TestResearchAggregation_NoBlockingFindings(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create research track implement task with two reviewers
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research: verify claims",
+			Spec:         "Verify the claims",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Promote, claim, and submit the implement task
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Verified claims", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Find the review tasks
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	var reviewTasks []*Task
+	for i := range allTasks {
+		if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID {
+			reviewTasks = append(reviewTasks, &allTasks[i])
+		}
+	}
+	if len(reviewTasks) != 2 {
+		t.Fatalf("expected 2 review tasks, got %d", len(reviewTasks))
+	}
+
+	// First reviewer submits with empty findings
+	review1 := reviewTasks[0]
+	_, err = store.ClaimTask(ctx, review1.ID, "reviewer-1", review1.Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim first review task: %v", err)
+	}
+	approve := "approve"
+	emptyFindings := json.RawMessage("[]")
+	_, err = store.SubmitTask(ctx, review1.ID, "reviewer-1", "No issues found", &approve, []LinkInput{}, 5, nil, emptyFindings)
+	if err != nil {
+		t.Fatalf("failed to submit first review task: %v", err)
+	}
+
+	// Verify parent is still in review (waiting for second reviewer)
+	parentTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+	if parentTask.State != "review" {
+		t.Errorf("expected parent to stay in review after first reviewer, got %s", parentTask.State)
+	}
+
+	// Second reviewer submits with P3 findings (non-blocking)
+	review2 := reviewTasks[1]
+	_, err = store.ClaimTask(ctx, review2.ID, "reviewer-2", review2.Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim second review task: %v", err)
+	}
+	p3Findings := json.RawMessage(`[{"id":"p3-1","severity":"P3","file":"test.md","line":10,"summary":"Wrong page number","in_changed_text":true,"status":"new"}]`)
+	_, err = store.SubmitTask(ctx, review2.ID, "reviewer-2", "Minor issue", &approve, []LinkInput{}, 5, nil, p3Findings)
+	if err != nil {
+		t.Fatalf("failed to submit second review task: %v", err)
+	}
+
+	// Verify parent moved to approved (no blocking findings)
+	parentTask, err = store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+	if parentTask.State != "approved" {
+		t.Errorf("expected parent to move to approved with no blocking findings, got %s", parentTask.State)
+	}
+}
+
+// TestResearchAggregation_BlockingFindingsP1InChangedText tests that P1 in changed text blocks the round
+func TestResearchAggregation_BlockingFindingsP1InChangedText(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create research track implement task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research: verify claims",
+			Spec:         "Verify the claims",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Promote, claim, and submit the implement task
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Verified claims", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Find the review tasks
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	var reviewTasks []*Task
+	for i := range allTasks {
+		if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID {
+			reviewTasks = append(reviewTasks, &allTasks[i])
+		}
+	}
+	if len(reviewTasks) != 2 {
+		t.Fatalf("expected 2 review tasks, got %d", len(reviewTasks))
+	}
+
+	// First reviewer approves with empty findings
+	review1 := reviewTasks[0]
+	_, err = store.ClaimTask(ctx, review1.ID, "reviewer-1", review1.Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim first review task: %v", err)
+	}
+	approve := "approve"
+	emptyFindings := json.RawMessage("[]")
+	_, err = store.SubmitTask(ctx, review1.ID, "reviewer-1", "Looks good", &approve, []LinkInput{}, 5, nil, emptyFindings)
+	if err != nil {
+		t.Fatalf("failed to submit first review task: %v", err)
+	}
+
+	// Second reviewer rejects with P1 in changed text (blocking)
+	review2 := reviewTasks[1]
+	_, err = store.ClaimTask(ctx, review2.ID, "reviewer-2", review2.Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim second review task: %v", err)
+	}
+	blockingFindings := json.RawMessage(`[{"id":"p1-1","severity":"P1","file":"test.md","line":5,"summary":"False claim","in_changed_text":true,"status":"new"}]`)
+	_, err = store.SubmitTask(ctx, review2.ID, "reviewer-2", "Issue found", &approve, []LinkInput{}, 5, nil, blockingFindings)
+	if err != nil {
+		t.Fatalf("failed to submit second review task: %v", err)
+	}
+
+	// Verify parent moved to ready (blocking finding)
+	parentTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+	if parentTask.State != "ready" {
+		t.Errorf("expected parent to move to ready with blocking P1 in changed text, got %s", parentTask.State)
+	}
+}
+
+// TestResearchAggregation_StillOpenFindings tests that still_open findings always block
+func TestResearchAggregation_StillOpenFindings(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create research track implement task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research: verify claims",
+			Spec:         "Verify the claims",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Round 1: implement and submit
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Verified claims", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Find review tasks for round 1
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	var reviewTasks []*Task
+	for i := range allTasks {
+		if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID && allTasks[i].ReviewRound == 1 {
+			reviewTasks = append(reviewTasks, &allTasks[i])
+		}
+	}
+
+	if len(reviewTasks) != 2 {
+		t.Fatalf("expected 2 review tasks, got %d", len(reviewTasks))
+	}
+
+	// Round 1: both reviewers approve
+	for _, reviewTask := range reviewTasks {
+		_, err = store.ClaimTask(ctx, reviewTask.ID, "reviewer", reviewTask.Model, 5*time.Minute)
+		if err != nil {
+			t.Fatalf("failed to claim review task: %v", err)
+		}
+		approve := "approve"
+		emptyFindings := json.RawMessage("[]")
+		_, err = store.SubmitTask(ctx, reviewTask.ID, "reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, emptyFindings)
+		if err != nil {
+			t.Fatalf("failed to submit review task: %v", err)
+		}
+	}
+
+	// Parent should be approved after round 1
+	parentTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+	if parentTask.State != "approved" {
+		t.Errorf("expected parent to be approved after round 1, got %s", parentTask.State)
+	}
+
+	// Now test round 2 with still_open findings
+	// Promote parent back to ready for round 2
+	_, err = store.TransitionTask(ctx, taskID, "ready", nil)
+	if err != nil {
+		t.Fatalf("failed to transition parent to ready: %v", err)
+	}
+
+	// Claim and submit for round 2
+	_, err = store.ClaimTask(ctx, taskID, "agent-2", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task for round 2: %v", err)
+	}
+	_, err = store.SubmitTask(ctx, taskID, "agent-2", "Updated verification", nil, []LinkInput{{Kind: "pr", Value: "#101"}}, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to submit round 2: %v", err)
+	}
+
+	// Find review tasks for round 2
+	allTasks, err = store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	reviewTasks = nil
+	for i := range allTasks {
+		if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID && allTasks[i].ReviewRound == 2 {
+			reviewTasks = append(reviewTasks, &allTasks[i])
+		}
+	}
+
+	if len(reviewTasks) != 2 {
+		t.Fatalf("expected 2 review tasks for round 2, got %d", len(reviewTasks))
+	}
+
+	// One reviewer approves, one submits with still_open finding (blocking)
+	_, err = store.ClaimTask(ctx, reviewTasks[0].ID, "reviewer", reviewTasks[0].Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim first round 2 review: %v", err)
+	}
+	approve := "approve"
+	emptyFindings := json.RawMessage("[]")
+	_, err = store.SubmitTask(ctx, reviewTasks[0].ID, "reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, emptyFindings)
+	if err != nil {
+		t.Fatalf("failed to submit first round 2 review: %v", err)
+	}
+
+	// Second reviewer with still_open finding
+	_, err = store.ClaimTask(ctx, reviewTasks[1].ID, "reviewer", reviewTasks[1].Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim second round 2 review: %v", err)
+	}
+	stillOpenFindings := json.RawMessage(`[{"id":"p1-2","severity":"P1","file":"test.md","line":5,"summary":"Still not fixed","in_changed_text":false,"status":"still_open","prior_id":"p1-1"}]`)
+	_, err = store.SubmitTask(ctx, reviewTasks[1].ID, "reviewer", "Issue persists", &approve, []LinkInput{}, 5, nil, stillOpenFindings)
+	if err != nil {
+		t.Fatalf("failed to submit second round 2 review: %v", err)
+	}
+
+	// Verify parent moved to ready (still_open finding blocks)
+	parentTask, err = store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+	if parentTask.State != "ready" {
+		t.Errorf("expected parent to move to ready with still_open finding, got %s", parentTask.State)
+	}
+}
+
+// TestResearchAggregation_MissingFindings tests that research track reviews require findings
+func TestResearchAggregation_MissingFindings(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create research track implement task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research: verify claims",
+			Spec:         "Verify the claims",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			Track:        "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Promote, claim, and submit the implement task
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Verified claims", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Find the review task
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	var reviewTask *Task
+	for i := range allTasks {
+		if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID {
+			reviewTask = &allTasks[i]
+			break
+		}
+	}
+
+	if reviewTask == nil {
+		t.Fatalf("expected 1 review task, got none")
+	}
+
+	// Claim the review task
+	_, err = store.ClaimTask(ctx, reviewTask.ID, "reviewer-1", reviewTask.Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	// Try to submit without findings - should fail
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "reviewer-1", "Looks good", &approve, []LinkInput{}, 5, nil)
+	if err == nil {
+		t.Errorf("expected error when submitting research review without findings, got none")
+	}
+
+	// Verify the error is about missing findings
+	if !strings.Contains(err.Error(), "findings are required for research track reviews") {
+		t.Errorf("expected error about missing findings, got: %v", err)
+	}
+}
+
+// TestBuildDesignAggregationUnchanged tests that build/design track aggregation still works
+func TestBuildDesignAggregationUnchanged(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create build track implement task (default track)
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Implement feature",
+			Spec:         "Do the thing",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Promote, claim, and submit the implement task
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to submit implement task: %v", err)
+	}
+
+	// Find the review tasks
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	var reviewTasks []*Task
+	for i := range allTasks {
+		if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID {
+			reviewTasks = append(reviewTasks, &allTasks[i])
+		}
+	}
+	if len(reviewTasks) != 2 {
+		t.Fatalf("expected 2 review tasks, got %d", len(reviewTasks))
+	}
+
+	// First reviewer approves
+	_, err = store.ClaimTask(ctx, reviewTasks[0].ID, "reviewer-1", reviewTasks[0].Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim first review task: %v", err)
+	}
+	approve := "approve"
+	_, err = store.SubmitTask(ctx, reviewTasks[0].ID, "reviewer-1", "Looks good", &approve, []LinkInput{}, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to submit first review task: %v", err)
+	}
+
+	// Verify parent is still in review (first approval doesn't move it)
+	parentTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+	if parentTask.State != "review" {
+		t.Errorf("expected parent task state='review' after first approve, got '%s'", parentTask.State)
+	}
+
+	// Second reviewer approves
+	_, err = store.ClaimTask(ctx, reviewTasks[1].ID, "reviewer-2", reviewTasks[1].Model, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim second review task: %v", err)
+	}
+	_, err = store.SubmitTask(ctx, reviewTasks[1].ID, "reviewer-2", "Looks good", &approve, []LinkInput{}, 5, nil)
+	if err != nil {
+		t.Fatalf("failed to submit second review task: %v", err)
+	}
+
+	// Verify parent task moved to approved state (all approved - build track behavior unchanged)
+	parentTask, err = store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+	if parentTask.State != "approved" {
+		t.Errorf("expected parent task state='approved' after all approve, got '%s'", parentTask.State)
+	}
+}
