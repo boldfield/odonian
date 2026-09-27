@@ -166,7 +166,9 @@ type findingThread struct {
 	resolvedGlobalRounds     []int // every globalRound at which a report, or an implicit non-restatement, settled it
 	finalOutstanding         bool  // per the latest information seen, whether it is still outstanding
 
-	disputed    bool   // true if the worker disputed one of this thread's reports (event.disputes) and it later settled without adjudication
+	openReportGlobalRounds  []int // every globalRound at which a report in this thread was not resolved (new or still_open)
+	lastDisputedGlobalRound int   // 0 if never disputed; else the latest globalRound of a report the worker disputed (event.disputes)
+
 	adjudicated string // "", "held" or "withdrawn": set by applyAdjudications, overriding the natural classification
 }
 
@@ -323,6 +325,9 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 				if isBlockingResearchFinding(f.Finding, f.round) && (thread.firstBlockingGlobalRound == 0 || g < thread.firstBlockingGlobalRound) {
 					thread.firstBlockingGlobalRound = g
 				}
+				if f.Status != "resolved" {
+					thread.openReportGlobalRounds = append(thread.openReportGlobalRounds, g)
+				}
 				agg.threadByReport[reportKey(task.ID, f.lineage, f.round, f.ID)] = thread
 			}
 			thread.lastKnownID = last.ID
@@ -357,7 +362,7 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 
 		openByLineage = openOut
 
-		if err := agg.collectVerdicts(ctx, s, allTasks, adjudicationTaskIDs, task.ID, taskIdx, chainRoot); err != nil {
+		if err := agg.collectVerdicts(ctx, tx, allTasks, adjudicationTaskIDs, task.ID, taskIdx, chainRoot); err != nil {
 			return err
 		}
 	}
@@ -371,9 +376,12 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 // findings at all still reviewed the task and must still count toward sample size and
 // total rounds. Disputes are collected here, rather than in processChain, because a
 // dispute must be matched against threadByReport, which processChain has already
-// fully populated for this task by the time it calls this method.
-func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, s *sqliteStore, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, taskID string, taskIdx int, chainRoot string) error {
-	events, err := s.ListEvents(ctx, taskID)
+// fully populated for this task by the time it calls this method. Events are read
+// through tx, not s.ListEvents: that would need a second readConn connection while tx
+// holds one, deadlocking the pool under enough concurrent callers, and would read
+// outside the aggregation's snapshot.
+func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, tx *sql.Tx, allTasks map[string]Task, adjudicationTaskIDs map[string]bool, taskID string, taskIdx int, chainRoot string) error {
+	events, err := listEvents(ctx, tx, taskID)
 	if err != nil {
 		return fmt.Errorf("failed to list events for %s: %w", taskID, err)
 	}
@@ -397,7 +405,7 @@ func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, s *sqliteS
 				agg.approvals = append(agg.approvals, scorecardApproval{model: reviewTask.Model, chainRoot: chainRoot, globalRound: globalRound(taskIdx, reviewTask.ReviewRound)})
 			}
 		case "submit":
-			if err := agg.recordDisputes(taskID, event); err != nil {
+			if err := agg.recordDisputes(taskID, taskIdx, event); err != nil {
 				return err
 			}
 		}
@@ -405,12 +413,13 @@ func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, s *sqliteS
 	return nil
 }
 
-// recordDisputes marks every thread named by a submit event's disputes (R10) as
-// disputed: docs/features/research-track.md section 5 says a disputed finding the
-// reviewer subsequently reports resolved, without going to adjudication, was
-// withdrawn, not fixed by the worker. applyAdjudications overrides this when the
-// reviewer instead maintains the finding and it goes to adjudication.
-func (agg *scorecardAggregation) recordDisputes(taskID string, event Event) error {
+// recordDisputes records, on every thread named by a submit event's disputes (R10),
+// the globalRound of the disputed report: docs/features/research-track.md section 5
+// says a disputed finding the reviewer settles in its next report, rather than
+// maintaining it, was withdrawn, not fixed by the worker. See classify for how a
+// maintained dispute is told apart; applyAdjudications overrides both when the
+// dispute went to adjudication.
+func (agg *scorecardAggregation) recordDisputes(taskID string, taskIdx int, event Event) error {
 	if event.Disputes == nil {
 		return nil
 	}
@@ -420,7 +429,9 @@ func (agg *scorecardAggregation) recordDisputes(taskID string, event Event) erro
 	}
 	for _, d := range disputes {
 		if thread, ok := agg.threadByReport[reportKey(taskID, d.Lineage, d.Round, d.FindingID)]; ok {
-			thread.disputed = true
+			if g := globalRound(taskIdx, d.Round); g > thread.lastDisputedGlobalRound {
+				thread.lastDisputedGlobalRound = g
+			}
 		}
 	}
 	return nil
@@ -469,19 +480,36 @@ func (agg *scorecardAggregation) applyAdjudications(ctx context.Context, tx *sql
 // classify decides a thread's final classification — an adjudication ruling wins if
 // one applies; otherwise a thread that ended outstanding is unresolved, and one that
 // settled naturally (per processChain) is held, unless the worker disputed it and the
-// reviewer never maintained it into adjudication, per section 5 ("if it withdraws the
-// finding, the finding is resolved") — that settlement is a withdrawal, not a fix.
+// reviewer settled it without ever maintaining it afterward, per section 5 ("if it
+// withdraws the finding, the finding is resolved") — that settlement is a withdrawal,
+// not a fix. A dispute the reviewer maintained (an open report after the latest
+// dispute) that later settled without an adjudication ruling — for instance because
+// no adjudicator was available — held up: the worker fixed it.
 func (t *findingThread) classify() string {
 	switch {
 	case t.adjudicated != "":
 		return t.adjudicated
 	case t.finalOutstanding:
 		return "unresolved"
-	case t.disputed:
+	case t.withdrawnAfterDispute():
 		return "withdrawn"
 	default:
 		return "held"
 	}
+}
+
+// withdrawnAfterDispute reports whether the worker disputed this thread and the
+// reviewer never reported it open again after the latest dispute.
+func (t *findingThread) withdrawnAfterDispute() bool {
+	if t.lastDisputedGlobalRound == 0 {
+		return false
+	}
+	for _, g := range t.openReportGlobalRounds {
+		if g > t.lastDisputedGlobalRound {
+			return false
+		}
+	}
+	return true
 }
 
 // computeApprovalsWithLaterFix implements the fourth section 8 metric: for each

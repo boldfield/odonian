@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1001,5 +1003,103 @@ func TestGetResearchReviewerScorecards_AdjudicationUpheld(t *testing.T) {
 	}
 	if opusCard.FindingsUnresolved != 0 {
 		t.Errorf("expected opus 0 unresolved, got %d", opusCard.FindingsUnresolved)
+	}
+}
+
+// TestGetResearchReviewerScorecards_MaintainedDisputeLaterFixedIsHeld verifies that a
+// disputed finding its reviewer maintains (reports still_open after the dispute) and
+// that the worker then fixes, with no adjudication ruling, counts as held rather than
+// withdrawn — and so still credits another reviewer's earlier approval as one whose
+// blocking finding was subsequently fixed.
+func TestGetResearchReviewerScorecards_MaintainedDisputeLaterFixedIsHeld(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "sonnet"})
+
+	opusTask1, sonnetTask1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil || sonnetTask1 == nil {
+		t.Fatalf("expected both round 1 review tasks")
+	}
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, sonnetTask1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"already covered elsewhere"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("dispute submission failed: %v", err)
+	}
+
+	// Round 2: opus maintains the finding; no adjudicator is configured, so it stays blocking.
+	opusTask2, sonnetTask2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusTask2 == nil || sonnetTask2 == nil {
+		t.Fatalf("expected both round 2 review tasks")
+	}
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f2","severity":"P2","file":"test.txt","line":1,"summary":"still missing info","in_changed_text":true,"status":"still_open","prior_id":"f1"}]`))
+	submitResearchReview(t, store, ctx, sonnetTask2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	// Round 3: the worker fixes it and opus reports it resolved.
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+	opusTask3, sonnetTask3 := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
+	if opusTask3 == nil || sonnetTask3 == nil {
+		t.Fatalf("expected both round 3 review tasks")
+	}
+	submitResearchReview(t, store, ctx, opusTask3, "opus-reviewer", "approve", json.RawMessage(`[{"id":"f3","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":false,"status":"resolved","prior_id":"f2"}]`))
+	submitResearchReview(t, store, ctx, sonnetTask3, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	sonnetCard := findScorecardByModel(scorecards.Scorecards, "sonnet")
+	if opusCard == nil || sonnetCard == nil {
+		t.Fatalf("expected both reviewers in scorecards")
+	}
+	if opusCard.FindingsRaised["p2"] != 1 {
+		t.Errorf("expected opus raised p2=1, got %d", opusCard.FindingsRaised["p2"])
+	}
+	if opusCard.FindingsHeld != 1 || opusCard.FindingsWithdrawn != 0 || opusCard.FindingsUnresolved != 0 {
+		t.Errorf("expected opus held=1 withdrawn=0 unresolved=0, got held=%d withdrawn=%d unresolved=%d",
+			opusCard.FindingsHeld, opusCard.FindingsWithdrawn, opusCard.FindingsUnresolved)
+	}
+	// Sonnet approved rounds 1 and 2 while opus's blocking finding was open; it was fixed in round 3.
+	if sonnetCard.ApprovalsWithLaterFixedBlockingFindings != 2 {
+		t.Errorf("expected sonnet 2 approvals with later fixed blocking findings, got %d", sonnetCard.ApprovalsWithLaterFixedBlockingFindings)
+	}
+}
+
+// TestGetResearchReviewerScorecards_ConcurrentCallsDoNotExhaustReadPool verifies the
+// aggregation reads everything through its own read transaction: more concurrent
+// callers than readConn's pool size must all complete rather than each holding one
+// connection while waiting on a second.
+func TestGetResearchReviewerScorecards_ConcurrentCallsDoNotExhaustReadPool(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	opusTask, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask == nil {
+		t.Fatalf("expected opus review task")
+	}
+	submitResearchReview(t, store, ctx, opusTask, "opus-reviewer", "reject", json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`))
+
+	const callers = 16
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sc, err := store.GetResearchReviewerScorecards(timeoutCtx, projID)
+			if err == nil && len(sc.Scorecards) != 1 {
+				err = fmt.Errorf("expected 1 scorecard, got %d", len(sc.Scorecards))
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent GetResearchReviewerScorecards failed: %v", err)
+		}
 	}
 }

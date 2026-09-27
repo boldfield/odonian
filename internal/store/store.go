@@ -444,7 +444,19 @@ func (s *sqliteStore) setTaskDepends(ctx context.Context, tx *sql.Tx, taskID str
 
 // ListEvents retrieves all events for a given task, ordered by created_at and id.
 func (s *sqliteStore) ListEvents(ctx context.Context, taskID string) ([]Event, error) {
-	rows, err := s.readConn.QueryContext(ctx, `
+	return listEvents(ctx, s.readConn, taskID)
+}
+
+// eventQuerier is the subset of *sql.DB and *sql.Tx that listEvents needs.
+type eventQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// listEvents is ListEvents against an explicit querier, so a caller already holding a
+// read transaction can list events inside it instead of taking a second pooled
+// connection from readConn.
+func listEvents(ctx context.Context, q eventQuerier, taskID string) ([]Event, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT id, task_id, actor, kind, verdict, note, findings, source_task_id, disputes, created_at
 		FROM event
 		WHERE task_id = ?
