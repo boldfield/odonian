@@ -2390,8 +2390,9 @@ func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql
 
 // createResearchFollowUpTasks collects non-blocking findings from all reviewers in the
 // current round and creates one follow-up task per unique (file, line, summary) combination.
-// Deduplication by (file, line, summary) is enforced via task_link to survive re-aggregation,
-// re-scheduling, and state changes. The follow-up links to the parent and source finding.
+// Deduplication is parent-scoped to prevent cross-parent collision and enforced via task_link
+// to survive re-aggregation, re-scheduling, and state changes. The follow-up links to the
+// parent and source finding.
 func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.Tx, parentID, projectID, documentID string, round int, now string) error {
 	// Collect all review task IDs and their model (reviewer) for this round
 	taskRows, err := tx.QueryContext(ctx, `
@@ -2476,13 +2477,20 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		return nil
 	}
 
-	createdFollowupIDs := []string{}
+	var newlyCreatedFollowupIDs []string
+	var allFollowupIDs []string
+
+	// Resolve the follow-up model: research default → general default
+	followupModel := s.researchDefaultModel
+	if followupModel == "" {
+		followupModel = s.getDefaultModel()
+	}
 
 	for _, fwr := range findingsByKey {
 		finding := fwr.finding
 		reviewer := fwr.reviewer
-		// Create the dedup key for this finding
-		dedupKey := fmt.Sprintf("research-finding:%s:%d:%s", finding.File, finding.Line, finding.Summary)
+		// Create the parent-scoped dedup key to prevent cross-parent collisions
+		dedupKey := fmt.Sprintf("research-finding:%s:%s:%d:%s", parentID, finding.File, finding.Line, finding.Summary)
 
 		// Check if a follow-up task already exists for this dedup key via task_link
 		var existingFollowupID *string
@@ -2495,7 +2503,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 
 		// If follow-up already exists for this finding, reuse it
 		if existingFollowupID != nil {
-			createdFollowupIDs = append(createdFollowupIDs, *existingFollowupID)
+			allFollowupIDs = append(allFollowupIDs, *existingFollowupID)
 			continue
 		}
 
@@ -2506,18 +2514,16 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		followupSpec := fmt.Sprintf("Finding: %s\nSeverity: %s\nFile: %s\nLine: %d\nReviewer: %s\nSource: %s",
 			finding.Summary, finding.Severity, finding.File, finding.Line, reviewer, finding.ID)
 
-		// Insert follow-up task without using raw SQL, to ensure model validation
-		// Note: we use raw SQL here as we're in a transaction, and the task creation helper
-		// doesn't accept a transaction. We set model to empty so default model logic applies.
+		// Insert follow-up task with the resolved model
 		if _, execErr := tx.ExecContext(ctx, `
-			INSERT INTO task (id, project_id, document_id, title, spec, state, track, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, followupID, projectID, documentID, followupTitle, followupSpec, "backlog", "research", now, now); execErr != nil {
+			INSERT INTO task (id, project_id, document_id, title, spec, state, track, model, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, followupID, projectID, documentID, followupTitle, followupSpec, "backlog", "research", followupModel, now, now); execErr != nil {
 			return fmt.Errorf("failed to create follow-up task: %w", execErr)
 		}
 
 		// Create task_link rows for deduplication and parent reference
-		// Dedup link: enables idempotency across repeated aggregation
+		// Dedup link: enables idempotency across repeated aggregation (parent-scoped)
 		dedupLinkID := GenerateID()
 		if _, execErr := tx.ExecContext(ctx, `
 			INSERT INTO task_link (id, task_id, kind, value)
@@ -2535,11 +2541,12 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			return fmt.Errorf("failed to create parent link: %w", execErr)
 		}
 
-		createdFollowupIDs = append(createdFollowupIDs, followupID)
+		newlyCreatedFollowupIDs = append(newlyCreatedFollowupIDs, followupID)
+		allFollowupIDs = append(allFollowupIDs, followupID)
 	}
 
-	// Update parent result with follow-up IDs if any were created
-	if len(createdFollowupIDs) > 0 {
+	// Only update parent result and event if new follow-ups were actually created
+	if len(newlyCreatedFollowupIDs) > 0 {
 		// Get current parent result
 		var currentResult sql.NullString
 		err := tx.QueryRowContext(ctx, `SELECT result FROM task WHERE id = ?`, parentID).Scan(&currentResult)
@@ -2555,7 +2562,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		if resultStr != "" {
 			resultStr += "\n"
 		}
-		resultStr += fmt.Sprintf("Follow-up tasks created: %s", strings.Join(createdFollowupIDs, ", "))
+		resultStr += fmt.Sprintf("Follow-up tasks created: %s", strings.Join(newlyCreatedFollowupIDs, ", "))
 
 		// Update parent result
 		if _, execErr := tx.ExecContext(ctx, `UPDATE task SET result = ?, updated_at = ? WHERE id = ?`,
@@ -2565,10 +2572,10 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 
 		// Record follow-up task IDs in a parent event
 		followupList := json.RawMessage(nil)
-		if data, marshalErr := json.Marshal(createdFollowupIDs); marshalErr == nil {
+		if data, marshalErr := json.Marshal(newlyCreatedFollowupIDs); marshalErr == nil {
 			followupList = json.RawMessage(data)
 		}
-		eventNote := fmt.Sprintf("Created %d research follow-up tasks for non-blocking findings", len(createdFollowupIDs))
+		eventNote := fmt.Sprintf("Created %d research follow-up tasks for non-blocking findings", len(newlyCreatedFollowupIDs))
 		if _, appendErr := s.appendEvent(ctx, tx, parentID, "system", "follow_up_created", nil, &eventNote, nil, followupList); appendErr != nil {
 			return fmt.Errorf("failed to append follow-up event: %w", appendErr)
 		}
