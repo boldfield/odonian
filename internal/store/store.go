@@ -2091,7 +2091,9 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 			t.ReviewRound = newReviewRound
 		} else if t.Kind == "review" && targetTaskID != nil {
 			// This is a review task. Append a review event on the parent task.
-			_, err := s.AppendEvent(ctx, tx, *targetTaskID, agentID, "review", verdict, &result, findingsToStore)
+			// Encode the review task ID in the note so we can filter by it in aggregation.
+			noteWithReviewTaskID := fmt.Sprintf(`{"review_task_id":"%s","result":"%s"}`, taskID, escapeJSON(result))
+			_, err := s.AppendEvent(ctx, tx, *targetTaskID, agentID, "review", verdict, &noteWithReviewTaskID, findingsToStore)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append review event on parent: %w", err)
 			}
@@ -2246,6 +2248,16 @@ func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, paren
 	return parentState, nil
 }
 
+func escapeJSON(s string) string {
+	return strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		"\n", `\n`,
+		"\r", `\r`,
+		"\t", `\t`,
+	).Replace(s)
+}
+
 func isBlockingFinding(f Finding, isRound1 bool) bool {
 	severity := f.Severity
 	if severity != "P1" && severity != "P2" && severity != "P3" {
@@ -2277,12 +2289,32 @@ func isBlockingFinding(f Finding, isRound1 bool) bool {
 func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql.Tx, parentID string, reviewRound int, expectedReviewCount int) (bool, error) {
 	isRound1 := reviewRound == 1
 
-	// Query review events on the parent. We get more than expectedReviewCount to ensure we capture
-	// all review task submissions even if some other events (like AddReview) are interspersed.
-	// We process events in reverse chronological order and stop after finding expectedReviewCount
-	// events with valid findings.
+	// Query review task IDs for the current round so we can filter events by them
+	reviewTaskRows, err := tx.QueryContext(ctx, `
+		SELECT id FROM task
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review'
+	`, parentID, reviewRound)
+	if err != nil {
+		return false, fmt.Errorf("failed to query review tasks: %w", err)
+	}
+	defer reviewTaskRows.Close()
+
+	reviewTaskIDs := make(map[string]bool)
+	for reviewTaskRows.Next() {
+		var taskID string
+		if err := reviewTaskRows.Scan(&taskID); err != nil {
+			return false, fmt.Errorf("failed to scan review task id: %w", err)
+		}
+		reviewTaskIDs[taskID] = true
+	}
+	if err := reviewTaskRows.Err(); err != nil {
+		return false, fmt.Errorf("failed to iterate review tasks: %w", err)
+	}
+
+	// Query review events on the parent, ordered by creation time DESC.
+	// We need to include the note field to verify the event is from a review task.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT findings FROM event
+		SELECT findings, note FROM event
 		WHERE task_id = ? AND kind = 'review' AND verdict IS NOT NULL
 		ORDER BY created_at DESC
 		LIMIT ?
@@ -2295,8 +2327,23 @@ func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql
 	findingsCount := 0
 	for rows.Next() {
 		var findingsText sql.NullString
-		if err := rows.Scan(&findingsText); err != nil {
+		var noteText sql.NullString
+		if err := rows.Scan(&findingsText, &noteText); err != nil {
 			return false, fmt.Errorf("failed to scan findings: %w", err)
+		}
+
+		// Extract review task ID from the note JSON (format: {"review_task_id":"...", "result":"..."})
+		var reviewTaskID string
+		if noteText.Valid {
+			var noteData map[string]string
+			if err := json.Unmarshal([]byte(noteText.String), &noteData); err == nil {
+				reviewTaskID = noteData["review_task_id"]
+			}
+		}
+
+		// Skip events that are not from a review task in this round (e.g., AddReview calls)
+		if reviewTaskID == "" || !reviewTaskIDs[reviewTaskID] {
+			continue
 		}
 
 		// For research, if a review event has no findings, that's an error (all research reviews must have findings)
