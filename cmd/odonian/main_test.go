@@ -5235,3 +5235,67 @@ func TestValidateResearchDefaultModel(t *testing.T) {
 func strPtr(s string) *string {
 	return &s
 }
+
+func TestParseResearchRoundBudget(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    int
+		wantErr bool
+	}{
+		{
+			name:    "empty string returns default",
+			input:   "",
+			want:    6,
+			wantErr: false,
+		},
+		{
+			name:    "valid positive number",
+			input:   "10",
+			want:    10,
+			wantErr: false,
+		},
+		{
+			name:    "one is valid",
+			input:   "1",
+			want:    1,
+			wantErr: false,
+		},
+		{
+			name:    "zero is invalid",
+			input:   "0",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "negative is invalid",
+			input:   "-5",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "non-numeric is invalid",
+			input:   "abc",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "floating point is invalid",
+			input:   "3.14",
+			want:    0,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseResearchRoundBudget(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseResearchRoundBudget() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("parseResearchRoundBudget() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

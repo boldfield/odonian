@@ -2797,99 +2797,147 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 // across a research task and all its predecessors in the supersede chain.
 // Each task's review_round counts as one rejected round for research tracks.
 // Walks backward from the current task to its predecessors using the superseded_by relationship.
-func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.Tx, taskID string) (int, error) {
-	count := 0
-	seen := make(map[string]bool)
-
-	var toVisit []string
-	toVisit = append(toVisit, taskID)
-
-	for len(toVisit) > 0 {
-		currentID := toVisit[0]
-		toVisit = toVisit[1:]
-
-		if seen[currentID] {
-			continue
+// countTaskRejectedRounds counts how many rounds of a single task had blocking findings (i.e., were rejected).
+func (s *sqliteStore) countTaskRejectedRounds(ctx context.Context, tx *sql.Tx, taskID string) (int, error) {
+	var reviewRound int
+	err := tx.QueryRowContext(ctx, `
+		SELECT review_round FROM task WHERE id = ?
+	`, taskID).Scan(&reviewRound)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
 		}
-		seen[currentID] = true
+		return 0, fmt.Errorf("failed to fetch task review_round: %w", err)
+	}
 
-		var reviewRound int
+	count := 0
+	for round := 1; round <= reviewRound; round++ {
+		hasBlocking, err := s.checkResearchBlockingFindings(ctx, tx, taskID, round)
+		if err != nil {
+			return 0, fmt.Errorf("failed to check blocking findings for round %d: %w", round, err)
+		}
+		if hasBlocking {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *sqliteStore) countChainWideRejectedRounds(ctx context.Context, tx *sql.Tx, taskID string) (int, error) {
+	// Collect the chain in reverse (from current back to root), then count in forward order
+	chain := []string{taskID}
+	current := taskID
+	seen := make(map[string]bool)
+	seen[current] = true
+
+	for {
+		var supersededBy sql.NullString
+		err := tx.QueryRowContext(ctx, `
+			SELECT superseded_by FROM task WHERE id = ?
+		`, current).Scan(&supersededBy)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				break
+			}
+			return 0, fmt.Errorf("failed to fetch superseded_by: %w", err)
+		}
+		if !supersededBy.Valid {
+			break
+		}
+		if seen[supersededBy.String] {
+			break
+		}
+		current = supersededBy.String
+		chain = append(chain, current)
+		seen[current] = true
+	}
+
+	// Reverse chain to go from root to current task
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+
+	// Count rejected rounds for each task in the chain, only for research tasks
+	count := 0
+	for _, taskInChain := range chain {
 		var track string
 		err := tx.QueryRowContext(ctx, `
-			SELECT review_round, track FROM task WHERE id = ?
-		`, currentID).Scan(&reviewRound, &track)
+			SELECT track FROM task WHERE id = ?
+		`, taskInChain).Scan(&track)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				continue
 			}
-			return 0, fmt.Errorf("failed to fetch task for chain count: %w", err)
+			return 0, fmt.Errorf("failed to fetch task track: %w", err)
 		}
 
-		// Only count rejected rounds for research tasks
-		if track == "research" && reviewRound > 0 {
-			count += reviewRound
-		}
-
-		// Find predecessors: tasks where superseded_by = currentID
-		rows, err := tx.QueryContext(ctx, `
-			SELECT id FROM task WHERE superseded_by = ?
-		`, currentID)
-		if err != nil {
-			return 0, fmt.Errorf("failed to find predecessors: %w", err)
-		}
-
-		for rows.Next() {
-			var predID string
-			if err := rows.Scan(&predID); err != nil {
-				rows.Close()
-				return 0, fmt.Errorf("failed to scan predecessor: %w", err)
+		if track == "research" {
+			rejectedRounds, err := s.countTaskRejectedRounds(ctx, tx, taskInChain)
+			if err != nil {
+				return 0, err
 			}
-			if !seen[predID] {
-				toVisit = append(toVisit, predID)
-			}
+			count += rejectedRounds
 		}
-
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return 0, fmt.Errorf("failed to iterate predecessors: %w", err)
-		}
-		rows.Close()
 	}
 
 	return count, nil
 }
 
 // collectChainBlockingFindings walks the task's supersede chain and collects blocking findings
-// from each round, returning them grouped by round for display in the budget block event.
+// from each round, returning them grouped by chain-wide round number for display in the budget block event.
+// Rounds are numbered 1, 2, 3, ... starting from the root of the chain (oldest predecessor).
 func (s *sqliteStore) collectChainBlockingFindings(ctx context.Context, tx *sql.Tx, taskID string) (map[int][]Finding, error) {
 	findings := make(map[int][]Finding)
+
+	// Collect the chain in reverse (from current back to root), then process in forward order
+	chain := []string{taskID}
+	current := taskID
 	seen := make(map[string]bool)
+	seen[current] = true
 
-	var toVisit []string
-	toVisit = append(toVisit, taskID)
-
-	for len(toVisit) > 0 {
-		currentID := toVisit[0]
-		toVisit = toVisit[1:]
-
-		if seen[currentID] {
-			continue
+	for {
+		var supersededBy sql.NullString
+		err := tx.QueryRowContext(ctx, `
+			SELECT superseded_by FROM task WHERE id = ?
+		`, current).Scan(&supersededBy)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				break
+			}
+			return nil, fmt.Errorf("failed to fetch superseded_by: %w", err)
 		}
-		seen[currentID] = true
+		if !supersededBy.Valid {
+			break
+		}
+		if seen[supersededBy.String] {
+			break
+		}
+		current = supersededBy.String
+		chain = append(chain, current)
+		seen[current] = true
+	}
 
+	// Reverse chain to go from root to current task
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+
+	// Process each task in chain order, numbering rounds chain-wide
+	chainWideRound := 1
+	for _, taskInChain := range chain {
 		var reviewRound int
 		err := tx.QueryRowContext(ctx, `
 			SELECT review_round FROM task WHERE id = ?
-		`, currentID).Scan(&reviewRound)
+		`, taskInChain).Scan(&reviewRound)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				continue
 			}
-			return nil, fmt.Errorf("failed to fetch task for findings: %w", err)
+			return nil, fmt.Errorf("failed to fetch task review_round: %w", err)
 		}
 
-		// Collect blocking findings from review events for this task across all rounds up to current
-		for round := 1; round <= reviewRound; round++ {
+		// Collect blocking findings from review events for this task across all of its rounds
+		for localRound := 1; localRound <= reviewRound; localRound++ {
 			rows, err := tx.QueryContext(ctx, `
 				SELECT source_task_id, findings FROM event
 				WHERE task_id = ? AND kind = 'review' AND source_task_id IS NOT NULL
@@ -2897,9 +2945,9 @@ func (s *sqliteStore) collectChainBlockingFindings(ctx context.Context, tx *sql.
 					SELECT id FROM task WHERE target_task_id = ? AND review_round = ? AND kind = 'review'
 				)
 				ORDER BY created_at ASC
-			`, currentID, currentID, round)
+			`, taskInChain, taskInChain, localRound)
 			if err != nil {
-				return nil, fmt.Errorf("failed to fetch findings for round %d: %w", round, err)
+				return nil, fmt.Errorf("failed to fetch findings for round %d of task %s: %w", localRound, taskInChain, err)
 			}
 
 			for rows.Next() {
@@ -2914,35 +2962,17 @@ func (s *sqliteStore) collectChainBlockingFindings(ctx context.Context, tx *sql.
 					var blockingFindings []Finding
 					if err := json.Unmarshal([]byte(findingsText.String), &blockingFindings); err == nil {
 						for _, f := range blockingFindings {
-							if isBlockingResearchFinding(f, round) {
-								findings[round] = append(findings[round], f)
+							if isBlockingResearchFinding(f, localRound) {
+								findings[chainWideRound] = append(findings[chainWideRound], f)
 							}
 						}
 					}
 				}
 			}
 			rows.Close()
-		}
 
-		// Find predecessors: tasks where superseded_by = currentID
-		rows, err := tx.QueryContext(ctx, `
-			SELECT id FROM task WHERE superseded_by = ?
-		`, currentID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to find predecessors for findings: %w", err)
+			chainWideRound++
 		}
-
-		for rows.Next() {
-			var predID string
-			if err := rows.Scan(&predID); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("failed to scan predecessor: %w", err)
-			}
-			if !seen[predID] {
-				toVisit = append(toVisit, predID)
-			}
-		}
-		rows.Close()
 	}
 
 	return findings, nil
@@ -3069,13 +3099,20 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			if shouldBlockForBudget {
 				// Budget exhausted: block with reason decompose
 				newParentState = "blocked"
-				// Collect blocking findings from the entire chain, grouped by round
+				// Collect blocking findings from the entire chain, grouped by chain-wide round
 				chainFindings, err := s.collectChainBlockingFindings(ctx, tx, parentID)
 				if err != nil {
 					return "", err
 				}
+				// Render findings for all rounds in the chain, in order
 				var findingsSummary []string
-				for round := 1; round <= parentReviewRound; round++ {
+				maxRound := 0
+				for round := range chainFindings {
+					if round > maxRound {
+						maxRound = round
+					}
+				}
+				for round := 1; round <= maxRound; round++ {
 					if len(chainFindings[round]) > 0 {
 						var summaries []string
 						for _, f := range chainFindings[round] {

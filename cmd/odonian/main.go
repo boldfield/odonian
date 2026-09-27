@@ -207,16 +207,9 @@ func runServer() {
 	}
 
 	// Parse research round budget
-	researchRoundBudgetStr := os.Getenv("ODONIAN_RESEARCH_ROUND_BUDGET")
-	if researchRoundBudgetStr == "" {
-		researchRoundBudgetStr = "6"
-	}
-	researchRoundBudget, err := strconv.Atoi(researchRoundBudgetStr)
+	researchRoundBudget, err := parseResearchRoundBudget(os.Getenv("ODONIAN_RESEARCH_ROUND_BUDGET"))
 	if err != nil {
 		log.Fatalf("failed to parse ODONIAN_RESEARCH_ROUND_BUDGET: %v", err)
-	}
-	if researchRoundBudget <= 0 {
-		log.Fatalf("ODONIAN_RESEARCH_ROUND_BUDGET must be positive, got %d", researchRoundBudget)
 	}
 
 	// Parse event retention configuration
@@ -1198,6 +1191,23 @@ func parseResearchEscalationThresholds(thresholdsStr string, allowedModels []str
 		result[model] = threshold
 	}
 	return result, nil
+}
+
+func parseResearchRoundBudget(budgetStr string) (int, error) {
+	if budgetStr == "" {
+		return 6, nil
+	}
+
+	budget, err := strconv.Atoi(budgetStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid format: %w", err)
+	}
+
+	if budget <= 0 {
+		return 0, fmt.Errorf("must be positive, got %d", budget)
+	}
+
+	return budget, nil
 }
 
 func validateResearchDefaultModel(modelStr string, allowedModels []string) (string, error) {
