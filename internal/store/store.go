@@ -2465,7 +2465,9 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		// order. Review tasks are spawned by iterating review_models in order, so
 		// the same slot names the same reviewer in every round, even when
 		// review_models lists a model more than once. Finding ids (and so
-		// prior_id) are only meaningful within one reviewer's lineage.
+		// prior_id) are only meaningful within one reviewer's lineage. This assumes
+		// review_models is unchanged between rounds and each round spawns exactly one
+		// review task per entry; otherwise slots shift and lineages mismatch.
 		slotKey := fmt.Sprintf("%d\x00%s", round, model)
 		slot := slotsTaken[slotKey]
 		slotsTaken[slotKey] = slot + 1
@@ -2558,18 +2560,29 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 	// one reviewer lineage. Ids are only unique within a single submission (section
 	// 3 asks for ids "unique within the task", but validation only enforces
 	// uniqueness within one findings array), so a prior_id resolves against the
-	// latest instance of that id recorded before the current report, not against a
-	// later instance reusing the id (including the current report itself, if it
-	// names its own id as prior_id).
+	// latest instance of that id from a strictly earlier round, never against a
+	// report in the same round's submission (reviewers commonly renumber each
+	// round, so a same-round id can collide with the prior_id) and never against
+	// the current report itself, if it names its own id as prior_id.
 	chainOf, linkChain := newUnionFind()
 	latestIndexByLineageAndID := make(map[string]int, len(allFindings))
-	for i, cf := range allFindings {
-		if cf.PriorID != nil {
-			if prior, ok := latestIndexByLineageAndID[cf.lineage+"\x00"+*cf.PriorID]; ok {
-				linkChain(i, prior)
+	for start := 0; start < len(allFindings); {
+		// allFindings is sorted by round: [start, end) is one round's reports.
+		end := start
+		for end < len(allFindings) && allFindings[end].round == allFindings[start].round {
+			end++
+		}
+		for i := start; i < end; i++ {
+			if cf := allFindings[i]; cf.PriorID != nil {
+				if prior, ok := latestIndexByLineageAndID[cf.lineage+"\x00"+*cf.PriorID]; ok {
+					linkChain(i, prior)
+				}
 			}
 		}
-		latestIndexByLineageAndID[cf.lineage+"\x00"+cf.ID] = i
+		for i := start; i < end; i++ {
+			latestIndexByLineageAndID[allFindings[i].lineage+"\x00"+allFindings[i].ID] = i
+		}
+		start = end
 	}
 
 	// A resolved report settles its chain up to and including its round. Only

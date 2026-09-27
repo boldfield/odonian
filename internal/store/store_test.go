@@ -5013,6 +5013,79 @@ func TestResearchFollowUps_ReRaisedAfterResolved(t *testing.T) {
 	}
 }
 
+// TestResearchFollowUps_PriorIDResolvesAgainstEarlierRoundOnly verifies that a
+// prior_id resolves against a finding from a strictly earlier round, never against a
+// report in the same round's submission. Round 2 renumbers its findings so that each
+// id collides with the other finding's round-1 id.
+func TestResearchFollowUps_PriorIDResolvesAgainstEarlierRoundOnly(t *testing.T) {
+	t.Run("swapped ids resolve the earlier findings", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		round1 := json.RawMessage(`[
+			{"id":"f1","severity":"P3","file":"b.md","line":5,"summary":"typo","in_changed_text":true,"status":"new"},
+			{"id":"f2","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"}
+		]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		round2 := json.RawMessage(`[
+			{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim fixed","in_changed_text":true,"status":"resolved","prior_id":"f2"},
+			{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"typo fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"}
+		]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Fatalf("expected approved, got %s", parent.State)
+		}
+		if got := findResearchFollowUps(t, store, ctx, projID, parentID); len(got) != 0 {
+			t.Errorf("expected no follow-ups: both round-1 findings were resolved, got %d", len(got))
+		}
+	})
+
+	t.Run("fresh finding reusing a same-round prior_id still gets a follow-up", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		round1 := json.RawMessage(`[
+			{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"}
+		]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", round1)
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		// Round 2's fresh P3 reuses id f1, which the resolving report names as its
+		// prior_id. The prior_id means round 1's f1, not the fresh P3.
+		round2 := json.RawMessage(`[
+			{"id":"f1","severity":"P3","file":"b.md","line":5,"summary":"typo","in_changed_text":true,"status":"new"},
+			{"id":"f2","severity":"P1","file":"a.md","line":1,"summary":"bad claim fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"}
+		]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+		if parent.State != "approved" {
+			t.Fatalf("expected approved, got %s", parent.State)
+		}
+		followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+		if len(followUps) != 1 {
+			t.Fatalf("expected exactly 1 follow-up for the fresh P3, got %d", len(followUps))
+		}
+		if !strings.Contains(followUps[0].Spec, "Finding: typo\n") {
+			t.Errorf("expected follow-up for the fresh P3, got spec %q", followUps[0].Spec)
+		}
+	})
+}
+
 // researchReviewTasksInSlotOrder returns the parent's review task ids for a round in
 // creation order, which is how reviewer slots are assigned.
 func researchReviewTasksInSlotOrder(t *testing.T, store Store, ctx context.Context, parentID string, round int) []string {
