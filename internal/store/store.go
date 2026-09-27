@@ -3471,6 +3471,78 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 	return t, nil
 }
 
+// getUnresolvedFindingsFromLastRound gets findings with status 'new' or 'still_open'
+// from the last review round for a research task. Returns them as a JSON array string
+// suitable for inclusion in a spec, or empty string if none found.
+func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx *sql.Tx, taskID string) (string, error) {
+	// Find the max review_round for review tasks of this implement task
+	var maxRound int
+	err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(review_round), 0) FROM task
+		WHERE target_task_id = ? AND kind = 'review'
+	`, taskID).Scan(&maxRound)
+	if err != nil {
+		return "", fmt.Errorf("failed to find max review round: %w", err)
+	}
+
+	if maxRound == 0 {
+		// No review rounds yet
+		return "", nil
+	}
+
+	// Get all review events from the last round
+	rows, err := tx.QueryContext(ctx, `
+		SELECT COALESCE(e.findings, '') FROM event e
+		JOIN task t ON e.source_task_id = t.id
+		WHERE t.target_task_id = ? AND t.kind = 'review' AND t.review_round = ? AND e.kind = 'review'
+		ORDER BY e.created_at, e.id
+	`, taskID, maxRound)
+	if err != nil {
+		return "", fmt.Errorf("failed to query review events: %w", err)
+	}
+	defer rows.Close()
+
+	var unresolvedFindings []Finding
+	for rows.Next() {
+		var findingsJSON string
+		if err := rows.Scan(&findingsJSON); err != nil {
+			return "", fmt.Errorf("failed to scan findings: %w", err)
+		}
+
+		if findingsJSON == "" {
+			continue
+		}
+
+		var findings []Finding
+		if err := json.Unmarshal([]byte(findingsJSON), &findings); err != nil {
+			return "", fmt.Errorf("failed to unmarshal findings: %w", err)
+		}
+
+		// Filter for unresolved findings (status != 'resolved')
+		for _, f := range findings {
+			if f.Status != "resolved" {
+				unresolvedFindings = append(unresolvedFindings, f)
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("failed to iterate review events: %w", err)
+	}
+
+	if len(unresolvedFindings) == 0 {
+		return "", nil
+	}
+
+	// Marshal findings to JSON array string
+	data, err := json.Marshal(unresolvedFindings)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal unresolved findings: %w", err)
+	}
+
+	return string(data), nil
+}
+
 // supersedeTaskTx is the core implementation of task supersession.
 // It creates a replacement task with copied fields and dependencies,
 // re-points all dependents, and marks the old task as superseded.
@@ -3505,46 +3577,75 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 		}
 	}
 
-	// 1b. Gather prior reject feedback
-	rows, err := tx.QueryContext(ctx, `
-		SELECT actor, verdict, note FROM event
-		WHERE task_id = ? AND kind IN ('review', 'submit') AND verdict = 'reject'
-		ORDER BY created_at ASC
-	`, taskID)
-	if err != nil {
-		return "", fmt.Errorf("failed to query feedback events: %w", err)
-	}
-	defer rows.Close()
-
-	var feedbackBlock strings.Builder
-	var hasFeedback bool
-	for rows.Next() {
-		var actor string
-		var verdict *string
-		var note *string
-		if err := rows.Scan(&actor, &verdict, &note); err != nil {
-			return "", fmt.Errorf("failed to scan feedback event: %w", err)
+	// 1b. Gather prior reject feedback (or unresolved findings for research tasks)
+	if oldTask.Track == "research" {
+		// For research tasks, attach only unresolved findings from the last round
+		unresolvedJSON, err := s.getUnresolvedFindingsFromLastRound(ctx, tx, taskID)
+		if err != nil {
+			return "", err
 		}
 
-		if !hasFeedback {
-			feedbackBlock.WriteString("## Prior attempt feedback\n\n")
-			hasFeedback = true
+		if unresolvedJSON != "" {
+			// Format findings in a readable way for the spec
+			var findings []Finding
+			if err := json.Unmarshal([]byte(unresolvedJSON), &findings); err != nil {
+				return "", fmt.Errorf("failed to unmarshal unresolved findings: %w", err)
+			}
+
+			var findingsBlock strings.Builder
+			findingsBlock.WriteString("## Unresolved findings from last review round\n\n")
+			for _, f := range findings {
+				findingsBlock.WriteString(fmt.Sprintf("- **%s** (P%s, %s:%d): %s\n",
+					f.ID, f.Severity[1:], f.File, f.Line, f.Summary))
+			}
+			findingsBlock.WriteString("\n**Structured findings (JSON):**\n```json\n")
+			findingsBlock.WriteString(unresolvedJSON)
+			findingsBlock.WriteString("\n```\n")
+
+			oldTask.Spec = oldTask.Spec + "\n\n" + findingsBlock.String()
+		}
+	} else {
+		// For non-research tasks (build, design), gather all prior reject feedback
+		rows, err := tx.QueryContext(ctx, `
+			SELECT actor, verdict, note FROM event
+			WHERE task_id = ? AND kind IN ('review', 'submit') AND verdict = 'reject'
+			ORDER BY created_at ASC
+		`, taskID)
+		if err != nil {
+			return "", fmt.Errorf("failed to query feedback events: %w", err)
+		}
+		defer rows.Close()
+
+		var feedbackBlock strings.Builder
+		var hasFeedback bool
+		for rows.Next() {
+			var actor string
+			var verdict *string
+			var note *string
+			if err := rows.Scan(&actor, &verdict, &note); err != nil {
+				return "", fmt.Errorf("failed to scan feedback event: %w", err)
+			}
+
+			if !hasFeedback {
+				feedbackBlock.WriteString("## Prior attempt feedback\n\n")
+				hasFeedback = true
+			}
+
+			feedbackBlock.WriteString(fmt.Sprintf("**%s (verdict: %s)**\n", actor, *verdict))
+			if note != nil && *note != "" {
+				feedbackBlock.WriteString(fmt.Sprintf("%s\n", *note))
+			}
+			feedbackBlock.WriteString("\n")
 		}
 
-		feedbackBlock.WriteString(fmt.Sprintf("**%s (verdict: %s)**\n", actor, *verdict))
-		if note != nil && *note != "" {
-			feedbackBlock.WriteString(fmt.Sprintf("%s\n", *note))
+		if err := rows.Err(); err != nil {
+			return "", fmt.Errorf("failed to iterate feedback events: %w", err)
 		}
-		feedbackBlock.WriteString("\n")
-	}
 
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("failed to iterate feedback events: %w", err)
-	}
-
-	// Prepend feedback to spec if any was found
-	if hasFeedback {
-		oldTask.Spec = oldTask.Spec + "\n\n" + feedbackBlock.String()
+		// Prepend feedback to spec if any was found
+		if hasFeedback {
+			oldTask.Spec = oldTask.Spec + "\n\n" + feedbackBlock.String()
+		}
 	}
 
 	// 2. Create replacement task

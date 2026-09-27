@@ -14859,3 +14859,341 @@ func TestTombstonedNoOpDoesNotFinalize(t *testing.T) {
 		t.Errorf("no merge task should be created for no_op finalization, got %d", len(mergeTasks))
 	}
 }
+
+// TestResearchSupersessionSpecCompaction verifies that research task supersession
+// compacts the spec to include only unresolved findings from the last review round,
+// per docs/features/research-track.md section 7, not all prior feedback.
+func TestResearchSupersessionSpecCompaction(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithEscalationLadder(t, true, []string{"opus"})
+
+	// First round: submit with some findings
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus1 == nil {
+		t.Fatalf("round 1: expected review task")
+	}
+
+	// Findings: one P1 (blocking), one P3 (non-blocking), both in changed text
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong page number","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent after round 1: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("round 1: expected ready, got %s", parent.State)
+	}
+
+	// Resubmit for round 2
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Second round: submit with findings resolved
+	opus2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opus2 == nil {
+		t.Fatalf("round 2: expected review task")
+	}
+
+	// f1 is resolved, f2 is still open, plus a new finding f3 (P3 - non-blocking)
+	findings2 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"resolved","prior_id":"f1"},
+		{"id":"f2","severity":"P3","file":"b.md","line":5,"summary":"wrong page number","in_changed_text":false,"status":"still_open","prior_id":"f2"},
+		{"id":"f3","severity":"P3","file":"c.md","line":10,"summary":"missing context","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", findings2)
+
+	// Manually supersede the task to test spec compaction, regardless of current state
+	// (the state machine is secondary to the spec compaction feature we're testing)
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"))
+	if err != nil {
+		t.Fatalf("failed to supersede task: %v", err)
+	}
+
+	// Verify spec compaction
+	if !strings.Contains(escalated.Spec, "Unresolved findings from last review round") {
+		t.Errorf("spec should contain 'Unresolved findings from last review round' section")
+	}
+
+	// Should include f2 (still_open P3) and f3 (new P3)
+	if !strings.Contains(escalated.Spec, "f2") {
+		t.Errorf("spec should contain unresolved finding f2")
+	}
+	if !strings.Contains(escalated.Spec, "f3") {
+		t.Errorf("spec should contain unresolved finding f3")
+	}
+
+	// f1 should not appear in unresolved findings (it's resolved)
+	if strings.Contains(escalated.Spec, `"id":"f1"`) {
+		t.Errorf("spec should not include resolved finding f1 in unresolved findings")
+	}
+
+	// Verify that the original task is now superseded
+	oldTask, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get old task: %v", err)
+	}
+	if oldTask.State != "superseded" {
+		t.Errorf("old task should be superseded, got %s", oldTask.State)
+	}
+	if oldTask.SupersededBy == nil || *oldTask.SupersededBy != escalated.ID {
+		t.Errorf("old task should reference new task in SupersededBy")
+	}
+
+	// Verify preserved fields
+	if escalated.ProjectID != parent.ProjectID {
+		t.Errorf("project should be preserved")
+	}
+	if escalated.DocumentID != parent.DocumentID {
+		t.Errorf("document should be preserved")
+	}
+	if escalated.Track != "research" {
+		t.Errorf("track should be preserved as research")
+	}
+	if len(escalated.ReviewModels) != len(parent.ReviewModels) {
+		t.Errorf("review models should be preserved")
+	}
+}
+
+// TestResearchSupersessionAllFindingsResolved verifies that research task supersession
+// doesn't add a findings section if all findings are resolved.
+func TestResearchSupersessionAllFindingsResolved(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithEscalationLadder(t, true, []string{"opus", "sonnet"})
+
+	opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus1 == nil || sonnet1 == nil {
+		t.Fatalf("round 1: expected review tasks")
+	}
+
+	// First round with blocking P1 finding
+	findings1 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
+	submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent after round 1: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("round 1: expected ready, got %s", parent.State)
+	}
+
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Second round with f1 resolved
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opus2 == nil || sonnet2 == nil {
+		t.Fatalf("round 2: expected review tasks")
+	}
+
+	findings2 := json.RawMessage(`[
+		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"resolved","prior_id":"f1"}
+	]`)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", findings2)
+	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent after round 2: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("sonnet"))
+	if err != nil {
+		t.Fatalf("failed to supersede task: %v", err)
+	}
+
+	// Spec should NOT contain unresolved findings section (all findings were resolved)
+	if strings.Contains(escalated.Spec, "Unresolved findings from last review round") {
+		t.Errorf("spec should not contain unresolved findings section when all findings are resolved")
+	}
+}
+
+// TestBuildTaskSupersessionPrependsFeedback verifies that build tasks still prepend
+// all prior feedback, unchanged from before, per docs/features/research-track.md.
+func TestBuildTaskSupersessionPrependsFeedback(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a build task (not research)
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:      "Build something",
+			Spec:       "Original spec",
+			DocumentID: doc.ID,
+			Model:      "haiku",
+			Track:      "build",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	buildTaskID := tasks[0].ID
+
+	if _, err = store.PromoteTask(ctx, buildTaskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	if _, err = store.ClaimTask(ctx, buildTaskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit, get rejected
+	if _, err = store.SubmitTask(ctx, buildTaskID, "agent-1", "Attempt 1", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 1, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	// Get review task and reject
+	review1, err := store.ListTasks(ctx, proj.ID, TaskListFilter{Kind: ptrStr("review")})
+	if err != nil || len(review1) == 0 {
+		t.Fatalf("failed to find review task: %v", err)
+	}
+	reviewTask1 := review1[0]
+
+	if _, err = store.ClaimTask(ctx, reviewTask1.ID, "reviewer", reviewTask1.Model, 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim review: %v", err)
+	}
+
+	v := "reject"
+	if _, err = store.SubmitTask(ctx, reviewTask1.ID, "reviewer", "Feedback 1", &v, []LinkInput{}, 1, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit review: %v", err)
+	}
+
+	// Task goes back to ready
+	buildTask, err := store.GetTask(ctx, buildTaskID)
+	if err != nil {
+		t.Fatalf("failed to get build task: %v", err)
+	}
+	if buildTask.State != "ready" {
+		t.Fatalf("expected ready, got %s", buildTask.State)
+	}
+
+	// Supersede the task
+	escalated, err := store.SupersedeTask(ctx, buildTaskID, ptrStr("haiku"))
+	if err != nil {
+		t.Fatalf("failed to supersede task: %v", err)
+	}
+
+	// Build task should prepend all prior feedback, NOT use spec compaction
+	if !strings.Contains(escalated.Spec, "Prior attempt feedback") {
+		t.Errorf("build task spec should contain 'Prior attempt feedback' section")
+	}
+	if !strings.Contains(escalated.Spec, "Feedback 1") {
+		t.Errorf("build task spec should contain feedback text")
+	}
+	if strings.Contains(escalated.Spec, "Unresolved findings from last review round") {
+		t.Errorf("build task should not use research-style findings compaction")
+	}
+}
+
+// TestDesignTaskSupersessionPrependsFeedback verifies that design tasks still prepend
+// all prior feedback, unchanged from before.
+func TestDesignTaskSupersessionPrependsFeedback(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a design task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:      "Design something",
+			Spec:       "Original design spec",
+			DocumentID: doc.ID,
+			Model:      "haiku",
+			Track:      "design",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	designTaskID := tasks[0].ID
+
+	if _, err = store.PromoteTask(ctx, designTaskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	if _, err = store.ClaimTask(ctx, designTaskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit, get rejected
+	if _, err = store.SubmitTask(ctx, designTaskID, "agent-1", "Attempt 1", nil, []LinkInput{{Kind: "pr", Value: "#200"}}, 1, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	// Get review task and reject
+	review1, err := store.ListTasks(ctx, proj.ID, TaskListFilter{Kind: ptrStr("review")})
+	if err != nil || len(review1) == 0 {
+		t.Fatalf("failed to find review task: %v", err)
+	}
+	reviewTask1 := review1[0]
+
+	if _, err = store.ClaimTask(ctx, reviewTask1.ID, "reviewer", reviewTask1.Model, 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim review: %v", err)
+	}
+
+	v := "reject"
+	if _, err = store.SubmitTask(ctx, reviewTask1.ID, "reviewer", "Design feedback", &v, []LinkInput{}, 1, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit review: %v", err)
+	}
+
+	// Task goes back to ready
+	designTask, err := store.GetTask(ctx, designTaskID)
+	if err != nil {
+		t.Fatalf("failed to get design task: %v", err)
+	}
+	if designTask.State != "ready" {
+		t.Fatalf("expected ready, got %s", designTask.State)
+	}
+
+	// Supersede the task
+	escalated, err := store.SupersedeTask(ctx, designTaskID, ptrStr("haiku"))
+	if err != nil {
+		t.Fatalf("failed to supersede task: %v", err)
+	}
+
+	// Design task should prepend all prior feedback, NOT use spec compaction
+	if !strings.Contains(escalated.Spec, "Prior attempt feedback") {
+		t.Errorf("design task spec should contain 'Prior attempt feedback' section")
+	}
+	if !strings.Contains(escalated.Spec, "Design feedback") {
+		t.Errorf("design task spec should contain feedback text")
+	}
+	if strings.Contains(escalated.Spec, "Unresolved findings from last review round") {
+		t.Errorf("design task should not use research-style findings compaction")
+	}
+}
