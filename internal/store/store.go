@@ -3086,9 +3086,11 @@ func (s *sqliteStore) collectResearchReviewReports(ctx context.Context, tx *sql.
 	// round it belongs to and the model that reviewed it (recorded as the follow-up's
 	// raising reviewer). Ordered by rowid, i.e. creation order, which is what
 	// assigns each review task its reviewer slot below.
+	// Exclude adjudication tasks (adjudicate_finding IS NOT NULL), which are
+	// scoped to individual findings and not part of the ordinary review round.
 	taskRows, err := tx.QueryContext(ctx, `
 		SELECT id, review_round, model FROM task
-		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ?
+		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ? AND adjudicate_finding IS NULL
 		ORDER BY review_round, rowid, id
 	`, parentID, throughRound)
 	if err != nil {
@@ -3587,6 +3589,17 @@ Rule on whether this finding is valid (uphold it) or whether the worker's eviden
 	return nil
 }
 
+// countPendingAdjudicationTasks counts adjudication tasks (adjudicate_finding IS NOT NULL)
+// for a parent in a specific round that are still pending (state != 'done').
+func (s *sqliteStore) countPendingAdjudicationTasks(ctx context.Context, tx *sql.Tx, parentID string, round int) (int, error) {
+	var count int
+	err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM task
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding IS NOT NULL AND state != 'done'
+	`, parentID, round).Scan(&count)
+	return count, err
+}
+
 // getReviewRoundFindingsWithReviewers collects all findings from all review tasks in the current round
 // and tracks which reviewer model raised each finding. Also returns the list of all reviewer models
 // (including those who approved with no findings). This is needed for adjudicator validation:
@@ -3715,12 +3728,29 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		return "", fmt.Errorf("failed to tally review tasks: %w", err)
 	}
 
-	// Guard: if parent is in a terminal state (failed/blocked/abandoned), do not resurrect it
+	// Guard: if parent is in a terminal state (failed/blocked/abandoned), do not resurrect it.
+	// Exception: if the parent is blocked and there are pending adjudication tasks that could
+	// change the outcome (i.e., they could overturn blocking findings), allow aggregation to
+	// proceed so the adjudication verdict can be accounted for.
 	var newParentState string
 	// researchBlockNote, when set, is the section 6 chain-wide-budget note that
 	// overrides the generic "auto-blocked" transition note below.
 	var researchBlockNote string
 	isTerminal := parentState == "failed" || parentState == "blocked" || parentState == "abandoned"
+
+	// For blocked parents with pending adjudications, re-run aggregation to see if the
+	// adjudication verdict changes the outcome
+	var hasPendingAdjudications bool
+	if isTerminal && parentState == "blocked" && parentTrack == "research" {
+		pendingCount, err := s.countPendingAdjudicationTasks(ctx, tx, parentID, parentReviewRound)
+		if err != nil {
+			return "", fmt.Errorf("failed to count pending adjudications: %w", err)
+		}
+		hasPendingAdjudications = pendingCount > 0
+		if hasPendingAdjudications {
+			isTerminal = false
+		}
+	}
 
 	if !isTerminal && doneReviewTasks == totalReviewTasks {
 		// Determine whether the round failed. Build and design keep the existing
@@ -3781,6 +3811,8 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			// per-tier circuit breaker below: a rejected research round is always
 			// recorded first, and if the chain-wide count has reached the budget, the
 			// task blocks for decomposition regardless of tier or escalation.
+			// Exception: if adjudication tasks are pending, defer the budget block until
+			// those tasks complete and can be accounted for in the blocking findings.
 			if parentTrack == "research" {
 				if err := s.appendResearchRoundRejectedEvent(ctx, tx, parentID, parentReviewRound, researchRoundFindings); err != nil {
 					return "", err
@@ -3791,17 +3823,26 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 					return "", err
 				}
 
-				chainWideRejectedRounds, err := s.countChainWideRejectedRounds(ctx, tx, parentID)
+				// Check for pending adjudication tasks before applying budget block
+				pendingCount, err := s.countPendingAdjudicationTasks(ctx, tx, parentID, parentReviewRound)
 				if err != nil {
-					return "", err
+					return "", fmt.Errorf("failed to count pending adjudications: %w", err)
 				}
-				if chainWideRejectedRounds >= researchRoundBudget {
-					description, err := s.describeChainWideBlockingFindings(ctx, tx, parentID)
+
+				// Only apply budget block if there are no pending adjudications that could change the outcome
+				if pendingCount == 0 {
+					chainWideRejectedRounds, err := s.countChainWideRejectedRounds(ctx, tx, parentID)
 					if err != nil {
 						return "", err
 					}
-					newParentState = "blocked"
-					researchBlockNote = fmt.Sprintf("Chain-wide research round budget reached (%d/%d rejected rounds); reason decompose — %s", chainWideRejectedRounds, researchRoundBudget, description)
+					if chainWideRejectedRounds >= researchRoundBudget {
+						description, err := s.describeChainWideBlockingFindings(ctx, tx, parentID)
+						if err != nil {
+							return "", err
+						}
+						newParentState = "blocked"
+						researchBlockNote = fmt.Sprintf("Chain-wide research round budget reached (%d/%d rejected rounds); reason decompose — %s", chainWideRejectedRounds, researchRoundBudget, description)
+					}
 				}
 			}
 
