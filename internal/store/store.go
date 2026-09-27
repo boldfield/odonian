@@ -3502,22 +3502,24 @@ func extractOriginalAssignment(spec string) string {
 // everywhere in the research track: not itself resolved, and not settled by a later
 // resolved report in its chain. Findings are deduplicated by (severity, file, line,
 // summary) so the same finding raised by two reviewers in the same round is listed
-// once. Returns nil if the task has no review rounds yet or every finding from the
-// last round is resolved.
-func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx *sql.Tx, taskID string) ([]Finding, error) {
+// once. The second return value reports whether taskID has had any review round at
+// all; the caller needs this to tell "no review yet, so nothing to carry forward
+// beyond what the predecessor already attached" apart from "reviewed, and every
+// finding from the last round is resolved".
+func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx *sql.Tx, taskID string) ([]Finding, bool, error) {
 	var maxRound int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(review_round), 0) FROM task WHERE target_task_id = ? AND kind = 'review'
 	`, taskID).Scan(&maxRound); err != nil {
-		return nil, fmt.Errorf("failed to find max review round: %w", err)
+		return nil, false, fmt.Errorf("failed to find max review round: %w", err)
 	}
 	if maxRound == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	allFindings, err := s.collectResearchReviewFindings(ctx, tx, taskID, maxRound)
 	if err != nil {
-		return nil, fmt.Errorf("failed to collect review findings: %w", err)
+		return nil, true, fmt.Errorf("failed to collect review findings: %w", err)
 	}
 	_, isOutstanding := researchFindingChains(allFindings)
 
@@ -3534,7 +3536,33 @@ func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx
 		seen[key] = true
 		unresolved = append(unresolved, cf.Finding)
 	}
-	return unresolved, nil
+	return unresolved, true, nil
+}
+
+// extractCarriedFindings recovers the findings a research task's own spec is already
+// carrying forward from its predecessor (the "Structured findings (JSON)" block
+// buildResearchSupersessionSpec writes). It is used when taskID is itself superseded
+// before ever reaching a review round of its own: getUnresolvedFindingsFromLastRound
+// only looks at taskID's own reviews, so without this, findings that are still
+// outstanding from the predecessor's last round would be silently dropped instead of
+// carried forward, since extractOriginalAssignment strips the whole generated block
+// (including this one) from the new spec. Returns nil if spec has no such block.
+func extractCarriedFindings(spec string) []Finding {
+	const marker = "**Structured findings (JSON):**\n```json\n"
+	idx := strings.Index(spec, marker)
+	if idx == -1 {
+		return nil
+	}
+	rest := spec[idx+len(marker):]
+	end := strings.Index(rest, "\n```")
+	if end == -1 {
+		return nil
+	}
+	var findings []Finding
+	if err := json.Unmarshal([]byte(rest[:end]), &findings); err != nil {
+		return nil
+	}
+	return findings
 }
 
 // buildResearchSupersessionSpec implements docs/features/research-track.md section 7
@@ -3546,9 +3574,16 @@ func (s *sqliteStore) getUnresolvedFindingsFromLastRound(ctx context.Context, tx
 func (s *sqliteStore) buildResearchSupersessionSpec(ctx context.Context, tx *sql.Tx, taskID, spec string) (string, error) {
 	originalAssignment := extractOriginalAssignment(spec)
 
-	unresolved, err := s.getUnresolvedFindingsFromLastRound(ctx, tx, taskID)
+	unresolved, reviewed, err := s.getUnresolvedFindingsFromLastRound(ctx, tx, taskID)
 	if err != nil {
 		return "", err
+	}
+	if !reviewed {
+		// taskID never reached a review round of its own (e.g. it was superseded again
+		// right after being created as a replacement). Whatever it was carrying forward
+		// from its own predecessor is still outstanding, so keep it instead of dropping
+		// it on the floor.
+		unresolved = extractCarriedFindings(spec)
 	}
 
 	var b strings.Builder
