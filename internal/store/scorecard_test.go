@@ -367,3 +367,51 @@ func TestGetResearchReviewerScorecards_DuplicateFindings_SameReviewer(t *testing
 		t.Errorf("expected 1 unresolved, got %d", sc.FindingsUnresolved)
 	}
 }
+
+func TestGetResearchReviewerScorecards_RenumberedFindings(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus"})
+
+	// Round 1: Opus raises f1
+	opusTask1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil {
+		t.Fatalf("expected opus review task")
+	}
+	findingsRound1 := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", findingsRound1)
+
+	// Resubmit parent
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Round 2: Opus renumbers f1 to f2 and marks as resolved
+	// This is the key scenario: a finding renumbered with prior_id
+	opusTask2, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opusTask2 == nil {
+		t.Fatalf("expected opus review task for round 2")
+	}
+	findingsRound2 := json.RawMessage(`[{"id":"f2","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"resolved","prior_id":"f1"}]`)
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "approve", findingsRound2)
+
+	// Check scorecards - should count the finding only once (not doubled)
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+
+	if len(scorecards.Scorecards) != 1 {
+		t.Errorf("expected 1 scorecard, got %d", len(scorecards.Scorecards))
+	}
+
+	sc := scorecards.Scorecards[0]
+	// Should count as 1 raised P2 (not 2)
+	if sc.FindingsRaised["p2"] != 1 {
+		t.Errorf("expected 1 P2 raised (not doubled due to renumbering), got %d", sc.FindingsRaised["p2"])
+	}
+	// Should count as 1 held (resolved)
+	if sc.FindingsHeld != 1 {
+		t.Errorf("expected 1 held finding, got %d", sc.FindingsHeld)
+	}
+	// Should have 0 unresolved
+	if sc.FindingsUnresolved != 0 {
+		t.Errorf("expected 0 unresolved findings, got %d", sc.FindingsUnresolved)
+	}
+}
