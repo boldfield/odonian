@@ -33,10 +33,11 @@ Research tasks use a dedicated escalation ladder and thresholds, separate from t
   the build/design `ODONIAN_ESCALATION_LADDER` and `ODONIAN_ESCALATION_THRESHOLDS`.
 - **Explicit task opt-out still applies.** A research task with `escalate=false` never escalates,
   even when a research ladder is configured.
-- **Round budget via threshold fallback.** When a research task's model is not on the research ladder,
-  its threshold falls back to `ODONIAN_MAX_REVIEW_ROUNDS` (default `5`), which acts as a round budget
-  that blocks for decomposition when exceeded. For research tasks on the ladder, threshold behavior is
-  identical to build/design tasks.
+- **Round budget via threshold fallback.** When no research ladder is configured, or a research task's
+  model is not on the configured research ladder, its threshold falls back to `ODONIAN_MAX_REVIEW_ROUNDS`
+  (default `5`), which acts as a round budget that blocks for decomposition when exceeded. This differs
+  from build/design tasks, whose fallback (for `haiku`, `sonnet`, and `opus`) is the built-in
+  `ODONIAN_ESCALATION_THRESHOLDS` default of `haiku=8,sonnet=6,opus=4`, not `ODONIAN_MAX_REVIEW_ROUNDS`.
 
 The chain-wide round budget (which counts across a task's entire supersede chain) is deferred to
 R8, a future task in `docs/features/research-track.md` milestone 2.

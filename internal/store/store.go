@@ -64,15 +64,13 @@ type Store interface {
 
 // sqliteStore wraps a SQLite database connection and provides migration functionality.
 type sqliteStore struct {
-	conn                         *sql.DB
-	readConn                     *sql.DB
-	allowedModels                []string
-	allowedModelsM               map[string]bool
-	escalationLadder             []string
-	escalationThresholds         map[string]int
-	researchDefaultModel         string
-	researchEscalationLadder     []string
-	researchEscalationThresholds map[string]int
+	conn                     *sql.DB
+	readConn                 *sql.DB
+	allowedModels            []string
+	allowedModelsM           map[string]bool
+	escalationLadder         []string
+	researchDefaultModel     string
+	researchEscalationLadder []string
 
 	// supersedeCloseHook, when set, is invoked after each background
 	// closeSupersededPR attempt finishes. It exists solely so tests can
@@ -109,26 +107,6 @@ func WithResearchEscalationLadder(ladder []string) StoreOption {
 	}
 }
 
-// WithEscalationThresholds sets the escalation thresholds for build/design tasks.
-func WithEscalationThresholds(thresholds map[string]int) StoreOption {
-	return func(s *sqliteStore) {
-		s.escalationThresholds = make(map[string]int)
-		for k, v := range thresholds {
-			s.escalationThresholds[k] = v
-		}
-	}
-}
-
-// WithResearchEscalationThresholds sets the escalation thresholds for research tasks.
-func WithResearchEscalationThresholds(thresholds map[string]int) StoreOption {
-	return func(s *sqliteStore) {
-		s.researchEscalationThresholds = make(map[string]int)
-		for k, v := range thresholds {
-			s.researchEscalationThresholds[k] = v
-		}
-	}
-}
-
 // Open opens a database connection and applies all pending migrations.
 // The dbPath should be a file path (e.g., "odonian.db") or "file::memory:?cache=shared"
 // for an in-memory database.
@@ -155,12 +133,10 @@ func Open(dbPath string, allowedModels []string, opts ...StoreOption) (Store, er
 	}
 
 	store := &sqliteStore{
-		conn:                         conn,
-		allowedModels:                allowedModels,
-		allowedModelsM:               allowedModelsM,
-		escalationLadder:             append([]string{}, allowedModels...), // Default to allowedModels
-		escalationThresholds:         make(map[string]int),
-		researchEscalationThresholds: make(map[string]int),
+		conn:             conn,
+		allowedModels:    allowedModels,
+		allowedModelsM:   allowedModelsM,
+		escalationLadder: append([]string{}, allowedModels...), // Default to allowedModels
 	}
 
 	// Apply functional options

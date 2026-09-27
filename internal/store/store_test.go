@@ -2364,7 +2364,7 @@ func TestSubmitImplementTaskAutoSpawnsReviewTasks_MultiReviewer(t *testing.T) {
 	// Submit the task
 	result := "Implementation complete"
 	links := []LinkInput{{Kind: "pr", Value: "#123"}}
-	submitted, err := store.SubmitTask(ctx, taskID, "agent-1", result, nil, links, 5, nil, nil, nil)
+	submitted, err := store.SubmitTask(ctx, taskID, "agent-1", result, nil, links, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit task: %v", err)
 	}
@@ -2649,7 +2649,7 @@ func TestSubmitImplementTaskAutoSpawnsReviewTasks_DefaultSingleOpus(t *testing.T
 	// Submit the task
 	result := "Implementation complete"
 	links := []LinkInput{{Kind: "pr", Value: "#456"}}
-	submitted, err := store.SubmitTask(ctx, taskID, "agent-1", result, nil, links, 5, nil, nil, nil)
+	submitted, err := store.SubmitTask(ctx, taskID, "agent-1", result, nil, links, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit task: %v", err)
 	}
@@ -2852,7 +2852,7 @@ func TestSubmitTaskIdempotentLinks(t *testing.T) {
 		{Kind: "pr", Value: "https://github.com/test/repo/pull/123"},
 		{Kind: "branch", Value: "feature/test-branch"},
 	}
-	submittedTask, err := store.SubmitTask(ctx, task.ID, "agent-1", "result of work", nil, links, 5, nil, nil, nil)
+	submittedTask, err := store.SubmitTask(ctx, task.ID, "agent-1", "result of work", nil, links, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("first submit failed: %v", err)
 	}
@@ -2888,7 +2888,7 @@ func TestSubmitTaskIdempotentLinks(t *testing.T) {
 	}
 
 	// Second submission with same links (testing idempotency)
-	submittedTask2, err := store.SubmitTask(ctx, task.ID, "agent-1", "updated result", nil, links, 5, nil, nil, nil)
+	submittedTask2, err := store.SubmitTask(ctx, task.ID, "agent-1", "updated result", nil, links, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("second submit failed: %v", err)
 	}
@@ -2912,7 +2912,7 @@ func TestSubmitTaskIdempotentLinks(t *testing.T) {
 		{Kind: "branch", Value: "feature/test-branch"},
 		{Kind: "commit", Value: "abc123def456"},
 	}
-	submittedTask3, err := store.SubmitTask(ctx, task.ID, "agent-1", "result with commit", nil, linksWithCommit, 5, nil, nil, nil)
+	submittedTask3, err := store.SubmitTask(ctx, task.ID, "agent-1", "result with commit", nil, linksWithCommit, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("third submit failed: %v", err)
 	}
@@ -3016,7 +3016,7 @@ func TestSubmitReviewTaskWithVerdictApprove(t *testing.T) {
 	}
 
 	approve := "approve"
-	reviewResult, err := store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	reviewResult, err := store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task with verdict: %v", err)
 	}
@@ -3131,7 +3131,7 @@ func TestSubmitReviewTaskWithVerdictReject(t *testing.T) {
 	}
 
 	reject := "reject"
-	reviewResult, err := store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, 5, nil, nil, nil)
+	reviewResult, err := store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task with verdict: %v", err)
 	}
@@ -3280,7 +3280,7 @@ func TestSubmitReviewTaskWithoutVerdictRejected(t *testing.T) {
 	}
 
 	// Try to submit a review task without a verdict - should be rejected
-	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Reviewed", nil, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Reviewed", nil, []LinkInput{}, 5, nil, nil)
 	if err == nil {
 		t.Fatalf("expected error when submitting review task without verdict")
 	}
@@ -3414,7 +3414,7 @@ func TestSubmitReviewWithoutFindingsUnchanged(t *testing.T) {
 	store, ctx, reviewTaskID, parentTaskID := newClaimedReviewTaskForFindings(t)
 
 	approve := "approve"
-	if _, err := store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil); err != nil {
+	if _, err := store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil); err != nil {
 		t.Fatalf("failed to submit review without findings: %v", err)
 	}
 
@@ -4173,6 +4173,118 @@ func TestResearchAggregation_NoEscalationLadder(t *testing.T) {
 	}
 }
 
+// TestResearchAggregation_EmptyLadderIgnoresConfiguredThreshold verifies that a
+// configured researchEscalationThresholds entry has no effect when no research
+// escalation ladder is configured: the task must fall back to maxReviewRounds.
+func TestResearchAggregation_EmptyLadderIgnoresConfiguredThreshold(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, true)
+
+	researchThresholds := map[string]int{"haiku": 1}
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+	round := func(n int) {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, n)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("round %d: expected both review tasks", n)
+		}
+		submitResearchReviewWithThresholds(t, store, ctx, opus, "opus-reviewer", "reject", blocking, 5, nil, researchThresholds)
+		submitResearchReviewWithThresholds(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`), 5, nil, researchThresholds)
+	}
+
+	round(1)
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+	round(2)
+
+	// The configured threshold for haiku is 1, so round 2 would block if it
+	// applied. With no research ladder configured, the threshold must be
+	// ignored in favor of maxReviewRounds (5), so the task stays ready.
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent after round 2: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("round 2: expected ready (empty ladder ignores configured threshold), got %s", parent.State)
+	}
+}
+
+// TestResearchAggregation_OffLadderModelIgnoresThreshold verifies that a research
+// task whose model is not on the configured research escalation ladder falls
+// back to maxReviewRounds, ignoring any configured threshold entry for that model.
+func TestResearchAggregation_OffLadderModelIgnoresThreshold(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
+		WithResearchEscalationLadder([]string{"sonnet", "opus"}))
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ctx := context.Background()
+	proj, err := store.CreateProject(ctx, "test", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// haiku is not on the configured research ladder (sonnet, opus).
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research task",
+			Spec:         "research",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+			Escalate:     ptrBool(true),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("failed to promote: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Impl", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 5, nil, nil); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	researchThresholds := map[string]int{"haiku": 1}
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+	round := func(n int) {
+		opus, sonnet := findResearchReviewTasks(t, store, ctx, proj.ID, taskID, n)
+		if opus == nil || sonnet == nil {
+			t.Fatalf("round %d: expected both review tasks", n)
+		}
+		submitResearchReviewWithThresholds(t, store, ctx, opus, "opus-reviewer", "reject", blocking, 5, nil, researchThresholds)
+		submitResearchReviewWithThresholds(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`), 5, nil, researchThresholds)
+	}
+
+	round(1)
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim for resubmit: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 5, nil, nil); err != nil {
+		t.Fatalf("failed to resubmit: %v", err)
+	}
+	round(2)
+
+	// The configured threshold for haiku is 1, but haiku is off the research
+	// ladder, so the threshold must be ignored in favor of maxReviewRounds (5).
+	// Round 2 <= 5, so the task stays ready.
+	final, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+	if final.State != "ready" {
+		t.Errorf("round 2: expected ready (off-ladder model ignores threshold), got %s", final.State)
+	}
+}
+
 // TestResearchAggregation_IndependentLadders verifies that research and build escalation
 // ladders can be configured independently. Research tasks escalate along the research ladder
 // using research thresholds, while build tasks escalate along the build ladder using build
@@ -4308,8 +4420,7 @@ func TestResearchAggregation_IndependentLadders(t *testing.T) {
 func TestResearchAggregation_TopTierBlocks(t *testing.T) {
 	// Research ladder: sonnet -> opus (opus is top tier)
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
-		WithResearchEscalationLadder([]string{"sonnet", "opus"}),
-		WithResearchEscalationThresholds(map[string]int{"sonnet": 1, "opus": 1}))
+		WithResearchEscalationLadder([]string{"sonnet", "opus"}))
 	if err != nil {
 		t.Fatalf("failed to open test database: %v", err)
 	}
@@ -4348,12 +4459,16 @@ func TestResearchAggregation_TopTierBlocks(t *testing.T) {
 	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
 		t.Fatalf("failed to claim: %v", err)
 	}
-	// Use maxReviewRounds=0 so any review triggers the circuit breaker
-	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Impl", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 0, nil, nil); err != nil {
+	// maxReviewRounds is generously large so the research threshold below (not
+	// the fallback) is what decides when the breaker trips.
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Impl", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 10, nil, nil); err != nil {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	// Get and reject reviews to exceed threshold
+	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
+	researchThresholds := map[string]int{"sonnet": 1, "opus": 1}
+
+	// Round 1: reject without exceeding the threshold of 1, task stays ready.
 	opusRev, sonnetRev := findResearchReviewTasks(t, store, ctx, proj.ID, taskID, 1)
 	if opusRev == nil {
 		t.Fatalf("no opus review task")
@@ -4361,12 +4476,36 @@ func TestResearchAggregation_TopTierBlocks(t *testing.T) {
 	if sonnetRev == nil {
 		t.Fatalf("no sonnet review task")
 	}
+	submitResearchReviewWithThresholds(t, store, ctx, opusRev, "opus-reviewer", "reject", blocking, 10, nil, researchThresholds)
+	submitResearchReviewWithThresholds(t, store, ctx, sonnetRev, "sonnet-reviewer", "reject", blocking, 10, nil, researchThresholds)
 
-	blocking := json.RawMessage(`[{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"issue","in_changed_text":true,"status":"new"}]`)
-	submitResearchReviewWithThresholds(t, store, ctx, opusRev, "opus-reviewer", "reject", blocking, 0, nil, nil)
-	submitResearchReviewWithThresholds(t, store, ctx, sonnetRev, "sonnet-reviewer", "reject", blocking, 0, nil, nil)
+	mid, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task after round 1: %v", err)
+	}
+	if mid.State != "ready" {
+		t.Fatalf("research task should still be ready at round 1 (threshold 1), got state %s", mid.State)
+	}
 
-	// Check that task blocked (not escalated)
+	// Resubmit to trigger round 2, which exceeds the threshold of 1.
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim for resubmit: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, taskID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 10, nil, nil); err != nil {
+		t.Fatalf("failed to resubmit: %v", err)
+	}
+
+	opusRev2, sonnetRev2 := findResearchReviewTasks(t, store, ctx, proj.ID, taskID, 2)
+	if opusRev2 == nil {
+		t.Fatalf("no opus review task round 2")
+	}
+	if sonnetRev2 == nil {
+		t.Fatalf("no sonnet review task round 2")
+	}
+	submitResearchReviewWithThresholds(t, store, ctx, opusRev2, "opus-reviewer", "reject", blocking, 10, nil, researchThresholds)
+	submitResearchReviewWithThresholds(t, store, ctx, sonnetRev2, "sonnet-reviewer", "reject", blocking, 10, nil, researchThresholds)
+
+	// Check that task blocked (not escalated) at round 2, since round(2) > threshold(1).
 	final, err := store.GetTask(ctx, taskID)
 	if err != nil {
 		t.Fatalf("failed to get task: %v", err)
@@ -4459,9 +4598,7 @@ func TestResearchAggregation_EscalateFalseBlocks(t *testing.T) {
 func TestResearchAggregation_BuildTasksUnchanged(t *testing.T) {
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(),
 		WithEscalationLadder([]string{"haiku", "sonnet"}),
-		WithEscalationThresholds(map[string]int{"haiku": 1}),
-		WithResearchEscalationLadder([]string{"sonnet", "opus"}),
-		WithResearchEscalationThresholds(map[string]int{"sonnet": 10}))
+		WithResearchEscalationLadder([]string{"sonnet", "opus"}))
 	if err != nil {
 		t.Fatalf("failed to open test database: %v", err)
 	}
@@ -5781,7 +5918,7 @@ func TestBuildDesignAggregationUnchanged(t *testing.T) {
 
 			approve := "approve"
 			resultText := "Detailed feedback\nline two, with more detail"
-			if _, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", resultText, &approve, []LinkInput{}, 5, nil, nil, nil); err != nil {
+			if _, err = store.SubmitTask(ctx, reviewTaskID, "opus-reviewer", resultText, &approve, []LinkInput{}, 5, nil, nil); err != nil {
 				t.Fatalf("failed to submit review task: %v", err)
 			}
 
@@ -6548,7 +6685,7 @@ func TestWaitForAllAggregation_FirstApproveSecondApprove(t *testing.T) {
 		t.Fatalf("failed to claim first review task: %v", err)
 	}
 	approve := "approve"
-	_, err = store.SubmitTask(ctx, opusTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, opusTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit first review task: %v", err)
 	}
@@ -6567,7 +6704,7 @@ func TestWaitForAllAggregation_FirstApproveSecondApprove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to claim second review task: %v", err)
 	}
-	_, err = store.SubmitTask(ctx, sonnetTask.ID, "sonnet-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, sonnetTask.ID, "sonnet-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit second review task: %v", err)
 	}
@@ -6668,7 +6805,7 @@ func TestWaitForAllAggregation_ApproveAndReject(t *testing.T) {
 		t.Fatalf("failed to claim first review task: %v", err)
 	}
 	approve := "approve"
-	_, err = store.SubmitTask(ctx, opusTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, opusTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit first review task: %v", err)
 	}
@@ -6688,7 +6825,7 @@ func TestWaitForAllAggregation_ApproveAndReject(t *testing.T) {
 		t.Fatalf("failed to claim second review task: %v", err)
 	}
 	reject := "reject"
-	_, err = store.SubmitTask(ctx, sonnetTask.ID, "sonnet-reviewer", "Needs changes", &reject, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, sonnetTask.ID, "sonnet-reviewer", "Needs changes", &reject, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit second review task: %v", err)
 	}
@@ -7948,7 +8085,7 @@ func TestRejectVerdictOnHeldTaskDoesNotAutoTransition(t *testing.T) {
 	}
 
 	reject := "reject"
-	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task with verdict: %v", err)
 	}
@@ -8601,7 +8738,7 @@ func TestRejectVerdictOnTerminalTaskDoesNotResurrect(t *testing.T) {
 	}
 
 	reject := "reject"
-	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Needs work", &reject, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task with reject verdict: %v", err)
 	}
@@ -8673,7 +8810,7 @@ func TestRejectVerdictOnTerminalTaskDoesNotResurrect(t *testing.T) {
 	}
 
 	approve := "approve"
-	_, err = store.SubmitTask(ctx, reviewTask2.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask2.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit second review task with approve verdict: %v", err)
 	}
@@ -8736,7 +8873,7 @@ func TestSubmitImplementTaskNoOpResolution(t *testing.T) {
 
 	// No-op submit: a no_op marker and NO pr link.
 	noOpLinks := []LinkInput{{Kind: "no_op", Value: "already-satisfied"}}
-	submitted, err := store.SubmitTask(ctx, taskID, "agent-1", "acceptance already satisfied on main; no changes needed", nil, noOpLinks, 5, nil, nil, nil)
+	submitted, err := store.SubmitTask(ctx, taskID, "agent-1", "acceptance already satisfied on main; no changes needed", nil, noOpLinks, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("no-op submit should be accepted, got error: %v", err)
 	}
@@ -8788,7 +8925,7 @@ func TestSubmitImplementTaskNoOpResolution(t *testing.T) {
 		t.Fatalf("failed to claim review task: %v", err)
 	}
 	approve := "approve"
-	if _, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "verified satisfied on main", &approve, []LinkInput{}, 5, nil, nil, nil); err != nil {
+	if _, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "verified satisfied on main", &approve, []LinkInput{}, 5, nil, nil); err != nil {
 		t.Fatalf("failed to submit review verdict: %v", err)
 	}
 
@@ -10807,7 +10944,7 @@ func TestAgentMergeNoOpAutoFinalizesToDone(t *testing.T) {
 	}
 
 	approve := "approve"
-	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task: %v", err)
 	}
@@ -10928,7 +11065,7 @@ func TestAgentMergePRStaysApproved(t *testing.T) {
 	}
 
 	approve := "approve"
-	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task: %v", err)
 	}
@@ -11205,7 +11342,7 @@ func TestAgentMergePRSpawnsMergeTask(t *testing.T) {
 	}
 
 	approve := "approve"
-	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task: %v", err)
 	}
@@ -11331,7 +11468,7 @@ func TestAgentMergeDisabledNoMergeTask(t *testing.T) {
 
 	// Submit review with approve
 	approve := "approve"
-	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Looks good", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task: %v", err)
 	}
@@ -11431,7 +11568,7 @@ func TestAgentMergeNoOpNoMergeTask(t *testing.T) {
 
 	// Submit review with approve
 	approve := "approve"
-	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Verified", &approve, []LinkInput{}, 5, nil, nil, nil)
+	_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Verified", &approve, []LinkInput{}, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to submit review task: %v", err)
 	}
@@ -11645,7 +11782,7 @@ func createSupersedableTaskWithPRLink(t *testing.T, ctx context.Context, st Stor
 		t.Fatalf("failed to claim task: %v", err)
 	}
 	links := []LinkInput{{Kind: "pr", Value: prURL}}
-	if _, err := st.SubmitTask(ctx, task.ID, "agent-1", "Implementation complete", nil, links, 5, nil, nil, nil); err != nil {
+	if _, err := st.SubmitTask(ctx, task.ID, "agent-1", "Implementation complete", nil, links, 5, nil, nil); err != nil {
 		t.Fatalf("failed to submit task: %v", err)
 	}
 
@@ -12675,7 +12812,7 @@ func TestUpdateTaskEscalatePreservesReviewHistoryPRLinksAndDependencies(t *testi
 		t.Fatalf("failed to claim review task: %v", err)
 	}
 	reject := "reject"
-	if _, err := store.SubmitTask(ctx, reviewTaskID, "reviewer-1", "Needs work", &reject, []LinkInput{}, 5, nil, nil, nil); err != nil {
+	if _, err := store.SubmitTask(ctx, reviewTaskID, "reviewer-1", "Needs work", &reject, []LinkInput{}, 5, nil, nil); err != nil {
 		t.Fatalf("failed to submit review task: %v", err)
 	}
 
