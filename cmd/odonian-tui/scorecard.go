@@ -114,11 +114,10 @@ func (m *BoardModel) renderScorecardView() string {
 		b.WriteString(fmt.Sprintf("» %s\n", m.scorecardMessage))
 	}
 
-	vpContent := m.scorecardViewport.View()
-	if vpContent == "" && m.scorecardMessage == "" {
+	if m.scorecardLoading && m.scorecardMessage == "" {
 		b.WriteString("Loading scorecards…")
 	} else {
-		b.WriteString(vpContent)
+		b.WriteString(m.scorecardViewport.View())
 	}
 
 	return b.String()
@@ -152,6 +151,7 @@ func (m *BoardModel) updateScorecardMode(msg tea.KeyMsg) (*BoardModel, tea.Cmd) 
 		m.scorecardMessage = ""
 		m.scorecardViewport.SetContent("")
 		m.lastScorecards = nil
+		m.scorecardLoading = true
 		return m, m.fetchScorecardCmd()
 
 	case "P":
@@ -165,6 +165,7 @@ func (m *BoardModel) updateScorecardMode(msg tea.KeyMsg) (*BoardModel, tea.Cmd) 
 		}
 		m.scorecardViewport.SetContent("")
 		m.lastScorecards = nil
+		m.scorecardLoading = false
 		return m, m.fetchProjects()
 
 	case "q", "ctrl+c":

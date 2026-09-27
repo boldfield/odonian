@@ -95,6 +95,15 @@ func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
 	if model.mode != modeNormal {
 		t.Errorf("expected mode to be modeNormal after esc, got %d", model.mode)
 	}
+
+	// Test reopening scorecards after exiting - should show loading state
+	m, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = m.(*BoardModel)
+
+	view = model.View()
+	if !strings.Contains(view, "Loading scorecards…") {
+		t.Errorf("expected 'Loading scorecards…' in view when reopening scorecards, got:\n%s", view)
+	}
 }
 
 // TestBoardModel_ScorecardMode_Empty tests the empty scorecard case.
@@ -345,6 +354,12 @@ func TestBoardModel_ScorecardMode_Refresh(t *testing.T) {
 	// Press 'r' to refresh
 	m, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
 	model = m.(*BoardModel)
+
+	// Check that we're showing loading state during refresh
+	view = model.View()
+	if !strings.Contains(view, "Loading scorecards…") {
+		t.Errorf("expected 'Loading scorecards…' in view during refresh, got:\n%s", view)
+	}
 
 	// Execute the refresh command
 	if cmd == nil {

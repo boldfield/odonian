@@ -105,6 +105,7 @@ type BoardModel struct {
 	// Scorecard view state
 	scorecardViewport viewport.Model
 	scorecardMessage  string
+	scorecardLoading  bool                          // true when a fetch is in progress
 	lastScorecards    *tuiclient.ReviewerScorecards // cached for rebuild on resize
 
 	// Project switcher state
@@ -999,6 +1000,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scorecardMessage = ""
 			m.scorecardViewport.SetContent("")
 			m.lastScorecards = nil
+			m.scorecardLoading = true
 			return m, m.fetchScorecardCmd()
 
 		// Help (stub for TUI-3+)
@@ -1021,6 +1023,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case scorecardFetchedMsg:
+		m.scorecardLoading = false
 		if msg.err != nil {
 			// Stay in scorecard mode but show error message.
 			m.scorecardMessage = fmt.Sprintf("Error: %v", msg.err)
