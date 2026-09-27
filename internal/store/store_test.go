@@ -13412,6 +13412,100 @@ func TestResearchBudget_ResolvedFindingExcludedFromDecomposeNote(t *testing.T) {
 	}
 }
 
+// TestResearchBudget_UnaggregatedRoundDoesNotMisalignRoundNumbers is a regression
+// test for a bug found in review: describeChainWideBlockingFindings inferred each
+// research_round_rejected event's round number from its position among that task's
+// events (the Nth event is local round N), rather than the round it actually
+// happened on. TransitionTask allows review->blocked and blocked->ready, so an
+// operator can send a round that never finished review back to ready and the worker
+// can resubmit, advancing review_round without ever appending a rejected event for
+// the skipped round. Every later rejected event then gets assigned the wrong round
+// number, which breaks the round-based matching describeOutstandingResearchRoundFindings
+// uses to decide whether a stored finding was later resolved: a resolved finding can
+// wrongly still show up in the decompose note as unresolved.
+func TestResearchBudget_UnaggregatedRoundDoesNotMisalignRoundNumbers(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	const budget = 2
+
+	// Round 1 is opened but only one of two reviewers submits. The operator blocks
+	// and unblocks the parent without waiting for the second reviewer, and the
+	// worker resubmits: review_round advances to 2 with no research_round_rejected
+	// event ever recorded for round 1.
+	opus1, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus1 == nil {
+		t.Fatalf("expected opus review task for round 1")
+	}
+	submitResearchReviewWithBudget(t, store, ctx, opus1, "opus-reviewer", "reject", researchBlockingFinding("partial"), budget)
+
+	if _, err := store.TransitionTask(ctx, parentID, "blocked", nil); err != nil {
+		t.Fatalf("failed to block parent: %v", err)
+	}
+	if _, err := store.TransitionTask(ctx, parentID, "ready", nil); err != nil {
+		t.Fatalf("failed to unblock parent: %v", err)
+	}
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Real round 2: opus raises OLD, a blocking P1. This is the chain's first
+	// rejected event, but its true round number is 2, not 1.
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opus2 == nil || sonnet2 == nil {
+		t.Fatalf("round 2: expected both review tasks")
+	}
+	submitResearchReviewWithBudget(t, store, ctx, opus2, "opus-reviewer", "reject", researchBlockingFinding("OLD"), budget)
+	submitResearchReviewWithBudget(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`), budget)
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent after round 2: %v", err)
+	}
+	if parent.State != "ready" {
+		t.Fatalf("round 2: expected ready (below budget %d), got %s", budget, parent.State)
+	}
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	// Real round 3: opus resolves OLD via prior_id, but also raises a new blocking
+	// P1, NEW. The round still fails on NEW, bringing the chain-wide rejected-round
+	// count to the budget (rounds 2 and 3), so the task blocks.
+	opus3, sonnet3 := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
+	if opus3 == nil || sonnet3 == nil {
+		t.Fatalf("round 3: expected both review tasks")
+	}
+	round3 := json.RawMessage(`[
+		{"id":"f2","severity":"P1","file":"b.md","line":2,"summary":"NEW","in_changed_text":true,"status":"new"},
+		{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"OLD, now fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"}
+	]`)
+	submitResearchReviewWithBudget(t, store, ctx, opus3, "opus-reviewer", "reject", round3, budget)
+	submitResearchReviewWithBudget(t, store, ctx, sonnet3, "sonnet-reviewer", "approve", json.RawMessage(`[]`), budget)
+
+	final, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent after round 3: %v", err)
+	}
+	if final.State != "blocked" {
+		t.Fatalf("expected blocked at chain-wide budget %d, got %s", budget, final.State)
+	}
+
+	events, err := store.ListEvents(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var blockedNote string
+	for _, e := range events {
+		if e.Kind == "transition" && e.Note != nil && strings.Contains(*e.Note, "decompose") {
+			blockedNote = *e.Note
+		}
+	}
+	if blockedNote == "" {
+		t.Fatalf("expected a blocked transition event with reason decompose")
+	}
+	if !strings.Contains(blockedNote, "NEW") {
+		t.Errorf("expected block note to include the still-outstanding finding NEW, got %q", blockedNote)
+	}
+	if strings.Contains(blockedNote, "OLD") {
+		t.Errorf("expected block note to exclude OLD, resolved in round 3 via prior_id — a round left unaggregated by a blocked/ready retry must not shift later rounds' numbering, got %q", blockedNote)
+	}
+}
+
 // TestResearchBudget_EscalationOnlyIfBudgetRemains verifies docs/features/research-
 // track.md section 6: "a task escalates at its tier's threshold only if the budget
 // still has rounds left. The budget always takes precedence." A rejection that would

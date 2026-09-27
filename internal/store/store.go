@@ -2525,7 +2525,11 @@ func describeOutstandingResearchRoundFindings(findingsText sql.NullString, round
 // resolution status from every review report on each task, the same way
 // createResearchFollowUpTasks does for non-blocking findings, since the
 // research_round_rejected snapshot only ever holds a round's blocking findings at the
-// moment it failed and never learns about a later round's resolution.
+// moment it failed and never learns about a later round's resolution. Resolution is
+// reconciled per task only: a blocker raised on a predecessor and resolved on its
+// successor still appears in the note. That is acceptable for this milestone, since
+// prior_id lineage is per task and R9 spec compaction carries unresolved findings
+// forward across supersession.
 func (s *sqliteStore) describeChainWideBlockingFindings(ctx context.Context, tx *sql.Tx, taskID string) (string, error) {
 	chain, err := s.supersedeChain(ctx, tx, taskID)
 	if err != nil {
@@ -2566,25 +2570,31 @@ func (s *sqliteStore) describeChainWideBlockingFindings(ctx context.Context, tx 
 		}
 
 		rows, err := tx.QueryContext(ctx, `
-			SELECT findings FROM event
+			SELECT note, findings FROM event
 			WHERE task_id = ? AND kind = 'research_round_rejected'
 			ORDER BY created_at, id
 		`, id)
 		if err != nil {
 			return "", fmt.Errorf("failed to query rejected-round events for %s: %w", id, err)
 		}
-		// research_round_rejected events are appended in round order, one per
-		// actually-rejected round with no gaps (a research task that passes a round
-		// moves to a terminal state instead of continuing), so the Nth event for this
-		// task is exactly local round N.
-		localRound := 0
+		// appendResearchRoundRejectedEvent stamps each event's note with the task's
+		// real review_round at the moment the round failed ("Round %d rejected"), so
+		// that round is read back from the note rather than inferred from the event's
+		// position. Position alone is not reliable: TransitionTask allows a task in
+		// review to be sent to blocked and back to ready, which lets a round be
+		// abandoned (and resubmitted past) without ever completing aggregation, so the
+		// Nth rejected event is not always local round N.
 		for rows.Next() {
+			var noteText sql.NullString
 			var findingsText sql.NullString
-			if err := rows.Scan(&findingsText); err != nil {
+			if err := rows.Scan(&noteText, &findingsText); err != nil {
 				rows.Close()
 				return "", fmt.Errorf("failed to scan rejected-round event: %w", err)
 			}
-			localRound++
+			var localRound int
+			if noteText.Valid {
+				fmt.Sscanf(noteText.String, "Round %d rejected", &localRound)
+			}
 			chainRound++
 			rounds = append(rounds, fmt.Sprintf("Round %d: %s", chainRound, describeOutstandingResearchRoundFindings(findingsText, localRound, findOutstanding)))
 		}
