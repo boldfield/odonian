@@ -365,6 +365,54 @@ func TestGetResearchReviewerScorecards_ApprovalsWithLaterFixedBlockingFindings(t
 	}
 }
 
+// TestGetResearchReviewerScorecards_ApprovalsWithLaterFix_SameModelSlots covers
+// review_models [opus, opus]: slot A's approval over slot B's later-fixed blocking
+// finding counts, because "another reviewer" is a different lineage (model plus
+// slot), not a different model. Slot B's own round-2 approval does not count, since
+// the finding was its own.
+func TestGetResearchReviewerScorecards_ApprovalsWithLaterFix_SameModelSlots(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "opus"})
+	getTask := func(id string) *Task {
+		tk, err := store.GetTask(ctx, id)
+		if err != nil {
+			t.Fatalf("failed to get task %s: %v", id, err)
+		}
+		return &Task{ID: tk.ID, Model: tk.Model}
+	}
+
+	round1 := researchReviewTasksInSlotOrder(t, store, ctx, parentID, 1)
+	if len(round1) != 2 {
+		t.Fatalf("expected 2 round-1 review tasks, got %d", len(round1))
+	}
+	submitResearchReview(t, store, ctx, getTask(round1[0]), "opus-a", "approve", json.RawMessage(`[]`))
+	submitResearchReview(t, store, ctx, getTask(round1[1]), "opus-b", "reject",
+		json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`))
+	resubmitResearchImplementTask(t, store, ctx, parentID)
+
+	round2 := researchReviewTasksInSlotOrder(t, store, ctx, parentID, 2)
+	if len(round2) != 2 {
+		t.Fatalf("expected 2 round-2 review tasks, got %d", len(round2))
+	}
+	submitResearchReview(t, store, ctx, getTask(round2[0]), "opus-a", "approve", json.RawMessage(`[]`))
+	submitResearchReview(t, store, ctx, getTask(round2[1]), "opus-b", "approve",
+		json.RawMessage(`[{"id":"f2","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"resolved","prior_id":"f1"}]`))
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	if opusCard == nil {
+		t.Fatalf("expected an opus scorecard")
+	}
+	if opusCard.ApprovalsWithLaterFixedBlockingFindings != 1 {
+		t.Errorf("expected opus 1 approval with later fixed (slot A's round-1 approval), got %d", opusCard.ApprovalsWithLaterFixedBlockingFindings)
+	}
+	if opusCard.FindingsRaised["p2"] != 1 || opusCard.FindingsHeld != 1 {
+		t.Errorf("expected opus 1 P2 raised and held, got raised=%v held=%d", opusCard.FindingsRaised, opusCard.FindingsHeld)
+	}
+}
+
 func findScorecardByModel(scorecards []ReviewerScorecard, model string) *ReviewerScorecard {
 	for i := range scorecards {
 		if scorecards[i].Model == model {

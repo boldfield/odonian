@@ -159,6 +159,7 @@ func globalRound(taskIdx, localRound int) int {
 // buildScorecards, after every chain and every adjudication has been applied.
 type findingThread struct {
 	reviewerModel string
+	lineage       string // the raising reviewer's lineage (model plus slot), so computeApprovalsWithLaterFix can tell same-model reviewer slots apart
 	chainRoot     string // the chain's root task id (chain[0].ID), so computeApprovalsWithLaterFix only compares within one chain
 	lastKnownID   string // the id of the most recent report in this thread, for cross-boundary prior_id matching (findCarriedByPriorID)
 
@@ -176,6 +177,7 @@ type findingThread struct {
 // computeApprovalsWithLaterFix.
 type scorecardApproval struct {
 	model       string
+	lineage     string // the approving reviewer's lineage (model plus slot); only another lineage's blocking finding counts against it
 	chainRoot   string // the chain's root task id, so the approval only competes against blocking findings raised in the same chain
 	globalRound int
 }
@@ -314,7 +316,7 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 				}
 				matchedIn[lineage][thread] = true
 			} else {
-				thread = &findingThread{reviewerModel: first.reviewerModel, chainRoot: chainRoot}
+				thread = &findingThread{reviewerModel: first.reviewerModel, lineage: lineage, chainRoot: chainRoot}
 				agg.threads = append(agg.threads, thread)
 				ragg.findingsRaised[severity]++
 			}
@@ -385,6 +387,10 @@ func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, tx *sql.Tx
 	if err != nil {
 		return fmt.Errorf("failed to list events for %s: %w", taskID, err)
 	}
+	lineages, err := researchReviewTaskLineages(ctx, tx, taskID)
+	if err != nil {
+		return err
+	}
 	for _, event := range events {
 		switch event.Kind {
 		case "review":
@@ -402,7 +408,7 @@ func (agg *scorecardAggregation) collectVerdicts(ctx context.Context, tx *sql.Tx
 			ragg.tasksReviewed[taskID] = true
 			ragg.totalReviews++
 			if event.Verdict != nil && *event.Verdict == "approve" {
-				agg.approvals = append(agg.approvals, scorecardApproval{model: reviewTask.Model, chainRoot: chainRoot, globalRound: globalRound(taskIdx, reviewTask.ReviewRound)})
+				agg.approvals = append(agg.approvals, scorecardApproval{model: reviewTask.Model, lineage: lineages[reviewTask.ID], chainRoot: chainRoot, globalRound: globalRound(taskIdx, reviewTask.ReviewRound)})
 			}
 		case "submit":
 			if err := agg.recordDisputes(taskID, taskIdx, event); err != nil {
@@ -512,8 +518,41 @@ func (t *findingThread) withdrawnAfterDispute() bool {
 	return true
 }
 
+// researchReviewTaskLineages maps each of parentID's non-adjudication review tasks to
+// its reviewer lineage, assigning slots exactly as collectResearchReviewReports does
+// (per round and model, in creation order), so an approval's lineage matches the
+// lineage its reviewer's findings were recorded under.
+func researchReviewTaskLineages(ctx context.Context, tx *sql.Tx, parentID string) (map[string]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, review_round, model FROM task
+		WHERE target_task_id = ? AND kind = 'review' AND review_round >= 1 AND adjudicate_finding_id IS NULL
+		ORDER BY review_round, rowid, id
+	`, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list review tasks for %s: %w", parentID, err)
+	}
+	defer rows.Close()
+	lineages := make(map[string]string)
+	slotsTaken := make(map[string]int)
+	for rows.Next() {
+		var id, model string
+		var round int
+		if err := rows.Scan(&id, &round, &model); err != nil {
+			return nil, fmt.Errorf("failed to scan review task for %s: %w", parentID, err)
+		}
+		slotKey := fmt.Sprintf("%d\x00%s", round, model)
+		slot := slotsTaken[slotKey]
+		slotsTaken[slotKey] = slot + 1
+		lineages[id] = researchReviewerLineage(model, slot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate review tasks for %s: %w", parentID, err)
+	}
+	return lineages, nil
+}
+
 // computeApprovalsWithLaterFix implements the fourth section 8 metric: for each
-// reviewer's approval of a round, whether another reviewer's blocking finding —
+// reviewer's approval of a round, whether another reviewer lineage's blocking finding —
 // already raised as of that round — was fixed in a later round, anywhere in the same
 // chain. Only a thread classified held can have been fixed: a withdrawn or overturned
 // finding was never valid, so its later settlement fixed nothing and the approving
@@ -527,8 +566,8 @@ func (agg *scorecardAggregation) computeApprovalsWithLaterFix() {
 			if thread.chainRoot != appr.chainRoot {
 				continue // a blocking finding on an unrelated chain was never relevant to this approval
 			}
-			if thread.reviewerModel == appr.model {
-				continue
+			if thread.lineage == appr.lineage {
+				continue // the approver's own finding; a same-model reviewer in another slot is still another reviewer
 			}
 			if thread.classify() != "held" {
 				continue
