@@ -1247,3 +1247,108 @@ func TestSubmitTaskWithDisputesAndFindings(t *testing.T) {
 		t.Fatalf("SubmitTaskWithDisputesAndFindings failed: %v", err)
 	}
 }
+
+func TestGetResearchReviewerScorecards_WithData(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/projects/proj123/research/reviewers" {
+			t.Errorf("expected /projects/proj123/research/reviewers, got %s", r.URL.Path)
+		}
+
+		auth := r.Header.Get("Authorization")
+		if auth != "Bearer testtoken" {
+			t.Errorf("expected Bearer testtoken, got %s", auth)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		scorecards := ReviewerScorecards{
+			Scorecards: []ReviewerScorecard{
+				{
+					Model: "opus",
+					FindingsRaised: map[string]int{
+						"p1": 5,
+						"p2": 10,
+						"p3": 15,
+					},
+					FindingsHeld:                            12,
+					FindingsWithdrawn:                       8,
+					FindingsUnresolved:                      10,
+					ApprovalsWithLaterFixedBlockingFindings: 2,
+					TotalReviewRounds:                       20,
+					SampleSize:                              5,
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(scorecards)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	scorecards, err := client.GetResearchReviewerScorecards(context.Background(), "proj123")
+	if err != nil {
+		t.Fatalf("GetResearchReviewerScorecards failed: %v", err)
+	}
+
+	if len(scorecards.Scorecards) != 1 {
+		t.Errorf("expected 1 scorecard, got %d", len(scorecards.Scorecards))
+	}
+
+	sc := scorecards.Scorecards[0]
+	if sc.Model != "opus" {
+		t.Errorf("expected model=opus, got %s", sc.Model)
+	}
+	if sc.FindingsRaised["p1"] != 5 {
+		t.Errorf("expected p1=5, got %d", sc.FindingsRaised["p1"])
+	}
+	if sc.SampleSize != 5 {
+		t.Errorf("expected sample size=5, got %d", sc.SampleSize)
+	}
+}
+
+func TestGetResearchReviewerScorecards_Empty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		scorecards := ReviewerScorecards{
+			Scorecards: []ReviewerScorecard{},
+		}
+		json.NewEncoder(w).Encode(scorecards)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	scorecards, err := client.GetResearchReviewerScorecards(context.Background(), "proj123")
+	if err != nil {
+		t.Fatalf("GetResearchReviewerScorecards failed: %v", err)
+	}
+
+	if len(scorecards.Scorecards) != 0 {
+		t.Errorf("expected 0 scorecards, got %d", len(scorecards.Scorecards))
+	}
+}
+
+func TestGetResearchReviewerScorecards_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":{"code":"INTERNAL_ERROR","message":"server error"}}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	_, err := client.GetResearchReviewerScorecards(context.Background(), "proj123")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T: %v", err, err)
+	}
+	if apiErr.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected StatusCode 500, got %d", apiErr.StatusCode)
+	}
+}
