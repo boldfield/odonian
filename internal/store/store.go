@@ -5172,21 +5172,22 @@ func (s *sqliteStore) UpdateTaskDependsOn(ctx context.Context, taskID string, de
 // Events older than retentionDays are deleted unconditionally.
 // For tasks in terminal states (done/failed/archived/abandoned), events older than terminalRetentionDays are deleted.
 // Events for active (non-terminal) tasks are never pruned.
+// Events for research-track tasks are kept indefinitely because the reviewer scorecard is computed from them.
 // Returns the number of rows deleted.
-// PruneEvents deletes events for terminal tasks older than terminalRetentionDays,
-// while preserving all events for active (non-terminal) tasks.
 func (s *sqliteStore) PruneEvents(ctx context.Context, terminalRetentionDays int) (int64, error) {
 	// Calculate cutoff timestamp for terminal task events
 	terminalCutoff := time.Now().UTC().AddDate(0, 0, -terminalRetentionDays).Format(timestampLayout)
 
 	// Delete events for terminal tasks older than terminalCutoff.
-	// Active-task events are never deleted (constraint: do NOT prune events for active tasks).
+	// Active-task events are never deleted.
+	// Research-track task events are kept indefinitely to preserve the reviewer scorecard.
 	result, err := s.conn.ExecContext(ctx, `
 		DELETE FROM event
 		WHERE
 			task_id IN (
 				SELECT id FROM task
 				WHERE state IN ('done', 'failed', 'archived', 'abandoned')
+				AND track != 'research'
 			)
 			AND created_at < ?
 	`, terminalCutoff)
