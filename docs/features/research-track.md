@@ -70,7 +70,7 @@ A research review verdict stays `approve` or `reject`. It also carries a list of
 
 Aggregation for research tasks:
 
-- **A finding blocks** if it is P1 or P2 and in changed text, if it is P1 or P2 in any text during round 1, or if its status is `still_open`.
+- **A finding blocks** if it is P1 or P2 and in changed text, if it is P1 or P2 in any text during round 1, or if it is P1 or P2 with status `still_open`. A P3 never blocks, whatever its status. A `still_open` P3 is carried as a non-blocking finding and becomes a follow-up task; blocking it would let a locator error hold the round, and a P3 in text outside the worker's assignment could never clear.
 - **The round passes** only if no reviewer raised a blocking finding. Any valid blocking finding from any reviewer fails the round. That keeps the value of two reviewers, since each is there to catch what the other misses.
 - **Non-blocking findings** are P3 findings, and P1 or P2 findings in unchanged text after round 1. They don't fail the round. They become follow-up tasks.
 
