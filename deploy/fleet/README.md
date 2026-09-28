@@ -170,6 +170,34 @@ memory-intensive. Extract specific page ranges when possible. Rendering outputs 
 extracted text) are ephemeral — store them in temporary directories (`/tmp` or pod-local
 `emptyDir` volumes) and clean them up to avoid filling the pod's home volume.
 
+### SVG rendering
+
+The fleet image includes `rsvg-convert` for rendering SVG files to PNG, enabling workflows that
+need to convert vector graphics to raster images.
+
+**SVG-to-PNG conversion:**
+
+To render an SVG file within a worker/reviewer pod:
+
+```sh
+rsvg-convert /path/to/file.svg -o /tmp/output.png
+```
+
+Optional flags:
+- `-w <width>` and `-h <height>` — specify output dimensions in pixels; aspect ratio is preserved
+- `-f png` (default) or `-f pdf` — output format
+- `--background-color rgb(255,255,255)` — set background color (default: transparent)
+
+**Runtime verification:** The fleet image verifies SVG rendering capability during build by
+running a synthetic smoke check (`svg-smoke-check.sh`) as the non-root user (UID 1000). This
+ensures `rsvg-convert` and its required libraries are available at runtime.
+
+**Manual smoke-check run:** To verify SVG rendering in a fleet pod, override the entrypoint:
+
+```sh
+kubectl exec -it <pod-name> -- /usr/local/bin/svg-smoke-check.sh
+```
+
 ### Releasing a new fleet image
 
 1. Build and push an explicit version: `make fleet-image VERSION=<version> FLEET_TAG=<version>`
