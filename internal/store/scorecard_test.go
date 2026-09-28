@@ -1151,3 +1151,95 @@ func TestGetResearchReviewerScorecards_ConcurrentCallsDoNotExhaustReadPool(t *te
 		}
 	}
 }
+
+// TestGetResearchReviewerScorecards_SupersededChain_ResolvedUnmatchedPriorIDIgnored
+// verifies that a resolved report with a prior_id that doesn't match in its own
+// reviewer's lineage is ignored for scorecard purposes: it's a claim about a finding
+// the reviewer never raised (e.g., a finding the other reviewer raised), so it must
+// not create a thread, count as raised, held, fixed, withdrawn, or unresolved.
+func TestGetResearchReviewerScorecards_SupersededChain_ResolvedUnmatchedPriorIDIgnored(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "sonnet"})
+
+	// Round 1: Each reviewer raises one P1 finding
+	opusTask1, sonnetTask1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opusTask1 == nil || sonnetTask1 == nil {
+		t.Fatalf("expected both review tasks")
+	}
+
+	opusFindings := json.RawMessage(`[{"id":"f1","severity":"P1","file":"test.txt","line":1,"summary":"opus finding","in_changed_text":true,"status":"new"}]`)
+	sonnetFindings := json.RawMessage(`[{"id":"f2","severity":"P1","file":"test.txt","line":2,"summary":"sonnet finding","in_changed_text":true,"status":"new"}]`)
+
+	submitResearchReview(t, store, ctx, opusTask1, "opus-reviewer", "reject", opusFindings)
+	submitResearchReview(t, store, ctx, sonnetTask1, "sonnet-reviewer", "reject", sonnetFindings)
+
+	// Supersede the task
+	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	if err != nil {
+		t.Fatalf("failed to supersede: %v", err)
+	}
+	if _, err := store.PromoteTask(ctx, successor.ID); err != nil {
+		t.Fatalf("failed to promote successor: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, successor.ID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim successor: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, successor.ID, "agent-1", "Reworked", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("failed to submit successor: %v", err)
+	}
+
+	// Round 1 on the replacement: each reviewer reports BOTH carried findings as resolved.
+	// This tests the bug: opus reports f1 (its own, correctly) and f2 (sonnet's)
+	// both as resolved. Sonnet reports f2 (its own, correctly) and f1 (opus's)
+	// both as resolved. The bug was that unmatched resolved prior_ids would create
+	// false threads; the fix should ignore them.
+	opusTask2, sonnetTask2 := findResearchReviewTasks(t, store, ctx, projID, successor.ID, 1)
+	if opusTask2 == nil || sonnetTask2 == nil {
+		t.Fatalf("expected both review tasks on successor")
+	}
+
+	// Opus reports: f1 (its own) resolved, f2 (sonnet's) resolved
+	opusFindings2 := json.RawMessage(`[{"id":"g1","severity":"P1","file":"test.txt","line":1,"summary":"opus finding","in_changed_text":false,"status":"resolved","prior_id":"f1"},{"id":"g2","severity":"P1","file":"test.txt","line":2,"summary":"sonnet finding (other reviewer)","in_changed_text":false,"status":"resolved","prior_id":"f2"}]`)
+	// Sonnet reports: f2 (its own) resolved, f1 (opus's) resolved
+	sonnetFindings2 := json.RawMessage(`[{"id":"h1","severity":"P1","file":"test.txt","line":2,"summary":"sonnet finding","in_changed_text":false,"status":"resolved","prior_id":"f2"},{"id":"h2","severity":"P1","file":"test.txt","line":1,"summary":"opus finding (other reviewer)","in_changed_text":false,"status":"resolved","prior_id":"f1"}]`)
+
+	submitResearchReview(t, store, ctx, opusTask2, "opus-reviewer", "approve", opusFindings2)
+	submitResearchReview(t, store, ctx, sonnetTask2, "sonnet-reviewer", "approve", sonnetFindings2)
+
+	scorecards, err := store.GetResearchReviewerScorecards(ctx, projID)
+	if err != nil {
+		t.Fatalf("failed to get scorecards: %v", err)
+	}
+
+	opusCard := findScorecardByModel(scorecards.Scorecards, "opus")
+	sonnetCard := findScorecardByModel(scorecards.Scorecards, "sonnet")
+
+	if opusCard == nil || sonnetCard == nil {
+		t.Fatalf("expected both reviewers in scorecards")
+	}
+
+	// Each reviewer should have raised exactly 1 P1 (their own finding), not 2.
+	// The bug was that the unmatched resolved prior_id (the other reviewer's)
+	// would incorrectly create a new thread and increment findings_raised.
+	if opusCard.FindingsRaised["p1"] != 1 {
+		t.Errorf("expected opus raised p1=1 (not doubled), got %d", opusCard.FindingsRaised["p1"])
+	}
+	if sonnetCard.FindingsRaised["p1"] != 1 {
+		t.Errorf("expected sonnet raised p1=1 (not doubled), got %d", sonnetCard.FindingsRaised["p1"])
+	}
+
+	// Each reviewer should hold exactly 1 finding (their own, resolved)
+	if opusCard.FindingsHeld != 1 {
+		t.Errorf("expected opus held=1, got %d", opusCard.FindingsHeld)
+	}
+	if sonnetCard.FindingsHeld != 1 {
+		t.Errorf("expected sonnet held=1, got %d", sonnetCard.FindingsHeld)
+	}
+
+	// No unresolved findings (all findings are resolved)
+	if opusCard.FindingsUnresolved != 0 {
+		t.Errorf("expected opus unresolved=0, got %d", opusCard.FindingsUnresolved)
+	}
+	if sonnetCard.FindingsUnresolved != 0 {
+		t.Errorf("expected sonnet unresolved=0, got %d", sonnetCard.FindingsUnresolved)
+	}
+}
