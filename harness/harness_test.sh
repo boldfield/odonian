@@ -311,6 +311,16 @@ else
   test_fail "research implement prompt missing dispute submission guidance"
 fi
 
+# Test 26b: Check that research implement prompt acknowledges disputed items with --disputed
+echo "Test 26b: research implement prompt acknowledges disputed feedback with pr-feedback ack --disputed"
+if grep -q -- 'odonian pr-feedback ack --disputed <pr-url> <item-id>' "$_ri_prompt" && \
+   grep -q 'Never acknowledge a disputed item as addressed by a commit' "$_ri_prompt" && \
+   grep -q -- 'Never use `--skip-feedback-gate`' "$_ri_prompt"; then
+  test_pass "research implement prompt acknowledges disputed feedback with --disputed"
+else
+  test_fail "research implement prompt missing pr-feedback ack --disputed guidance"
+fi
+
 # Test 27: Check that severity rules correctly exclude P3 from blocking
 echo "Test 27: research review prompt correctly excludes P3 from blocking"
 if grep -q 'P3 findings never block' "$_rr_prompt" && grep -q 'Reject on any P1 or P2' "$_rr_prompt"; then
