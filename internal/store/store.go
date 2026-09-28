@@ -3644,6 +3644,18 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		model = s.getDefaultModel()
 	}
 
+	var parentReviewModels []string
+	var parentReviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `SELECT review_models FROM task WHERE id = ?`, parentID).Scan(&parentReviewModelsJSON)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("failed to read parent review_models: %w", err)
+	}
+	if parentReviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*parentReviewModelsJSON), &parentReviewModels); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal parent review_models: %w", err)
+		}
+	}
+
 	var createdIDs []string
 	for _, candidate := range candidates {
 		cf := candidate.finding
@@ -3688,10 +3700,20 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 			cf.Severity, cf.File, cf.Line, strings.Join(candidate.reviewers, ", "), parentID, cf.Summary,
 		)
 
+		var followUpReviewModelsJSON *string
+		if len(parentReviewModels) > 0 {
+			data, err := json.Marshal(parentReviewModels)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal follow-up review_models: %w", err)
+			}
+			str := string(data)
+			followUpReviewModelsJSON = &str
+		}
+
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, track, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, 'backlog', ?, 'implement', 'research', ?, ?)
-		`, followUpID, parentProjectID, parentDocumentID, title, spec, model, now, now); err != nil {
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, track, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'backlog', ?, 'implement', ?, 'research', ?, ?)
+		`, followUpID, parentProjectID, parentDocumentID, title, spec, model, followUpReviewModelsJSON, now, now); err != nil {
 			return nil, fmt.Errorf("failed to create follow-up task: %w", err)
 		}
 
