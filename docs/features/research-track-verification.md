@@ -59,13 +59,19 @@ Expected outcome: Task.Track == "research"
 
 Verified by:
 1. Round 1: P1 finding for inaccessible *confirmed* source blocks the round (causes rejection)
-2. Round 2: Same source marked as *pending* with access attempt recorded does not block
-3. Round passes and follow-up is created for the pending P1 finding
+2. Round 2: the claim is downgraded to *pending* with an access attempt recorded. Per
+   docs/features/research-track.md section 2, "inaccessibility alone is not a finding"
+   once a claim is pending with an access record, so the reviewer raises no new finding
+   for it and reports the round 1 finding as `resolved` (the downgrade fixed the
+   confirmed-but-unverifiable violation)
+3. Round passes with nothing outstanding, so no follow-up is created
 
 Expected outcomes:
 - Round 1 with inaccessible confirmed source: Parent returns to "ready" (P1 blocks)
-- Round 2 with pending + access record: Parent reaches "approved" (non-blocking)
-- Follow-up task created for the pending finding
+- Round 2 with pending + access record and the prior finding resolved: Parent reaches
+  "approved"
+- No follow-up task is created (the resolved finding isn't outstanding, and no new
+  finding was raised for the pending state itself)
 
 ### AC3: Round with only P3 findings passes and creates follow-up tasks
 
@@ -119,21 +125,33 @@ Expected outcomes:
 
 **Tests:**
 - `acceptance_7_round_budget_blocks_with_decompose`: Empty-ladder case (no escalation)
-- `acceptance_7_configured_ladder_shared_budget`: Configured-ladder case with tier escalation
+- `acceptance_7_configured_ladder_shared_budget`: Configured-ladder case, tier escalation half
+- `TestResearchBudget_MultipleSupersessions` (pre-existing, `internal/store/store_test.go`):
+  configured-ladder case, chain-wide budget half
 
 Verified by:
 1. **Empty-ladder:** Budget exhaustion blocks (no escalation possible), model stays constant
-2. **Configured-ladder:** Rounds escalate across tiers; budget is chain-wide (shared across all tiers)
-   - Escalation happens when per-tier threshold is reached (e.g., 2 rejections on haiku)
-   - New escalated task moves to next tier (haiku → sonnet → opus)
-   - Total rounds across all tiers are bounded by chain-wide budget limit
+2. **Configured-ladder, escalation half** (`acceptance_7_configured_ladder_shared_budget`):
+   rejected rounds on one tier escalate the task to the next tier on the configured
+   ladder. This subtest uses an unlimited research round budget, so it only proves the
+   tier changes; it does not exercise the budget itself.
+3. **Configured-ladder, chain-wide budget half** (`TestResearchBudget_MultipleSupersessions`):
+   with a configured ladder and a chain-wide budget of 4, a task rejected on haiku
+   auto-escalates to sonnet after its per-tier threshold, is then manually superseded
+   again on sonnet, and blocks with reason `decompose` on chain-wide round 4 — the
+   fourth rejected round counting across all three tasks in the chain, not the fourth
+   round on the final task alone. The block note lists all 4 rounds, oldest first,
+   numbered chain-wide.
 
 Expected outcomes:
 - **Empty-ladder:** Parent task reaches "blocked" state after budget exhaustion
-- **Configured-ladder:** Parent task escalates (superseded) before budget exhaustion
+- **Configured-ladder escalation:** Parent task escalates (superseded) to the next tier
   - Original parent: "superseded" state, SupersededBy points to escalated task
   - Escalated task: Next model tier, track remains "research"
-- Both: Block/decompose reason recorded in task events
+- **Configured-ladder chain-wide budget:** the chain blocks with reason `decompose` once
+  the cumulative round count across every tier and supersession reaches the budget,
+  even though no single task in the chain reached that many rounds on its own
+- All decompose blocks: reason recorded in task events
 
 ### AC8: Model assignment and defaults
 
@@ -246,13 +264,15 @@ go test -count=1 ./internal/store -run TestResearchAdjudication -v
 
 - [x] AC1: Research track created without Makefile requirement
 - [x] AC2a: Confirmed claim with inaccessible source fails round
-- [x] AC2b: Pending with access record doesn't fail (full end-to-end test)
+- [x] AC2b: Pending with access record doesn't fail (round 2 resolves the round-1
+      finding and raises no new one; round passes with no follow-up)
 - [x] AC3: P3 findings pass and create follow-ups
 - [x] AC4: P2 in unchanged text creates follow-up (not blocking after round 1)
 - [x] AC5: P2 in changed text blocks from either reviewer
 - [x] AC6: Disputed findings trigger adjudication; ruling decides finding
 - [x] AC7a: Round budget blocks with "decompose" (empty-ladder case)
-- [x] AC7b: Configured-ladder with tier escalation and shared budget
+- [x] AC7b: Configured-ladder tier escalation (`acceptance_7_configured_ladder_shared_budget`)
+      and chain-wide shared budget across tiers (`TestResearchBudget_MultipleSupersessions`)
 - [x] AC8a: Explicit model preserved
 - [x] AC8b: Research default model applied
 - [x] AC8c: Build/design defaults unchanged (verified with research default set)

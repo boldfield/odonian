@@ -17334,19 +17334,23 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		resubmitResearchImplementTask(t, store, ctx, parentID)
 		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
 
-		// Round 2: Same source now marked as pending with access attempt recorded
-		// This should NOT block the round (pending with access record is non-blocking)
-		pendingFinding := json.RawMessage(`[{
+		// Round 2: the claim was downgraded from confirmed to pending with an access
+		// attempt recorded. Per docs/features/research-track.md section 2 ("If the
+		// claim is already marked pending, with a record of the access attempt,
+		// inaccessibility alone is not a finding"), the reviewer raises no new
+		// finding for it and reports the round-1 finding as resolved, since
+		// downgrading the claim fixed the confirmed-but-unverifiable violation.
+		resolvedFinding := json.RawMessage(`[{
 			"id":"f-pending-with-access",
 			"severity":"P1",
 			"file":"claims.md",
 			"line":10,
 			"summary":"Source marked pending with access attempt recorded",
 			"in_changed_text":false,
-			"status":"still_open",
+			"status":"resolved",
 			"prior_id":"f-confirmed-inaccessible"
 		}]`)
-		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", pendingFinding)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", resolvedFinding)
 		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
 
 		parent, err = store.GetTask(ctx, parentID)
@@ -17357,10 +17361,11 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Errorf("expected approved (pending with access record doesn't block), got %s", parent.State)
 		}
 
-		// Verify follow-up created for the pending finding (still_open non-blocking)
+		// No follow-up: the round-1 finding is resolved, and the pending-with-access
+		// state is not itself a finding, so nothing is outstanding to follow up on.
 		followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
-		if len(followUps) != 1 {
-			t.Errorf("expected 1 follow-up task for pending P1, got %d", len(followUps))
+		if len(followUps) != 0 {
+			t.Errorf("expected no follow-up tasks (finding resolved, no new finding raised), got %d", len(followUps))
 		}
 	})
 
@@ -17719,7 +17724,14 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		}
 	})
 
-	// AC7b: Configured-ladder case - rounds count toward same chain-wide budget across escalation
+	// AC7b: Configured-ladder case - a task escalates across tiers instead of the
+	// model staying fixed. This subtest uses an unlimited research round budget, so
+	// it exercises only the escalation half of AC7b (tier change). The other half —
+	// that rounds on every tier count toward the same chain-wide budget, which
+	// eventually blocks with reason "decompose" after crossing tiers — is exercised
+	// by TestResearchBudget_MultipleSupersessions, which escalates haiku->sonnet,
+	// manually supersedes again, and blocks at the chain-wide budget on round 4,
+	// with the decompose note listing all 4 rounds across every tier in order.
 	t.Run("acceptance_7_configured_ladder_shared_budget", func(t *testing.T) {
 		// Use the existing TestResearchAggregation_CircuitBreakerEscalates test pattern
 		// which verifies escalation with a configured ladder and thresholds
@@ -17785,11 +17797,8 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Errorf("escalated task should keep track 'research', got %s", escalated.Track)
 		}
 
-		// The key point for AC7b: rounds are counted chain-wide (shared budget across tiers)
-		// When escalating, the new task starts fresh on the next tier but still respects
-		// the global budget that was consumed on the previous tier
 		if escalated.State != "review" && escalated.State != "ready" && escalated.State != "backlog" {
-			t.Logf("escalated task in state %s (expected for fresh escalation)", escalated.State)
+			t.Errorf("expected escalated task in review, ready, or backlog state, got %s", escalated.State)
 		}
 	})
 
@@ -17962,12 +17971,6 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 	t.Run("acceptance_9_supersede_spec_compaction", func(t *testing.T) {
 		store, ctx, projID, parentID := newResearchTask(t, false)
 
-		// Save original spec
-		origTask, err := store.GetTask(ctx, parentID)
-		if err != nil {
-			t.Fatalf("failed to get original task: %v", err)
-		}
-		originalSpec := origTask.Spec
 		originalAssignment := "Verify the claims in the doc"
 
 		// Round 1: Get findings that will trigger rejection
@@ -18074,11 +18077,12 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Errorf("new task spec should NOT contain resolved finding f2 feedback, got: %s", newTask.Spec)
 		}
 
-		// Spec should be shorter than the original + all feedback history
-		// (compaction removed resolved findings, unlike build/design)
-		if len(newTask.Spec) > len(originalSpec)*3 {
-			t.Logf("warning: compacted spec may not be properly compacted, orig=%d bytes, new=%d bytes",
-				len(originalSpec), len(newTask.Spec))
+		// Spec should NOT contain feedback that only ever appeared in round 1's
+		// still_open finding text (superseded by round 2's own wording), confirming
+		// compaction keeps only the last round's unresolved findings, not the full
+		// history.
+		if strings.Contains(newTask.Spec, "Issue in round 1") {
+			t.Errorf("new task spec should not contain round-1-only finding wording, got: %s", newTask.Spec)
 		}
 	})
 
