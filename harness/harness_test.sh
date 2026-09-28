@@ -231,6 +231,15 @@ else
   test_fail "research review prompt does not correctly enforce round 2+ scoped re-review"
 fi
 
+# Test 20b: a replacement task's round 1 reports status only for the reviewer's own carried findings
+echo "Test 20b: research review prompt scopes carried-finding status to the reviewer's own findings"
+if grep -q 'Unresolved findings from last review round' "$_rr_prompt" && \
+   grep -q 'Do not report a status for a carried finding raised only by a different reviewer model' "$_rr_prompt"; then
+  test_pass "research review prompt scopes carried-finding status to the reviewer's own findings"
+else
+  test_fail "research review prompt is missing the replacement-round carried-findings instruction"
+fi
+
 # Test 21: Check that research review prompt handles unchanged-text defects
 echo "Test 21: research review prompt handles unchanged-text defects"
 if grep -q 'Newly discovered unchanged-text defects' "$_rr_prompt" && grep -q 'in_changed_text: false' "$_rr_prompt"; then
