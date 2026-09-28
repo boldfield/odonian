@@ -339,12 +339,12 @@ func isReviewerApproval(body string) bool {
 
 // isGlobalCommentAcknowledged reports whether target has an explicit worker
 // acknowledgment among the given comments. A valid acknowledgment is a worker-marked
-// comment that was created strictly LATER than target and whose body carries the
-// writer format "addressed in <sha> (see comment <target.ID>)" with a non-empty
-// fixing commit. An acknowledgment naming a different comment, a reviewer/merger/
-// reconciler comment, a bare reaction, a worker note without a fixing commit, or an
-// earlier worker comment does NOT acknowledge the target: a fix cannot be recorded
-// before the request it addresses.
+// comment that was created strictly LATER than target and whose body carries one of
+// the writer formats: "addressed in <sha> (see comment <target.ID>)" with a non-empty
+// fixing commit, or "disputed (see comment <target.ID>)". An acknowledgment naming a
+// different comment, a reviewer/merger/reconciler comment, a bare reaction, a worker
+// note in neither of the canonical formats, or an earlier worker comment does NOT
+// acknowledge the target: a fix or dispute cannot be recorded before the request it addresses.
 func isGlobalCommentAcknowledged(target comment, all []comment) bool {
 	targetTime, ok := parseCommentTime(target.CreatedAt)
 	if !ok {
@@ -380,32 +380,53 @@ func parseCommentTime(s string) (time.Time, bool) {
 	return t, true
 }
 
-// bodyAcknowledgesComment reports whether body is the acknowledgment writer's exact
-// format "addressed in <sha> (see comment <targetNodeID>)". The marker-stripped
-// message must BEGIN with "addressed in " (a mere substring elsewhere — e.g. a worker
-// status "not addressed in <sha> (see comment <id>)" — does not qualify), carry a
-// single non-empty fixing-commit token, and then reference the exact target comment ID.
+// bodyAcknowledgesComment reports whether body is an acknowledgment in one of the
+// writer's exact formats: "addressed in <sha> (see comment <targetNodeID>)" or
+// "disputed (see comment <targetNodeID>)". The marker-stripped message must BEGIN
+// with one of these prefixes (a mere substring elsewhere — e.g. a worker status
+// "not addressed in <sha> (see comment <id>)" — does not qualify), and then
+// reference the exact target comment ID.
 func bodyAcknowledgesComment(body, targetNodeID string) bool {
 	// Strip the leading agent marker so the check anchors on the writer format itself
 	// rather than the "<model>-worker: " prefix.
 	msg := AgentCommentMessage(body)
-	const prefix = "addressed in "
-	if !strings.HasPrefix(msg, prefix) {
-		return false
-	}
-	rest := msg[len(prefix):]
 	marker := " (see comment " + targetNodeID + ")"
-	idx := strings.Index(rest, marker)
-	if idx < 0 {
-		return false
+
+	// Check addressed format: "addressed in <sha> (see comment <id>)"
+	const addressedPrefix = "addressed in "
+	if strings.HasPrefix(msg, addressedPrefix) {
+		rest := msg[len(addressedPrefix):]
+		idx := strings.Index(rest, marker)
+		if idx < 0 {
+			return false
+		}
+		// The fixing commit is the single token between "addressed in " and the marker;
+		// it must be non-empty and contain no whitespace (the writer emits a bare sha).
+		sha := rest[:idx]
+		if sha == "" || strings.ContainsAny(sha, " \t\r\n") {
+			return false
+		}
+		return true
 	}
-	// The fixing commit is the single token between "addressed in " and the marker;
-	// it must be non-empty and contain no whitespace (the writer emits a bare sha).
-	sha := rest[:idx]
-	if sha == "" || strings.ContainsAny(sha, " \t\r\n") {
-		return false
+
+	// Check disputed format: "disputed (see comment <id>)" (anchored prefix)
+	const disputedPrefix = "disputed (see comment "
+	if strings.HasPrefix(msg, disputedPrefix) {
+		rest := msg[len(disputedPrefix):]
+		idx := strings.Index(rest, ")")
+		if idx < 0 {
+			return false
+		}
+		// The comment ID is the single token between the prefix and the closing ")";
+		// it must be non-empty and contain no whitespace (the writer emits a bare ID).
+		commentID := rest[:idx]
+		if commentID == "" || strings.ContainsAny(commentID, " \t\r\n") {
+			return false
+		}
+		return commentID == targetNodeID
 	}
-	return true
+
+	return false
 }
 
 // fetchGlobalCommentsPageRaw fetches a single page of global PR comments from the GraphQL API.
@@ -572,14 +593,15 @@ func fetchGlobalCommentsPageRaw(ctx context.Context, owner, repo string, prNumbe
 	return comments, prNodeID, hasNextPage, endCursor, nil
 }
 
-// AcknowledgeFeedbackItem marks a feedback item as addressed.
+// AcknowledgeFeedbackItem marks a feedback item as addressed or disputed.
 // For inline items (review threads): posts a reply comment and resolves the thread via GraphQL.
 // For global items (comments): posts a reply comment and adds a thumbsup reaction.
 // markerPrefix is prepended to the reply body; if empty, no marker is added.
-func AcknowledgeFeedbackItem(ctx context.Context, owner, repo string, prNumber int, token string, item FeedbackItem, fixingSha, markerPrefix string) error {
+// If disputed is true, the reply format is "disputed (see comment <id>)"; otherwise "addressed in <sha> (see comment <id>)".
+func AcknowledgeFeedbackItem(ctx context.Context, owner, repo string, prNumber int, token string, item FeedbackItem, fixingSha, markerPrefix string, disputed bool) error {
 	if item.Kind == "inline" {
 		// For inline items: post reply and resolve thread
-		if err := postReviewThreadReply(ctx, item.ID, fixingSha, markerPrefix, token); err != nil {
+		if err := postReviewThreadReply(ctx, item.ID, fixingSha, markerPrefix, token, disputed); err != nil {
 			return err
 		}
 		if err := resolveReviewThread(ctx, item.ID, token); err != nil {
@@ -587,7 +609,7 @@ func AcknowledgeFeedbackItem(ctx context.Context, owner, repo string, prNumber i
 		}
 	} else if item.Kind == "global" {
 		// For global items: post reply and add reaction
-		if err := postCommentReply(ctx, item.PRID, fixingSha, item.ID, markerPrefix, token); err != nil {
+		if err := postCommentReply(ctx, item.PRID, fixingSha, item.ID, markerPrefix, token, disputed); err != nil {
 			return err
 		}
 		if err := addThumbsupReaction(ctx, owner, repo, item.DatabaseID, token); err != nil {
@@ -600,7 +622,7 @@ func AcknowledgeFeedbackItem(ctx context.Context, owner, repo string, prNumber i
 }
 
 // postReviewThreadReply posts a reply comment to a review thread via GraphQL.
-func postReviewThreadReply(ctx context.Context, threadID, fixingSha, markerPrefix, token string) error {
+func postReviewThreadReply(ctx context.Context, threadID, fixingSha, markerPrefix, token string, disputed bool) error {
 	const mutationTemplate = `mutation {
   addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: "%s", body: "%s"}) {
     comment {
@@ -610,7 +632,12 @@ func postReviewThreadReply(ctx context.Context, threadID, fixingSha, markerPrefi
 }`
 	// AddPullRequestReviewThreadReplyInput
 
-	replyBody := markerPrefix + "addressed in " + fixingSha
+	var replyBody string
+	if disputed {
+		replyBody = markerPrefix + "disputed (see comment " + threadID + "): finding disputed with source evidence in this round's submission; not fixed"
+	} else {
+		replyBody = markerPrefix + "addressed in " + fixingSha
+	}
 	mutation := fmt.Sprintf(mutationTemplate, threadID, escapeGraphQLString(replyBody))
 	payload := map[string]string{"query": mutation}
 
@@ -726,7 +753,7 @@ func resolveReviewThread(ctx context.Context, threadID, token string) error {
 }
 
 // postCommentReply posts a reply comment to a PR global comment via GraphQL.
-func postCommentReply(ctx context.Context, prNodeID, fixingSha, originalCommentID, markerPrefix, token string) error {
+func postCommentReply(ctx context.Context, prNodeID, fixingSha, originalCommentID, markerPrefix, token string, disputed bool) error {
 	const mutationTemplate = `mutation {
   addComment(input: {subjectId: "%s", body: "%s"}) {
     commentEdge {
@@ -737,7 +764,12 @@ func postCommentReply(ctx context.Context, prNodeID, fixingSha, originalCommentI
   }
 }`
 
-	replyBody := markerPrefix + "addressed in " + fixingSha + " (see comment " + originalCommentID + ")"
+	var replyBody string
+	if disputed {
+		replyBody = markerPrefix + "disputed (see comment " + originalCommentID + "): finding disputed with source evidence in this round's submission; not fixed"
+	} else {
+		replyBody = markerPrefix + "addressed in " + fixingSha + " (see comment " + originalCommentID + ")"
+	}
 	mutation := fmt.Sprintf(mutationTemplate, prNodeID, escapeGraphQLString(replyBody))
 	payload := map[string]string{"query": mutation}
 
