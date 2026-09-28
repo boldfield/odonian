@@ -339,12 +339,12 @@ func isReviewerApproval(body string) bool {
 
 // isGlobalCommentAcknowledged reports whether target has an explicit worker
 // acknowledgment among the given comments. A valid acknowledgment is a worker-marked
-// comment that was created strictly LATER than target and whose body carries the
-// writer format "addressed in <sha> (see comment <target.ID>)" with a non-empty
-// fixing commit. An acknowledgment naming a different comment, a reviewer/merger/
-// reconciler comment, a bare reaction, a worker note without a fixing commit, or an
-// earlier worker comment does NOT acknowledge the target: a fix cannot be recorded
-// before the request it addresses.
+// comment that was created strictly LATER than target and whose body carries one of
+// the writer formats: "addressed in <sha> (see comment <target.ID>)" with a non-empty
+// fixing commit, or "disputed (see comment <target.ID>)". An acknowledgment naming a
+// different comment, a reviewer/merger/reconciler comment, a bare reaction, a worker
+// note in neither of the canonical formats, or an earlier worker comment does NOT
+// acknowledge the target: a fix or dispute cannot be recorded before the request it addresses.
 func isGlobalCommentAcknowledged(target comment, all []comment) bool {
 	targetTime, ok := parseCommentTime(target.CreatedAt)
 	if !ok {

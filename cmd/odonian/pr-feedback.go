@@ -123,6 +123,11 @@ func executePRFeedbackAck(ctx context.Context, args []string) error {
 	prURL := positional[0]
 	itemID := positional[1]
 
+	// Reject extra positionals (e.g., "ack url id sha --disputed" where --disputed becomes 4th positional)
+	if len(positional) > 3 {
+		return fmt.Errorf("unexpected extra arguments (did you mean to use --disputed flag before the positional arguments?)")
+	}
+
 	// Validate that either --disputed is set or sha is provided, but not both
 	var sha string
 	if *disputedFlag {

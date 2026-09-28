@@ -915,3 +915,24 @@ func TestExecutePRFeedbackAckDisputedAfterPositionals(t *testing.T) {
 		t.Errorf("expected error about flag in sha position, got: %v", err)
 	}
 }
+
+func TestExecutePRFeedbackAckShaWithTrailingDisputed(t *testing.T) {
+	t.Setenv("GH_TOKEN", "test-token")
+
+	// Test that sha followed by trailing --disputed is rejected without making HTTP calls.
+	// Flag parsing stops at first positional, so [url, id, sha, "--disputed"] leaves
+	// disputed=false and takes sha=positional[2]. The trailing --disputed becomes
+	// positional[3] and should be rejected as an unexpected extra argument.
+	err := executePRFeedbackAck(context.Background(), []string{
+		"https://github.com/owner/repo/pull/42",
+		"thread-1",
+		"abc123def456",
+		"--disputed",
+	})
+	if err == nil {
+		t.Fatal("expected error when both sha and --disputed are specified in that order")
+	}
+	if !strings.Contains(err.Error(), "unexpected extra arguments") {
+		t.Errorf("expected error about unexpected extra arguments, got: %v", err)
+	}
+}
