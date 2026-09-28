@@ -18148,6 +18148,40 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		if buildReviewCount != 2 {
 			t.Errorf("expected 2 build review tasks (both reviewers), got %d", buildReviewCount)
 		}
+
+		// Create a parallel design task to verify the design track is also unaffected.
+		designTasks, err := store.CreateTasks(ctx, projID, []TaskInput{
+			{
+				Title:        "Design task",
+				Spec:         "design spec",
+				DocumentID:   doc.ID,
+				Model:        "haiku",
+				ReviewModels: []string{"opus", "sonnet"},
+				Track:        "design",
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create design task: %v", err)
+		}
+
+		designID := designTasks[0].ID
+		if _, err := store.PromoteTask(ctx, designID); err != nil {
+			t.Fatalf("failed to promote design task: %v", err)
+		}
+		if _, err := store.ClaimTask(ctx, designID, "agent-1", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim design task: %v", err)
+		}
+		if _, err := store.SubmitTask(ctx, designID, "agent-1", "Done", nil, []LinkInput{{Kind: "pr", Value: "#101"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+			t.Fatalf("failed to submit design task: %v", err)
+		}
+
+		designTask, err := store.GetTask(ctx, designID)
+		if err != nil {
+			t.Fatalf("failed to get design task: %v", err)
+		}
+		if designTask.Track != "design" {
+			t.Errorf("expected design track, got %q", designTask.Track)
+		}
 	})
 
 	// AC-M4: Scorecard API read and TUI view
@@ -18182,25 +18216,32 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			if sc.Model == "" {
 				t.Errorf("scorecard missing Model")
 			}
-			// Scorecard should have basic metrics populated
-			if sc.TotalReviewRounds == 0 {
-				t.Logf("scorecard for %s has no review rounds yet (acceptable)", sc.Model)
-			}
 		}
 
-		// Verify opus raised a finding (should appear in scorecard)
-		var opusScorecard *ReviewerScorecard
+		// Opus raised one P2 finding in round 1: assert the real counts, not just presence.
+		var opusScorecard, sonnetScorecard *ReviewerScorecard
 		for i := range scorecardData.Scorecards {
-			if scorecardData.Scorecards[i].Model == "opus" {
+			switch scorecardData.Scorecards[i].Model {
+			case "opus":
 				opusScorecard = &scorecardData.Scorecards[i]
-				break
+			case "sonnet":
+				sonnetScorecard = &scorecardData.Scorecards[i]
 			}
 		}
-		if opusScorecard != nil {
-			// Check that opus's scorecard has findings data
-			if len(opusScorecard.FindingsRaised) > 0 {
-				t.Logf("opus scorecard shows findings raised: %v", opusScorecard.FindingsRaised)
-			}
+		if opusScorecard == nil {
+			t.Fatalf("expected an opus scorecard, got none")
+		}
+		if opusScorecard.FindingsRaised["p2"] != 1 {
+			t.Errorf("expected opus FindingsRaised[p2] == 1, got %d (%v)", opusScorecard.FindingsRaised["p2"], opusScorecard.FindingsRaised)
+		}
+		if opusScorecard.TotalReviewRounds != 1 {
+			t.Errorf("expected opus TotalReviewRounds == 1, got %d", opusScorecard.TotalReviewRounds)
+		}
+		if sonnetScorecard == nil {
+			t.Fatalf("expected a sonnet scorecard, got none")
+		}
+		if sonnetScorecard.FindingsRaised["p1"] != 0 || sonnetScorecard.FindingsRaised["p2"] != 0 {
+			t.Errorf("expected sonnet to have raised no P1/P2 findings, got %v", sonnetScorecard.FindingsRaised)
 		}
 	})
 

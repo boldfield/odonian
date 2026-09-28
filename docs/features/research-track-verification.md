@@ -15,6 +15,11 @@ The research track is a third task track alongside `build` and `design` for veri
 Before running the verification scenario, ensure these environment variables are configured in your Odonian deployment:
 
 ```bash
+# Allowed models must include the research default and adjudicator before
+# they are referenced below — ODONIAN_MODELS is the allowlist (NOT
+# ODONIAN_ALLOWED_MODELS, which the server does not read).
+export ODONIAN_MODELS="haiku,sonnet,opus,claude-opus-5-5,claude-fable-5-1"
+
 # Required settings for research track
 export ODONIAN_RESEARCH_DEFAULT_MODEL=claude-opus-5-5
 export ODONIAN_RESEARCH_ADJUDICATOR=claude-fable-5-1  # For adjudication disputes
@@ -22,12 +27,12 @@ export ODONIAN_RESEARCH_ROUND_BUDGET=6  # Recommended: 6 rounds before decompose
 export ODONIAN_RESEARCH_ESCALATION_LADDER=""  # Empty by default: no escalation
 export ODONIAN_RESEARCH_ESCALATION_THRESHOLDS=""  # Empty when ladder is empty
 
-# Allowed models must include the research default and adjudicator
-export ODONIAN_ALLOWED_MODELS="haiku,sonnet,opus,claude-opus-5-5,claude-fable-5-1"
-
-# Optional: test with research escalation enabled
+# Optional: test with research escalation enabled. ODONIAN_RESEARCH_ESCALATION_THRESHOLDS
+# only applies when ODONIAN_RESEARCH_ESCALATION_LADDER is non-empty, and each entry must be
+# a "model=count" pair (parseResearchEscalationThresholds, cmd/odonian/main.go:1183) —
+# a bare "3,2" list fails to parse and the server refuses to start (log.Fatalf).
 # export ODONIAN_RESEARCH_ESCALATION_LADDER=claude-opus-5-5,claude-fable-5-1
-# export ODONIAN_RESEARCH_ESCALATION_THRESHOLDS=3,2
+# export ODONIAN_RESEARCH_ESCALATION_THRESHOLDS=claude-opus-5-5=3,claude-fable-5-1=2
 ```
 
 ## Verification Approach
@@ -187,11 +192,12 @@ Expected outcomes:
 
 **Test:** `acceptance_10_build_design_unchanged`
 
-Verified by: Creating build task in parallel with research task, confirming it behaves as before.
+Verified by: Creating a build task and a design task in parallel with a research task, confirming both behave as before.
 
 Expected outcomes:
-- Build task track="build" (unaffected)
-- Build task behavior unchanged by research track addition
+- Build task track="build" (unaffected), with review tasks spawned for both reviewers
+- Design task track="design" (unaffected)
+- Neither task's behavior is affected by the research track addition
 
 ## Scorecard API and Reviewer Performance Tracking
 
@@ -206,8 +212,18 @@ Verified by:
 Expected outcomes:
 - GetResearchReviewerScorecards(ctx, projID) returns scorecard for each reviewer model
 - Scorecard contains ReviewerModel, FindingsRaised, TotalReviewRounds, and other metrics
-- Metrics accurately reflect the reviews submitted in the scenario
-- The TUI view is covered by existing scorecard tests (internal/cmd/odonian-tui/scorecard_test.go)
+- After the scenario's rounds: the opus scorecard has FindingsRaised["P2"] == 1 and
+  TotalReviewRounds == 1; the sonnet scorecard has no P2/P1 findings raised
+
+API and TUI read commands:
+
+```bash
+# API: exercises the GET /projects/{id}/research/reviewers handler directly
+go test -count=1 ./internal/api -run TestGetResearchReviewerScorecards -v
+
+# TUI: exercises the scorecard view added in cmd/odonian-tui/scorecard.go
+go test -count=1 ./cmd/odonian-tui -run Scorecard -v
+```
 
 ## Human Merge Gate Verification
 
