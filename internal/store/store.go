@@ -2587,7 +2587,7 @@ func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, paren
 //   - P1/P2 anywhere blocks during round 1 (round 1 findings are always in changed
 //     text by definition, but this is enforced independently of the reviewer's own
 //     in_changed_text report).
-//   - A still_open finding (a prior finding the reviewer reports as unfixed) blocks.
+//   - A still_open P1 or P2 finding blocks. A P3 never blocks.
 //   - A resolved finding never blocks, even if it would otherwise match the rules
 //     above: a reviewer reports it as resolved precisely because the round's changes
 //     fixed the text the finding was raised against.
@@ -2602,7 +2602,7 @@ func isBlockingResearchFinding(f Finding, round int) bool {
 	if isP1OrP2 && round == 1 {
 		return true
 	}
-	return f.Status == "still_open"
+	return isP1OrP2 && f.Status == "still_open"
 }
 
 // checkResearchBlockingFindings reports whether any reviewer in the current round

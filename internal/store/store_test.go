@@ -3786,7 +3786,7 @@ func TestResearchAggregation_RoundScopeAndStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("still_open finding always blocks", func(t *testing.T) {
+	t.Run("still_open P3 does not block", func(t *testing.T) {
 		store, ctx, projID, parentID := newResearchTask(t, false)
 		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
 		blocking := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":1,"summary":"missing qualification","in_changed_text":true,"status":"new"}]`)
@@ -3806,8 +3806,43 @@ func TestResearchAggregation_RoundScopeAndStatus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to get parent: %v", err)
 		}
+		if parent.State != "approved" {
+			t.Errorf("expected approved (still_open P3 does not block), got %s", parent.State)
+		}
+
+		followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+		if len(followUps) != 1 {
+			t.Errorf("expected 1 follow-up task for the still_open P3, got %d", len(followUps))
+		}
+	})
+
+	t.Run("regression: P2 still_open in unchanged text round 2 blocks", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		blocking := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":1,"summary":"missing qualification","in_changed_text":true,"status":"new"}]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", blocking)
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+		resubmitResearchImplementTask(t, store, ctx, parentID)
+
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		if opus2 == nil || sonnet2 == nil {
+			t.Fatalf("expected round 2 review tasks")
+		}
+		stillOpen := json.RawMessage(`[{"id":"f1b","severity":"P2","file":"a.md","line":1,"summary":"still missing qualification","in_changed_text":false,"status":"still_open","prior_id":"f1"}]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", stillOpen)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		parent, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
 		if parent.State != "ready" {
-			t.Errorf("expected ready (a still_open finding always blocks, regardless of severity), got %s", parent.State)
+			t.Errorf("expected ready (P2 still_open blocks even in unchanged text), got %s", parent.State)
+		}
+
+		followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+		if len(followUps) != 0 {
+			t.Errorf("expected no follow-up task for blocking P2 still_open, got %d", len(followUps))
 		}
 	})
 }
@@ -4752,6 +4787,71 @@ func taskLinkValues(t *testing.T, store Store, ctx context.Context, taskID, kind
 	return values
 }
 
+// TestIsBlockingResearchFinding covers the blocking rules from
+// docs/features/research-track.md section 3 with table-driven tests across severity
+// (P1, P2, P3), status (new, still_open, resolved), round (1, 2), and location
+// (changed text and unchanged text).
+func TestIsBlockingResearchFinding(t *testing.T) {
+	cases := []struct {
+		name        string
+		severity    string
+		status      string
+		round       int
+		inChanged   bool
+		shouldBlock bool
+	}{
+		// P1 findings
+		{"P1 new in changed text round 1", "P1", "new", 1, true, true},
+		{"P1 new in unchanged text round 1", "P1", "new", 1, false, true},
+		{"P1 new in changed text round 2", "P1", "new", 2, true, true},
+		{"P1 new in unchanged text round 2", "P1", "new", 2, false, false},
+		{"P1 still_open in changed text round 1", "P1", "still_open", 1, true, true},
+		{"P1 still_open in unchanged text round 1", "P1", "still_open", 1, false, true},
+		{"P1 still_open in changed text round 2", "P1", "still_open", 2, true, true},
+		{"P1 still_open in unchanged text round 2", "P1", "still_open", 2, false, true},
+		{"P1 resolved in changed text round 2", "P1", "resolved", 2, true, false},
+		{"P1 resolved in unchanged text round 2", "P1", "resolved", 2, false, false},
+
+		// P2 findings
+		{"P2 new in changed text round 1", "P2", "new", 1, true, true},
+		{"P2 new in unchanged text round 1", "P2", "new", 1, false, true},
+		{"P2 new in changed text round 2", "P2", "new", 2, true, true},
+		{"P2 new in unchanged text round 2", "P2", "new", 2, false, false},
+		{"P2 still_open in changed text round 1", "P2", "still_open", 1, true, true},
+		{"P2 still_open in unchanged text round 1", "P2", "still_open", 1, false, true},
+		{"P2 still_open in changed text round 2", "P2", "still_open", 2, true, true},
+		{"P2 still_open in unchanged text round 2", "P2", "still_open", 2, false, true},
+		{"P2 resolved in changed text round 2", "P2", "resolved", 2, true, false},
+		{"P2 resolved in unchanged text round 2", "P2", "resolved", 2, false, false},
+
+		// P3 findings (never block)
+		{"P3 new in changed text round 1", "P3", "new", 1, true, false},
+		{"P3 new in unchanged text round 1", "P3", "new", 1, false, false},
+		{"P3 new in changed text round 2", "P3", "new", 2, true, false},
+		{"P3 new in unchanged text round 2", "P3", "new", 2, false, false},
+		{"P3 still_open in changed text round 1", "P3", "still_open", 1, true, false},
+		{"P3 still_open in unchanged text round 1", "P3", "still_open", 1, false, false},
+		{"P3 still_open in changed text round 2", "P3", "still_open", 2, true, false},
+		{"P3 still_open in unchanged text round 2", "P3", "still_open", 2, false, false},
+		{"P3 resolved in changed text round 2", "P3", "resolved", 2, true, false},
+		{"P3 resolved in unchanged text round 2", "P3", "resolved", 2, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := Finding{
+				Severity:      tc.severity,
+				Status:        tc.status,
+				InChangedText: tc.inChanged,
+			}
+			got := isBlockingResearchFinding(f, tc.round)
+			if got != tc.shouldBlock {
+				t.Errorf("expected %v, got %v", tc.shouldBlock, got)
+			}
+		})
+	}
+}
+
 // TestResearchFollowUps_NonBlockingCreatesFollowUp covers acceptance criterion 3
 // (P3 findings) and criterion 4 (a P2 in unchanged text after round 1) from
 // docs/features/research-track.md section 4: a round that passes with non-blocking
@@ -4957,9 +5057,7 @@ func TestResearchFollowUps_DedupAcrossRounds(t *testing.T) {
 		resubmitResearchImplementTask(t, store, ctx, parentID)
 
 		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
-		// Round 2 resolves the P1 and repeats the same P3 (still_open would block, so
-		// the reviewer reports it again as "new" against the same file/line/summary,
-		// e.g. re-raised independently since it was never fixed).
+		// Round 2 resolves the P1 and repeats the same P3 (still_open P3 does not block).
 		round2 := json.RawMessage(`[
 			{"id":"f1b","severity":"P1","file":"a.md","line":1,"summary":"fabricated source, fixed","in_changed_text":true,"status":"resolved","prior_id":"f1"},
 			{"id":"f2b","severity":"P3","file":"b.md","line":5,"summary":"typo","in_changed_text":true,"status":"new"}
@@ -5643,20 +5741,15 @@ func TestResearchFollowUps_ResolvedMarkSurvivesLaterUnion(t *testing.T) {
 		{"id":"f2b","severity":"P3","file":"b.md","line":5,"summary":"wrong locator, fixed","in_changed_text":true,"status":"resolved","prior_id":"f2"},
 		{"id":"f3b","severity":"P3","file":"b.md","line":5,"summary":"wrong locator, fixed","in_changed_text":true,"status":"still_open","prior_id":"f3"}
 	]`)
-	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", round2)
+	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", round2)
 	submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
-	resubmitResearchImplementTask(t, store, ctx, parentID)
-
-	opus3, sonnet3 := findResearchReviewTasks(t, store, ctx, projID, parentID, 3)
-	submitResearchReview(t, store, ctx, opus3, "opus-reviewer", "approve", json.RawMessage(`[]`))
-	submitResearchReview(t, store, ctx, sonnet3, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
 
 	parent, err := store.GetTask(ctx, parentID)
 	if err != nil {
 		t.Fatalf("failed to get parent: %v", err)
 	}
 	if parent.State != "approved" {
-		t.Fatalf("expected approved, got %s", parent.State)
+		t.Fatalf("expected approved (still_open P3 does not block), got %s", parent.State)
 	}
 
 	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
