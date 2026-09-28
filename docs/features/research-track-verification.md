@@ -53,13 +53,19 @@ Expected outcome: Task.Track == "research"
 
 ### AC2: Confirmed claim with inaccessible source fails; pending with access record does not
 
-**Test:** `acceptance_2_confirmed_source_inaccessible_fails`
+**Tests:**
+- `acceptance_2_confirmed_source_inaccessible_fails`: P1 finding for inaccessible confirmed source blocks the round
+- `acceptance_2_pending_source_with_access_record_passes`: Pending source with access record does not block
 
-Verified by: P1 finding for inaccessible confirmed source blocks the round (causes rejection).
+Verified by:
+1. Round 1: P1 finding for inaccessible *confirmed* source blocks the round (causes rejection)
+2. Round 2: Same source marked as *pending* with access attempt recorded does not block
+3. Round passes and follow-up is created for the pending P1 finding
 
-Expected outcome: Parent task returns to "ready" state when P1 blocking finding is present.
-
-**Partial verification (via prompt behavior):** The second half - "pending source with access record does not block" - is verified through the research review prompt implementation. The worker marks sources as "pending" with an access attempt record before resubmitting, and the reviewer prompt recognizes this context to avoid blocking on inaccessibility. This is verified during review prompt integration testing, not in unit tests.
+Expected outcomes:
+- Round 1 with inaccessible confirmed source: Parent returns to "ready" (P1 blocks)
+- Round 2 with pending + access record: Parent reaches "approved" (non-blocking)
+- Follow-up task created for the pending finding
 
 ### AC3: Round with only P3 findings passes and creates follow-up tasks
 
@@ -111,16 +117,23 @@ Expected outcomes:
 
 ### AC7: Round budget blocks task with "decompose" reason; model tier and budget handling
 
-**Tests:** `acceptance_7_round_budget_blocks_with_decompose`, `acceptance_7_configured_ladder_shared_budget`
+**Tests:**
+- `acceptance_7_round_budget_blocks_with_decompose`: Empty-ladder case (no escalation)
+- `acceptance_7_configured_ladder_shared_budget`: Configured-ladder case with tier escalation
 
 Verified by:
-1. Empty-ladder case: Budget exhaustion blocks, model stays constant
-2. Configured-ladder case: Budget still enforces across escalation tiers
+1. **Empty-ladder:** Budget exhaustion blocks (no escalation possible), model stays constant
+2. **Configured-ladder:** Rounds escalate across tiers; budget is chain-wide (shared across all tiers)
+   - Escalation happens when per-tier threshold is reached (e.g., 2 rejections on haiku)
+   - New escalated task moves to next tier (haiku → sonnet → opus)
+   - Total rounds across all tiers are bounded by chain-wide budget limit
 
 Expected outcomes:
-- Parent task reaches "blocked" state after budget exhaustion
-- Block reason includes "decompose"
-- Budget is shared across tiers in configured-ladder case
+- **Empty-ladder:** Parent task reaches "blocked" state after budget exhaustion
+- **Configured-ladder:** Parent task escalates (superseded) before budget exhaustion
+  - Original parent: "superseded" state, SupersededBy points to escalated task
+  - Escalated task: Next model tier, track remains "research"
+- Both: Block/decompose reason recorded in task events
 
 ### AC8: Model assignment and defaults
 
@@ -139,15 +152,18 @@ Expected outcomes:
 **Test:** `acceptance_9_supersede_spec_compaction`
 
 Verified by:
-1. Create task with original spec
-2. Reject in round 1 (multiple findings)
-3. Reject in round 2 (some findings resolved, some remain)
-4. Confirm spec contains original assignment + last round's unresolved findings
+1. Create research task with original spec
+2. Round 1: Reject with multiple findings (f1, f2)
+3. Round 2: Reject with some findings resolved (f2 resolved, f1 still_open)
+4. Call SupersedeTask to create a new task from the rejected parent
+5. Verify new task's spec compaction
 
 Expected outcomes:
-- Spec is shorter than if all feedback was prepended (like build/design)
-- Original assignment is preserved
-- Only unresolved findings from last round are in spec
+- Original parent reaches "superseded" state, SupersededBy points to new task
+- New task spec contains original assignment ("Verify the claims in the doc")
+- New task spec contains unresolved finding (f1 still_open)
+- New task spec does NOT contain resolved finding (f2) or round 1-only feedback
+- Compacted spec is shorter than original + all history combined
 
 ### AC10: Build and design tracks unchanged
 
@@ -161,40 +177,52 @@ Expected outcomes:
 
 ## Scorecard API and Reviewer Performance Tracking
 
-**Status:** UNVERIFIED - Requires implementation of scorecard endpoint
+**Test:** `acceptance_scorecard_api_and_tui_read`
 
-The scorecard API endpoint (`GET /projects/{id}/research/reviewers`) is required by AC-M4 (milestone 4 - scorecards and sizing).
-This endpoint should return per-reviewer-model statistics including:
-- findings_raised (by severity)
-- findings_held (fixed or upheld on adjudication)
-- findings_withdrawn (overturned or withdrawn)
-- findings_unresolved
-- approvals_with_later_fixed_blocking_findings
-- total_review_rounds
-- sample_size
+Verified by:
+1. Create research task with multiple review rounds
+2. Call GetResearchReviewerScorecards() API
+3. Verify scorecard contains expected fields for each reviewer model
+4. Confirm findings_raised and other metrics are populated correctly
 
-**Follow-up task required:** Implement scorecard endpoint and TUI view.
+Expected outcomes:
+- GetResearchReviewerScorecards(ctx, projID) returns scorecard for each reviewer model
+- Scorecard contains ReviewerModel, FindingsRaised, TotalReviewRounds, and other metrics
+- Metrics accurately reflect the reviews submitted in the scenario
+- The TUI view is covered by existing scorecard tests (internal/cmd/odonian-tui/scorecard_test.go)
 
 ## Human Merge Gate Verification
 
-**Status:** UNVERIFIED - Requires human code review
+**Test:** `acceptance_human_merge_gate`
 
-This verification document itself is reviewed by independent Opus and gpt-5.5 reviewers before the research track ships.
-The merge gate is implicit: this task and all dependent research track PRs require human approval before merging.
+Verified by:
+1. Create research task and get it to "approved" state
+2. Verify no merge-kind task is spawned (agent_merge=false for research)
+3. Confirm approved task stays in "approved" state pending human decision
 
-**No automated test possible** - human judgment cannot be automated. Verification occurs through the PR review process and sign-off by project owner.
+Expected outcome:
+- Approved research task does not trigger automatic merge-kind task creation
+- Task remains in "approved" state awaiting human review and merge decision
+- This enforces the human merge gate: only humans can merge research findings
 
 ## Regression Testing
 
 To verify build and design tracks are unaffected:
 
 ```bash
-# Run all build/design tests
-go test -count=1 ./internal/store -run TestBuildTrack -v
-go test -count=1 ./internal/store -run TestDesignTrack -v
+# Run all tests to verify no regressions
+make test
+
+# Or run store tests specifically to ensure build/design behavior is unchanged
+go test -count=1 ./internal/store -v
+
+# The end-to-end scenario includes acceptance_10_build_design_unchanged
+# which verifies build task behavior is not affected by research track addition
 ```
 
-All existing tests should pass unchanged.
+All existing tests should pass unchanged. The research track verification test
+includes explicit regression checks (acceptance_10_build_design_unchanged) to ensure
+parallel build/design tasks operate independently.
 
 ## Test Execution Summary
 
@@ -218,14 +246,17 @@ go test -count=1 ./internal/store -run TestResearchAdjudication -v
 
 - [x] AC1: Research track created without Makefile requirement
 - [x] AC2a: Confirmed claim with inaccessible source fails round
-- [~] AC2b: Pending with access record doesn't fail (via prompt behavior)
+- [x] AC2b: Pending with access record doesn't fail (full end-to-end test)
 - [x] AC3: P3 findings pass and create follow-ups
 - [x] AC4: P2 in unchanged text creates follow-up (not blocking after round 1)
 - [x] AC5: P2 in changed text blocks from either reviewer
 - [x] AC6: Disputed findings trigger adjudication; ruling decides finding
-- [x] AC7: Round budget blocks with "decompose" (no-ladder and configured-ladder)
-- [x] AC8: Model defaults and preservation
-- [x] AC9: Supersede spec compaction
+- [x] AC7a: Round budget blocks with "decompose" (empty-ladder case)
+- [x] AC7b: Configured-ladder with tier escalation and shared budget
+- [x] AC8a: Explicit model preserved
+- [x] AC8b: Research default model applied
+- [x] AC8c: Build/design defaults unchanged (verified with research default set)
+- [x] AC9: Supersede spec compaction (SupersedeTask called, spec verified)
 - [x] AC10: Build and design unchanged
-- [ ] Scorecard API endpoint and TUI view (milestone 4)
-- [ ] Human merge gate (implicit, via PR review process)
+- [x] Scorecard API read (GetResearchReviewerScorecards tested)
+- [x] Human merge gate (approved task does not spawn merge-kind task)
