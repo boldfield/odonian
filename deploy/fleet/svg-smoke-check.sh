@@ -19,6 +19,19 @@ if ! command -v rsvg-convert &>/dev/null; then
 fi
 echo "  ✓ rsvg-convert found"
 
+# Verify a fallback font is available
+echo "Checking for fallback font..."
+if [ -d /usr/share/fonts ]; then
+  if [ -z "$(find /usr/share/fonts -type f \( -name '*.ttf' -o -name '*.otf' \) 2>/dev/null | head -1)" ]; then
+    echo "ERROR: No font files found in /usr/share/fonts"
+    exit 1
+  fi
+  echo "  ✓ Font files found"
+else
+  echo "ERROR: /usr/share/fonts directory not found"
+  exit 1
+fi
+
 # Create a synthetic test SVG with geometry and text
 TEST_SVG="$WORKDIR/test.svg"
 cat > "$TEST_SVG" << 'EOF'
@@ -70,7 +83,7 @@ echo "  ✓ rsvg-convert succeeded; rendered image is $PNG_SIZE bytes"
 
 # Validate PNG signature (magic bytes: 89 50 4E 47 0D 0A 1A 0A)
 echo "Validating PNG signature and dimensions..."
-PNG_MAGIC=$(xxd -p -l 8 "$OUTPUT_PNG")
+PNG_MAGIC=$(od -An -tx1 -N8 "$OUTPUT_PNG" | tr -d ' \n')
 EXPECTED_MAGIC="89504e470d0a1a0a"
 
 if [ "$PNG_MAGIC" != "$EXPECTED_MAGIC" ]; then
@@ -81,15 +94,15 @@ echo "  ✓ PNG signature valid"
 
 # Extract PNG dimensions (stored in IHDR chunk at bytes 16-24)
 # Width and height are 4 bytes each, big-endian
-IHDR_HEX=$(xxd -p -s 16 -l 8 "$OUTPUT_PNG")
+IHDR_HEX=$(od -An -tx1 -j16 -N8 "$OUTPUT_PNG" | tr -d ' \n')
 WIDTH=$((16#${IHDR_HEX:0:8}))
 HEIGHT=$((16#${IHDR_HEX:8:8}))
 
 echo "  ✓ PNG dimensions: ${WIDTH}x${HEIGHT}"
 
-# Verify dimensions are reasonable (should be 200x200 or close to it due to scaling)
-if [ "$WIDTH" -lt 100 ] || [ "$HEIGHT" -lt 100 ]; then
-  echo "ERROR: PNG dimensions too small (${WIDTH}x${HEIGHT})"
+# Verify exact expected dimensions (SVG declares 200x200 and rsvg-convert renders at that size by default)
+if [ "$WIDTH" -ne 200 ] || [ "$HEIGHT" -ne 200 ]; then
+  echo "ERROR: PNG dimensions incorrect (expected 200x200, got ${WIDTH}x${HEIGHT})"
   exit 1
 fi
 
@@ -105,4 +118,3 @@ echo "  - SVG with geometry and text rendered successfully to PNG"
 echo "  - PNG signature is valid"
 echo "  - PNG dimensions are ${WIDTH}x${HEIGHT}"
 echo ""
-echo "Temporary files cleaned up from $TMPDIR"

@@ -192,10 +192,10 @@ Optional flags:
 running a synthetic smoke check (`svg-smoke-check.sh`) as the non-root user (UID 1000). This
 ensures `rsvg-convert` and its required libraries are available at runtime.
 
-**Manual smoke-check run:** To verify SVG rendering in a fleet pod, override the entrypoint:
+**Manual smoke-check run:** To verify SVG rendering with the fleet image, override the entrypoint:
 
 ```sh
-kubectl exec -it <pod-name> -- /usr/local/bin/svg-smoke-check.sh
+docker run --rm --entrypoint /usr/local/bin/svg-smoke-check.sh <image>
 ```
 
 ### Releasing a new fleet image
