@@ -315,6 +315,12 @@ func (agg *scorecardAggregation) processChain(ctx context.Context, tx *sql.Tx, s
 					matchedIn[lineage] = make(map[*findingThread]bool)
 				}
 				matchedIn[lineage][thread] = true
+			} else if first.PriorID != nil && first.Status == "resolved" {
+				// A resolved report with an unmatched prior_id is a claim about a finding
+				// this reviewer never raised, so ignore it for scorecard purposes.
+				// threadByReport never gets entries for ignored reports, so a later dispute
+				// that names one finds no thread — acceptable since the finding doesn't exist for this reviewer.
+				continue
 			} else {
 				thread = &findingThread{reviewerModel: first.reviewerModel, lineage: lineage, chainRoot: chainRoot}
 				agg.threads = append(agg.threads, thread)
