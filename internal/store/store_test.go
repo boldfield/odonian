@@ -5381,9 +5381,10 @@ func TestResearchFollowUps_DoNotPolluteParentReviewTally(t *testing.T) {
 	if _, err := store.SubmitTask(ctx, fu.ID, "agent-2", "Working on follow-up", nil, []LinkInput{{Kind: "pr", Value: "#200"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
 		t.Fatalf("failed to submit follow-up round 1: %v", err)
 	}
-	fuReview1 := findSingleResearchReviewTask(t, store, ctx, projID, fu.ID, 1)
-	submitResearchReview(t, store, ctx, fuReview1, "fu-reviewer", "reject",
+	fuReviewOpus1, fuReviewSonnet1 := findResearchReviewTasks(t, store, ctx, projID, fu.ID, 1)
+	submitResearchReview(t, store, ctx, fuReviewOpus1, "fu-opus-reviewer", "reject",
 		json.RawMessage(`[{"id":"g1","severity":"P1","file":"x.md","line":1,"summary":"bad claim","in_changed_text":true,"status":"new"}]`))
+	submitResearchReview(t, store, ctx, fuReviewSonnet1, "fu-sonnet-reviewer", "approve", json.RawMessage(`[]`))
 
 	fuAfterRound1, err := store.GetTask(ctx, fu.ID)
 	if err != nil {
@@ -5869,6 +5870,36 @@ func TestResearchFollowUps_SameModelReviewersKeepOwnLineage(t *testing.T) {
 	}
 	if len(seenOrder) < 2 {
 		t.Fatalf("expected to exercise both review-task id orderings, saw %v", seenOrder)
+	}
+}
+
+// TestResearchFollowUps_InheritsParentReviewModels verifies that follow-up tasks
+// created from a research parent inherit the parent's review_models.
+func TestResearchFollowUps_InheritsParentReviewModels(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "sonnet"})
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	findings := json.RawMessage(`[
+		{"id":"f1","severity":"P3","file":"a.md","line":10,"summary":"minor issue","in_changed_text":true,"status":"new"}
+	]`)
+	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "approve", findings)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Fatalf("expected approved, got %s", parent.State)
+	}
+
+	followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
+	if len(followUps) != 1 {
+		t.Fatalf("expected 1 follow-up task, got %d", len(followUps))
+	}
+
+	fu := followUps[0]
+	if len(fu.ReviewModels) != 2 || fu.ReviewModels[0] != "opus" || fu.ReviewModels[1] != "sonnet" {
+		t.Errorf("expected follow-up to inherit parent's review_models ['opus','sonnet'], got %v", fu.ReviewModels)
 	}
 }
 
