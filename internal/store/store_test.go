@@ -17265,8 +17265,8 @@ func TestResearchAdjudication_BuildTrackNeverAdjudicates(t *testing.T) {
 // rework, round budget, and spec compaction. See docs/features/research-track-verification.md
 // for the detailed verification scenario with step-by-step commands.
 func TestResearchTrack_EndToEndVerification(t *testing.T) {
-	// AC1 & AC8: Research task with track set and no Makefile requirement
-	t.Run("acceptance_1_8_research_track_no_makefile", func(t *testing.T) {
+	// AC1: Research task with no Makefile requirement passes review when correct
+	t.Run("acceptance_1_research_track_no_makefile", func(t *testing.T) {
 		store, ctx, _, taskID := newResearchTask(t, false)
 		task, err := store.GetTask(ctx, taskID)
 		if err != nil {
@@ -17278,11 +17278,11 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 	})
 
 	// AC2: Confirmed claim with inaccessible source fails; pending with access record does not
-	t.Run("acceptance_2_inaccessible_source", func(t *testing.T) {
+	t.Run("acceptance_2_confirmed_source_inaccessible_fails", func(t *testing.T) {
 		store, ctx, projID, parentID := newResearchTask(t, false)
 		opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
 
-		// P1 finding for inaccessible source blocks the round
+		// P1 finding for inaccessible confirmed source blocks the round
 		inaccessibleFinding := json.RawMessage(`[{
 			"id":"f-inaccessible",
 			"severity":"P1",
@@ -17303,6 +17303,10 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Errorf("expected ready (P1 blocking finding), got %s", parent.State)
 		}
 	})
+
+	// AC2 is tested via the review prompt behavior: if source is marked pending with
+	// access record, it's not a blocking issue. This is verified through reviewer
+	// implementation, not in unit tests. The unit test covers the confirmed source case above.
 
 	// AC3: Round with only P3 findings passes and creates follow-up tasks
 	t.Run("acceptance_3_p3_findings_create_followups", func(t *testing.T) {
@@ -17355,21 +17359,18 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		}
 	})
 
-	// AC4: P2 in unchanged text after round 1 creates follow-up (still_open always blocks)
+	// AC4: After round 1, P2 in unchanged text doesn't fail the round but creates follow-up
 	t.Run("acceptance_4_p2_unchanged_creates_followup", func(t *testing.T) {
 		store, ctx, projID, parentID := newResearchTask(t, false)
 		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
-		if opus1 == nil || sonnet1 == nil {
-			t.Fatalf("expected review tasks")
-		}
 
-		// Round 1: P2 in changed text that's then fixed to unchanged text
+		// Round 1: Opus reports P2 in changed text (blocks), needs rework
 		p2Changed := json.RawMessage(`[{
-			"id":"f-p2-1",
+			"id":"f-p2-r1",
 			"severity":"P2",
 			"file":"doc.md",
 			"line":5,
-			"summary":"Claim overstates source",
+			"summary":"Claim overstates source evidence",
 			"in_changed_text":true,
 			"status":"new"
 		}]`)
@@ -17381,26 +17382,32 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Fatalf("failed to get parent: %v", err)
 		}
 		if parent.State != "ready" {
-			t.Fatalf("expected ready (P2 blocking), got %s", parent.State)
+			t.Fatalf("expected ready (P2 in changed text blocks round 1), got %s", parent.State)
 		}
 
-		// Rework and round 2
+		// Rework to round 2
 		resubmitResearchImplementTask(t, store, ctx, parentID)
 		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
-		if opus2 == nil || sonnet2 == nil {
-			t.Fatalf("expected round 2 review tasks")
-		}
 
-		// Round 2: P2 now resolved (fixed in changed text)
+		// Round 2: P2 is now resolved in changed text (marked as resolved),
+		// but opus reports a NEW P2 in UNCHANGED text - this should NOT block
 		p2Resolved := json.RawMessage(`[{
-			"id":"f-p2-1b",
+			"id":"f-p2-r2-resolved",
 			"severity":"P2",
 			"file":"doc.md",
 			"line":5,
-			"summary":"Claim fixed",
+			"summary":"Claim fixed from round 1",
 			"in_changed_text":true,
 			"status":"resolved",
-			"prior_id":"f-p2-1"
+			"prior_id":"f-p2-r1"
+		},{
+			"id":"f-p2-r2-unchanged",
+			"severity":"P2",
+			"file":"doc.md",
+			"line":10,
+			"summary":"Another claim slightly overstates evidence",
+			"in_changed_text":false,
+			"status":"new"
 		}]`)
 		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "approve", p2Resolved)
 		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
@@ -17410,23 +17417,20 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Fatalf("failed to get parent: %v", err)
 		}
 		if parent.State != "approved" {
-			t.Errorf("expected approved after resolving P2, got %s", parent.State)
+			t.Errorf("expected approved (P2 in unchanged text in round 2 doesn't block), got %s", parent.State)
 		}
 
-		// Verify no follow-ups for resolved finding
+		// Verify follow-up created for the P2 in unchanged text
 		followUps := findResearchFollowUps(t, store, ctx, projID, parentID)
-		if len(followUps) > 0 {
-			t.Errorf("expected no follow-ups for resolved finding, got %d", len(followUps))
+		if len(followUps) != 1 {
+			t.Errorf("expected 1 follow-up task for P2 in unchanged text, got %d", len(followUps))
 		}
 	})
 
 	// AC5: P2 in changed text fails the round from either reviewer
-	t.Run("acceptance_5_p2_changed_text_blocks", func(t *testing.T) {
+	t.Run("acceptance_5_p2_changed_text_blocks_opus_rejects", func(t *testing.T) {
 		store, ctx, projID, parentID := newResearchTask(t, false)
 		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
-		if opus1 == nil || sonnet1 == nil {
-			t.Fatalf("expected review tasks")
-		}
 
 		// P2 in changed text from opus - should block despite sonnet approve
 		p2Changed := json.RawMessage(`[{
@@ -17450,27 +17454,93 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		}
 	})
 
-	// AC6: Disputes and adjudication are tested in TestResearchAdjudication_* tests.
-	// This test verifies the research track supports dispute submission and adjudication.
-	t.Run("acceptance_6_disputes_supported", func(t *testing.T) {
-		// The research track supports dispute submission during rework.
-		// Adjudication is tested separately in TestResearchAdjudication_* tests
-		// which verify that disputes trigger adjudication tasks when configured.
-		// This test just verifies the feature is present in the research track.
-		store, ctx, _, taskID := newResearchTask(t, false)
-		task, err := store.GetTask(ctx, taskID)
+	// AC5b: P2 in changed text from sonnet also blocks round
+	t.Run("acceptance_5_p2_changed_text_blocks_sonnet_rejects", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTask(t, false)
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+
+		// P2 in changed text from sonnet - should block despite opus approve
+		p2Changed := json.RawMessage(`[{
+			"id":"f-p2-changed",
+			"severity":"P2",
+			"file":"doc.md",
+			"line":5,
+			"summary":"New claim unsupported",
+			"in_changed_text":true,
+			"status":"new"
+		}]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "approve", json.RawMessage(`[]`))
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "reject", p2Changed)
+
+		parent, err := store.GetTask(ctx, parentID)
 		if err != nil {
-			t.Fatalf("failed to get task: %v", err)
+			t.Fatalf("failed to get parent: %v", err)
 		}
-		if task.Track != "research" {
-			t.Errorf("expected research track for dispute support")
+		if parent.State != "ready" {
+			t.Errorf("expected ready (P2 in changed text from sonnet blocks), got %s", parent.State)
 		}
 	})
 
-	// AC7: Round budget blocks with "decompose"
-	t.Run("acceptance_7_round_budget_blocks", func(t *testing.T) {
+	// AC6: Disputed finding that reviewer maintains triggers adjudication
+	t.Run("acceptance_6_dispute_triggers_adjudication", func(t *testing.T) {
+		store, ctx, projID, parentID := newResearchTaskWithAdjudicator(t, []string{"opus", "sonnet"}, "haiku")
+
+		// Round 1: Opus raises a P2 finding
+		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+		finding := json.RawMessage(`[{
+			"id":"f-dispute",
+			"severity":"P2",
+			"file":"claims.md",
+			"line":10,
+			"summary":"Source interpretation is debatable",
+			"in_changed_text":true,
+			"status":"new"
+		}]`)
+		submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", finding)
+		submitResearchReview(t, store, ctx, sonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		// Worker disputes the finding in rework
+		disputes := json.RawMessage(`[{"finding_id":"f-dispute","evidence":"Our interpretation is supported by pages 23-24 of the source"}]`)
+		if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+			t.Fatalf("dispute submission failed: %v", err)
+		}
+
+		// Round 2: Opus maintains the finding (should trigger adjudication)
+		opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+		maintained := json.RawMessage(`[{
+			"id":"f-dispute-r2",
+			"severity":"P2",
+			"file":"claims.md",
+			"line":10,
+			"summary":"Source interpretation is debatable",
+			"in_changed_text":false,
+			"status":"still_open",
+			"prior_id":"f-dispute"
+		}]`)
+		submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", maintained)
+		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+
+		// Verify adjudication task created
+		adjTasks := findAdjudicationTasks(t, store, ctx, projID, parentID)
+		if len(adjTasks) != 1 {
+			t.Fatalf("expected 1 adjudication task, got %d", len(adjTasks))
+		}
+		if adjTasks[0].Model != "haiku" {
+			t.Errorf("expected adjudication on 'haiku', got %q", adjTasks[0].Model)
+		}
+	})
+
+	// AC7: Round budget blocks task with "decompose" reason
+	t.Run("acceptance_7_round_budget_blocks_with_decompose", func(t *testing.T) {
 		store, ctx, projID, parentID := newResearchTask(t, false)
 		budget := 3 // Use small budget for quick test
+
+		// Get initial model to verify it doesn't change
+		initialTask, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get initial task: %v", err)
+		}
+		initialModel := initialTask.Model
 
 		// Cycle through rounds, rejecting each time
 		for round := 1; round <= budget; round++ {
@@ -17506,7 +17576,7 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Errorf("expected blocked state after budget exhaustion, got state=%s", parent.State)
 		}
 
-		// Verify the block reason is "decompose" by checking events
+		// Verify the block reason is "decompose"
 		events, err := store.ListEvents(ctx, parentID)
 		if err != nil {
 			t.Fatalf("failed to get events: %v", err)
@@ -17521,50 +17591,42 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		if !foundDecomposeBlock {
 			t.Errorf("expected decompose block event in task history")
 		}
+
+		// Verify model tier stays constant (no escalation without ladder)
+		if parent.Model != initialModel {
+			t.Errorf("expected model tier unchanged without escalation ladder, was %q, now %q", initialModel, parent.Model)
+		}
 	})
 
-	// AC8: Explicit model overrides research default
+	// AC8: Model assignment and preservation
+	// Test that explicit model is preserved. newResearchTask helper creates
+	// tasks with explicit Model: "haiku", verifying explicit models are kept.
 	t.Run("acceptance_8_explicit_model_preserved", func(t *testing.T) {
-		store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+		store, ctx, _, taskID := newResearchTask(t, false)
+		task, err := store.GetTask(ctx, taskID)
 		if err != nil {
-			t.Fatalf("failed to open store: %v", err)
+			t.Fatalf("failed to get task: %v", err)
 		}
-		t.Cleanup(func() { store.Close() })
-
-		ctx := context.Background()
-		proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
-		if err != nil {
-			t.Fatalf("failed to create project: %v", err)
+		// Task created with explicit model "haiku" keeps that model
+		if task.Model != "haiku" {
+			t.Errorf("expected explicit model 'haiku', got %q", task.Model)
 		}
-		doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
-		if err != nil {
-			t.Fatalf("failed to create document: %v", err)
-		}
-
-		// Create task WITH explicit model
-		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
-			{
-				Title:        "Test task",
-				Spec:         "test spec",
-				DocumentID:   doc.ID,
-				Model:        "sonnet", // Explicit model
-				ReviewModels: []string{"opus"},
-				Track:        "research",
-			},
-		})
-		if err != nil {
-			t.Fatalf("failed to create task: %v", err)
-		}
-
-		task := tasks[0]
-		if task.Model != "sonnet" {
-			t.Errorf("expected explicit model 'sonnet', got %q", task.Model)
+		// Verify it's a research task
+		if task.Track != "research" {
+			t.Errorf("expected research track, got %q", task.Track)
 		}
 	})
 
 	// AC9: Superseded research spec is compacted
 	t.Run("acceptance_9_supersede_spec_compaction", func(t *testing.T) {
 		store, ctx, projID, parentID := newResearchTask(t, false)
+
+		// Save original spec
+		origTask, err := store.GetTask(ctx, parentID)
+		if err != nil {
+			t.Fatalf("failed to get original task: %v", err)
+		}
+		originalSpec := origTask.Spec
 
 		// Round 1: Get findings
 		opus1, sonnet1 := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
@@ -17606,10 +17668,12 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Fatalf("expected approved after fixing, got %s", parent.State)
 		}
 
-		// Verify spec is compact (original spec should be in the result)
-		originalSpec := parent.Spec
-		if originalSpec == "" {
-			t.Errorf("expected spec to be preserved in approved task")
+		// Verify spec still contains original assignment
+		if parent.Spec != originalSpec {
+			t.Errorf("expected original spec to be preserved")
+		}
+		if parent.Spec == "" {
+			t.Errorf("expected spec to be non-empty in approved task")
 		}
 	})
 
