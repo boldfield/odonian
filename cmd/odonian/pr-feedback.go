@@ -40,10 +40,11 @@ func printPRFeedbackHelp(w io.Writer) {
 
 Subcommands:
   list <pr-url>                   List unaddressed feedback items as JSON lines
-  ack [--marker PREFIX] <pr-url> <item-id> <sha>    Acknowledge a feedback item
+  ack [--marker PREFIX] [--disputed] <pr-url> <item-id> [<sha>]    Acknowledge a feedback item
 
 Flags (ack only):
   --marker PREFIX                 Override worker marker prefix (e.g., 'custom-worker: ')
+  --disputed                      Mark the item as disputed instead of fixed (omit <sha>)
 
 Environment:
   GH_TOKEN                        GitHub token (fallback if not in forge-tokens)
@@ -109,18 +110,31 @@ func executePRFeedbackList(ctx context.Context, args []string, out io.Writer) er
 func executePRFeedbackAck(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ack", flag.ContinueOnError)
 	markerFlag := fs.String("marker", "", "optional marker prefix override (e.g., 'custom-worker: ')")
+	disputedFlag := fs.Bool("disputed", false, "mark the item as disputed instead of fixed")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
 
 	positional := fs.Args()
-	if len(positional) < 3 {
-		return fmt.Errorf("pr-feedback ack requires pr-url, item-id, and sha")
+	if len(positional) < 2 {
+		return fmt.Errorf("pr-feedback ack requires pr-url, item-id, and either sha or --disputed")
 	}
 
 	prURL := positional[0]
 	itemID := positional[1]
-	sha := positional[2]
+
+	// Validate that either --disputed is set or sha is provided, but not both
+	var sha string
+	if *disputedFlag {
+		if len(positional) > 2 {
+			return fmt.Errorf("cannot specify both --disputed and sha")
+		}
+	} else {
+		if len(positional) < 3 {
+			return fmt.Errorf("pr-feedback ack requires pr-url, item-id, and sha (or use --disputed)")
+		}
+		sha = positional[2]
+	}
 
 	owner, repo, prNumber, err := parsePRURL(prURL)
 	if err != nil {
@@ -167,7 +181,7 @@ func executePRFeedbackAck(ctx context.Context, args []string) error {
 		marker = forge.MarkerPrefix(model, "worker")
 	}
 
-	if err := forge.AcknowledgeFeedbackItem(ctx, owner, repo, prNumber, token, *item, sha, marker); err != nil {
+	if err := forge.AcknowledgeFeedbackItem(ctx, owner, repo, prNumber, token, *item, sha, marker, *disputedFlag); err != nil {
 		return fmt.Errorf("failed to acknowledge feedback item: %w", err)
 	}
 

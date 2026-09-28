@@ -794,7 +794,7 @@ func TestAcknowledgeFeedbackItem_InlineItem(t *testing.T) {
 	}
 
 	fixingSha := "abc123def456"
-	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, fixingSha, "")
+	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, fixingSha, "", false)
 
 	if err != nil {
 		t.Fatalf("AcknowledgeFeedbackItem() error = %v, want nil", err)
@@ -879,7 +879,7 @@ func TestAcknowledgeFeedbackItem_GlobalItem(t *testing.T) {
 		Body:       "Global feedback",
 	}
 
-	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, "abc123def456", "")
+	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, "abc123def456", "", false)
 
 	if err != nil {
 		t.Fatalf("AcknowledgeFeedbackItem() error = %v, want nil", err)
@@ -924,7 +924,7 @@ func TestAcknowledgeFeedbackItem_InlineItemGraphQLError(t *testing.T) {
 		Body:   "This needs fixing",
 	}
 
-	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, "abc123def456", "")
+	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, "abc123def456", "", false)
 
 	if err == nil {
 		t.Fatalf("AcknowledgeFeedbackItem() error = nil, want error for GraphQL error")
@@ -977,7 +977,7 @@ func TestAcknowledgeFeedbackItem_GlobalItemReactionError(t *testing.T) {
 		Body:       "Global feedback",
 	}
 
-	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, "abc123def456", "")
+	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, "abc123def456", "", false)
 
 	if err == nil {
 		t.Fatalf("AcknowledgeFeedbackItem() error = nil, want error for reaction failure")
@@ -999,7 +999,7 @@ func TestAcknowledgeFeedbackItem_UnknownKind(t *testing.T) {
 		Body:   "Some feedback",
 	}
 
-	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, "abc123def456", "")
+	err := AcknowledgeFeedbackItem(ctx, "owner", "repo", 42, "token", item, "abc123def456", "", false)
 
 	if err == nil {
 		t.Fatalf("AcknowledgeFeedbackItem() error = nil, want error for unknown kind")
@@ -1833,5 +1833,94 @@ func TestListUnaddressedFeedback_WorkerAndReconcilerStatusNotFeedback(t *testing
 
 	if len(items) != 0 {
 		t.Fatalf("returned %d items, want 0 (fleet status is not feedback): %+v", len(items), items)
+	}
+}
+
+// TestBodyAcknowledgesComment_DisputedFormat tests that the disputed format is recognized.
+func TestBodyAcknowledgesComment_DisputedFormat(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		targetID  string
+		wantMatch bool
+	}{
+		{
+			name:      "exact disputed format",
+			body:      "haiku-worker: disputed (see comment comment-123)",
+			targetID:  "comment-123",
+			wantMatch: true,
+		},
+		{
+			name:      "no marker prefix",
+			body:      "disputed (see comment comment-123)",
+			targetID:  "comment-123",
+			wantMatch: true,
+		},
+		{
+			name:      "different target ID",
+			body:      "haiku-worker: disputed (see comment comment-456)",
+			targetID:  "comment-123",
+			wantMatch: false,
+		},
+		{
+			name:      "disputed with wrong comment ID",
+			body:      "haiku-worker: disputed (see comment comment-wrong)",
+			targetID:  "comment-123",
+			wantMatch: false,
+		},
+		{
+			name:      "disputed mid-sentence",
+			body:      "haiku-worker: this is disputed (see comment comment-123) but not the format",
+			targetID:  "comment-123",
+			wantMatch: false,
+		},
+		{
+			name:      "addressed format still works",
+			body:      "haiku-worker: addressed in abc123 (see comment comment-123)",
+			targetID:  "comment-123",
+			wantMatch: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := bodyAcknowledgesComment(tt.body, tt.targetID)
+			if got != tt.wantMatch {
+				t.Errorf("bodyAcknowledgesComment(%q, %q) = %v, want %v", tt.body, tt.targetID, got, tt.wantMatch)
+			}
+		})
+	}
+}
+
+// TestListUnaddressedFeedback_DisputedAcknowledgement tests that a disputed acknowledgment is recognized.
+func TestListUnaddressedFeedback_DisputedAcknowledgement(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-original", 1, "human", "2024-01-01T10:00:00Z", "Fix this issue"),
+		globalComment("comment-dispute", 2, "fleet", "2024-01-01T10:05:00Z",
+			"haiku-worker: disputed (see comment comment-original)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "fleet", nodes)
+
+	if len(items) != 0 {
+		t.Fatalf("returned %d items, want 0 (disputed acknowledgment should clear the item): %+v", len(items), items)
+	}
+}
+
+// TestListUnaddressedFeedback_DisputedAcknowledgementWrongID tests that a disputed acknowledgment with wrong ID doesn't clear.
+func TestListUnaddressedFeedback_DisputedAcknowledgementWrongID(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-original", 1, "human", "2024-01-01T10:00:00Z", "Fix this issue"),
+		globalComment("comment-dispute", 2, "fleet", "2024-01-01T10:05:00Z",
+			"haiku-worker: disputed (see comment comment-wrong)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "fleet", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (wrong ID should not clear): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-original" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-original")
 	}
 }

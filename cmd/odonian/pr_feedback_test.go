@@ -744,3 +744,157 @@ func TestExecutePRFeedbackAckMarkerSatisfiesPredicate(t *testing.T) {
 		t.Fatalf("executePRFeedbackAck failed: %v", err)
 	}
 }
+
+func TestExecutePRFeedbackAckDisputed(t *testing.T) {
+	var capturedMutation string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"login": "test-bot",
+			})
+		} else if r.URL.Path == "/graphql" {
+			w.Header().Set("Content-Type", "application/json")
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			query := body["query"]
+			if strings.Contains(query, "reviewThreads") {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"repository": map[string]interface{}{
+							"pullRequest": map[string]interface{}{
+								"reviewThreads": map[string]interface{}{
+									"pageInfo": map[string]interface{}{
+										"hasNextPage": false,
+									},
+									"nodes": []map[string]interface{}{
+										{
+											"id":         "thread-1",
+											"isResolved": false,
+											"path":       "main.go",
+											"line":       42,
+											"firstComments": map[string]interface{}{
+												"nodes": []map[string]interface{}{
+													{
+														"id":   "comment-1",
+														"body": "This looks wrong",
+														"author": map[string]string{
+															"login": "reviewer",
+														},
+													},
+												},
+											},
+											"lastComments": map[string]interface{}{
+												"nodes": []map[string]interface{}{
+													{
+														"id":   "comment-1",
+														"body": "This looks wrong",
+														"author": map[string]string{
+															"login": "reviewer",
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+			} else if strings.Contains(query, "comments(first:") {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"repository": map[string]interface{}{
+							"pullRequest": map[string]interface{}{
+								"id": "pr-node-1",
+								"comments": map[string]interface{}{
+									"pageInfo": map[string]interface{}{
+										"hasNextPage": false,
+									},
+									"nodes": []map[string]interface{}{},
+								},
+							},
+						},
+					},
+				})
+			} else if strings.Contains(query, "addPullRequestReviewThreadReply") {
+				capturedMutation = query
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"addPullRequestReviewThreadReply": map[string]interface{}{
+							"comment": map[string]string{
+								"id": "reply-1",
+							},
+						},
+					},
+				})
+			} else if strings.Contains(query, "resolveReviewThread") {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"resolveReviewThread": map[string]interface{}{
+							"thread": map[string]string{
+								"id": "thread-1",
+							},
+						},
+					},
+				})
+			}
+		}
+	}))
+	defer server.Close()
+
+	forge.GitHubBaseURL = server.URL
+
+	t.Setenv("GH_TOKEN", "test-token")
+	t.Setenv("ODONIAN_MODEL", "haiku")
+
+	err := executePRFeedbackAck(context.Background(), []string{
+		"--disputed",
+		"https://github.com/owner/repo/pull/42",
+		"thread-1",
+	})
+	if err != nil {
+		t.Fatalf("executePRFeedbackAck --disputed failed: %v", err)
+	}
+
+	if !strings.Contains(capturedMutation, "disputed (see comment thread-1)") {
+		t.Errorf("expected mutation to contain 'disputed (see comment thread-1)', got: %s", capturedMutation)
+	}
+}
+
+func TestExecutePRFeedbackAckDisputedWithShaIsError(t *testing.T) {
+	t.Setenv("GH_TOKEN", "test-token")
+
+	err := executePRFeedbackAck(context.Background(), []string{
+		"--disputed",
+		"https://github.com/owner/repo/pull/42",
+		"thread-1",
+		"abc123def456",
+	})
+	if err == nil {
+		t.Fatal("expected error when both --disputed and sha are specified")
+	}
+	if !strings.Contains(err.Error(), "both") {
+		t.Errorf("expected error to mention 'both', got: %v", err)
+	}
+}
+
+func TestExecutePRFeedbackAckMissingShaWithoutDisputed(t *testing.T) {
+	t.Setenv("GH_TOKEN", "test-token")
+
+	err := executePRFeedbackAck(context.Background(), []string{
+		"https://github.com/owner/repo/pull/42",
+		"thread-1",
+	})
+	if err == nil {
+		t.Fatal("expected error when sha is missing and --disputed is not set")
+	}
+	if !strings.Contains(err.Error(), "sha") || !strings.Contains(err.Error(), "disputed") {
+		t.Errorf("expected error to mention sha/disputed requirement, got: %v", err)
+	}
+}
