@@ -133,9 +133,23 @@ more than a minute. Pin heartbeats to those points; do not rely on sensing elaps
    - Run `odonian pr-feedback list <pr-url>` to enumerate EVERY unaddressed item — both inline
      review threads AND global comments. (`<pr-url>` is the same PR you resolve in the find-or-create
      step 8; on a rework it already exists.)
-   - You MUST address every returned item in your diff. After the commit that fixes each item (you
-     create those commits in step 8), run `odonian pr-feedback ack <pr-url> <item-id> <sha>`, where
-     `<sha>` is the commit that addressed it. **Every listed item — inline threads included — is
+   - You MUST address every returned item — by fixing it in your diff or by disputing its finding
+     in this round's `--disputes-file`. Acknowledge each item according to how you addressed it:
+     - **Fixed:** after the commit that fixes the item (you create those commits in step 8), run
+       `odonian pr-feedback ack <pr-url> <item-id> <sha>`, where `<sha>` is the commit that
+       addressed it.
+     - **Disputed:** if you are disputing the item's finding in this round's `--disputes-file`, run
+       `odonian pr-feedback ack --disputed <pr-url> <item-id>` — no `<sha>`, and `--disputed` MUST
+       come before the positional arguments (the CLI rejects it after them). This posts a
+       "disputed … not fixed" reply that clears the item from `pr-feedback list` without claiming
+       a fix.
+     - **Mixed:** a single reviewer comment can carry several findings, some you fixed and some you
+       dispute. Acknowledge it with `--disputed` if you dispute at least one finding in it, and in
+       that dispute's `evidence` name which of the comment's findings you fixed (with the fixing
+       commit) and which you dispute.
+
+     **Never acknowledge a disputed item as addressed by a commit** — a `<sha>` ack asserts a fix
+     you did not make. **Never use `--skip-feedback-gate`.** **Every listed item — inline threads included — is
      acknowledged ONLY by running `odonian pr-feedback ack` with that item's id; a prose comment
      does not count and leaves the item outstanding.** **`odonian pr-feedback ack` automatically stamps replies
      with your worker marker** (e.g., `haiku-worker:`) — the tooling uses this marker to distinguish
