@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates jq build-essential pkg-config cmake clang lld \
       libgc-dev \
       poppler-utils \
+      librsvg2-bin \
       python3 python3-pip python3-venv python3-yaml \
  && rm -rf /var/lib/apt/lists/*
 
@@ -62,7 +63,8 @@ COPY --from=odonian-builder /out/odonian /usr/local/bin/odonian
 COPY harness/ /harness/
 COPY deploy/fleet/fleet-entrypoint.sh /usr/local/bin/fleet-entrypoint.sh
 COPY deploy/fleet/pdf-smoke-check.sh /usr/local/bin/pdf-smoke-check.sh
-RUN chmod +x /usr/local/bin/fleet-entrypoint.sh /harness/agent.sh /usr/local/bin/pdf-smoke-check.sh
+COPY deploy/fleet/svg-smoke-check.sh /usr/local/bin/svg-smoke-check.sh
+RUN chmod +x /usr/local/bin/fleet-entrypoint.sh /harness/agent.sh /usr/local/bin/pdf-smoke-check.sh /usr/local/bin/svg-smoke-check.sh
 
 # Symlink Go binaries to /usr/local/bin so Codex reviewer can find them.
 # Codex rebuilds PATH and doesn't inherit Docker ENV additions, so Go must be in /usr/local/bin.
@@ -80,6 +82,11 @@ ENV HOME=/home/agent \
 # This ensures the worker/reviewer runtime can render PDFs, which research tasks require.
 # Tests against a public multi-page PDF whose page 2 must render.
 RUN PDF_URL=https://cdn.factcheck.org/UploadedFiles/SOCM-2025-11374_Redacted.pdf /usr/local/bin/pdf-smoke-check.sh
+
+# Verify SVG rendering capabilities: run smoke check as non-root user.
+# This ensures the worker/reviewer runtime can render SVGs with rsvg-convert.
+# Tests a synthetic SVG containing geometry and text.
+RUN /usr/local/bin/svg-smoke-check.sh
 
 # Rust toolchain (per-user via rustup) — many faictory tools are Rust crates.
 # rustfmt + clippy are required for sigil's `make check` (and the CI rustfmt gate): the minimal
