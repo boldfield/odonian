@@ -10934,6 +10934,251 @@ func TestPruneEventsListEventsStillReturnsKeptEvents(t *testing.T) {
 	}
 }
 
+func TestPruneEventsPreservesResearchTrackTaskEvents(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a research task and a build task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:      "Research Task",
+			Spec:       "Spec",
+			DocumentID: doc.ID,
+			Model:      "haiku",
+			Track:      "research",
+		},
+		{
+			Title:      "Build Task",
+			Spec:       "Spec",
+			DocumentID: doc.ID,
+			Model:      "haiku",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+	researchTaskID := tasks[0].ID
+	buildTaskID := tasks[1].ID
+
+	// Set up both tasks with events
+	for _, taskID := range []string{researchTaskID, buildTaskID} {
+		_, err = store.PromoteTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to promote task: %v", err)
+		}
+
+		_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", time.Minute)
+		if err != nil {
+			t.Fatalf("failed to claim task: %v", err)
+		}
+	}
+
+	// Mark both tasks as done
+	_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = 'done' WHERE id IN (?, ?)", researchTaskID, buildTaskID)
+	if err != nil {
+		t.Fatalf("failed to update task states: %v", err)
+	}
+
+	// Get event counts before prune
+	researchEventsBefore, err := store.ListEvents(ctx, researchTaskID)
+	if err != nil {
+		t.Fatalf("failed to list research task events: %v", err)
+	}
+	if len(researchEventsBefore) == 0 {
+		t.Errorf("research task should have events before pruning")
+	}
+
+	buildEventsBefore, err := store.ListEvents(ctx, buildTaskID)
+	if err != nil {
+		t.Fatalf("failed to list build task events: %v", err)
+	}
+	if len(buildEventsBefore) == 0 {
+		t.Errorf("build task should have events before pruning")
+	}
+
+	// Run prune with 0-day retention for terminal tasks
+	pruned, err := store.PruneEvents(ctx, 0)
+	if err != nil {
+		t.Fatalf("failed to prune events: %v", err)
+	}
+
+	if pruned == 0 {
+		t.Errorf("PruneEvents should have removed build task events")
+	}
+
+	// Verify research task events are preserved
+	researchEventsAfter, err := store.ListEvents(ctx, researchTaskID)
+	if err != nil {
+		t.Fatalf("failed to list research task events after prune: %v", err)
+	}
+	if len(researchEventsAfter) != len(researchEventsBefore) {
+		t.Errorf("research task events should be preserved: had %d before, got %d after", len(researchEventsBefore), len(researchEventsAfter))
+	}
+
+	// Verify build task events are deleted
+	buildEventsAfter, err := store.ListEvents(ctx, buildTaskID)
+	if err != nil {
+		t.Fatalf("failed to list build task events after prune: %v", err)
+	}
+	if len(buildEventsAfter) > 0 {
+		t.Errorf("build task events should be pruned, but got %d events", len(buildEventsAfter))
+	}
+}
+
+func TestPruneEventsPreservesScorecardData(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a research task with a reviewer model
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research Task",
+			Spec:         "Verify claims",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			Track:        "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Submit the task
+	_, err = store.PromoteTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Find the opus review task
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	var opusReviewTask *Task
+	for i := range allTasks {
+		tk := allTasks[i]
+		if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == taskID && tk.State == "ready" {
+			opusReviewTask = &tk
+			break
+		}
+	}
+
+	if opusReviewTask == nil {
+		t.Fatalf("expected opus review task")
+	}
+
+	// Submit a review with findings
+	findingsJSON := json.RawMessage(`[{"id":"f1","severity":"P1","file":"test.txt","line":1,"summary":"test finding","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, opusReviewTask, "opus-reviewer", "reject", findingsJSON)
+
+	// Mark the research task as done
+	_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = 'done' WHERE id = ?", taskID)
+	if err != nil {
+		t.Fatalf("failed to update task state: %v", err)
+	}
+
+	// Get scorecard before prune
+	scorecardBefore, err := store.GetResearchReviewerScorecards(ctx, proj.ID)
+	if err != nil {
+		t.Fatalf("failed to get scorecard before prune: %v", err)
+	}
+
+	// Run prune with 0-day retention
+	_, err = store.PruneEvents(ctx, 0)
+	if err != nil {
+		t.Fatalf("failed to prune events: %v", err)
+	}
+
+	// Get scorecard after prune
+	scorecardAfter, err := store.GetResearchReviewerScorecards(ctx, proj.ID)
+	if err != nil {
+		t.Fatalf("failed to get scorecard after prune: %v", err)
+	}
+
+	// Verify scorecards are identical
+	if len(scorecardBefore.Scorecards) != len(scorecardAfter.Scorecards) {
+		t.Errorf("scorecard length changed: had %d before, got %d after", len(scorecardBefore.Scorecards), len(scorecardAfter.Scorecards))
+	}
+
+	if len(scorecardBefore.Scorecards) > 0 {
+		sc := scorecardAfter.Scorecards[0]
+		scBefore := scorecardBefore.Scorecards[0]
+
+		if sc.Model != scBefore.Model {
+			t.Errorf("model changed: was %s, now %s", scBefore.Model, sc.Model)
+		}
+
+		// Compare FindingsRaised maps
+		if len(sc.FindingsRaised) != len(scBefore.FindingsRaised) {
+			t.Errorf("findings_raised length changed: had %d before, got %d after", len(scBefore.FindingsRaised), len(sc.FindingsRaised))
+		} else {
+			for k, v := range scBefore.FindingsRaised {
+				if sc.FindingsRaised[k] != v {
+					t.Errorf("findings_raised[%s] changed: was %d, now %d", k, v, sc.FindingsRaised[k])
+				}
+			}
+		}
+
+		if sc.FindingsHeld != scBefore.FindingsHeld {
+			t.Errorf("findings_held changed: was %d, now %d", scBefore.FindingsHeld, sc.FindingsHeld)
+		}
+		if sc.FindingsUnresolved != scBefore.FindingsUnresolved {
+			t.Errorf("findings_unresolved changed: was %d, now %d", scBefore.FindingsUnresolved, sc.FindingsUnresolved)
+		}
+		if sc.TotalReviewRounds != scBefore.TotalReviewRounds {
+			t.Errorf("total_review_rounds changed: was %d, now %d", scBefore.TotalReviewRounds, sc.TotalReviewRounds)
+		}
+		if sc.SampleSize != scBefore.SampleSize {
+			t.Errorf("sample_size changed: was %d, now %d", scBefore.SampleSize, sc.SampleSize)
+		}
+	}
+}
+
 func TestHeartbeatTaskDoesNotCreateEvent(t *testing.T) {
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
 	if err != nil {
