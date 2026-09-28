@@ -134,6 +134,12 @@ func executePRFeedbackAck(ctx context.Context, args []string) error {
 			return fmt.Errorf("pr-feedback ack requires pr-url, item-id, and sha (or use --disputed)")
 		}
 		sha = positional[2]
+		// Reject shas starting with "-" to catch cases where --disputed was supplied
+		// after positional args (flag parsing stops at first positional, so "--disputed"
+		// would be captured as the sha argument)
+		if strings.HasPrefix(sha, "-") {
+			return fmt.Errorf("sha cannot start with '-' (looks like a flag; did you mean --disputed before the positional arguments?)")
+		}
 	}
 
 	owner, repo, prNumber, err := parsePRURL(prURL)

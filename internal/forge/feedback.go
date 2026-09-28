@@ -409,12 +409,21 @@ func bodyAcknowledgesComment(body, targetNodeID string) bool {
 		return true
 	}
 
-	// Check disputed format: "disputed (see comment <id>)"
-	const disputedPrefix = "disputed"
+	// Check disputed format: "disputed (see comment <id>)" (anchored prefix)
+	const disputedPrefix = "disputed (see comment "
 	if strings.HasPrefix(msg, disputedPrefix) {
-		// Must have exactly the format "disputed (see comment <id>)"
-		expectedMsg := disputedPrefix + marker
-		return msg == expectedMsg
+		rest := msg[len(disputedPrefix):]
+		idx := strings.Index(rest, ")")
+		if idx < 0 {
+			return false
+		}
+		// The comment ID is the single token between the prefix and the closing ")";
+		// it must be non-empty and contain no whitespace (the writer emits a bare ID).
+		commentID := rest[:idx]
+		if commentID == "" || strings.ContainsAny(commentID, " \t\r\n") {
+			return false
+		}
+		return commentID == targetNodeID
 	}
 
 	return false
@@ -625,7 +634,7 @@ func postReviewThreadReply(ctx context.Context, threadID, fixingSha, markerPrefi
 
 	var replyBody string
 	if disputed {
-		replyBody = markerPrefix + "disputed (see comment " + threadID + ")"
+		replyBody = markerPrefix + "disputed (see comment " + threadID + "): finding disputed with source evidence in this round's submission; not fixed"
 	} else {
 		replyBody = markerPrefix + "addressed in " + fixingSha
 	}
@@ -757,7 +766,7 @@ func postCommentReply(ctx context.Context, prNodeID, fixingSha, originalCommentI
 
 	var replyBody string
 	if disputed {
-		replyBody = markerPrefix + "disputed (see comment " + originalCommentID + ")"
+		replyBody = markerPrefix + "disputed (see comment " + originalCommentID + "): finding disputed with source evidence in this round's submission; not fixed"
 	} else {
 		replyBody = markerPrefix + "addressed in " + fixingSha + " (see comment " + originalCommentID + ")"
 	}

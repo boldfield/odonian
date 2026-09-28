@@ -862,8 +862,8 @@ func TestExecutePRFeedbackAckDisputed(t *testing.T) {
 		t.Fatalf("executePRFeedbackAck --disputed failed: %v", err)
 	}
 
-	if !strings.Contains(capturedMutation, "disputed (see comment thread-1)") {
-		t.Errorf("expected mutation to contain 'disputed (see comment thread-1)', got: %s", capturedMutation)
+	if !strings.Contains(capturedMutation, "disputed (see comment thread-1): finding disputed with source evidence in this round's submission; not fixed") {
+		t.Errorf("expected mutation to contain full disputed acknowledgment body, got: %s", capturedMutation)
 	}
 }
 
@@ -896,5 +896,22 @@ func TestExecutePRFeedbackAckMissingShaWithoutDisputed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sha") || !strings.Contains(err.Error(), "disputed") {
 		t.Errorf("expected error to mention sha/disputed requirement, got: %v", err)
+	}
+}
+
+func TestExecutePRFeedbackAckDisputedAfterPositionals(t *testing.T) {
+	t.Setenv("GH_TOKEN", "test-token")
+
+	// Test that --disputed after positional args is rejected (flag parsing stops at first positional)
+	err := executePRFeedbackAck(context.Background(), []string{
+		"https://github.com/owner/repo/pull/42",
+		"thread-1",
+		"--disputed",
+	})
+	if err == nil {
+		t.Fatal("expected error when --disputed is placed after positional args")
+	}
+	if !strings.Contains(err.Error(), "cannot start with '-'") {
+		t.Errorf("expected error about flag in sha position, got: %v", err)
 	}
 }

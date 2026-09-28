@@ -1845,26 +1845,26 @@ func TestBodyAcknowledgesComment_DisputedFormat(t *testing.T) {
 		wantMatch bool
 	}{
 		{
-			name:      "exact disputed format",
-			body:      "haiku-worker: disputed (see comment comment-123)",
+			name:      "exact disputed format with explanation",
+			body:      "haiku-worker: disputed (see comment comment-123): finding disputed with source evidence in this round's submission; not fixed",
 			targetID:  "comment-123",
 			wantMatch: true,
 		},
 		{
 			name:      "no marker prefix",
-			body:      "disputed (see comment comment-123)",
+			body:      "disputed (see comment comment-123): finding disputed with source evidence in this round's submission; not fixed",
 			targetID:  "comment-123",
 			wantMatch: true,
 		},
 		{
 			name:      "different target ID",
-			body:      "haiku-worker: disputed (see comment comment-456)",
+			body:      "haiku-worker: disputed (see comment comment-456): finding disputed with source evidence in this round's submission; not fixed",
 			targetID:  "comment-123",
 			wantMatch: false,
 		},
 		{
 			name:      "disputed with wrong comment ID",
-			body:      "haiku-worker: disputed (see comment comment-wrong)",
+			body:      "haiku-worker: disputed (see comment comment-wrong): finding disputed with source evidence in this round's submission; not fixed",
 			targetID:  "comment-123",
 			wantMatch: false,
 		},
@@ -1897,7 +1897,7 @@ func TestListUnaddressedFeedback_DisputedAcknowledgement(t *testing.T) {
 	nodes := strings.Join([]string{
 		globalComment("comment-original", 1, "human", "2024-01-01T10:00:00Z", "Fix this issue"),
 		globalComment("comment-dispute", 2, "fleet", "2024-01-01T10:05:00Z",
-			"haiku-worker: disputed (see comment comment-original)"),
+			"haiku-worker: disputed (see comment comment-original): finding disputed with source evidence in this round's submission; not fixed"),
 	}, ",")
 
 	items := listGlobalFeedback(t, "fleet", nodes)
@@ -1912,13 +1912,32 @@ func TestListUnaddressedFeedback_DisputedAcknowledgementWrongID(t *testing.T) {
 	nodes := strings.Join([]string{
 		globalComment("comment-original", 1, "human", "2024-01-01T10:00:00Z", "Fix this issue"),
 		globalComment("comment-dispute", 2, "fleet", "2024-01-01T10:05:00Z",
-			"haiku-worker: disputed (see comment comment-wrong)"),
+			"haiku-worker: disputed (see comment comment-wrong): finding disputed with source evidence in this round's submission; not fixed"),
 	}, ",")
 
 	items := listGlobalFeedback(t, "fleet", nodes)
 
 	if len(items) != 1 {
 		t.Fatalf("returned %d items, want 1 (wrong ID should not clear): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-original" {
+		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-original")
+	}
+}
+
+// TestListUnaddressedFeedback_DisputedAcknowledgementEarlier tests that a disputed acknowledgment appearing
+// before the comment it names does not clear the feedback.
+func TestListUnaddressedFeedback_DisputedAcknowledgementEarlier(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-dispute", 1, "fleet", "2024-01-01T10:00:00Z",
+			"haiku-worker: disputed (see comment comment-original): finding disputed with source evidence in this round's submission; not fixed"),
+		globalComment("comment-original", 2, "human", "2024-01-01T10:05:00Z", "Fix this issue"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "fleet", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (earlier dispute should not clear): %+v", len(items), items)
 	}
 	if items[0].ID != "comment-original" {
 		t.Errorf("items[0].ID = %q, want %q", items[0].ID, "comment-original")
