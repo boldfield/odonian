@@ -31,7 +31,7 @@ Usage:
 Task object for the create-tasks file (a JSON array of these). depends_on entries are
 either an intra-batch "key" or an existing task id, and must be ACYCLIC:
   { "key": "slug", "title": "...", "spec": "<prose, NO code>", "document_id": "<doc id>",
-    "depends_on": ["other-key"], "model": "haiku", "review_models": ["opus", "gpt-5.5"], "agent_merge": false }
+    "depends_on": ["other-key"], "model": "haiku", "review_models": ["opus", "gpt-6.1-sol"], "agent_merge": false }
   (review_models — pass the pair explicitly. Two independent reviewers: one Claude, one Codex.
    Server fallback when omitted is ["opus"]; this script shows the intended pairing. agent_merge defaults to false.)
 USAGE

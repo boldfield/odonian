@@ -53,8 +53,9 @@ arm64 (Pi) build comes later with the cross-arch build/test dimension. The merge
 and keeps running on the Pis.
 
 **Note on Go symlinks:** The Dockerfile creates symlinks from `/usr/local/go/bin/{go,gofmt}` to
-`/usr/local/bin/` because the Codex-based gpt-5.5 reviewer rebuilds its shell's PATH and does not
-inherit Docker `ENV` additions. Go binaries must be in `/usr/local/bin` or Go reviews fail spuriously.
+`/usr/local/bin/` because the Codex-based reviewer (`gpt-6.1-sol` / legacy `gpt-5.5`) rebuilds its
+shell's PATH and does not inherit Docker `ENV` additions. Go binaries must be in `/usr/local/bin`
+or Go reviews fail spuriously.
 The existing `PATH` env var in the Dockerfile still helps all other environments.
 
 **Note on PyYAML:** The Dockerfile installs `python3-yaml` because the manifests repo and other
@@ -84,9 +85,9 @@ kubectl --context admin@summercamp-cp -n odonian-fleet \
 The `odonian-fleet` (server API token) and `odonian-forge-tokens` secrets from the merger setup are
 reused — create them in this namespace on the cp cluster too if they aren't there yet.
 
-### 2b. codex auth for gpt-5.5 reviewers — READ THIS, IT EXPIRES
+### 2b. codex auth for gpt-6.1-sol reviewers (and gpt-5.5) — READ THIS, IT EXPIRES
 
-Reviewers that run `gpt-5.5` (via `AGENT_CODEX_MODELS`) authenticate codex with the `codex-auth`
+Reviewers that run `gpt-6.1-sol` or `gpt-5.5` (via `AGENT_CODEX_MODELS`) authenticate codex with the `codex-auth`
 secret, seeded from `~/.codex/auth.json` (see `secret.example.yaml`). Unlike the claude
 `setup-token`, **this one decays and will take your review queue down.**
 
@@ -98,7 +99,8 @@ replica plus any machine where you run `codex` locally are all rotating the same
 revoking each other. Expect it to break periodically — a 4-replica fleet survived ~13 days.
 
 Symptom: reviewers log `Your access token could not be refreshed because your refresh token was
-revoked` plus `401 Unauthorized`, and every `gpt-5.5` review dispatch exits `rc=1`. Because the
+revoked` plus `401 Unauthorized`, and every Codex reviewer (`gpt-6.1-sol` / `gpt-5.5`) dispatch
+exits `rc=1`. Because the
 harness peeks the queue head without claiming it, the failing task stays at the head and stalls the
 whole review queue rather than just its own task.
 
@@ -114,7 +116,8 @@ The rollout restart is **mandatory** — updating the secret alone does nothing,
 initContainer only reads it at pod start.
 
 Running exactly one codex-capable reviewer reduces the churn (one rotation lineage instead of N) at
-the cost of `gpt-5.5` review throughput. `auth_mode: apikey` avoids rotation entirely but moves you
+the cost of Codex reviewer (`gpt-6.1-sol` / `gpt-5.5`) throughput. `auth_mode: apikey` avoids
+rotation entirely but moves you
 from subscription to API billing.
 
 ### 3. Request the rollout in manifests

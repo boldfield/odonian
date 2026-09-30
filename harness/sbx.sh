@@ -214,8 +214,9 @@ command -v odonian >/dev/null 2>&1 || die "odonian not on PATH after build"
 say "odonian: $(command -v odonian)"
 
 # --- preflight: the agent CLIs the fleet will actually dispatch ---
-# BOTH are required: the server allowlists gpt-5.5 and AGENT_CODEX_MODELS routes it through
-# `codex exec`, so a board using the standard two-reviewer pair dispatches claude AND codex. A
+# BOTH are required: the server allowlists gpt-6.1-sol (and legacy gpt-5.5) and AGENT_CODEX_MODELS
+# routes them through `codex exec`, so a board using the standard two-reviewer pair dispatches
+# claude AND codex. A
 # missing CLI otherwise surfaces only as `dispatch exited rc=127` buried in workers.log, behind
 # agent.sh's 30s→300s backoff — which reads as a mysteriously stalled board rather than a setup
 # error. Fail here, while the operator is still looking at the terminal.
@@ -267,10 +268,11 @@ if command -v codex >/dev/null 2>&1; then
   say "codex: $(command -v codex)"
 elif [ "$SEED_DEMO" -eq 1 ]; then
   # The seeded demo task is reviewed by opus only, so the demo runs without codex. Any task you add
-  # with a gpt-5.5 reviewer would still fail to dispatch, so say so once, loudly, and carry on.
-  say "WARNING: codex CLI not on PATH — fine for the seeded demo (its reviewer is opus), but a gpt-5.5 review task would fail to dispatch"
+  # with a gpt-6.1-sol (or legacy gpt-5.5) reviewer would still fail to dispatch, so say so once,
+  # loudly, and carry on.
+  say "WARNING: codex CLI not on PATH — fine for the seeded demo (its reviewer is opus), but a gpt-6.1-sol/gpt-5.5 review task would fail to dispatch"
 else
-  die "codex CLI not on PATH — gpt-5.5 is allowlisted and routed via AGENT_CODEX_MODELS, so its review dispatches would fail"
+  die "codex CLI not on PATH — gpt-6.1-sol (and legacy gpt-5.5) are allowlisted and routed via AGENT_CODEX_MODELS, so their review dispatches would fail"
 fi
 
 # ============================== 2. handle a stale / bound port ==============================
@@ -289,14 +291,15 @@ fi
 # ============================== 3. start the server ==============================
 if [ "$REUSE_SERVER" -eq 0 ]; then
   say "starting odonian server on :$PORT (db: $DB_PATH)…"
-  # gpt-5.5 is allowlisted (review_models: ["opus","gpt-5.5"] validates) but deliberately left OUT
-  # of ODONIAN_ESCALATION_LADDER: it's a review-only model routed through codex exec (see
-  # AGENT_CODEX_MODELS below), not an implementer, so it must never become an escalation target for
-  # implement work. Thresholds/ladder mirror production (manifests repo) as of 2026-08-10.
+  # gpt-5.5 and gpt-6.1-sol are allowlisted (review_models validates) but deliberately left OUT
+  # of ODONIAN_ESCALATION_LADDER: they're review-only models routed through codex exec (see
+  # AGENT_CODEX_MODELS below), not implementers, so they must never become escalation targets for
+  # implement work. Retain gpt-5.5 for backwards compatibility with existing pinned tasks.
+  # Thresholds/ladder mirror production (manifests repo) as of 2026-08-10.
   ODONIAN_DB="$DB_PATH" \
   ODONIAN_ADDR=":$PORT" \
   ODONIAN_TOKEN="$LOCAL_TOKEN" \
-  ODONIAN_MODELS="haiku,sonnet,opus,fable,gpt-5.5" \
+  ODONIAN_MODELS="haiku,sonnet,opus,fable,gpt-5.5,gpt-6.1-sol" \
   ODONIAN_ESCALATION_THRESHOLDS="haiku=3,sonnet=2,opus=2,fable=1" \
   ODONIAN_ESCALATION_LADDER="haiku,sonnet,opus,fable" \
     odonian server >>"$SERVER_LOG" 2>&1 &
@@ -453,10 +456,14 @@ export ODONIAN_WORKTREE_HOME="$WORKTREE_HOME"
 export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
 # Nested claude -p inside a sandbox needs this alongside --dangerously-skip-permissions:
 export AGENT_CLAUDE_FLAGS="--allow-dangerously-skip-permissions"
+# Pin Claude alias resolution for sandbox workers/reviewers:
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4-5-20251001}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-5-5}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-5-5}"
 # agent.sh routes any dispatch whose model is in this comma-separated list through codex exec
-# instead of claude -p — gpt-5.5 isn't a claude model, so without this its review dispatch would
-# fail as "claude -p --model gpt-5.5".
-export AGENT_CODEX_MODELS="gpt-5.5"
+# instead of claude -p — these aren't claude models, so without this their review dispatches would
+# fail as "claude -p --model <model>".
+export AGENT_CODEX_MODELS="gpt-5.5,gpt-6.1-sol"
 EOF
 
 # Forward CLAUDE_CODE_OAUTH_TOKEN into the env file too, but only when the operator actually
@@ -477,13 +484,24 @@ export ODONIAN_URL ODONIAN_TOKEN ODONIAN_WORKTREE_HOME
 export ODONIAN_REPO="$FLEET_REPO"
 export ODONIAN_PROJECT="$PROJECT_ID"
 export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
+# NOTE: with REUSE_SERVER=1 (§2) this is what THIS invocation would start the server with, not
+# necessarily the allowlist the already-running reused server was actually started with — the
+# §7 verifier check below only proves the two agree when this script itself started the server.
+export ODONIAN_MODELS="haiku,sonnet,opus,fable,gpt-5.5,gpt-6.1-sol"
 export AGENT_CLAUDE_FLAGS="--allow-dangerously-skip-permissions"
-export AGENT_CODEX_MODELS="gpt-5.5"
+export AGENT_CODEX_MODELS="gpt-5.5,gpt-6.1-sol"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4-5-20251001}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-5-5}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-5-5}"
 [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && export CLAUDE_CODE_OAUTH_TOKEN
+
+# ============================== 7. verify model configuration ==============================
+say "verifying model configuration…"
+bash "$HARNESS_DIR/verify-model-config.sh" || die "model configuration verification failed"
 
 # ============================== 8. start the fleet ==============================
 # `set -m` (job control) makes each backgrounded fleet its OWN process-group leader, so $! == its
-# pgid and stop_all can kill the whole group (fleet + agents + nested claude) — see §7. Each fleet's
+# pgid and stop_all can kill the whole group (fleet + agents + nested claude). Each fleet's
 # combined output goes to a per-kind log file; every line is already prefixed with the agent's slot
 # id by agent.sh (e.g. "[worker-1-…] …"), so one file per kind tells you which agent did what. Follow
 # them live with: tail -f "$LOG_DIR"/workers.log "$LOG_DIR"/reviewers.log

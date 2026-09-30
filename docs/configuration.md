@@ -12,7 +12,7 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_ADDR` | `:8080` | Listen address. |
 | `ODONIAN_MODELS` | `haiku,sonnet,opus` | Allowlist of model names that may be pinned to a task or named as a reviewer. |
 | `ODONIAN_RESEARCH_DEFAULT_MODEL` | unset | Default model for research tasks created without an explicit model. Must be in `ODONIAN_MODELS` if set. Recommended: `claude-opus-5-5`. When unset, research tasks without an explicit model use the default fallback (prefers `haiku`). |
-| `ODONIAN_ESCALATION_LADDER` | same as `ODONIAN_MODELS` | Ordered tiers for the review circuit breaker's escalation path. Every entry must be in `ODONIAN_MODELS`. A model can be a valid reviewer without being on the ladder; `gpt-5.5` via Codex is the usual example. |
+| `ODONIAN_ESCALATION_LADDER` | same as `ODONIAN_MODELS` | Ordered tiers for the review circuit breaker's escalation path. Every entry must be in `ODONIAN_MODELS`. A model can be a valid reviewer without being on the ladder; `gpt-6.1-sol` via Codex is the current active example, with `gpt-5.5` retained for backwards compatibility. |
 | `ODONIAN_ESCALATION_THRESHOLDS` | `haiku=8,sonnet=6,opus=4` | Per-model review-round threshold for build and design tasks. A rejection that pushes a task past its threshold trips the circuit breaker. A malformed value logs a warning and falls back to the defaults. |
 | `ODONIAN_RESEARCH_ESCALATION_LADDER` | unset | Ordered tiers for the review circuit breaker's escalation path for research tasks. Empty or unset means research tasks never change tier on rejection. Every entry must be in `ODONIAN_MODELS`. A configured research ladder operates independently of the build/design ladder. |
 | `ODONIAN_RESEARCH_ESCALATION_THRESHOLDS` | unset (treated as empty map) | Per-model review-round threshold for research tasks. Only applies if `ODONIAN_RESEARCH_ESCALATION_LADDER` is configured. When a research task's model is not on the research ladder, falls back to `ODONIAN_MAX_REVIEW_ROUNDS`. Build and design tasks use `ODONIAN_ESCALATION_THRESHOLDS` exclusively. |
@@ -180,7 +180,7 @@ overridden per invocation.
 | `ODONIAN_REPOS_HIGH_GIB`, `ODONIAN_REPOS_LOW_GIB` | `14`, `8` | Disk watermarks for the on-demand clone cache in `all` mode: when usage crosses the high mark, clones are evicted until it is under the low mark. |
 | `AGENT_SLOT` | wrapper default | Slot name (`worker-1`, `reviewer-2`, …). Each slot gets a persistent agent id and its own worktree. |
 | `AGENT_CLAUDE_FLAGS` | empty | Extra flags appended to every `claude -p` dispatch. `sbx.sh` uses it to pass the flag a nested `claude` needs inside a sandbox. |
-| `AGENT_CODEX_MODELS` | unset | Comma-separated models to dispatch through `codex exec` instead of `claude -p`, e.g. `gpt-5.5`. Review-only in practice. |
+| `AGENT_CODEX_MODELS` | unset | Comma-separated models to dispatch through `codex exec` instead of `claude -p`, e.g. `gpt-6.1-sol` or `gpt-5.5` (for backwards compatibility). Review-only in practice. |
 | `AGENT_CODEX_FLAGS` | unset | Extra flags for `codex exec`, on top of the hardcoded `-c model_reasoning_effort=high`. |
 
 Project selection is evaluated after sourcing `$ODONIAN_HOME/env`. The example file supplies
