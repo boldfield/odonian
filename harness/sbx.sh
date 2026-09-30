@@ -484,6 +484,9 @@ export ODONIAN_URL ODONIAN_TOKEN ODONIAN_WORKTREE_HOME
 export ODONIAN_REPO="$FLEET_REPO"
 export ODONIAN_PROJECT="$PROJECT_ID"
 export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
+# NOTE: with REUSE_SERVER=1 (§2) this is what THIS invocation would start the server with, not
+# necessarily the allowlist the already-running reused server was actually started with — the
+# §7 verifier check below only proves the two agree when this script itself started the server.
 export ODONIAN_MODELS="haiku,sonnet,opus,fable,gpt-5.5,gpt-6.1-sol"
 export AGENT_CLAUDE_FLAGS="--allow-dangerously-skip-permissions"
 export AGENT_CODEX_MODELS="gpt-5.5,gpt-6.1-sol"
