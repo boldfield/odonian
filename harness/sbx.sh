@@ -214,8 +214,9 @@ command -v odonian >/dev/null 2>&1 || die "odonian not on PATH after build"
 say "odonian: $(command -v odonian)"
 
 # --- preflight: the agent CLIs the fleet will actually dispatch ---
-# BOTH are required: the server allowlists gpt-5.5 and AGENT_CODEX_MODELS routes it through
-# `codex exec`, so a board using the standard two-reviewer pair dispatches claude AND codex. A
+# BOTH are required: the server allowlists gpt-6.1-sol (and legacy gpt-5.5) and AGENT_CODEX_MODELS
+# routes them through `codex exec`, so a board using the standard two-reviewer pair dispatches
+# claude AND codex. A
 # missing CLI otherwise surfaces only as `dispatch exited rc=127` buried in workers.log, behind
 # agent.sh's 30s→300s backoff — which reads as a mysteriously stalled board rather than a setup
 # error. Fail here, while the operator is still looking at the terminal.
@@ -267,10 +268,11 @@ if command -v codex >/dev/null 2>&1; then
   say "codex: $(command -v codex)"
 elif [ "$SEED_DEMO" -eq 1 ]; then
   # The seeded demo task is reviewed by opus only, so the demo runs without codex. Any task you add
-  # with a gpt-5.5 reviewer would still fail to dispatch, so say so once, loudly, and carry on.
-  say "WARNING: codex CLI not on PATH — fine for the seeded demo (its reviewer is opus), but a gpt-5.5 review task would fail to dispatch"
+  # with a gpt-6.1-sol (or legacy gpt-5.5) reviewer would still fail to dispatch, so say so once,
+  # loudly, and carry on.
+  say "WARNING: codex CLI not on PATH — fine for the seeded demo (its reviewer is opus), but a gpt-6.1-sol/gpt-5.5 review task would fail to dispatch"
 else
-  die "codex CLI not on PATH — gpt-5.5 is allowlisted and routed via AGENT_CODEX_MODELS, so its review dispatches would fail"
+  die "codex CLI not on PATH — gpt-6.1-sol (and legacy gpt-5.5) are allowlisted and routed via AGENT_CODEX_MODELS, so their review dispatches would fail"
 fi
 
 # ============================== 2. handle a stale / bound port ==============================

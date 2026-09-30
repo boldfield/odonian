@@ -19,7 +19,7 @@ script creates for the purpose.
 | Go 1.25.6 or newer inside the sandbox | The script builds the `odonian` binary for the container's own architecture. |
 | `claude` (Claude Code CLI), **logged in** | Workers and reviewers are `claude -p` dispatches. Either the sandbox's own `claude` login or a `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. |
 | `git`, `jq`, `curl`, `bash` 3.2+ | Used by the harness. `gh` is only needed for pull-request mode, which the demo does not use. |
-| `codex` (OpenAI Codex CLI) | **Optional for the seeded demo**, whose reviewer is `opus`. `sbx.sh --seed-demo` warns and continues without it. Tasks with a `gpt-5.5` reviewer need Codex installed and authenticated separately. |
+| `codex` (OpenAI Codex CLI) | **Optional for the seeded demo**, whose reviewer is `opus`. `sbx.sh --seed-demo` warns and continues without it. Tasks with a `gpt-6.1-sol` (or legacy `gpt-5.5`) reviewer need Codex installed and authenticated separately. |
 
 **Usage and cost.** The run makes real model calls on your Claude account: one boot-time
 authentication probe (capped at $0.02 with `--max-budget-usd`), then `haiku` implementation
