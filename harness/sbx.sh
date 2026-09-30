@@ -454,6 +454,10 @@ export ODONIAN_WORKTREE_HOME="$WORKTREE_HOME"
 export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
 # Nested claude -p inside a sandbox needs this alongside --dangerously-skip-permissions:
 export AGENT_CLAUDE_FLAGS="--allow-dangerously-skip-permissions"
+# Pin Claude alias resolution for sandbox workers/reviewers:
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4-5-20251001}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-5-5}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-5-5}"
 # agent.sh routes any dispatch whose model is in this comma-separated list through codex exec
 # instead of claude -p — these aren't claude models, so without this their review dispatches would
 # fail as "claude -p --model <model>".
@@ -480,7 +484,14 @@ export ODONIAN_PROJECT="$PROJECT_ID"
 export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
 export AGENT_CLAUDE_FLAGS="--allow-dangerously-skip-permissions"
 export AGENT_CODEX_MODELS="gpt-5.5,gpt-6.1-sol"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4-5-20251001}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-5-5}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-5-5}"
 [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && export CLAUDE_CODE_OAUTH_TOKEN
+
+# ============================== 7. verify model configuration ==============================
+say "verifying model configuration…"
+bash "$HARNESS_DIR/verify-model-config.sh" || die "model configuration verification failed"
 
 # ============================== 8. start the fleet ==============================
 # `set -m` (job control) makes each backgrounded fleet its OWN process-group leader, so $! == its

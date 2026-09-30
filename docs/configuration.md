@@ -180,7 +180,7 @@ overridden per invocation.
 | `ODONIAN_REPOS_HIGH_GIB`, `ODONIAN_REPOS_LOW_GIB` | `14`, `8` | Disk watermarks for the on-demand clone cache in `all` mode: when usage crosses the high mark, clones are evicted until it is under the low mark. |
 | `AGENT_SLOT` | wrapper default | Slot name (`worker-1`, `reviewer-2`, …). Each slot gets a persistent agent id and its own worktree. |
 | `AGENT_CLAUDE_FLAGS` | empty | Extra flags appended to every `claude -p` dispatch. `sbx.sh` uses it to pass the flag a nested `claude` needs inside a sandbox. |
-| `AGENT_CODEX_MODELS` | unset | Comma-separated models to dispatch through `codex exec` instead of `claude -p`, e.g. `gpt-5.5`. Review-only in practice. |
+| `AGENT_CODEX_MODELS` | unset | Comma-separated models to dispatch through `codex exec` instead of `claude -p`, e.g. `gpt-6.1-sol` or `gpt-5.5` (for backwards compatibility). Review-only in practice. |
 | `AGENT_CODEX_FLAGS` | unset | Extra flags for `codex exec`, on top of the hardcoded `-c model_reasoning_effort=high`. |
 
 Project selection is evaluated after sourcing `$ODONIAN_HOME/env`. The example file supplies
