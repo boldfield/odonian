@@ -3,6 +3,13 @@
 # allowlist and AGENT_CODEX_MODELS dispatch agree with the requested model defaults.
 set -uo pipefail
 
+# --- resolve our REAL directory, even when invoked via a symlink (matches harness/sbx.sh) ---
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _d="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"; [[ $_src != /* ]] && _src="$_d/$_src"
+done
+HARNESS_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+
 say() { echo "[verify] $*"; }
 die() { echo "[verify] ERROR: $*" >&2; exit 1; }
 
@@ -70,16 +77,20 @@ verify_codex_dispatch() {
 verify_reviewer_and_allowlist() {
   say "Reviewer pair and allowlist verification:"
 
-  # Check generated instructions file contains the correct reviewer pair
-  local instructions_file="${CLAUDE_HOME:-$HOME/.claude}/CLAUDE.md"
-  if [ -f "$instructions_file" ]; then
-    if grep -q '\["opus", "gpt-6.1-sol"\]' "$instructions_file"; then
-      say "  ✓ Generated instructions use correct reviewer pair [\"opus\", \"gpt-6.1-sol\"]"
-    else
-      die "Generated instructions do not use reviewer pair [\"opus\", \"gpt-6.1-sol\"]"
-    fi
+  # Check the reviewer pair at its SOURCE — harness/sbx-agent-setup.sh, which generates the
+  # board instructions — rather than the instructions file it writes. That file only exists once an
+  # operator has run sbx-agent-setup.sh, which docs/demo.md documents as OPTIONAL (an operator with
+  # claude already installed and authenticated can go straight to `sbx.sh --seed-demo`); requiring
+  # it here would make sbx.sh startup depend on an optional step that may never have run.
+  # sbx-agent-setup.sh builds the pair with a double-quoted `echo "...\"opus\", \"gpt-6.1-sol\"..."`,
+  # so the literal bytes on disk are `opus\", \"gpt-6.1-sol` — match that exact source form (-F: no
+  # regex, so the `.` in gpt-6.1-sol can't accidentally wildcard-match).
+  local setup_script="$HARNESS_DIR/sbx-agent-setup.sh"
+  [ -f "$setup_script" ] || die "sbx-agent-setup.sh not found: $setup_script"
+  if grep -qF 'opus\", \"gpt-6.1-sol' "$setup_script"; then
+    say "  ✓ sbx-agent-setup.sh generates reviewer pair [\"opus\", \"gpt-6.1-sol\"]"
   else
-    die "Generated instructions file not found: $instructions_file"
+    die "sbx-agent-setup.sh does not generate reviewer pair [\"opus\", \"gpt-6.1-sol\"]"
   fi
 
   # Check server allowlist contains gpt-6.1-sol (exact comma-list matching)
