@@ -482,6 +482,7 @@ export ODONIAN_URL ODONIAN_TOKEN ODONIAN_WORKTREE_HOME
 export ODONIAN_REPO="$FLEET_REPO"
 export ODONIAN_PROJECT="$PROJECT_ID"
 export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
+export ODONIAN_MODELS="haiku,sonnet,opus,fable,gpt-5.5,gpt-6.1-sol"
 export AGENT_CLAUDE_FLAGS="--allow-dangerously-skip-permissions"
 export AGENT_CODEX_MODELS="gpt-5.5,gpt-6.1-sol"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4-5-20251001}"
@@ -495,7 +496,7 @@ bash "$HARNESS_DIR/verify-model-config.sh" || die "model configuration verificat
 
 # ============================== 8. start the fleet ==============================
 # `set -m` (job control) makes each backgrounded fleet its OWN process-group leader, so $! == its
-# pgid and stop_all can kill the whole group (fleet + agents + nested claude) — see §7. Each fleet's
+# pgid and stop_all can kill the whole group (fleet + agents + nested claude). Each fleet's
 # combined output goes to a per-kind log file; every line is already prefixed with the agent's slot
 # id by agent.sh (e.g. "[worker-1-…] …"), so one file per kind tells you which agent did what. Follow
 # them live with: tail -f "$LOG_DIR"/workers.log "$LOG_DIR"/reviewers.log

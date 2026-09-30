@@ -46,18 +46,20 @@ verify_env_file() {
   say "  ✓ env file and environment consistent"
 }
 
-# Check Codex dispatch routing
+# Check Codex dispatch routing with exact comma-list matching
 verify_codex_dispatch() {
   local codex_models="${AGENT_CODEX_MODELS:-}"
   say "Codex dispatch routing verification:"
 
-  if echo "$codex_models" | grep -q 'gpt-6.1-sol'; then
+  # Exact match: gpt-6.1-sol must be in the comma-separated list (with anchors and lookahead)
+  if echo ",$codex_models," | grep -q ',gpt-6\.1-sol,'; then
     say "  ✓ gpt-6.1-sol routed through codex"
   else
     die "gpt-6.1-sol not in AGENT_CODEX_MODELS: $codex_models"
   fi
 
-  if echo "$codex_models" | grep -q 'gpt-5.5'; then
+  # Exact match: gpt-5.5 must be in the comma-separated list
+  if echo ",$codex_models," | grep -q ',gpt-5\.5,'; then
     say "  ✓ gpt-5.5 retained for backwards compatibility"
   else
     die "gpt-5.5 not in AGENT_CODEX_MODELS (backwards compatibility): $codex_models"
@@ -68,28 +70,28 @@ verify_codex_dispatch() {
 verify_reviewer_and_allowlist() {
   say "Reviewer pair and allowlist verification:"
 
-  # Check sbx-agent-setup.sh uses the correct reviewer pair
-  local sbx_setup="${HARNESS_DIR:-$(dirname "${BASH_SOURCE[0]}")}/sbx-agent-setup.sh"
-  if [ -f "$sbx_setup" ]; then
-    if grep -q '\["opus", "gpt-6.1-sol"\]' "$sbx_setup"; then
-      say "  ✓ sbx-agent-setup.sh uses correct reviewer pair [\"opus\", \"gpt-6.1-sol\"]"
+  # Check generated instructions file contains the correct reviewer pair
+  local instructions_file="${CLAUDE_HOME:-$HOME/.claude}/CLAUDE.md"
+  if [ -f "$instructions_file" ]; then
+    if grep -q '\["opus", "gpt-6.1-sol"\]' "$instructions_file"; then
+      say "  ✓ Generated instructions use correct reviewer pair [\"opus\", \"gpt-6.1-sol\"]"
     else
-      die "sbx-agent-setup.sh does not use reviewer pair [\"opus\", \"gpt-6.1-sol\"]"
+      die "Generated instructions do not use reviewer pair [\"opus\", \"gpt-6.1-sol\"]"
     fi
   else
-    say "  ⚠ sbx-agent-setup.sh not found; skipping reviewer pair check"
+    die "Generated instructions file not found: $instructions_file"
   fi
 
-  # Check server allowlist contains gpt-6.1-sol
+  # Check server allowlist contains gpt-6.1-sol (exact comma-list matching)
   local server_models="${ODONIAN_MODELS:-}"
   if [ -n "$server_models" ]; then
-    if echo "$server_models" | grep -q 'gpt-6.1-sol'; then
+    if echo ",$server_models," | grep -q ',gpt-6\.1-sol,'; then
       say "  ✓ ODONIAN_MODELS includes gpt-6.1-sol"
     else
       die "ODONIAN_MODELS does not include gpt-6.1-sol: $server_models"
     fi
   else
-    say "  ⚠ ODONIAN_MODELS not set; skipping allowlist check"
+    die "ODONIAN_MODELS not set; cannot verify allowlist"
   fi
 }
 
