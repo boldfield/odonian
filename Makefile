@@ -95,7 +95,7 @@ verify-fleet-tags fleet-deploy diff-fleet merger-deploy:
 	@echo "Build/push images here, then update image pins there and merge the reviewed PR."
 	@exit 1
 
-# --- codex (gpt-5.5) reviewer auth ---
+# --- codex (gpt-5.5, gpt-6.1-sol) reviewer auth ---
 #
 # codex runs under `auth_mode: chatgpt`, which uses refresh-token ROTATION: every refresh
 # mints a new refresh token and REVOKES the previous one. The cluster secret is therefore a
@@ -159,7 +159,7 @@ sbx-codex-auth:
 	@sbx exec $(SBX_NAME) -- sudo install -o agent -g agent -m 600 \
 	  /tmp/odonian-codex-auth.json.incoming /home/agent/.codex/auth.json
 	@sbx exec $(SBX_NAME) -- sudo rm -f /tmp/odonian-codex-auth.json.incoming
-	@echo "Verifying: running 'codex exec -m gpt-5.5' inside sandbox '$(SBX_NAME)'..."
+	@echo "Verifying: running 'codex exec -m gpt-6.1-sol' inside sandbox '$(SBX_NAME)'..."
 	@# `sbx exec` runs argv directly through the container runtime (like `docker exec`) — there is
 	@# no shell to interpret builtins, so `command -v codex` would try to exec a literal `command`
 	@# binary and always fail. Invoke the codex binary itself with a harmless flag instead.
@@ -177,8 +177,8 @@ sbx-codex-auth:
 	@#    additional input from stdin..." and never runs the prompt. Closing stdin makes the prompt
 	@#    argument the whole input.
 	@# Without both, this verification failed even though the auth copy above had fully succeeded.
-	@if sbx exec $(SBX_NAME) -- codex exec --skip-git-repo-check -m gpt-5.5 "reply with the single word: ok" </dev/null >/tmp/sbx-codex-auth-verify.out 2>&1; then \
-	  echo "OK: codex authenticated in sandbox '$(SBX_NAME)' (gpt-5.5 invocation succeeded)"; \
+	@if sbx exec $(SBX_NAME) -- codex exec --skip-git-repo-check -m gpt-6.1-sol "reply with the single word: ok" </dev/null >/tmp/sbx-codex-auth-verify.out 2>&1; then \
+	  echo "OK: codex authenticated in sandbox '$(SBX_NAME)' (gpt-6.1-sol invocation succeeded)"; \
 	  rm -f /tmp/sbx-codex-auth-verify.out; \
 	else \
 	  echo "ERROR: codex auth was seeded but the verification invocation failed in sandbox '$(SBX_NAME)':"; \

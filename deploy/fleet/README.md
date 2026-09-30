@@ -84,9 +84,9 @@ kubectl --context admin@summercamp-cp -n odonian-fleet \
 The `odonian-fleet` (server API token) and `odonian-forge-tokens` secrets from the merger setup are
 reused — create them in this namespace on the cp cluster too if they aren't there yet.
 
-### 2b. codex auth for gpt-5.5 reviewers — READ THIS, IT EXPIRES
+### 2b. codex auth for gpt-6.1-sol reviewers (and gpt-5.5) — READ THIS, IT EXPIRES
 
-Reviewers that run `gpt-5.5` (via `AGENT_CODEX_MODELS`) authenticate codex with the `codex-auth`
+Reviewers that run `gpt-6.1-sol` or `gpt-5.5` (via `AGENT_CODEX_MODELS`) authenticate codex with the `codex-auth`
 secret, seeded from `~/.codex/auth.json` (see `secret.example.yaml`). Unlike the claude
 `setup-token`, **this one decays and will take your review queue down.**
 

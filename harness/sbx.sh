@@ -289,14 +289,15 @@ fi
 # ============================== 3. start the server ==============================
 if [ "$REUSE_SERVER" -eq 0 ]; then
   say "starting odonian server on :$PORT (db: $DB_PATH)…"
-  # gpt-5.5 is allowlisted (review_models: ["opus","gpt-5.5"] validates) but deliberately left OUT
-  # of ODONIAN_ESCALATION_LADDER: it's a review-only model routed through codex exec (see
-  # AGENT_CODEX_MODELS below), not an implementer, so it must never become an escalation target for
-  # implement work. Thresholds/ladder mirror production (manifests repo) as of 2026-08-10.
+  # gpt-5.5 and gpt-6.1-sol are allowlisted (review_models validates) but deliberately left OUT
+  # of ODONIAN_ESCALATION_LADDER: they're review-only models routed through codex exec (see
+  # AGENT_CODEX_MODELS below), not implementers, so they must never become escalation targets for
+  # implement work. Retain gpt-5.5 for backwards compatibility with existing pinned tasks.
+  # Thresholds/ladder mirror production (manifests repo) as of 2026-08-10.
   ODONIAN_DB="$DB_PATH" \
   ODONIAN_ADDR=":$PORT" \
   ODONIAN_TOKEN="$LOCAL_TOKEN" \
-  ODONIAN_MODELS="haiku,sonnet,opus,fable,gpt-5.5" \
+  ODONIAN_MODELS="haiku,sonnet,opus,fable,gpt-5.5,gpt-6.1-sol" \
   ODONIAN_ESCALATION_THRESHOLDS="haiku=3,sonnet=2,opus=2,fable=1" \
   ODONIAN_ESCALATION_LADDER="haiku,sonnet,opus,fable" \
     odonian server >>"$SERVER_LOG" 2>&1 &
@@ -454,9 +455,9 @@ export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
 # Nested claude -p inside a sandbox needs this alongside --dangerously-skip-permissions:
 export AGENT_CLAUDE_FLAGS="--allow-dangerously-skip-permissions"
 # agent.sh routes any dispatch whose model is in this comma-separated list through codex exec
-# instead of claude -p — gpt-5.5 isn't a claude model, so without this its review dispatch would
-# fail as "claude -p --model gpt-5.5".
-export AGENT_CODEX_MODELS="gpt-5.5"
+# instead of claude -p — these aren't claude models, so without this their review dispatches would
+# fail as "claude -p --model <model>".
+export AGENT_CODEX_MODELS="gpt-5.5,gpt-6.1-sol"
 EOF
 
 # Forward CLAUDE_CODE_OAUTH_TOKEN into the env file too, but only when the operator actually
@@ -478,7 +479,7 @@ export ODONIAN_REPO="$FLEET_REPO"
 export ODONIAN_PROJECT="$PROJECT_ID"
 export ODONIAN_DELIVERY_MODE="$DELIVERY_MODE"
 export AGENT_CLAUDE_FLAGS="--allow-dangerously-skip-permissions"
-export AGENT_CODEX_MODELS="gpt-5.5"
+export AGENT_CODEX_MODELS="gpt-5.5,gpt-6.1-sol"
 [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && export CLAUDE_CODE_OAUTH_TOKEN
 
 # ============================== 8. start the fleet ==============================
