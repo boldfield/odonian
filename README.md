@@ -293,8 +293,8 @@ Run one wrapper per terminal. Set the URL to an address reachable from the fleet
 [running guide](./docs/running.md#the-fleet-in-your-development-environment) covers persistent
 configuration and the separate server token file needed by PR-watch.
 
-For a self-contained throwaway demo inside an `sbx` sandbox, `bash harness/sbx.sh --seed-demo`
-boots the server and a small fleet with all state under `/tmp/odonian`, posts one example task,
+For a self-contained throwaway demo inside an `sbx` sandbox, `bash harness/sbx.sh` (the demo is
+the default in `local_commit` mode; `--seed-demo` makes it explicit) boots the server and a small fleet with all state under `/tmp/odonian`, posts one example task,
 and leaves it waiting for your approval once a worker and a reviewer have handled it. The
 walkthrough, with prerequisites, expected output, the approval step, and cleanup, is
 [`docs/demo.md`](./docs/demo.md). The full build, server, TUI, fleet, sandbox, and deployment

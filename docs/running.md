@@ -155,7 +155,9 @@ before running these commands.
 bash harness/sbx.sh --project <uuid> --repo <path-to-local-git-repo>
 
 # A fully self-contained throwaway demo: creates its own repo, project, and board, and posts one
-# example task (harness/seed-demo.sh). Walkthrough: docs/demo.md
+# example task (harness/seed-demo.sh). In local_commit mode (the default) this is also what you get
+# when you pass neither --project nor --repo, so a bare `bash harness/sbx.sh` does the same.
+# Walkthrough: docs/demo.md
 bash harness/sbx.sh --seed-demo
 
 # Drain every board over GitHub (needs forge tokens)
@@ -171,6 +173,32 @@ Options: `--workers N` and `--reviewers N` (default 2 each), `--port P` (8080),
 pin reviewers to one tier (default: dynamic, the task's own model), `--worktree-home <path>`.
 `CLAUDE_CODE_OAUTH_TOKEN` in the environment is forwarded to the fleet; otherwise the sandbox's own
 `claude` login is used.
+
+`--project` takes a UUID, a project name, or `all`. A name is resolved to its UUID through the
+server, and the boot fails if the name is unknown or ambiguous. The board only understands UUIDs, so
+a fleet started with a raw name would log "nothing claimable" forever.
+
+If `codex` is missing, `sbx.sh` installs it with `npm install -g @openai/codex` (falling back to
+`sudo -n`, which never prompts: without passwordless sudo the install fails rather than stalling the
+boot). It uses npm rather than a GitHub release download because sandbox egress policies commonly
+allow `registry.npmjs.org` but deny `github.com`. Installing is not authenticating: `codex login` is
+an interactive browser flow, so `sbx.sh` only warns when codex is unauthenticated. Seed credentials
+from the host with `make sbx-codex-auth SBX_NAME=<sandbox>`.
+
+Before starting the fleet, `sbx.sh` also runs `harness/sbx-agent-setup.sh`, which links the repo's
+skills into `~/.claude/skills` and writes the board instructions into `~/.claude/CLAUDE.md`. For a
+single-project `local_commit` fleet (including the demo) it also puts `ODONIAN_URL`, `ODONIAN_TOKEN`,
+`ODONIAN_PROJECT` and related variables into the `env` block of `~/.claude/settings.json`, so an
+interactive `claude` started in the sandbox already knows the board; restart any session that was
+open beforehand. It does not do that for a `pull_request` or multi-project fleet: that file is also
+read by the fleet's own `claude -p`, whose agents set `ODONIAN_PROJECT`/`ODONIAN_REPO` per task, and a
+fixed value there would override them, so `sbx.sh` instead clears any left over from an earlier boot.
+A missing codex does not stop this step, and a failure to install skills, instructions or CLIs only
+warns (`/tmp/odonian/logs/agent-setup.log`). The board variables are the exception: `sbx.sh` then
+checks that `settings.json` holds exactly this boot's (or, when clearing, none), and refuses to start
+the fleet if it does not, since stale values would override the agents' own. Run on its own (no flags), the script
+never writes `ODONIAN_*` variables into `settings.json`, so a host shell's real token cannot end up
+there.
 
 A nested `claude -p` inside a sandbox needs `--allow-dangerously-skip-permissions` alongside
 `--dangerously-skip-permissions`; `sbx.sh` passes it through `AGENT_CLAUDE_FLAGS`, which

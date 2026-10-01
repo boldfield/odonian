@@ -16,6 +16,18 @@
 #
 # Usage:
 #   bash harness/sbx-agent-setup.sh [--port P]   # P defaults to harness/sbx.sh's own default (8080)
+#   sbx.sh also passes:
+#     --board-env        write the ODONIAN_* board vars from ITS environment into settings.json `env`
+#                        (only for a single-project local_commit fleet; see section 6). Never inferred
+#                        from the ambient environment: a host shell's exported ODONIAN_TOKEN must not end
+#                        up persisted in ~/.claude/settings.json.
+#     --clear-board-env  remove those ODONIAN_* vars from settings.json `env` (a later boot of a fleet
+#                        whose agents set them per task, which a fixed value there would override).
+#     --codex-optional   warn instead of failing when codex cannot be installed (sbx.sh has already
+#                        decided the board can run without it, e.g. the opus-reviewed demo).
+#     --check-board-env  with --board-env or --clear-board-env: change nothing, just exit 0 if
+#                        settings.json `env` already holds exactly the requested board vars (or none),
+#                        else 1. sbx.sh runs it before starting the fleet, whose claude -p reads that file.
 set -uo pipefail
 
 # --- resolve our REAL directory, even when invoked via a symlink (matches harness/sbx.sh) ---
@@ -28,11 +40,16 @@ REPO_ROOT="$(cd -P "$HARNESS_DIR/.." && pwd)"
 
 # --- args ---
 PORT=8080
+BOARD_ENV=0 CLEAR_BOARD_ENV=0 CODEX_OPTIONAL=0 CHECK_BOARD_ENV=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="${2:?}"; shift 2 ;;
+    --board-env) BOARD_ENV=1; shift ;;
+    --clear-board-env) CLEAR_BOARD_ENV=1; shift ;;
+    --codex-optional) CODEX_OPTIONAL=1; shift ;;
+    --check-board-env) CHECK_BOARD_ENV=1; shift ;;
     -h|--help)
-      sed -n '2,18p' "$_src"; exit 0 ;;
+      sed -n '2,31p' "$_src"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -53,6 +70,38 @@ SKILLS_DST="$CLAUDE_HOME/skills"
 INSTRUCTIONS_FILE="$CLAUDE_HOME/CLAUDE.md"       # global user memory: applies no matter what dir an
                                                   # interactive claude session is started from.
 SETTINGS_FILE="$CLAUDE_HOME/settings.json"       # same reasoning: user-level, not project-level.
+# The board vars this script manages in settings.json `env` (see section 6). harness/sbx.sh relies on
+# --check-board-env (below) rather than its own copy of this list.
+BOARD_ENV_KEYS='["ODONIAN_URL","ODONIAN_TOKEN","ODONIAN_PROJECT","ODONIAN_HOME","ODONIAN_DELIVERY_MODE","ODONIAN_REPO","ODONIAN_WORKTREE_HOME"]'
+
+# board_env_matches set|clear: does settings.json `env` hold exactly the board vars requested — for
+# `set`, those (non-empty) ODONIAN_* vars in this process's environment; for `clear`, none of them?
+# Other keys in `env` are not considered. A missing settings.json holds none; an unreadable one fails.
+board_env_matches() {
+  local current expected='{}'
+  command -v jq >/dev/null 2>&1 || return 1
+  if [ -f "$SETTINGS_FILE" ]; then
+    current="$(jq -cS --argjson keys "$BOARD_ENV_KEYS" '(.env // {}) | with_entries(select(.key as $k | $keys | index($k)))' "$SETTINGS_FILE" 2>/dev/null)" || return 1
+  else
+    current='{}'
+  fi
+  if [ "$1" = "set" ]; then
+    expected="$(jq -cnS --argjson keys "$BOARD_ENV_KEYS" 'env | with_entries(select((.key as $k | $keys | index($k)) and (.value != "")))')" || return 1
+  fi
+  if [ "$current" != "$expected" ]; then
+    echo "board vars in $SETTINGS_FILE: $current; expected: $expected" >&2
+    return 1
+  fi
+}
+
+if [ "$CHECK_BOARD_ENV" -eq 1 ]; then
+  if [ "$BOARD_ENV" -eq 1 ]; then board_env_matches set
+  elif [ "$CLEAR_BOARD_ENV" -eq 1 ]; then board_env_matches clear
+  else die "--check-board-env needs --board-env or --clear-board-env"
+  fi
+  exit $?
+fi
+
 INSTALL_LOG="$(mktemp -t sbx-agent-setup-install.XXXXXX)"
 trap 'rm -f "$INSTALL_LOG"' EXIT
 
@@ -68,7 +117,9 @@ else
   command -v npm  >/dev/null 2>&1 || die "npm not on PATH — cannot install the claude CLI"
   command -v sudo >/dev/null 2>&1 || die "sudo not on PATH — cannot write into the root-owned npm global prefix"
   say "claude: not found — installing (sudo npm install -g @anthropic-ai/claude-code)…"
-  sudo npm install -g @anthropic-ai/claude-code >>"$INSTALL_LOG" 2>&1 \
+  # -n: never prompt. Passwordless sudo is expected; without it, fail into the error below rather
+  # than stall an unattended boot at a password prompt.
+  sudo -n npm install -g @anthropic-ai/claude-code >>"$INSTALL_LOG" 2>&1 \
     || die "npm install of @anthropic-ai/claude-code failed (see $INSTALL_LOG): $(tail -20 "$INSTALL_LOG")"
 fi
 # Verify: presence on PATH AND a working version call. `npm install` exiting zero is not evidence
@@ -78,18 +129,33 @@ CLAUDE_VERSION="$(claude --version 2>&1)" || die "claude is on PATH but 'claude 
 say "claude: $(command -v claude)  ($CLAUDE_VERSION)"
 
 # ============================== 2. codex CLI: install + verify ==============================
+# With --codex-optional (sbx.sh, which has already decided the board can run without codex), a
+# missing or broken codex only warns, so the skills, instructions and settings below still get written.
+codex_unavailable() {
+  if [ "$CODEX_OPTIONAL" -eq 1 ]; then warn "$*; continuing without codex (--codex-optional)"; return 0; fi
+  die "$*"
+}
+CODEX_OK=1
 if command -v codex >/dev/null 2>&1; then
   say "codex: already present at $(command -v codex) — leaving install + credentials untouched"
+elif ! command -v npm >/dev/null 2>&1; then
+  codex_unavailable "npm not on PATH — cannot install the codex CLI"; CODEX_OK=0
+elif ! command -v sudo >/dev/null 2>&1; then
+  codex_unavailable "sudo not on PATH — cannot write into the root-owned npm global prefix"; CODEX_OK=0
 else
-  command -v npm  >/dev/null 2>&1 || die "npm not on PATH — cannot install the codex CLI"
-  command -v sudo >/dev/null 2>&1 || die "sudo not on PATH — cannot write into the root-owned npm global prefix"
   say "codex: not found — installing (sudo npm install -g @openai/codex)…"
-  sudo npm install -g @openai/codex >>"$INSTALL_LOG" 2>&1 \
-    || die "npm install of @openai/codex failed (see $INSTALL_LOG): $(tail -20 "$INSTALL_LOG")"
+  sudo -n npm install -g @openai/codex >>"$INSTALL_LOG" 2>&1 \
+    || { codex_unavailable "npm install of @openai/codex failed (see $INSTALL_LOG): $(tail -20 "$INSTALL_LOG")"; CODEX_OK=0; }
 fi
-command -v codex >/dev/null 2>&1 || die "codex still not on PATH after install"
-CODEX_VERSION="$(codex --version 2>&1)" || die "codex is on PATH but 'codex --version' failed: $CODEX_VERSION"
-say "codex: $(command -v codex)  ($CODEX_VERSION)"
+if [ "$CODEX_OK" -eq 1 ]; then
+  if ! command -v codex >/dev/null 2>&1; then
+    codex_unavailable "codex still not on PATH after install"; CODEX_OK=0
+  elif ! CODEX_VERSION="$(codex --version 2>&1)"; then
+    codex_unavailable "codex is on PATH but 'codex --version' failed: $CODEX_VERSION"; CODEX_OK=0
+  else
+    say "codex: $(command -v codex)  ($CODEX_VERSION)"
+  fi
+fi
 
 # ============================== 3. report (never fail) auth state ==============================
 # Presence is verified above; whether either CLI is actually AUTHENTICATED is a separate concern
@@ -111,7 +177,9 @@ else
   say "        Fix with: interactive 'claude auth login', or export CLAUDE_CODE_OAUTH_TOKEN (a"
   say "        'claude setup-token' token) before running harness/sbx.sh."
 fi
-if codex login status >/dev/null 2>&1; then
+if [ "$CODEX_OK" -eq 0 ]; then
+  say "codex: not installed (see above)"
+elif codex login status >/dev/null 2>&1; then
   say "codex: authenticated"
 else
   say "codex: NOT authenticated — fix from the HOST with: make sbx-codex-auth SBX_NAME=<name>"
@@ -179,6 +247,15 @@ printf '%s\n' "$(cat "$INSTRUCTIONS_FILE")" > "$INSTRUCTIONS_FILE"
   echo "constant: it gives every task two INDEPENDENT reviewers — opus (dispatched via \`claude -p\`)"
   echo "and gpt-6.1-sol (dispatched via \`codex exec\`) — so no single model, or model family, grades its"
   echo "own or a sibling's work."
+  if [ "$BOARD_ENV" -eq 1 ] && [ -n "${ODONIAN_PROJECT:-}" ]; then
+    echo ""
+    echo "- Project (the board the fleet drains): ${ODONIAN_PROJECT}"
+    echo "- Delivery mode: ${ODONIAN_DELIVERY_MODE:-local_commit}${ODONIAN_REPO:+, repo ${ODONIAN_REPO}}"
+    echo "- The ODONIAN_URL/ODONIAN_TOKEN/ODONIAN_PROJECT env vars are already set for this session"
+    if ODONIAN_CLI="$(command -v odonian 2>/dev/null)"; then
+      echo "- The \`odonian\` CLI is at ${ODONIAN_CLI}; if \`odonian\` is not found on your PATH, call it by that absolute path"
+    fi
+  fi
   echo "$END_MARK"
 } >> "$INSTRUCTIONS_FILE"
 say "board instructions written -> $INSTRUCTIONS_FILE"
@@ -200,15 +277,40 @@ if [ -f "$SETTINGS_FILE" ]; then
 else
   EXISTING='{}'
 fi
-MERGED="$(jq '
+# Board config -> the claude session's environment. Claude Code's settings.json `env` block is applied
+# to every session AND to the Bash tool's subprocesses, so `odonian` just works without the operator
+# exporting anything. It is also applied to the fleet's own `claude -p` dispatches, which is why sbx.sh
+# asks for it (--board-env) only for a single-project local_commit fleet, whose agents use exactly
+# these values. Agents of a pull_request or multi-project fleet set ODONIAN_PROJECT/ODONIAN_REPO per
+# task (harness/agent.sh), and a fixed value here would override them, so for those sbx.sh passes
+# --clear-board-env to drop any left over from an earlier boot. Without either flag the env block is
+# left alone: ODONIAN_* vars are never copied from the ambient environment, where (e.g. on a host
+# shell) ODONIAN_TOKEN can be a real credential. CLAUDE_CODE_OAUTH_TOKEN is never copied here.
+if [ "$BOARD_ENV" -eq 1 ]; then ENV_ACTION="set"
+elif [ "$CLEAR_BOARD_ENV" -eq 1 ]; then ENV_ACTION="clear"
+else ENV_ACTION="keep"
+fi
+ODONIAN_CLI_ABS="$(command -v odonian 2>/dev/null || true)"
+MERGED="$(jq --arg cli "$ODONIAN_CLI_ABS" --arg action "$ENV_ACTION" --argjson keys "$BOARD_ENV_KEYS" '
   .permissions.allow = ((.permissions.allow // []) + [
     "Bash(curl:*)",
     "WebFetch(domain:localhost)",
     "Bash(odonian:*)",
     "Bash(git:*)"
-  ] | unique)
+  ] + (if $cli != "" then ["Bash(" + $cli + ":*)"] else [] end) | unique)
+  | if $action == "keep" then .
+    else .env = ((.env // {}) | with_entries(select(.key as $k | $keys | index($k) | not)))
+      + (if $action == "set"
+         then (env | with_entries(select((.key as $k | $keys | index($k)) and (.value != ""))))
+         else {} end)
+    end
+  | if .env == {} then del(.env) else . end
 ' <<<"$EXISTING")" || die "failed to merge $SETTINGS_FILE"
-printf '%s\n' "$MERGED" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+{ printf '%s\n' "$MERGED" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"; } \
+  || { rm -f "$SETTINGS_FILE.tmp"; die "failed to write $SETTINGS_FILE"; }
+if [ "$ENV_ACTION" != "keep" ]; then
+  board_env_matches "$ENV_ACTION" || die "$SETTINGS_FILE does not hold the requested board vars after writing it"
+fi
 say "settings merged -> $SETTINGS_FILE"
 
 say "done."
