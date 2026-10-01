@@ -8,11 +8,11 @@
 # Usage:
 #   bash harness/sbx.sh [start] --project <uuid> --repo <path> [common opts]  # local_commit (default)
 #   bash harness/sbx.sh [start] --project all --delivery-mode pull_request     # drain all boards (needs GitHub)
-#   bash harness/sbx.sh [start] --seed-demo [common opts]                      # throwaway self-contained demo
+#   bash harness/sbx.sh [start] [--seed-demo] [common opts]                    # throwaway self-contained demo (DEFAULT in local_commit mode with no --project/--repo)
 #   bash harness/sbx.sh stop   [--port P]    # stop the running stack cleanly (no Ctrl-C needed)
 #   bash harness/sbx.sh status [--port P]    # report server + fleet state
 #
-#   --project <uuid|all>   what the fleet drains (required unless --seed-demo). 'all' = pull_request multi.
+#   --project <uuid|name|all>  what the fleet drains (default: the demo). A name is resolved to its UUID.
 #   --repo <path>          local git repo the CLI commits into (required for local_commit / pull_request single).
 #   --seed-demo            create+use a throwaway local repo + project + board (no GitHub), with ONE example
 #                          task already posted (harness/seed-demo.sh) — the guided first run in docs/demo.md.
@@ -73,6 +73,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$DELIVERY_MODE" in pull_request|local_commit) ;; *) echo "delivery mode must be pull_request or local_commit" >&2; exit 1 ;; esac
+# No target given => boot the self-contained demo (throwaway repo + project + one READY task), so a
+# bare `bash harness/sbx.sh` does something useful. Naming a --project/--repo opts out of seeding. The
+# demo is a local_commit board, so this only applies in local_commit mode: a pull_request boot with no
+# target still fails with "no target" below instead of silently booting a demo it cannot serve.
+if [ "$SUBCMD" = "start" ] && [ "$DELIVERY_MODE" = "local_commit" ] && [ -z "$PROJECT_ARG" ] && [ -z "$REPO_ARG" ]; then SEED_DEMO=1; fi
 
 # --- fixed local config (never leaves the container) ---
 export ODONIAN_HOME=/tmp/odonian
@@ -206,7 +211,7 @@ fi
 # but `go build` is incremental — a no-op rebuild after the first boot is a fraction of a second, not
 # a full compile — so unconditional rebuild is no slower in the common case and has no validation
 # logic of its own to get wrong.
-say "building odonian binary -> $ODONIAN_BIN…"
+say "building odonian binary -> ${ODONIAN_BIN}…"
 VERSION="$(cd "$REPO_ROOT" && git describe --tags --always --dirty 2>/dev/null)"
 ( cd "$REPO_ROOT" && go build -ldflags "-X main.version=$VERSION" -o "$ODONIAN_BIN" ./cmd/odonian ) \
   >>"$LOG_DIR/build.log" 2>&1 || die "go build failed (see $LOG_DIR/build.log)"
@@ -264,15 +269,35 @@ else
   die "claude auth probe failed for a NON-auth reason — not a login problem, so re-authenticating will not help (claude -p said: $CLAUDE_AUTH_OUT). Check network/proxy egress to api.anthropic.com from inside the sandbox, then re-run."
 fi
 
-if command -v codex >/dev/null 2>&1; then
-  say "codex: $(command -v codex)"
+if ! command -v codex >/dev/null 2>&1; then
+  # Install from the npm registry, NOT a GitHub release download: the sandbox egress policy allows
+  # registry.npmjs.org but denies github.com, so the release-tarball / brew paths 403.
+  say "codex: not found — installing (npm install -g @openai/codex)…"
+  CODEX_INSTALL_LOG="$LOG_DIR/codex-install.log"
+  if command -v npm >/dev/null 2>&1; then
+    # The global npm prefix is root-owned in the sandbox image; fall back to sudo when it isn't writable.
+    # -n: never prompt. Without passwordless sudo this fails into the warn/die below rather than stalling
+    # the boot at a password prompt.
+    if ! npm install -g @openai/codex >"$CODEX_INSTALL_LOG" 2>&1; then
+      command -v sudo >/dev/null 2>&1 && sudo -n npm install -g @openai/codex >>"$CODEX_INSTALL_LOG" 2>&1
+    fi
+  else
+    echo "npm not on PATH" >"$CODEX_INSTALL_LOG"
+  fi
+fi
+if command -v codex >/dev/null 2>&1 && CODEX_VERSION="$(codex --version 2>&1)"; then
+  say "codex: $(command -v codex)  (${CODEX_VERSION})"
+  # Presence is not auth. codex login is an interactive browser flow and can't run headless here;
+  # seed credentials from the HOST with `make sbx-codex-auth`. Warn only: a claude-only board is fine.
+  codex login status >/dev/null 2>&1 \
+    || say "WARNING: codex is not authenticated — gpt-6.1-sol/gpt-5.5 dispatches will fail. From the HOST: make sbx-codex-auth SBX_NAME=<sandbox>"
 elif [ "$SEED_DEMO" -eq 1 ]; then
   # The seeded demo task is reviewed by opus only, so the demo runs without codex. Any task you add
   # with a gpt-6.1-sol (or legacy gpt-5.5) reviewer would still fail to dispatch, so say so once,
   # loudly, and carry on.
-  say "WARNING: codex CLI not on PATH — fine for the seeded demo (its reviewer is opus), but a gpt-6.1-sol/gpt-5.5 review task would fail to dispatch"
+  say "WARNING: codex install failed (see ${CODEX_INSTALL_LOG:-$LOG_DIR/codex-install.log}) — fine for the seeded demo (its reviewer is opus), but a gpt-6.1-sol/gpt-5.5 review task would fail to dispatch"
 else
-  die "codex CLI not on PATH — gpt-6.1-sol (and legacy gpt-5.5) are allowlisted and routed via AGENT_CODEX_MODELS, so their review dispatches would fail"
+  die "codex is not installed and the npm install failed — gpt-6.1-sol (and legacy gpt-5.5) are routed via AGENT_CODEX_MODELS, so their review dispatches would fail. See ${CODEX_INSTALL_LOG:-$LOG_DIR/codex-install.log}; a 403 there means the sandbox egress policy is blocking a host (check: sbx policy log)"
 fi
 
 # ============================== 2. handle a stale / bound port ==============================
@@ -428,6 +453,23 @@ else
   # Drain the caller's project. Soft-check it exists (the board may legitimately be empty for now).
   PROJECT_ID="$PROJECT_ARG"
   FLEET_REPO="$REPO_ARG"
+  # The board looks projects up by UUID only. A name handed to the fleet as ODONIAN_PROJECT is not an
+  # error anywhere — `odonian next` just answers "nothing claimable" forever — so resolve a name to its
+  # UUID here, where we can fail loudly, rather than letting the fleet idle silently.
+  case "$PROJECT_ID" in
+    all|ALL) ;;
+    *)
+      if ! printf '%s' "$PROJECT_ID" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+        PROJECTS_JSON="$(curl -fsS "${AUTH[@]}" "$ODONIAN_URL/projects" 2>/dev/null)" \
+          || die "--project '$PROJECT_ID' is not a UUID and the project list could not be fetched from $ODONIAN_URL to resolve it by name"
+        MATCHES="$(jq -r --arg n "$PROJECT_ID" '.[] | select(.name == $n) | .id' <<<"$PROJECTS_JSON" 2>/dev/null)"
+        case "$(printf '%s' "$MATCHES" | grep -c .)" in
+          1) say "resolved project name '$PROJECT_ID' -> $MATCHES"; PROJECT_ID="$MATCHES" ;;
+          0) die "--project '$PROJECT_ID' is not a UUID and no project has that name (known: $(jq -r '[.[].name] | join(", ")' <<<"$PROJECTS_JSON" 2>/dev/null))" ;;
+          *) die "--project '$PROJECT_ID' matches more than one project by name — pass the UUID: $(printf '%s' "$MATCHES" | tr '\n' ' ')" ;;
+        esac
+      fi ;;
+  esac
   case "$PROJECT_ID" in
     all|ALL) say "fleet target: ALL projects (pull_request multi-project)" ;;
     *)
@@ -498,6 +540,41 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus
 # ============================== 7. verify model configuration ==============================
 say "verifying model configuration…"
 bash "$HARNESS_DIR/verify-model-config.sh" || die "model configuration verification failed"
+
+# ============================== 7b. inject board config into the claude environment ==============================
+# Installs the repo's skills, writes the board instructions into ~/.claude/CLAUDE.md, and, for a
+# single-project local_commit fleet (including the demo), puts the ODONIAN_* vars into
+# ~/.claude/settings.json `env` so an interactive claude started in this sandbox already knows the
+# board. That file is also read by the fleet's own claude -p, so the vars are written only where the
+# fleet's agents use exactly these values; a pull_request or multi-project fleet's agents set
+# ODONIAN_PROJECT/ODONIAN_REPO per task, which a fixed value there would override, so for those any
+# left over from an earlier boot is cleared instead. Non-fatal: the fleet itself is configured through
+# $ODONIAN_HOME/env above. An already-open claude session must be restarted to pick this up.
+case "$DELIVERY_MODE:$PROJECT_ID" in
+  local_commit:all|local_commit:ALL|local_commit:) BOARD_ENV_FLAG=--clear-board-env BOARD_ENV_LABEL="" ;;
+  local_commit:*) BOARD_ENV_FLAG=--board-env BOARD_ENV_LABEL=", env" ;;
+  *) BOARD_ENV_FLAG=--clear-board-env BOARD_ENV_LABEL="" ;;
+esac
+say "configuring claude for this board (skills, instructions${BOARD_ENV_LABEL})…"
+run_agent_setup() {
+  ODONIAN_URL="$ODONIAN_URL" ODONIAN_TOKEN="$LOCAL_TOKEN" ODONIAN_PROJECT="$PROJECT_ID" \
+  ODONIAN_HOME="$ODONIAN_HOME" ODONIAN_DELIVERY_MODE="$DELIVERY_MODE" ODONIAN_REPO="$FLEET_REPO" \
+  ODONIAN_WORKTREE_HOME="$WORKTREE_HOME" \
+    bash "$HARNESS_DIR/sbx-agent-setup.sh" --port "$PORT" "$BOARD_ENV_FLAG" "$@" >>"$LOG_DIR/agent-setup.log" 2>&1
+}
+# --codex-optional: the codex policy for this boot was decided in section 1 (die if required).
+# Skills, instructions and CLI provisioning failing only costs an interactive claude its board
+# context, so it warns.
+run_agent_setup --codex-optional \
+  && say "claude configured (log: $LOG_DIR/agent-setup.log)" \
+  || say "WARNING: sbx-agent-setup.sh failed — an interactive claude may not see the board config (see $LOG_DIR/agent-setup.log)"
+# The board vars in settings.json are another matter: the fleet's own claude -p reads them, and stale
+# values (from an earlier boot of another project or delivery mode) would override its agents' own
+# ODONIAN_PROJECT/ODONIAN_REPO/ODONIAN_DELIVERY_MODE. Verify the file's actual state, whatever the
+# setup run above reported (it may have failed before reaching that step), and refuse to start the
+# fleet on a mismatch.
+run_agent_setup --check-board-env \
+  || die "${CLAUDE_HOME:-$HOME/.claude}/settings.json does not hold this boot's board settings (${BOARD_ENV_FLAG#--}), and the fleet's claude -p would read the stale ones; see $LOG_DIR/agent-setup.log, fix or remove its ODONIAN_* env entries, then re-run"
 
 # ============================== 8. start the fleet ==============================
 # `set -m` (job control) makes each backgrounded fleet its OWN process-group leader, so $! == its

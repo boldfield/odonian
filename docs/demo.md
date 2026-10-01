@@ -19,7 +19,7 @@ script creates for the purpose.
 | Go 1.25.6 or newer inside the sandbox | The script builds the `odonian` binary for the container's own architecture. |
 | `claude` (Claude Code CLI), **logged in** | Workers and reviewers are `claude -p` dispatches. Either the sandbox's own `claude` login or a `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. |
 | `git`, `jq`, `curl`, `bash` 3.2+ | Used by the harness. `gh` is only needed for pull-request mode, which the demo does not use. |
-| `codex` (OpenAI Codex CLI) | **Optional for the seeded demo**, whose reviewer is `opus`. `sbx.sh --seed-demo` warns and continues without it. Tasks with a `gpt-6.1-sol` (or legacy `gpt-5.5`) reviewer need Codex installed and authenticated separately. |
+| `codex` (OpenAI Codex CLI) | **Optional for the seeded demo**, whose reviewer is `opus`. `sbx.sh` tries to install it from npm if missing, and in demo mode warns and continues if that fails. It cannot authenticate it: tasks with a `gpt-6.1-sol` (or legacy `gpt-5.5`) reviewer need `make sbx-codex-auth` from the host. |
 
 **Usage and cost.** The run makes real model calls on your Claude account: one boot-time
 authentication probe (capped at $0.02 with `--max-budget-usd`), then `haiku` implementation
@@ -51,13 +51,14 @@ sbx exec -it --workdir "$PWD" odonian-demo bash
 directory: the sandbox's home is typically `/home/agent`, so `~/src/odonian` inside it is a
 different path. The `-it` flags keep the shell interactive.
 
-With `claude` installed and authenticated, continue directly to step 2. The seeded demo does
-not require the skills or settings installed by `sbx-agent-setup.sh`.
+With `claude` installed and authenticated, continue directly to step 2. `sbx.sh` runs
+`sbx-agent-setup.sh` for you (see step 2), so you do not need to run it by hand.
 
-For the broader agent setup, this **optional** script installs missing `claude` and `codex`
-CLIs and wires the repo's Claude Code skills. It requires `npm`, registry access, and passwordless
-`sudo` when a CLI needs installing, and it fails if either installation fails. Skip it for the
-demo when authenticated `claude` is already available:
+To provision the CLIs and skills ahead of time, without booting anything, you can still run the
+script on its own. It requires `npm`, registry access, and passwordless `sudo` when a CLI needs
+installing (it never prompts for a sudo password), and it fails if either installation fails. Run on
+its own it does not write the board's `ODONIAN_*` variables into `~/.claude/settings.json`; only
+`sbx.sh` asks it to:
 
 ```bash
 bash harness/sbx-agent-setup.sh
@@ -70,7 +71,7 @@ before the next step; `sbx.sh` forwards it to the fleet.
 ## 2. Boot the stack with the demo board
 
 ```bash
-bash harness/sbx.sh --seed-demo
+bash harness/sbx.sh --seed-demo   # --seed-demo is the default when no --project/--repo is given
 ```
 
 What the script does, in order, and what you should see:
@@ -88,7 +89,11 @@ What the script does, in order, and what you should see:
    *Append a greeting line to GREETINGS.md*, pinned to `haiku`, reviewed by `opus`,
    `agent_merge=false`, promoted to `ready`. This step is `harness/seed-demo.sh` and is
    idempotent.
-6. Starts 2 workers and 2 reviewers in `local_commit` delivery mode (the CLI makes the commits;
+6. Configures `claude` for the board by running `harness/sbx-agent-setup.sh`: the repo's skills,
+   the board instructions in `~/.claude/CLAUDE.md`, and the `ODONIAN_*` variables in
+   `~/.claude/settings.json`, so a `claude` you start in the sandbox can use `odonian` directly.
+   A failure here warns and does not stop the boot.
+7. Starts 2 workers and 2 reviewers in `local_commit` delivery mode (the CLI makes the commits;
    there is no push and no pull request).
 
 The boot ends with a banner like:
