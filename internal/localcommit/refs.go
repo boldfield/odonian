@@ -45,6 +45,16 @@ func Slugify(title string) string {
 	return s
 }
 
+// BranchSlug is the slug of a task's MR branch wi/<slug>. A task with an explicit branch
+// shares wi/<branch> with every other task naming it; otherwise the task gets its own branch
+// from its title.
+func BranchSlug(branch, title string) string {
+	if branch != "" {
+		return branch
+	}
+	return Slugify(title)
+}
+
 func BaseRef() string {
 	return "origin/main"
 }

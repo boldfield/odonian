@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -28,6 +29,9 @@ type Client interface {
 	HeartbeatTask(ctx context.Context, id, agentID string) error
 	SubmitTask(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput) error
 	HoldTask(ctx context.Context, id string) error
+	BeginLanding(ctx context.Context, id string, reviewRound int, commit, attempt string) error
+	CancelLanding(ctx context.Context, id, attempt string) error
+	CompleteLanding(ctx context.Context, id, attempt string, note *string) error
 	ReleaseTask(ctx context.Context, id string) error
 	ArchiveTask(ctx context.Context, id string) error
 	ArchiveProject(ctx context.Context, id string) error
@@ -53,6 +57,7 @@ type Task struct {
 	Kind           string  `json:"kind"`
 	Model          string  `json:"model"`
 	Track          string  `json:"track"`
+	Branch         string  `json:"branch"`
 	Assignee       *string `json:"assignee"`
 	LeaseExpiresAt *string `json:"lease_expires_at"`
 	Result         *string `json:"result"`
@@ -62,33 +67,41 @@ type Task struct {
 }
 
 type TaskDetail struct {
-	ID             string     `json:"id"`
-	ProjectID      string     `json:"project_id"`
-	DocumentID     string     `json:"document_id"`
-	Title          string     `json:"title"`
-	Spec           string     `json:"spec"`
-	State          string     `json:"state"`
-	Model          string     `json:"model"`
-	Kind           string     `json:"kind"`
-	Track          string     `json:"track"`
-	Assignee       *string    `json:"assignee"`
-	LeaseExpiresAt *string    `json:"lease_expires_at"`
-	Result         *string    `json:"result"`
-	Held           bool       `json:"held"`
-	ReviewRound    int        `json:"review_round"`
-	TargetTaskID   *string    `json:"target_task_id"`
-	AgentMerge     bool       `json:"agent_merge"`
-	CreatedAt      string     `json:"created_at"`
-	UpdatedAt      string     `json:"updated_at"`
-	DependsOn      []string   `json:"depends_on"`
-	Links          []TaskLink `json:"links"`
+	ID             string  `json:"id"`
+	ProjectID      string  `json:"project_id"`
+	DocumentID     string  `json:"document_id"`
+	Title          string  `json:"title"`
+	Spec           string  `json:"spec"`
+	State          string  `json:"state"`
+	Model          string  `json:"model"`
+	Kind           string  `json:"kind"`
+	Track          string  `json:"track"`
+	Branch         string  `json:"branch"`
+	LandingRound   *int    `json:"landing_round"`
+	LandingCommit  *string `json:"landing_commit"`
+	LandingAttempt *string `json:"landing_attempt"`
+	// CurrentRoundLinks is the submission under review, as the server determines it.
+	CurrentRoundLinks []TaskLink `json:"current_round_links"`
+	Assignee          *string    `json:"assignee"`
+	LeaseExpiresAt    *string    `json:"lease_expires_at"`
+	Result            *string    `json:"result"`
+	Held              bool       `json:"held"`
+	ReviewRound       int        `json:"review_round"`
+	TargetTaskID      *string    `json:"target_task_id"`
+	AgentMerge        bool       `json:"agent_merge"`
+	CreatedAt         string     `json:"created_at"`
+	UpdatedAt         string     `json:"updated_at"`
+	DependsOn         []string   `json:"depends_on"`
+	Links             []TaskLink `json:"links"`
 }
 
 type TaskLink struct {
-	ID     string `json:"id"`
-	TaskID string `json:"task_id"`
-	Kind   string `json:"kind"`
-	Value  string `json:"value"`
+	ID           string  `json:"id"`
+	TaskID       string  `json:"task_id"`
+	Kind         string  `json:"kind"`
+	Value        string  `json:"value"`
+	ReviewRound  *int    `json:"review_round"`  // the review round an implement submission added it in; nil for older links
+	TombstonedAt *string `json:"tombstoned_at"` // set once the reconciler has nothing left to do for the link
 }
 
 type LinkInput struct {
@@ -656,6 +669,44 @@ func (c *HTTPClient) ArchiveProject(ctx context.Context, id string) error {
 // HoldTask pins a task out of automated flow.
 func (c *HTTPClient) HoldTask(ctx context.Context, id string) error {
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/hold", id), nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return nil
+}
+
+// BeginLanding reserves an approved local_commit task for approve attempt `attempt` to land the
+// work reviewed in reviewRound (commit); it fails unless the task is still approved in that round.
+func (c *HTTPClient) BeginLanding(ctx context.Context, id string, reviewRound int, commit, attempt string) error {
+	body := map[string]any{"review_round": reviewRound, "commit": commit, "attempt": attempt}
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/landing", id), body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return nil
+}
+
+// CompleteLanding marks a task done for approve attempt `attempt`, which holds its landing
+// reservation and has published the reviewed work.
+func (c *HTTPClient) CompleteLanding(ctx context.Context, id, attempt string, note *string) error {
+	body := map[string]any{"attempt": attempt, "note": note}
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/landing/complete", id), body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return nil
+}
+
+// CancelLanding drops a landing reservation whose work never reached the branch, if approve
+// attempt `attempt` still owns it.
+func (c *HTTPClient) CancelLanding(ctx context.Context, id, attempt string) error {
+	resp, err := c.do(ctx, "DELETE", fmt.Sprintf("/tasks/%s/landing?attempt=%s", id, url.QueryEscape(attempt)), nil)
 	if err != nil {
 		return err
 	}

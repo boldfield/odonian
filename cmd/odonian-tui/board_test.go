@@ -4744,3 +4744,37 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 		t.Errorf("Expected task-5 NOT in final render (scrolled out), got:\n%s", output)
 	}
 }
+
+// TestBoardModel_ApproveRefusedInLocalCommitMode: in local_commit mode approving must land the
+// task's work on its MR branch, which only `odonian approve` does, so the TUI must neither record
+// the verdict nor transition the task to done (which would unblock dependents onto a branch that
+// lacks the task's code).
+func TestBoardModel_ApproveRefusedInLocalCommitMode(t *testing.T) {
+	t.Setenv("ODONIAN_DELIVERY_MODE", "local_commit")
+	var reviewCalled, transitionCalled bool
+	mockClient := &tuiclient.MockClient{
+		ReviewTaskFunc: func(ctx context.Context, id, actor, verdict string, note *string) error {
+			reviewCalled = true
+			return nil
+		},
+		TransitionTaskFunc: func(ctx context.Context, id, to string, note *string) error {
+			transitionCalled = true
+			return nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{{ID: "review-task-1", Title: "Review Task", State: "approved"}}, nil
+		},
+	}
+	model := buildReviewModel(t, mockClient)
+
+	msg, ok := model.reviewApprove("review-task-1", nil, false)().(reviewActionMsg)
+	if !ok {
+		t.Fatal("expected a reviewActionMsg")
+	}
+	if reviewCalled || transitionCalled {
+		t.Errorf("local_commit approve from the TUI must not touch the task (review=%v transition=%v)", reviewCalled, transitionCalled)
+	}
+	if !strings.Contains(msg.err, "odonian approve review-task-1") {
+		t.Errorf("expected the message to point at odonian approve, got %q", msg.err)
+	}
+}

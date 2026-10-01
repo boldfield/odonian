@@ -24,6 +24,9 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
    the **Parent task** id (also in `target_task_id`). Then `odonian show <target_task_id>` (the
    **parent**): its `spec` is the real acceptance criteria you review against, its `pr` link is the
    PR you review, and its `links` may carry a `no_op` marker.
+   The `pr` link is the task's PR across every review round (a rework pushes to the same PR). A
+   `no_op` marker counts only if it is from the parent's **current** round: `odonian show` labels
+   links `(round N, current)` or `(round N, superseded)`, and a superseded `no_op` is ignored.
    **No-PR handling — distinguish three cases:**
    - **Has PR link** — the parent has a recorded `pr` link. Proceed normally to step 3.
    - **NO-OP submission** — the parent carries a `{"kind":"no_op",...}` link and NO `pr` link (the

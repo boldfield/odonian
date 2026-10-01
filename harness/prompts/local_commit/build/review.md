@@ -31,7 +31,11 @@ verb fails.)
    `target_task_id`). Then `odonian show <target_task_id>` (the **parent**): its `spec` is the real
    acceptance criteria you review against, and its `links` carry the implementer's work — a `commit`
    link (the SHA the CLI committed) or, for a no-op submission, a `no_op` marker and NO `commit` link.
-   **Distinguish two cases:**
+   **Only the links from the parent's current review round count.** A rework adds a new `commit` link
+   each round and the old ones stay, so `odonian show` marks each link `(round N, current)` or
+   `(round N, superseded)`; ignore superseded links entirely — an earlier round's `commit` is not the
+   code under review, and an earlier round's `no_op` says nothing about this round. `odonian diff`
+   always shows the current round's commit. **Distinguish two cases** (on the current round's links):
    - **Has commit link** — the parent carries a `commit` link. Proceed to step 3.
    - **NO-OP submission** — the parent carries a `{"kind":"no_op",...}` link and NO `commit` link. This
      is NOT an automatic reject. The implementer claims the parent's acceptance criteria are ALREADY

@@ -388,6 +388,7 @@ Bulk-create tasks for a project.
 - `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
 - `escalate` (optional, default `true`): Allow replacement by a higher model tier after the review threshold is exceeded.
 - `track` (optional, default `build`): `build`, `design`, or `research`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
+- `branch` (optional, `local_commit` only): Name of an MR branch shared across tasks. Every task with the same `branch` starts its worktree from, and freezes onto, `wi/<branch>`, so a dependent task builds on earlier tasks' approved work without anything landing on `main`. Omitted or empty keeps the default: the task gets its own `wi/<slug of its title>`. Must be lowercase letters, digits, and single dashes (e.g. `event-platform`); otherwise `400 INVALID_BRANCH`. A task superseded or escalated to a new model keeps its branch. Each task still works on its own `wip/<id>` branch, so tasks sharing a branch can run concurrently: on approve, a task fast-forwards `wi/<branch>` when nothing else has landed on it since the task started, and is otherwise merged into it. A merge runs the repository's `make check` and `make test` on the merged result first, because the combination was never built or reviewed together. The gate runs the tasks' code, so it gets a scrubbed environment (no tokens or credentials) and refuses to run outside a sandbox (`SANDBOX_NAME` unset) unless `odonian approve --allow-host-gate` is passed; `--gate-timeout` (default 8m) bounds it. The scrubbed environment keeps the basics and the usual Go, Rust, Python, Node and Java toolchain variables; name any others the repository's `make` needs in `ODONIAN_GATE_ENV` (comma-separated). A merge conflict, a failing gate, or a gate that cannot run refuses the approve and leaves the task `approved` and the branch unchanged. After the gate, approve reserves the task for landing (`POST /tasks/{id}/landing`), conditional on it still being approved in the review round it prepared, so a task reworked and re-approved while the gate ran is never landed with its old version; it then moves `wi/<branch>`, and only then marks the task `done`, so dependents become claimable only once the work is on the branch they start from. It holds a per-branch lock in the repository (`refs/odonian/locks/<branch>`) throughout, so approves on one branch run one at a time. Use `depends_on` when a task needs another task's code to exist before it starts.
 
 | Delivery mode | Supported tracks |
 |---|---|
@@ -448,6 +449,7 @@ superseding the task will not resolve a missing prompt.
 - `400 INVALID_DOCUMENT_ID`: One or more document IDs do not exist
 - `400 UNKNOWN_MODEL`: The `model` or a `review_models` entry is not in the deployment allowlist
 - `400 UNKNOWN_TRACK`: The `track` field is not one of `"build"`, `"design"`, or `"research"`
+- `400 INVALID_BRANCH`: The `branch` field is not lowercase letters, digits, and single dashes
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `400 <other validation errors>`: Client input validation errors
 - `500 CREATE_ERROR`: Server error creating tasks
@@ -594,17 +596,32 @@ curl -H "Authorization: Bearer token" \
       "id": "990e8400-e29b-41d4-a716-446655440004",
       "task_id": "770e8400-e29b-41d4-a716-446655440002",
       "kind": "pr",
-      "value": "#123"
+      "value": "#123",
+      "tombstoned_at": null,
+      "review_round": 1
     },
     {
       "id": "aa0e8400-e29b-41d4-a716-446655440005",
       "task_id": "770e8400-e29b-41d4-a716-446655440002",
       "kind": "commit",
-      "value": "abc123def456"
+      "value": "abc123def456",
+      "tombstoned_at": null,
+      "review_round": 1
     }
   ]
 }
 ```
+
+Each link carries `review_round`: the review round of the implement submission that added it
+(a link re-submitted unchanged moves to the new round), or `null` for links recorded before
+links carried their round and for links on other kinds of task. Earlier rounds' links stay on the
+task, so the submission under review is the links whose `review_round` equals the task's
+`review_round`; for a task none of whose links have a round, it is all of them. The server reports
+that set, minus tombstoned links, as `current_round_links`; clients use it rather than re-deriving
+it. The no-op finalization (an approved round goes straight to `done`) requires the current
+round's links to include a `no_op` and the task to have no active `pr` link; the PR is task-wide,
+since a rework pushes to the same PR and may not re-submit its link. `POST /tasks/{id}/landing`
+and the `LANDING_REQUIRED` check look only at the current round's links.
 
 **Status Codes:**
 - `200 OK`: Task retrieved
@@ -1054,6 +1071,8 @@ to drain the `approved` lane by merging and marking done, or to override an appr
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `404 NOT_FOUND`: Task not found
 - `409 CONFLICT`: Transition is not allowed from the current state
+- `409 LANDING_IN_PROGRESS`: The task is `approved` and reserved by an `odonian approve` landing its work (see `POST /tasks/{id}/landing`); only that approve can move it, to `done` via `POST /tasks/{id}/landing/complete`, until it finishes or the reservation is cancelled
+- `409 LANDING_REQUIRED`: `to: done` for an `approved` task whose current review round submitted a `commit` (a `local_commit` task): its work must land on its branch first, so it reaches `done` only through `odonian approve` (`POST /tasks/{id}/landing` then `/landing/complete`)
 - `500 TRANSITION_ERROR`: Server error transitioning task
 
 **Valid Transitions:**
@@ -1063,7 +1082,7 @@ The state machine enforces these rules:
 - `review` → `approved` (when all reviewers approve; via the final verdict, or release after a held round finishes)
 - `review` → `done` (automatic after unanimous approval when `agent_merge=true`, a `no_op` link exists, and no `pr` link exists)
 - `review` → `ready` (once every review finishes and at least one rejects, unless the circuit breaker escalates or blocks the task)
-- `approved` → `done` (human merges PR)
+- `approved` → `done` (human merges PR; for a `local_commit` task, only via `POST /tasks/{id}/landing/complete` — see `LANDING_REQUIRED`)
 - `approved` → `ready` (human disagrees with reviewers, requests rework)
 - `blocked` → `ready` (human unblocks / retries; clears stale assignee and lease)
 - `blocked` → `failed` (retire a dead blocked task without re-entering the queue)
@@ -1212,7 +1231,8 @@ differs from circuit-breaker escalation, which automatically promotes its replac
 
 **Response:** `201 Created` with the **new task**, including its full UUID. Returns
 `400 UNKNOWN_MODEL`, `400 JSON_DECODE_ERROR`, `404 NOT_FOUND`, `409 CONFLICT` for a terminal
-task, or `500 SUPERSEDE_ERROR`.
+task, `409 LANDING_IN_PROGRESS` for an `approved` task an approve is landing, or
+`500 SUPERSEDE_ERROR`.
 
 After the board transaction commits, the server attempts to close the old task's open PR and
 delete its head branch using its per-owner forge token. If the file or matching token is
@@ -1263,6 +1283,58 @@ revoke a lease or unclaim the task. Claimability still depends on state, depende
 
 **Response:** `200 OK` with the task object and `held: false`; `404 NOT_FOUND` if absent,
 or `500 RELEASE_ERROR` on failure.
+
+#### `POST /tasks/{id}/landing`
+
+Reserve an `approved` `local_commit` task while `odonian approve` lands the work reviewed in a
+given review round on its branch. Atomic and conditional: it succeeds only if the task is still
+`approved` and `review_round` is still its current review round, so a task reworked and
+re-approved while approve ran its merge gate is refused (`STALE_REVIEW_ROUND`) instead of being
+finalised with the version approve prepared. While reserved, every transition out of `approved`
+except to `done` — and `supersede` — returns `409 LANDING_IN_PROGRESS`: once the work may be on
+the branch the task cannot be rejected, and since it is not yet `done` its dependents stay
+blocked. The reservation does not expire; an interrupted approve is resumed by re-running it.
+Any transition clears it. `attempt` identifies the approve making the reservation (its branch-lock
+token); re-reserving the same round and commit succeeds and makes the caller the owner (a resumed
+approve taking over from one that stalled). `GET /tasks/{id}` shows it as `landing_round` /
+`landing_commit` / `landing_attempt`.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" -H "Content-Type: application/json" \
+  -d '{"review_round": 2, "commit": "3f9c2e1...", "attempt": "8d1f0c2..."}' \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/landing
+```
+
+It also checks that `commit` is the commit submitted for that review round (the `commit` link
+tagged with it; see `review_round` on links), so approve lands exactly what the reviewers
+approved: a wip branch changed after submission is refused with `UNREVIEWED_COMMIT`. A round that
+submitted a `no_op` instead passes. For a task submitted before links carried their round,
+`commit` must be its only commit link; a reworked one (several untagged commit links, any of
+which may be a rejected round's) is refused until it is re-submitted.
+
+**Response:** `204 No Content`; `400 INVALID_LANDING` unless `review_round >= 1`, `commit`, and
+`attempt` are set; `404 NOT_FOUND`; `409 NOT_APPROVED`; `409 STALE_REVIEW_ROUND`; `409 UNREVIEWED_COMMIT`;
+`409 LANDING_IN_PROGRESS` if reserved for a different round or commit.
+
+#### `POST /tasks/{id}/landing/complete`
+
+Mark a reserved task `done` once its approve has published the reviewed work to its branch. Only
+the attempt holding the reservation can: body `{"attempt": "<attempt>", "note": "..."}`. This is the
+only way an `approved` task whose current round submitted a `commit` reaches `done`, so its
+dependents never become claimable before its work is on the branch they start from.
+
+**Response:** `200 OK` with the task; `400 INVALID_LANDING` without `attempt`; `404 NOT_FOUND`;
+`409 NOT_APPROVED`; `409 NOT_RESERVED` if the task holds no reservation; `409
+LANDING_ATTEMPT_MISMATCH` if another attempt holds it.
+
+#### `DELETE /tasks/{id}/landing?attempt=<attempt>`
+
+Drop a landing reservation, but only if `attempt` still owns it: a stalled approve that was
+replaced (its replacement re-reserved the task and so owns it) gets `409 LANDING_ATTEMPT_MISMATCH`
+instead of clearing the replacement's reservation. Only safe if the reserved work never reached
+the branch, which the server cannot check: use `odonian approve <id> --cancel-landing`, which
+verifies that first. Cancelling an unreserved task is a no-op. **Response:** `204 No Content`;
+`400 INVALID_LANDING` without `attempt`; `404 NOT_FOUND`; `409 LANDING_ATTEMPT_MISMATCH`.
 
 #### `POST /tasks/{id}/archive`
 
@@ -1441,7 +1513,7 @@ curl -fsS "$BASE/tasks/$TASK_ID" -H "$AUTH" | jq -e 'select(.state == "done")'
 **Key Points:**
 1. Tasks are created with a `model` field; workers claim by declaring their model (e.g., `haiku`, `opus`)
 2. Claiming is atomic and model-matched — if the model doesn't match, you get `409 MODEL_MISMATCH`
-3. In this human-gated example, implement tasks transition `in_progress` → `review` → `approved` → `done`. An `agent_merge=true` task with a `no_op` link and no `pr` link goes directly from `review` to `done` after unanimous approval.
+3. In this human-gated example, implement tasks transition `in_progress` → `review` → `approved` → `done`. An `agent_merge=true` task whose current round has a `no_op` link and no `pr` link goes directly from `review` to `done` after unanimous approval.
 4. Submitting an implement task auto-spawns review tasks for each required reviewer (default: Opus)
 5. Review tasks are claimed and completed by reviewers submitting verdicts (approve or reject)
 6. When all reviewers of a round approve, the parent moves to `approved` (or directly to `done` for the opted-in no-op case); if any reject, it returns to `ready` unless the circuit breaker escalates or blocks it

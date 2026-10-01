@@ -36,6 +36,7 @@ func taskToSummary(task store.Task) map[string]interface{} {
 		"held":             task.Held,
 		"escalate":         task.Escalate,
 		"track":            task.Track,
+		"branch":           task.Branch,
 		"created_at":       task.CreatedAt,
 		"updated_at":       task.UpdatedAt,
 		"archived_at":      task.ArchivedAt,
@@ -112,6 +113,9 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("PATCH /tasks/{id}", wrapProtected("PATCH /tasks/{id}", server.handleUpdateTask))
 	mux.HandleFunc("PATCH /tasks/{id}/escalation", wrapProtected("PATCH /tasks/{id}/escalation", server.handleUpdateEscalation))
 	mux.HandleFunc("POST /tasks/{id}/hold", wrapProtected("POST /tasks/{id}/hold", server.handleHold))
+	mux.HandleFunc("POST /tasks/{id}/landing", wrapProtected("POST /tasks/{id}/landing", server.handleBeginLanding))
+	mux.HandleFunc("DELETE /tasks/{id}/landing", wrapProtected("DELETE /tasks/{id}/landing", server.handleCancelLanding))
+	mux.HandleFunc("POST /tasks/{id}/landing/complete", wrapProtected("POST /tasks/{id}/landing/complete", server.handleCompleteLanding))
 	mux.HandleFunc("POST /tasks/{id}/release", wrapProtected("POST /tasks/{id}/release", server.handleRelease))
 	mux.HandleFunc("POST /tasks/{id}/archive", wrapProtected("POST /tasks/{id}/archive", server.handleArchiveTask))
 	mux.HandleFunc("POST /tasks/{id}/unarchive", wrapProtected("POST /tasks/{id}/unarchive", server.handleUnarchiveTask))
@@ -876,6 +880,11 @@ func (s *Server) handleTransition(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 			return
 		}
+		var conflictErr *store.ConflictError
+		if errors.As(err, &conflictErr) {
+			s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+			return
+		}
 		if errors.Is(err, store.ErrConflict) {
 			s.errorResponse(w, http.StatusConflict, "CONFLICT", "Transition is not allowed from the current state")
 			return
@@ -913,6 +922,11 @@ func (s *Server) handleSupersede(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, store.ErrNotFound) {
 			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+			return
+		}
+		var conflictErr *store.ConflictError
+		if errors.As(err, &conflictErr) {
+			s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
 			return
 		}
 		if errors.Is(err, store.ErrConflict) {
@@ -1147,6 +1161,106 @@ func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.encodeJSON(w, http.StatusOK, task)
+}
+
+// handleBeginLanding handles POST /tasks/{id}/landing: `odonian approve` reserves an approved
+// local_commit task to land the work reviewed in a given round. Body:
+// {"review_round": N, "commit": "<sha>", "attempt": "<approve attempt token>"}.
+func (s *Server) handleBeginLanding(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
+
+	var payload struct {
+		ReviewRound int    `json:"review_round"`
+		Commit      string `json:"commit"`
+		Attempt     string `json:"attempt"`
+	}
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return // decodeJSON already wrote error response
+	}
+	if payload.ReviewRound < 1 || strings.TrimSpace(payload.Commit) == "" || strings.TrimSpace(payload.Attempt) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_LANDING", "review_round (>= 1), commit, and attempt are required")
+		return
+	}
+
+	err := s.store.BeginLanding(r.Context(), taskID, payload.ReviewRound, payload.Commit, payload.Attempt)
+	var conflictErr *store.ConflictError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+	case errors.As(err, &conflictErr):
+		s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+	case err != nil:
+		s.errorResponse(w, http.StatusInternalServerError, "LANDING_ERROR", "Failed to reserve task for landing")
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// handleCompleteLanding handles POST /tasks/{id}/landing/complete: the approve attempt holding a
+// task's landing reservation marks it done once the reviewed work is on its branch. Body:
+// {"attempt": "<token>", "note": "..."}.
+func (s *Server) handleCompleteLanding(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
+
+	var payload struct {
+		Attempt string  `json:"attempt"`
+		Note    *string `json:"note"`
+	}
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return // decodeJSON already wrote error response
+	}
+	if strings.TrimSpace(payload.Attempt) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_LANDING", "attempt is required")
+		return
+	}
+
+	task, err := s.store.CompleteLanding(r.Context(), taskID, payload.Attempt, payload.Note)
+	var conflictErr *store.ConflictError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+	case errors.As(err, &conflictErr):
+		s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+	case errors.Is(err, store.ErrConflict):
+		s.errorResponse(w, http.StatusConflict, "CONFLICT", "Transition is not allowed from the current state")
+	case err != nil:
+		s.errorResponse(w, http.StatusInternalServerError, "LANDING_ERROR", "Failed to complete landing")
+	default:
+		s.encodeJSON(w, http.StatusOK, task)
+	}
+}
+
+// handleCancelLanding handles DELETE /tasks/{id}/landing?attempt=<token>: drop a landing
+// reservation whose work never reached the branch, if that attempt still owns it.
+func (s *Server) handleCancelLanding(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
+	attempt := strings.TrimSpace(r.URL.Query().Get("attempt"))
+	if attempt == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_LANDING", "the attempt query parameter is required")
+		return
+	}
+
+	err := s.store.CancelLanding(r.Context(), taskID, attempt)
+	var conflictErr *store.ConflictError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+	case errors.As(err, &conflictErr):
+		s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+	case err != nil:
+		s.errorResponse(w, http.StatusInternalServerError, "LANDING_ERROR", "Failed to cancel landing")
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 // handleRelease handles POST /tasks/{id}/release to restore normal automated flow.

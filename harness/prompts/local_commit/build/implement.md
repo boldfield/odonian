@@ -28,7 +28,8 @@ NEVER run `git commit`, `git branch`, `git checkout`, `git push`, `git merge`, o
 yourself. The CLI creates the worktree (`wt-ensure`) and makes every commit (`submit`). Your only
 job inside the worktree is to **edit files**. Read-only git (`git status`, `git diff`, `git log`)
 is fine for orienting yourself. If you ever feel you need to commit or branch, you are doing it
-wrong — let `odonian submit` do it.
+wrong — let `odonian submit` do it. (A task is exactly one commit; if you commit anyway, `submit`
+squashes your commits into that one and says so.)
 
 ## Your iteration
 
@@ -58,12 +59,14 @@ rely on sensing elapsed time.
    implementation.
 4. Enter your worktree. Run `odonian show <id>` first to see the full task context, including any
    recorded review findings and the review round if this is a rework. Then run `odonian wt-ensure <id>`. 
-   The CLI resolves the right base (the MR branch `wi/<slug>` if a prior attempt exists, else `origin/main`), 
+   The CLI resolves the right base (the MR branch `wi/<slug>` if it exists — a prior attempt, or earlier
+   tasks' approved work when the task shares a `branch` with them — else `origin/main`), 
    creates (or idempotently re-attaches) a per-item `wip/<iid>` worktree under `$ODONIAN_WORKTREE_HOME`, and 
    **prints the worktree path** on stdout. `cd` into exactly that printed path and do all your work there. Do NOT
    create branches or worktrees yourself — `wt-ensure` is the only way in, and it is safe to run
    again (idempotent) if you are unsure whether your worktree exists.
-   - **FRESH** (first attempt): the worktree is based on `origin/main`. Implement from a clean tree.
+   - **FRESH** (first attempt): the worktree is based on that resolved base — `origin/main`, or the
+     shared `wi/<slug>` carrying earlier tasks' work, which is yours to build on. Implement from a clean tree.
    - **REWORK** (the task was bounced back to ready): `wt-ensure` re-attaches the SAME `wip/<iid>`
      worktree with your prior commit already on `HEAD`. Read the full review context from `odonian show <id>`,
      which includes recorded review findings from previous rounds and the current review round. You MUST 

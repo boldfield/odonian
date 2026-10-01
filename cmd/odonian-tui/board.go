@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/boldfield/odonian/internal/localcommit"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -246,6 +247,15 @@ func (m *BoardModel) reviewApprove(taskID string, note *string, fromDetail bool)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+
+		// In local_commit mode approving must also land the task's work on its MR branch, which
+		// only `odonian approve` does. Marking the task done here would unblock its dependents
+		// onto a branch that lacks its code, so refuse before recording anything.
+		if localcommit.IsLocalCommit() {
+			msg := m.fetchTasksInline(ctx, fmt.Sprintf("local_commit: approve with `odonian approve %s` so its work lands on its branch; the TUI cannot do that", taskID))
+			msg.fromDetail = fromDetail
+			return msg
+		}
 
 		// Step 1: record the review verdict.
 		if err := m.client.ReviewTask(ctx, taskID, actor, "approve", note); err != nil {

@@ -67,8 +67,9 @@ What it shows depends on the delivery mode:
 - **`pull_request` mode** (default): prints the PR URL, then — if `gh` is on PATH — the PR diff
   (`gh pr diff <url>`), best-effort.
 - **`local_commit` mode** (`ODONIAN_DELIVERY_MODE=local_commit`): shows the diff of the task's
-  `commit` link against the base (`origin/main`). Add `--full` to show the entire commit instead
-  of just the diff against base. The repo directory comes from `--repo <dir>` or, if unset,
+  `commit` link against its parent — the tip the task started from — so a task sharing a branch
+  shows only its own change, not earlier tasks' already-approved work. Add `--full` to show the
+  entire commit instead of just the diff. The repo directory comes from `--repo <dir>` or, if unset,
   `$ODONIAN_REPO`.
 
 Useful flags:
@@ -99,12 +100,38 @@ verdict and is on the human's merge lane):
 odonian approve <task-id>
 ```
 
-- The task must be in `approved`; `approve` errors otherwise.
+- The task must be in `approved`; `approve` errors otherwise (except a `done` task in
+  `local_commit` mode, below).
 - **`pull_request` mode**: transitions `approved → done`. (The human still does the actual PR merge
   out of band; the skill only records the state.)
-- **`local_commit` mode**: transitions `approved → done` **and then freezes** — advances the MR
-  branch `wi/<slug>` onto the per-item WIP branch `wip/<id>`, removes the item's worktree, and
-  deletes the WIP branch. In this mode, **approve = freeze**: there is no separate merge step.
+- **`local_commit` mode**: prepares the task's landing on its MR branch `wi/<slug>`, reserves the
+  task for landing (only if it is still approved in the review round it prepared), moves the
+  branch, and only then transitions `approved → done`; then it removes the item's worktree and WIP
+  branch `wip/<id>`. In this mode, **approve = freeze**: there is no separate merge step, and
+  nothing lands on `main`. `<slug>` is the task's `branch` when set (shared across tasks), else its
+  title's slug. Approve holds a per-branch lock throughout, so a second approve on the same branch
+  refuses with `another approve is landing work on wi/<slug>`; wait for the first to finish, then
+  re-run it. If the task was reworked and re-approved while the gate ran, approve refuses with
+  `STALE_REVIEW_ROUND`; re-run it to land the new version.
+  - If nothing else landed on the branch since the task started, it **fast-forwards** (exactly the
+    reviewed commit; quick).
+  - Otherwise it **merges** the task in and first runs the repo's `make check` and `make test` on
+    the merged result — this can take minutes, so say so, and **run the command with a 600-second
+    tool timeout** (the gate's own default limit is 8 minutes; `--gate-timeout` changes it). The
+    gate runs the tasks' code, so it gets a scrubbed environment and **refuses to run outside a
+    sandbox**; `--allow-host-gate` overrides that. Never add `--allow-host-gate` on your own —
+    only when the human explicitly says to run the gate on their machine.
+  - A merge conflict, a failing gate, or a gate that cannot run (missing target, timeout, no
+    sandbox) refuses the approve **before** transitioning: the task stays `approved` and the
+    branch is unchanged. So does a reject that lands while the gate runs. The error says which it was. Relay it to the human verbatim; the recovery
+    is their call (for a conflict or a real failure, typically `reject --abandon` and re-running
+    the task from the current branch — a plain `reject` would rework on the same stale base).
+- The TUI cannot approve in `local_commit` mode (it cannot land the work); approvals go through
+  `odonian approve`. The board enforces this: a plain `transition <id> done` on such a task is
+  refused with `LANDING_REQUIRED`.
+- If the merge gate fails because the sandbox's toolchain needs an environment variable the gate
+  does not pass through (it keeps the common Go/Rust/Python/Node/Java ones), name it in
+  `ODONIAN_GATE_ENV` and re-run approve.
 
 ### Reject
 
@@ -127,22 +154,35 @@ odonian reject <task-id> --note "<the human's reason>"
 
 ## The approve = freeze footgun (local_commit mode)
 
-`approve` does the board transition **first**, then the git freeze. If the freeze fails *after* the
-transition has already moved the task to `done`, the task is `done` but the branch is **not** frozen
-— and re-running plain `odonian approve <task-id>` will fail with `task is in "done" state, expected
-approved`, because the transition guard no longer matches.
-
-The most common cause is the MR branch being checked out somewhere, which surfaces as:
+`approve` moves the MR branch only after reserving the task, and marks it `done` only after
+moving the branch. A failure before the branch moves — the MR branch checked out somewhere, a
+merge conflict, a failing merge gate, a reject or rework during the gate (`STALE_REVIEW_ROUND`) —
+leaves the task `approved` and the branch untouched; fix the cause the message names and re-run
+plain `odonian approve <task-id>`. The checked-out case surfaces as:
 
 ```
 MR branch wi/<slug> is checked out at <path>; cd out or run 'git checkout --detach' there, then re-approve
 ```
 
-**Recovery — `odonian approve <task-id> --freeze-only`.** Clear the cause the message names (e.g.
-`cd` out of that worktree or run `git checkout --detach` there), then re-run approve with
-`--freeze-only`. That flag **skips the already-done transition** and retries **only** the freeze, so
-the WIP branch lands on the MR branch and the worktree/WIP branch are cleaned up. Do not try to
-re-approve without it — the state guard will keep rejecting you.
+Once approve has reserved the task for landing, the task can only become `done`: it cannot be
+rejected, and its dependents stay blocked until the work is on the branch. If approve is
+interrupted after that point (a crash, a lost response, a failed done transition), the error says
+so and the task stays reserved. **Recovery — re-run plain `odonian approve <task-id>`**: it resumes
+(landing is a no-op once the work is on the branch) and marks the task done. If the human instead
+wants to drop the approval, `odonian approve <task-id> --cancel-landing` releases the reservation,
+but only if the work never reached the branch; a `reject` of a reserved task fails with
+`LANDING_IN_PROGRESS` until then.
+
+Plain `approve` on a task that is already `done` but still has its `wip/<id>` branch (its cleanup
+failed) finishes the job, landing only the commit the final review round approved: it refuses if
+`wip/<id>` has moved off that commit, and if the final round was a **no-op** it lands nothing and
+leaves `wip/<id>` alone (it can only hold work that was never approved; tell the human it is there).
+With nothing left it says so and succeeds. (`--freeze-only` does the same but refuses a task that
+is not yet `done`.)
+
+A task reworked **before** links recorded their review round has several commit links and no way
+to tell which one was reviewed; `approve` and `diff` refuse it. The fix is a fresh submission:
+`reject` it (with a note saying why) so the implementer re-submits and the round is recorded.
 
 ## The gates you do not cross
 
