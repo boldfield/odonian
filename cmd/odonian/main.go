@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -655,6 +653,9 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		fmt.Fprintf(out, "State: %s\n", task.State)
 		fmt.Fprintf(out, "Model: %s\n", task.Model)
 		fmt.Fprintf(out, "Kind: %s\n", task.Kind)
+		if task.Branch != "" {
+			fmt.Fprintf(out, "Branch: %s\n", task.Branch)
+		}
 		fmt.Fprintf(out, "Title: %s\n", task.Title)
 		fmt.Fprintf(out, "Spec: %s\n", task.Spec)
 		if task.ReviewRound > 0 {
@@ -666,7 +667,7 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		if len(task.Links) > 0 {
 			fmt.Fprintf(out, "Links:\n")
 			for _, link := range task.Links {
-				fmt.Fprintf(out, "  - %s: %s\n", link.Kind, link.Value)
+				fmt.Fprintf(out, "  - %s: %s%s\n", link.Kind, link.Value, linkRoundLabel(task, link))
 			}
 		}
 		if len(reviewFindings) > 0 {
@@ -955,32 +956,20 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 
 			wtPath := filepath.Join(wtHome, taskID)
 
-			// Resolve tip for rework detection: use MR branch if it exists, else origin/main
-			slug := localcommit.Slugify(task.Title)
+			// Resolve the tip the task's worktree started from (MR branch if it exists, else
+			// origin/main) and record the work as exactly one commit on top of it.
+			slug := localcommit.BranchSlug(task.Branch, task.Title)
 			tip, err := localcommit.ResolveTip(wtPath, slug)
 			if err != nil {
 				return fmt.Errorf("failed to resolve tip: %w", err)
 			}
 
-			isRework := false
-			cmd := exec.Command("git", "-C", wtPath, "rev-list", "--count", tip+"..HEAD")
-			var stdout bytes.Buffer
-			cmd.Stdout = &stdout
-			if err := cmd.Run(); err == nil {
-				commitCount := strings.TrimSpace(stdout.String())
-				if commitCount != "0" && commitCount != "" {
-					isRework = true
-				}
-			}
-
-			var sha string
-			if isRework {
-				sha, err = localcommit.AmendAll(wtPath, message)
-			} else {
-				sha, err = localcommit.CommitAll(wtPath, message)
-			}
+			sha, squashedCommits, err := localcommit.CommitTask(wtPath, tip, message)
 			if err != nil {
 				return fmt.Errorf("failed to commit: %w", err)
+			}
+			if squashedCommits > 0 {
+				fmt.Fprintf(os.Stderr, "note: squashed %d commits into one; the CLI makes the task's single commit, do not commit by hand\n", squashedCommits)
 			}
 
 			links = []tuiclient.LinkInput{
@@ -1644,7 +1633,7 @@ func executeWtEnsure(ctx context.Context, baseURL, token string, args []string) 
 	}
 
 	// Compute slug from task title
-	slug := localcommit.Slugify(task.Title)
+	slug := localcommit.BranchSlug(task.Branch, task.Title)
 
 	// Resolve tip (MR branch or origin/main)
 	tip, err := localcommit.ResolveTip(repoDir, slug)

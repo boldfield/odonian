@@ -43,17 +43,10 @@ func executeDiff(ctx context.Context, baseURL, token string, args []string, out 
 
 	// Local commit mode
 	if localcommit.IsLocalCommit() {
-		// Find the commit link
-		var commitSHA string
-		for _, link := range task.Links {
-			if link.Kind == "commit" {
-				commitSHA = link.Value
-				break
-			}
-		}
-
-		if commitSHA == "" {
-			return fmt.Errorf("task has no commit link")
+		// The commit under review is the current round's; earlier rounds' commit links remain.
+		commitSHA, err := reviewedCommit(task)
+		if err != nil {
+			return err
 		}
 
 		// Resolve repoDir from --repo flag or ODONIAN_REPO
@@ -69,7 +62,7 @@ func executeDiff(ctx context.Context, baseURL, token string, args []string, out 
 		if *fullFlag {
 			output, err = localcommit.ShowCommit(repoDir, commitSHA)
 		} else {
-			output, err = localcommit.DiffBase(repoDir, commitSHA)
+			output, err = localcommit.DiffBase(repoDir, localcommit.BranchSlug(task.Branch, task.Title), commitSHA)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to get diff/show: %w", err)

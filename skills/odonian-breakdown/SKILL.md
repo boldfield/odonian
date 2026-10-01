@@ -99,6 +99,11 @@ Break the design into tasks. For **each** task, propose and STOP for the human:
 - **Dependencies** on other tasks (by key).
 - A proposed **model**, with a one-line rationale.
 - An **`agent_merge`** suggestion (default `false`).
+- For `local_commit` projects, an optional shared **`branch`** (e.g. `event-platform`): tasks for
+  one feature should share one, so each starts from the work already approved onto
+  `wi/<branch>`. Independent tasks on a branch can run in parallel (approve merges them in and
+  re-runs `make check`/`make test` on the result); a task that needs another's code still needs
+  `depends_on`.
 
 Non-negotiable decomposition rules:
 

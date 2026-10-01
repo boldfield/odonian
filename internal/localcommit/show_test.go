@@ -152,7 +152,7 @@ func TestDiffBase(t *testing.T) {
 		sha := strings.TrimSpace(string(out))
 
 		// Test DiffBase
-		result, err := DiffBase(tmpDir, sha)
+		result, err := DiffBase(tmpDir, "item", sha)
 		if err != nil {
 			t.Errorf("DiffBase() error = %v", err)
 		}
@@ -175,7 +175,7 @@ func TestDiffBase(t *testing.T) {
 			t.Fatalf("setup failed: %v", err)
 		}
 
-		_, err := DiffBase(tmpDir, "0000000000000000000000000000000000000000")
+		_, err := DiffBase(tmpDir, "item", "0000000000000000000000000000000000000000")
 		if err == nil {
 			t.Errorf("DiffBase() with unknown SHA should return error")
 		}

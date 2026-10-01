@@ -2849,13 +2849,13 @@ func TestExecuteDiffLocalCommitBaseDiff(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/tasks/") {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+			json.NewEncoder(w).Encode(withCurrentRound(tuiclient.TaskDetail{
 				ID:    "task-1",
 				State: "in_progress",
 				Links: []tuiclient.TaskLink{
 					{Kind: "commit", Value: commitSHA},
 				},
-			})
+			}))
 		}
 	}))
 	defer server.Close()
@@ -2922,13 +2922,13 @@ func TestExecuteDiffLocalCommitFull(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/tasks/") {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+			json.NewEncoder(w).Encode(withCurrentRound(tuiclient.TaskDetail{
 				ID:    "task-1",
 				State: "in_progress",
 				Links: []tuiclient.TaskLink{
 					{Kind: "commit", Value: commitSHA},
 				},
-			})
+			}))
 		}
 	}))
 	defer server.Close()
@@ -3511,11 +3511,7 @@ func TestExecuteApproveLocalCommitSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" && r.URL.Path == "/tasks/task-123" {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
-				ID:    "task-123",
-				State: "approved",
-				Title: "Test Task Title",
-			})
+			json.NewEncoder(w).Encode(reviewedTaskDetail("task-123", "approved", "Test Task Title", strings.TrimSpace(string(expectedWipSha))))
 		} else if r.Method == "POST" && r.URL.Path == "/tasks/task-123/transition" {
 			w.WriteHeader(http.StatusOK)
 		}
@@ -3590,6 +3586,8 @@ func TestExecuteApproveLocalCommitFootgun(t *testing.T) {
 		t.Fatalf("failed to create wip branch: %v", err)
 	}
 
+	footgunWipSha := getGitSHA(t, mainRepo, "wip/task-123")
+
 	// Create a worktree with wi/test-task-title checked out
 	wtPath := filepath.Join(tmpDir, "worktree")
 	cmd = exec.Command("git", "-C", mainRepo, "worktree", "add", wtPath, "wi/test-task-title")
@@ -3601,11 +3599,7 @@ func TestExecuteApproveLocalCommitFootgun(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" && r.URL.Path == "/tasks/task-123" {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
-				ID:    "task-123",
-				State: "approved",
-				Title: "Test Task Title",
-			})
+			json.NewEncoder(w).Encode(reviewedTaskDetail("task-123", "approved", "Test Task Title", footgunWipSha))
 		}
 	}))
 	defer server.Close()
@@ -3687,11 +3681,7 @@ func TestExecuteApproveFreezeOnly(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" && r.URL.Path == "/tasks/task-123" {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
-				ID:    "task-123",
-				State: "approved",
-				Title: "Test Task Title",
-			})
+			json.NewEncoder(w).Encode(reviewedTaskDetail("task-123", "done", "Test Task Title", strings.TrimSpace(string(expectedWipShaFreezeOnly))))
 		} else if r.Method == "POST" && r.URL.Path == "/tasks/task-123/transition" {
 			transitionCalled = true
 			w.WriteHeader(http.StatusOK)

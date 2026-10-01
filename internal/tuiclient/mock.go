@@ -19,6 +19,9 @@ type MockClient struct {
 	HeartbeatTaskFunc                 func(ctx context.Context, id, agentID string) error
 	SubmitTaskFunc                    func(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput) error
 	HoldTaskFunc                      func(ctx context.Context, id string) error
+	BeginLandingFunc                  func(ctx context.Context, id string, reviewRound int, commit, attempt string) error
+	CancelLandingFunc                 func(ctx context.Context, id, attempt string) error
+	CompleteLandingFunc               func(ctx context.Context, id, attempt string, note *string) error
 	ReleaseTaskFunc                   func(ctx context.Context, id string) error
 	ArchiveTaskFunc                   func(ctx context.Context, id string) error
 	ArchiveProjectFunc                func(ctx context.Context, id string) error
@@ -104,6 +107,27 @@ func (m *MockClient) SubmitTask(ctx context.Context, id, agentID, result string,
 func (m *MockClient) HoldTask(ctx context.Context, id string) error {
 	if m.HoldTaskFunc != nil {
 		return m.HoldTaskFunc(ctx, id)
+	}
+	return nil
+}
+
+func (m *MockClient) BeginLanding(ctx context.Context, id string, reviewRound int, commit, attempt string) error {
+	if m.BeginLandingFunc != nil {
+		return m.BeginLandingFunc(ctx, id, reviewRound, commit, attempt)
+	}
+	return nil
+}
+
+func (m *MockClient) CompleteLanding(ctx context.Context, id, attempt string, note *string) error {
+	if m.CompleteLandingFunc != nil {
+		return m.CompleteLandingFunc(ctx, id, attempt, note)
+	}
+	return nil
+}
+
+func (m *MockClient) CancelLanding(ctx context.Context, id, attempt string) error {
+	if m.CancelLandingFunc != nil {
+		return m.CancelLandingFunc(ctx, id, attempt)
 	}
 	return nil
 }

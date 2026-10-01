@@ -8387,3 +8387,103 @@ func TestGetResearchReviewerScorecardsRequiresAuth(t *testing.T) {
 		t.Errorf("expected status 401, got %d", scorecardsW.Code)
 	}
 }
+
+// TestLandingReservationEndpoints: POST /tasks/{id}/landing reserves an approved task for the
+// current review round only, a reject is then refused with LANDING_IN_PROGRESS, and DELETE
+// gives it back.
+func TestLandingReservationEndpoints(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	taskID := setupTaskInReview(t, server, "Bearer test-token")
+	if _, err := server.store.Conn().ExecContext(context.Background(), "UPDATE task SET state = 'approved', review_round = 1 WHERE id = ?", taskID); err != nil {
+		t.Fatalf("failed to set task to approved: %v", err)
+	}
+	if _, err := server.store.Conn().ExecContext(context.Background(), "INSERT INTO task_link (id, task_id, kind, value, review_round) VALUES ('landing-link', ?, 'commit', 'abc', 1)", taskID); err != nil {
+		t.Fatalf("failed to record the round's commit: %v", err)
+	}
+	call := func(method, path string, payload interface{}) *httptest.ResponseRecorder {
+		var encoded []byte
+		if payload != nil {
+			encoded, _ = json.Marshal(payload)
+		}
+		request := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+		request.Header.Set("Authorization", "Bearer test-token")
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		server.mux.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	if recorder := call("POST", "/tasks/"+taskID+"/landing", map[string]any{"review_round": 0, "commit": "abc", "attempt": "attempt-1"}); recorder.Code != http.StatusBadRequest {
+		t.Errorf("round 0: expected 400, got %d", recorder.Code)
+	}
+	if recorder := call("POST", "/tasks/"+taskID+"/landing", map[string]any{"review_round": 2, "commit": "abc", "attempt": "attempt-1"}); recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "STALE_REVIEW_ROUND") {
+		t.Fatalf("stale round: expected 409 STALE_REVIEW_ROUND, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("POST", "/tasks/"+taskID+"/landing", map[string]any{"review_round": 1, "commit": "not-reviewed", "attempt": "attempt-1"}); recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "UNREVIEWED_COMMIT") {
+		t.Fatalf("unreviewed commit: expected 409 UNREVIEWED_COMMIT, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("POST", "/tasks/"+taskID+"/landing", map[string]any{"review_round": 1, "commit": "abc", "attempt": "attempt-1"}); recorder.Code != http.StatusNoContent {
+		t.Fatalf("reserve: expected 204, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("GET", "/tasks/"+taskID, nil); !strings.Contains(recorder.Body.String(), `"landing_round":1`) {
+		t.Errorf("GET should expose the reservation, got %s", recorder.Body.String())
+	}
+
+	reject := map[string]string{"to": "ready", "note": "rework"}
+	if recorder := call("POST", "/tasks/"+taskID+"/transition", reject); recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "LANDING_IN_PROGRESS") {
+		t.Fatalf("reject while landing: expected 409 LANDING_IN_PROGRESS, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("DELETE", "/tasks/"+taskID+"/landing", nil); recorder.Code != http.StatusBadRequest {
+		t.Errorf("cancel without an attempt: expected 400, got %d", recorder.Code)
+	}
+	if recorder := call("DELETE", "/tasks/"+taskID+"/landing?attempt=someone-else", nil); recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "LANDING_ATTEMPT_MISMATCH") {
+		t.Fatalf("cancel by another attempt: expected 409 LANDING_ATTEMPT_MISMATCH, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("DELETE", "/tasks/"+taskID+"/landing?attempt=attempt-1", nil); recorder.Code != http.StatusNoContent {
+		t.Fatalf("cancel: expected 204, got %d", recorder.Code)
+	}
+	if recorder := call("POST", "/tasks/"+taskID+"/transition", reject); recorder.Code != http.StatusOK {
+		t.Errorf("reject after cancel: expected 200, got %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestCompleteLandingEndpoint: an approved task whose round submitted a commit cannot be marked
+// done by a plain transition; only the approve attempt holding its landing reservation can.
+func TestCompleteLandingEndpoint(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	taskID := setupTaskInReview(t, server, "Bearer test-token")
+	if _, err := server.store.Conn().ExecContext(context.Background(), "UPDATE task SET state = 'approved', review_round = 1 WHERE id = ?", taskID); err != nil {
+		t.Fatalf("failed to set task to approved: %v", err)
+	}
+	if _, err := server.store.Conn().ExecContext(context.Background(), "INSERT INTO task_link (id, task_id, kind, value, review_round) VALUES ('complete-link', ?, 'commit', 'abc', 1)", taskID); err != nil {
+		t.Fatalf("failed to record the round's commit: %v", err)
+	}
+	call := func(method, path string, payload interface{}) *httptest.ResponseRecorder {
+		var encoded []byte
+		if payload != nil {
+			encoded, _ = json.Marshal(payload)
+		}
+		request := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+		request.Header.Set("Authorization", "Bearer test-token")
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		server.mux.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	if recorder := call("POST", "/tasks/"+taskID+"/transition", map[string]string{"to": "done"}); recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "LANDING_REQUIRED") {
+		t.Fatalf("plain done: expected 409 LANDING_REQUIRED, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("POST", "/tasks/"+taskID+"/landing/complete", map[string]string{"attempt": "attempt-1"}); recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "NOT_RESERVED") {
+		t.Fatalf("complete without a reservation: expected 409 NOT_RESERVED, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("POST", "/tasks/"+taskID+"/landing", map[string]any{"review_round": 1, "commit": "abc", "attempt": "attempt-1"}); recorder.Code != http.StatusNoContent {
+		t.Fatalf("reserve: expected 204, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("POST", "/tasks/"+taskID+"/landing/complete", map[string]string{"attempt": "someone-else"}); recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "LANDING_ATTEMPT_MISMATCH") {
+		t.Fatalf("complete by another attempt: expected 409 LANDING_ATTEMPT_MISMATCH, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := call("POST", "/tasks/"+taskID+"/landing/complete", map[string]string{"attempt": "attempt-1", "note": "landed"}); recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"state":"done"`) {
+		t.Fatalf("complete by the owner: expected 200 done, got %d %s", recorder.Code, recorder.Body.String())
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -26,6 +27,10 @@ import (
 
 //go:embed migrations
 var migrationsFS embed.FS
+
+// validBranch is the shape of a task's optional shared branch name: exactly what
+// localcommit.Slugify produces, so wi/<branch> is always a safe git ref.
+var validBranch = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // Store is the interface for database operations.
 // Concrete implementations (sqliteStore) satisfy this interface.
@@ -56,6 +61,9 @@ type Store interface {
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
+	BeginLanding(ctx context.Context, taskID string, reviewRound int, commit, attempt string) error
+	CancelLanding(ctx context.Context, taskID, attempt string) error
+	CompleteLanding(ctx context.Context, taskID, attempt string, note *string) (Task, error)
 	ReleaseTask(ctx context.Context, taskID string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error)
 	ArchiveTask(ctx context.Context, taskID string) (Task, error)
 	UnarchiveTask(ctx context.Context, taskID string) (Task, error)
@@ -606,6 +614,7 @@ type Task struct {
 	Held           bool     `db:"held" json:"held"`
 	Escalate       bool     `db:"escalate" json:"escalate"`
 	Track          string   `db:"track" json:"track"`
+	Branch         string   `db:"branch" json:"branch"` // local_commit target: shares wi/<branch>; empty = per-task wi/<slug of title>
 	CreatedAt      string   `db:"created_at" json:"created_at"`
 	UpdatedAt      string   `db:"updated_at" json:"updated_at"`
 	ArchivedAt     *string  `db:"archived_at" json:"archived_at"`     // nullable
@@ -619,6 +628,7 @@ type TaskLink struct {
 	Kind         string  `db:"kind" json:"kind"` // 'pr', 'branch', 'commit', or 'ci'
 	Value        string  `db:"value" json:"value"`
 	TombstonedAt *string `db:"tombstoned_at" json:"tombstoned_at"` // nullable, set when the reconciler has established there is nothing left to do for the link (PR is gone, merged, closed, or closed by the reconciler) and the link must not be polled again
+	ReviewRound  *int    `db:"review_round" json:"review_round"`   // the review round an implement submission added it in; nil for older links and other task kinds
 }
 
 // TaskInput is the input format for bulk task creation.
@@ -633,6 +643,7 @@ type TaskInput struct {
 	AgentMerge   bool     `json:"agent_merge"`
 	Escalate     *bool    `json:"escalate"` // nullable, defaults to true if not provided
 	Track        string   `json:"track"`    // optional, defaults to 'build' if not provided
+	Branch       string   `json:"branch"`   // optional local_commit branch shared across tasks (wi/<branch>)
 }
 
 // LinkInput is the input format for task links during submission.
@@ -643,31 +654,39 @@ type LinkInput struct {
 
 // TaskWithDepsAndLinks combines a Task with its dependencies and links.
 type TaskWithDepsAndLinks struct {
-	ID             string     `json:"id"`
-	ProjectID      string     `json:"project_id"`
-	DocumentID     string     `json:"document_id"`
-	Title          string     `json:"title"`
-	Spec           string     `json:"spec"`
-	State          string     `json:"state"`
-	Assignee       *string    `json:"assignee"`
-	LeaseExpiresAt *string    `json:"lease_expires_at"`
-	Result         *string    `json:"result"`
-	Model          string     `json:"model"`
-	Kind           string     `json:"kind"`
-	ReviewModels   []string   `json:"review_models"`
-	ReviewRound    int        `json:"review_round"`
-	TargetTaskID   *string    `json:"target_task_id"`
-	Verdict        *string    `json:"verdict"`
-	AgentMerge     bool       `json:"agent_merge"`
-	Held           bool       `json:"held"`
-	Escalate       bool       `json:"escalate"`
-	Track          string     `json:"track"`
-	CreatedAt      string     `json:"created_at"`
-	UpdatedAt      string     `json:"updated_at"`
-	ArchivedAt     *string    `json:"archived_at"`
-	SupersededBy   *string    `json:"superseded_by"`
-	DependsOn      []string   `json:"depends_on"`
-	Links          []TaskLink `json:"links"`
+	ID             string   `json:"id"`
+	ProjectID      string   `json:"project_id"`
+	DocumentID     string   `json:"document_id"`
+	Title          string   `json:"title"`
+	Spec           string   `json:"spec"`
+	State          string   `json:"state"`
+	Assignee       *string  `json:"assignee"`
+	LeaseExpiresAt *string  `json:"lease_expires_at"`
+	Result         *string  `json:"result"`
+	Model          string   `json:"model"`
+	Kind           string   `json:"kind"`
+	ReviewModels   []string `json:"review_models"`
+	ReviewRound    int      `json:"review_round"`
+	TargetTaskID   *string  `json:"target_task_id"`
+	Verdict        *string  `json:"verdict"`
+	AgentMerge     bool     `json:"agent_merge"`
+	Held           bool     `json:"held"`
+	Escalate       bool     `json:"escalate"`
+	Track          string   `json:"track"`
+	Branch         string   `json:"branch"`
+	LandingRound   *int     `json:"landing_round"`   // set while an approve lands this round's work (see BeginLanding)
+	LandingCommit  *string  `json:"landing_commit"`  // the reviewed commit that approve is landing
+	LandingAttempt *string  `json:"landing_attempt"` // the approve attempt that owns the reservation
+	// CurrentRoundLinks is the submission under review: the active links of the submission that
+	// started the current review round (see submissionLinks). Clients use it rather than
+	// re-deriving the rule from Links.
+	CurrentRoundLinks []TaskLink `json:"current_round_links"`
+	CreatedAt         string     `json:"created_at"`
+	UpdatedAt         string     `json:"updated_at"`
+	ArchivedAt        *string    `json:"archived_at"`
+	SupersededBy      *string    `json:"superseded_by"`
+	DependsOn         []string   `json:"depends_on"`
+	Links             []TaskLink `json:"links"`
 }
 
 // TaskListFilter contains filters for listing tasks.
@@ -1386,6 +1405,10 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 			track = input.Track
 		}
 
+		if input.Branch != "" && !validBranch.MatchString(input.Branch) {
+			return nil, invalid("INVALID_BRANCH", fmt.Sprintf("branch %q must be lowercase letters, digits, and single dashes (e.g. event-platform)", input.Branch))
+		}
+
 		task := Task{
 			ID:           taskID,
 			ProjectID:    projectID,
@@ -1401,6 +1424,7 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 			AgentMerge:   input.AgentMerge,
 			Escalate:     escalate,
 			Track:        track,
+			Branch:       input.Branch,
 			CreatedAt:    now,
 			UpdatedAt:    now,
 		}
@@ -1412,9 +1436,9 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 
 		// Insert task
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, escalate, track, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, task.ID, task.ProjectID, task.DocumentID, task.Title, task.Spec, task.State, task.Model, task.Kind, reviewModelsJSON, task.ReviewRound, task.TargetTaskID, task.AgentMerge, task.Escalate, task.Track, task.CreatedAt, task.UpdatedAt)
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, escalate, track, branch, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, task.ID, task.ProjectID, task.DocumentID, task.Title, task.Spec, task.State, task.Model, task.Kind, reviewModelsJSON, task.ReviewRound, task.TargetTaskID, task.AgentMerge, task.Escalate, task.Track, task.Branch, task.CreatedAt, task.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert task: %w", err)
 		}
@@ -1542,10 +1566,13 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 
 	var t Task
 	var reviewModelsJSON *string
+	var landingRound *int
+	var landingCommit *string
+	var landingAttempt *string
 	err = s.readConn.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by, landing_round, landing_commit, landing_attempt
 		FROM task WHERE id = ?
-	`, id).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, id).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy, &landingRound, &landingCommit, &landingAttempt)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return TaskWithDepsAndLinks{}, ErrNotFound
@@ -1585,7 +1612,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 
 	// Fetch links
 	linkRows, err := s.readConn.QueryContext(ctx, `
-		SELECT id, task_id, kind, value, tombstoned_at FROM task_link WHERE task_id = ? ORDER BY id
+		SELECT id, task_id, kind, value, tombstoned_at, review_round FROM task_link WHERE task_id = ? ORDER BY id
 	`, id)
 	if err != nil {
 		return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query links: %w", err)
@@ -1595,7 +1622,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	links := make([]TaskLink, 0)
 	for linkRows.Next() {
 		var link TaskLink
-		if err := linkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt); err != nil {
+		if err := linkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt, &link.ReviewRound); err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to scan link: %w", err)
 		}
 		links = append(links, link)
@@ -1603,33 +1630,45 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	if err := linkRows.Err(); err != nil {
 		return TaskWithDepsAndLinks{}, fmt.Errorf("error iterating links: %w", err)
 	}
+	currentRoundLinks, err := submissionLinks(ctx, s.readConn, id, t.ReviewRound)
+	if err != nil {
+		return TaskWithDepsAndLinks{}, err
+	}
+	if currentRoundLinks == nil {
+		currentRoundLinks = []TaskLink{}
+	}
 
 	return TaskWithDepsAndLinks{
-		ID:             t.ID,
-		ProjectID:      t.ProjectID,
-		DocumentID:     t.DocumentID,
-		Title:          t.Title,
-		Spec:           t.Spec,
-		State:          t.State,
-		Assignee:       t.Assignee,
-		LeaseExpiresAt: t.LeaseExpiresAt,
-		Result:         t.Result,
-		Model:          t.Model,
-		Kind:           t.Kind,
-		ReviewModels:   t.ReviewModels,
-		ReviewRound:    t.ReviewRound,
-		TargetTaskID:   t.TargetTaskID,
-		Verdict:        t.Verdict,
-		AgentMerge:     t.AgentMerge,
-		Held:           t.Held,
-		Escalate:       t.Escalate,
-		Track:          t.Track,
-		CreatedAt:      t.CreatedAt,
-		UpdatedAt:      t.UpdatedAt,
-		ArchivedAt:     t.ArchivedAt,
-		SupersededBy:   t.SupersededBy,
-		DependsOn:      dependsOn,
-		Links:          links,
+		ID:                t.ID,
+		ProjectID:         t.ProjectID,
+		DocumentID:        t.DocumentID,
+		Title:             t.Title,
+		Spec:              t.Spec,
+		State:             t.State,
+		Assignee:          t.Assignee,
+		LeaseExpiresAt:    t.LeaseExpiresAt,
+		Result:            t.Result,
+		Model:             t.Model,
+		Kind:              t.Kind,
+		ReviewModels:      t.ReviewModels,
+		ReviewRound:       t.ReviewRound,
+		TargetTaskID:      t.TargetTaskID,
+		Verdict:           t.Verdict,
+		AgentMerge:        t.AgentMerge,
+		Held:              t.Held,
+		Escalate:          t.Escalate,
+		Track:             t.Track,
+		Branch:            t.Branch,
+		LandingRound:      landingRound,
+		LandingCommit:     landingCommit,
+		LandingAttempt:    landingAttempt,
+		CurrentRoundLinks: currentRoundLinks,
+		CreatedAt:         t.CreatedAt,
+		UpdatedAt:         t.UpdatedAt,
+		ArchivedAt:        t.ArchivedAt,
+		SupersededBy:      t.SupersededBy,
+		DependsOn:         dependsOn,
+		Links:             links,
 	}, nil
 }
 
@@ -1655,7 +1694,7 @@ const claimableSQL = `(state = 'ready' OR (state = 'in_progress' AND lease_expir
 // Filters compose with AND logic.
 // By default, archived tasks are excluded unless filter.IncludeArchived is true.
 func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error) {
-	query := `SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+	query := `SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task
 		WHERE project_id = ?`
 	args := []interface{}{projectID}
@@ -1705,7 +1744,7 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 	for rows.Next() {
 		var t Task
 		var reviewModelsJSON *string
-		if err := rows.Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy); err != nil {
+		if err := rows.Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy); err != nil {
 			return nil, fmt.Errorf("failed to scan task: %w", err)
 		}
 		// Unmarshal review_models from JSON
@@ -1795,9 +1834,9 @@ func (s *sqliteStore) ClaimTask(ctx context.Context, taskID, agentID, model stri
 		var t Task
 		var reviewModelsJSON *string
 		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 			FROM task WHERE id = ?
-		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to fetch claimed task: %w", err)
 		}
@@ -1882,9 +1921,9 @@ func (s *sqliteStore) HeartbeatTask(ctx context.Context, taskID, agentID string,
 		var t Task
 		var reviewModelsJSON *string
 		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 			FROM task WHERE id = ?
-		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to fetch updated task: %w", err)
 		}
@@ -1964,9 +2003,9 @@ func (s *sqliteStore) PromoteTask(ctx context.Context, taskID string) (Task, err
 		var t Task
 		var reviewModelsJSON *string
 		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 			FROM task WHERE id = ?
-		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to fetch promoted task: %w", err)
 		}
@@ -2266,7 +2305,14 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 	}
 
 	if rowsAffected == 1 {
-		// Submit succeeded. Insert task_link rows (dedup by task_id, kind, value).
+		// Submit succeeded. Insert task_link rows (dedup by task_id, kind, value). An implement
+		// submission starts review round currentReviewRound+1 (incremented below); its links are
+		// tagged with that round, so readers can tell this round's commit from earlier rounds'.
+		var linkRound *int
+		if taskKind == "implement" {
+			submittedRound := currentReviewRound + 1
+			linkRound = &submittedRound
+		}
 		for _, link := range links {
 			// Check if this link already exists
 			var existingCount int
@@ -2277,15 +2323,22 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to check link existence: %w", err)
 			}
 
-			// Only insert if it doesn't exist
 			if existingCount == 0 {
 				linkID := GenerateID()
 				_, err := tx.ExecContext(ctx, `
-					INSERT INTO task_link (id, task_id, kind, value)
-					VALUES (?, ?, ?, ?)
-				`, linkID, taskID, link.Kind, link.Value)
+					INSERT INTO task_link (id, task_id, kind, value, review_round)
+					VALUES (?, ?, ?, ?, ?)
+				`, linkID, taskID, link.Kind, link.Value, linkRound)
 				if err != nil {
 					return TaskWithDepsAndLinks{}, fmt.Errorf("failed to insert link: %w", err)
+				}
+			} else if linkRound != nil {
+				// Re-submitted unchanged (e.g. the same PR across rounds): it belongs to this round now.
+				_, err := tx.ExecContext(ctx, `
+					UPDATE task_link SET review_round = ? WHERE task_id = ? AND kind = ? AND value = ?
+				`, linkRound, taskID, link.Kind, link.Value)
+				if err != nil {
+					return TaskWithDepsAndLinks{}, fmt.Errorf("failed to update link round: %w", err)
 				}
 			}
 		}
@@ -2313,9 +2366,9 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 		var t Task
 		var reviewModelsJSON *string
 		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 			FROM task WHERE id = ?
-		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 		if err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to fetch submitted task: %w", err)
 		}
@@ -2461,7 +2514,7 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 
 		// Fetch links (including those we just inserted)
 		linkRows, err := tx.QueryContext(ctx, `
-			SELECT id, task_id, kind, value, tombstoned_at FROM task_link WHERE task_id = ? ORDER BY id
+			SELECT id, task_id, kind, value, tombstoned_at, review_round FROM task_link WHERE task_id = ? ORDER BY id
 		`, taskID)
 		if err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query links: %w", err)
@@ -2471,7 +2524,7 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 		fetchedLinks := make([]TaskLink, 0)
 		for linkRows.Next() {
 			var link TaskLink
-			if err := linkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt); err != nil {
+			if err := linkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt, &link.ReviewRound); err != nil {
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to scan link: %w", err)
 			}
 			fetchedLinks = append(fetchedLinks, link)
@@ -2502,6 +2555,9 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			Verdict:        t.Verdict,
 			AgentMerge:     t.AgentMerge,
 			Held:           t.Held,
+			Escalate:       t.Escalate,
+			Track:          t.Track,
+			Branch:         t.Branch,
 			CreatedAt:      t.CreatedAt,
 			UpdatedAt:      t.UpdatedAt,
 			ArchivedAt:     t.ArchivedAt,
@@ -2534,33 +2590,30 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 // reviewer reported a blocking finding". It checks for a no-op resolution (which
 // finalizes straight to done), otherwise spawns a merge task when agent_merge is
 // set, otherwise leaves the parent at approved. Returns the new parent state.
-func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, parentID, parentModel, parentTrack, parentTitle, parentProjectID, parentDocumentID string, parentAgentMerge bool, now string) (string, error) {
+func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, parentID string, parentReviewRound int, parentModel, parentTrack, parentTitle, parentProjectID, parentDocumentID string, parentAgentMerge bool, now string) (string, error) {
 	newParentState := "approved"
 
-	// Check if parent has a no_op link (and no pr link)
-	var hasNoOp bool
-	var hasPR bool
-	rows, err := tx.QueryContext(ctx, `
-		SELECT kind FROM task_link WHERE task_id = ? AND tombstoned_at IS NULL
-	`, parentID)
+	// The no-op finalisation needs the approved round itself to be a no_op: a no_op from an
+	// earlier, rejected round must not finalise a later round that submitted real work (in
+	// local_commit mode there is no pr link to tell them apart). The task's PR, by contrast, is
+	// task-wide: a rework pushes to the same PR, and may not re-submit its link.
+	roundLinks, err := submissionLinks(ctx, tx, parentID, parentReviewRound)
 	if err != nil {
-		return "", fmt.Errorf("failed to query active task links: %w", err)
+		return "", err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var kind string
-		if err := rows.Scan(&kind); err != nil {
-			return "", fmt.Errorf("failed to scan task link kind: %w", err)
-		}
-		if kind == "no_op" {
+	var hasNoOp bool
+	for _, link := range roundLinks {
+		if link.Kind == "no_op" {
 			hasNoOp = true
-		} else if kind == "pr" {
-			hasPR = true
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("failed to iterate task links: %w", err)
+	var activePRLinks int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM task_link WHERE task_id = ? AND kind = 'pr' AND tombstoned_at IS NULL
+	`, parentID).Scan(&activePRLinks); err != nil {
+		return "", fmt.Errorf("failed to query active pr links: %w", err)
 	}
+	hasPR := activePRLinks > 0
 
 	// If no_op link with no pr link, go straight to done (regardless of agent_merge)
 	if hasNoOp && !hasPR {
@@ -3770,9 +3823,10 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 	var parentTitle string
 	var parentTrack string
 	var parentReviewModelsJSON *string
+	var parentLandingRound *int
 	err := tx.QueryRowContext(ctx, `
-		SELECT review_round, state, held, model, escalate, agent_merge, project_id, document_id, title, track, review_models FROM task WHERE id = ?
-	`, parentID).Scan(&parentReviewRound, &parentState, &parentHeld, &parentModel, &parentEscalate, &parentAgentMerge, &parentProjectID, &parentDocumentID, &parentTitle, &parentTrack, &parentReviewModelsJSON)
+		SELECT review_round, state, held, model, escalate, agent_merge, project_id, document_id, title, track, review_models, landing_round FROM task WHERE id = ?
+	`, parentID).Scan(&parentReviewRound, &parentState, &parentHeld, &parentModel, &parentEscalate, &parentAgentMerge, &parentProjectID, &parentDocumentID, &parentTitle, &parentTrack, &parentReviewModelsJSON, &parentLandingRound)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch parent task review_round: %w", err)
 	}
@@ -3863,7 +3917,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 		}
 
 		if !roundFailed {
-			state, err := s.handleApprovedRound(ctx, tx, parentID, parentModel, parentTrack, parentTitle, parentProjectID, parentDocumentID, parentAgentMerge, now)
+			state, err := s.handleApprovedRound(ctx, tx, parentID, parentReviewRound, parentModel, parentTrack, parentTitle, parentProjectID, parentDocumentID, parentAgentMerge, now)
 			if err != nil {
 				return "", err
 			}
@@ -3932,6 +3986,12 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 				newParentState = state
 			}
 		}
+	}
+
+	// An approve is landing the parent's reviewed work: a late review result must not move it
+	// (the landing reservation only lets it go to done).
+	if parentLandingRound != nil {
+		newParentState = ""
 	}
 
 	// Update parent state if needed (and not in terminal state)
@@ -4035,6 +4095,20 @@ func (s *sqliteStore) AddReview(ctx context.Context, taskID, actor, verdict stri
 // Returns ErrConflict if the transition is not allowed.
 // Returns ValidationError if 'to' state is invalid.
 func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error) {
+	return s.transitionTask(ctx, taskID, to, note, nil)
+}
+
+// CompleteLanding marks an approved task done for the approve attempt that holds its landing
+// reservation, once that approve has published the reviewed work to the task's branch. It is the
+// only way an approved task whose review round submitted a commit (a local_commit task) reaches
+// done: TransitionTask refuses that, so dependents can never unblock before the work has landed.
+// Returns NOT_RESERVED or LANDING_ATTEMPT_MISMATCH conflicts unless attempt owns the reservation.
+func (s *sqliteStore) CompleteLanding(ctx context.Context, taskID, attempt string, note *string) (Task, error) {
+	return s.transitionTask(ctx, taskID, "done", note, &attempt)
+}
+
+// transitionTask is TransitionTask, or with landingAttempt set, CompleteLanding.
+func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, note *string, landingAttempt *string) (Task, error) {
 	// Validate 'to' state
 	validTargets := map[string]bool{"done": true, "ready": true, "blocked": true, "failed": true, "superseded": true, "abandoned": true}
 	if !validTargets[to] {
@@ -4114,12 +4188,33 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 		return Task{}, ErrConflict
 	}
 
+	if taskState == "approved" {
+		if landingAttempt != nil {
+			if err := checkLandingOwner(ctx, tx, taskID, *landingAttempt); err != nil {
+				return Task{}, err
+			}
+		} else {
+			// While an approve is landing the task, only that approve may move it (to done).
+			if err := checkNoLanding(ctx, tx, taskID); err != nil {
+				return Task{}, err
+			}
+			if to == "done" {
+				if err := checkNothingToLand(ctx, tx, taskID); err != nil {
+					return Task{}, err
+				}
+			}
+		}
+	} else if landingAttempt != nil {
+		return Task{}, conflict("NOT_APPROVED", fmt.Sprintf("task is in %q state, expected approved", taskState))
+	}
+
 	// Perform the conditional UPDATE
-	// On blocked→ready, also clear assignee and lease_expires_at to make it freshly claimable
+	// On blocked→ready, also clear assignee and lease_expires_at to make it freshly claimable.
+	// Any transition ends an approve's landing reservation.
 	now := nowTimestamp()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE task
-		SET state=?, updated_at=?,
+		SET state=?, updated_at=?, landing_round=NULL, landing_commit=NULL, landing_attempt=NULL,
 		    assignee=CASE WHEN ? = 'blocked' THEN NULL ELSE assignee END,
 		    lease_expires_at=CASE WHEN ? = 'blocked' THEN NULL ELSE lease_expires_at END
 		WHERE id=? AND state=?
@@ -4148,9 +4243,9 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 	var t Task
 	var reviewModelsJSON *string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to fetch transitioned task: %w", err)
 	}
@@ -4372,9 +4467,9 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 	var oldTask Task
 	var reviewModelsJSON *string
 	err := tx.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, taskID).Scan(&oldTask.ID, &oldTask.ProjectID, &oldTask.DocumentID, &oldTask.Title, &oldTask.Spec, &oldTask.State, &oldTask.Assignee, &oldTask.LeaseExpiresAt, &oldTask.Result, &oldTask.Model, &oldTask.Kind, &reviewModelsJSON, &oldTask.ReviewRound, &oldTask.TargetTaskID, &oldTask.Verdict, &oldTask.AgentMerge, &oldTask.Held, &oldTask.Escalate, &oldTask.Track, &oldTask.CreatedAt, &oldTask.UpdatedAt, &oldTask.ArchivedAt, &oldTask.SupersededBy)
+	`, taskID).Scan(&oldTask.ID, &oldTask.ProjectID, &oldTask.DocumentID, &oldTask.Title, &oldTask.Spec, &oldTask.State, &oldTask.Assignee, &oldTask.LeaseExpiresAt, &oldTask.Result, &oldTask.Model, &oldTask.Kind, &reviewModelsJSON, &oldTask.ReviewRound, &oldTask.TargetTaskID, &oldTask.Verdict, &oldTask.AgentMerge, &oldTask.Held, &oldTask.Escalate, &oldTask.Track, &oldTask.Branch, &oldTask.CreatedAt, &oldTask.UpdatedAt, &oldTask.ArchivedAt, &oldTask.SupersededBy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -4386,6 +4481,10 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 	switch oldTask.State {
 	case "done", "failed", "abandoned", "superseded":
 		return "", ErrConflict
+	case "approved":
+		if err := checkNoLanding(ctx, tx, taskID); err != nil {
+			return "", err
+		}
 	}
 
 	// Unmarshal review_models
@@ -4472,9 +4571,9 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 	}
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, track, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, newTaskID, oldTask.ProjectID, oldTask.DocumentID, oldTask.Title, oldTask.Spec, "backlog", model, oldTask.Kind, newReviewModelsJSON, 0, oldTask.AgentMerge, oldTask.Escalate, oldTask.Track, now, now)
+		INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, track, branch, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, newTaskID, oldTask.ProjectID, oldTask.DocumentID, oldTask.Title, oldTask.Spec, "backlog", model, oldTask.Kind, newReviewModelsJSON, 0, oldTask.AgentMerge, oldTask.Escalate, oldTask.Track, oldTask.Branch, now, now)
 	if err != nil {
 		return "", fmt.Errorf("failed to insert replacement task: %w", err)
 	}
@@ -4555,9 +4654,9 @@ func (s *sqliteStore) SupersedeTask(ctx context.Context, taskID string, modelOve
 	var newTask Task
 	var reviewModelsJSON *string
 	err = s.conn.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, newTaskID).Scan(&newTask.ID, &newTask.ProjectID, &newTask.DocumentID, &newTask.Title, &newTask.Spec, &newTask.State, &newTask.Assignee, &newTask.LeaseExpiresAt, &newTask.Result, &newTask.Model, &newTask.Kind, &reviewModelsJSON, &newTask.ReviewRound, &newTask.TargetTaskID, &newTask.Verdict, &newTask.AgentMerge, &newTask.Held, &newTask.Escalate, &newTask.Track, &newTask.CreatedAt, &newTask.UpdatedAt, &newTask.ArchivedAt, &newTask.SupersededBy)
+	`, newTaskID).Scan(&newTask.ID, &newTask.ProjectID, &newTask.DocumentID, &newTask.Title, &newTask.Spec, &newTask.State, &newTask.Assignee, &newTask.LeaseExpiresAt, &newTask.Result, &newTask.Model, &newTask.Kind, &reviewModelsJSON, &newTask.ReviewRound, &newTask.TargetTaskID, &newTask.Verdict, &newTask.AgentMerge, &newTask.Held, &newTask.Escalate, &newTask.Track, &newTask.Branch, &newTask.CreatedAt, &newTask.UpdatedAt, &newTask.ArchivedAt, &newTask.SupersededBy)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to load new task: %w", err)
 	}
@@ -4591,9 +4690,9 @@ func (s *sqliteStore) UpdateTaskEscalate(ctx context.Context, taskID string, esc
 	var t Task
 	var reviewModelsJSON *string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Task{}, ErrNotFound
 	}
@@ -4748,9 +4847,9 @@ func (s *sqliteStore) ArchiveTask(ctx context.Context, taskID string) (Task, err
 	var t Task
 	var reviewModelsJSON *string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to fetch archived task: %w", err)
 	}
@@ -4804,9 +4903,9 @@ func (s *sqliteStore) UnarchiveTask(ctx context.Context, taskID string) (Task, e
 	var t Task
 	var reviewModelsJSON *string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to fetch unarchived task: %w", err)
 	}
@@ -4942,6 +5041,220 @@ func (s *sqliteStore) TombstoneLink(ctx context.Context, taskID, linkID string) 
 	return nil
 }
 
+// submissionLinks returns the active (non-tombstoned) links of the submission that started
+// review round reviewRound: those tagged with that round. A task none of whose links are tagged
+// was only ever submitted before links were tagged, so its untagged links are all there is.
+func submissionLinks(ctx context.Context, q eventQuerier, taskID string, reviewRound int) ([]TaskLink, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT id, task_id, kind, value, tombstoned_at, review_round FROM task_link WHERE task_id = ? AND tombstoned_at IS NULL ORDER BY id
+	`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active task links: %w", err)
+	}
+	defer rows.Close()
+	var roundLinks, untagged []TaskLink
+	anyTagged := false
+	for rows.Next() {
+		var link TaskLink
+		if err := rows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt, &link.ReviewRound); err != nil {
+			return nil, fmt.Errorf("failed to scan task link: %w", err)
+		}
+		switch {
+		case link.ReviewRound == nil:
+			untagged = append(untagged, link)
+		case *link.ReviewRound == reviewRound:
+			anyTagged = true
+			roundLinks = append(roundLinks, link)
+		default:
+			anyTagged = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate task links: %w", err)
+	}
+	if anyTagged {
+		return roundLinks, nil
+	}
+	return untagged, nil
+}
+
+// checkNoLanding returns a LANDING_IN_PROGRESS conflict if an approve holds task taskID's
+// landing reservation (see BeginLanding).
+func checkNoLanding(ctx context.Context, tx *sql.Tx, taskID string) error {
+	var landingRound sql.NullInt64
+	if err := tx.QueryRowContext(ctx, "SELECT landing_round FROM task WHERE id = ?", taskID).Scan(&landingRound); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("failed to load landing reservation: %w", err)
+	}
+	if landingRound.Valid {
+		return conflict("LANDING_IN_PROGRESS", fmt.Sprintf("an approve is landing this task's reviewed work (round %d) on its local_commit branch, so only that approve can move it (to done); finish it with `odonian approve %s`, or, if nothing has landed yet, cancel it with `odonian approve %s --cancel-landing`", landingRound.Int64, taskID, taskID))
+	}
+	return nil
+}
+
+// checkLandingOwner returns a conflict unless attempt holds task taskID's landing reservation.
+func checkLandingOwner(ctx context.Context, tx *sql.Tx, taskID, attempt string) error {
+	var landingRound sql.NullInt64
+	var landingAttempt sql.NullString
+	if err := tx.QueryRowContext(ctx, "SELECT landing_round, landing_attempt FROM task WHERE id = ?", taskID).Scan(&landingRound, &landingAttempt); err != nil {
+		return fmt.Errorf("failed to load landing reservation: %w", err)
+	}
+	if !landingRound.Valid {
+		return conflict("NOT_RESERVED", "the task holds no landing reservation; reserve it (POST /tasks/{id}/landing) before completing the landing")
+	}
+	if landingAttempt.String != attempt {
+		return conflict("LANDING_ATTEMPT_MISMATCH", "the landing reservation belongs to another approve attempt")
+	}
+	return nil
+}
+
+// checkNothingToLand returns a LANDING_REQUIRED conflict if task taskID's current review round
+// submitted a commit (a local_commit task): marking it done directly would unblock its
+// dependents without that commit on the branch they start from. Such a task reaches done only
+// through CompleteLanding.
+func checkNothingToLand(ctx context.Context, tx *sql.Tx, taskID string) error {
+	var reviewRound int
+	if err := tx.QueryRowContext(ctx, "SELECT review_round FROM task WHERE id = ?", taskID).Scan(&reviewRound); err != nil {
+		return fmt.Errorf("failed to load review round: %w", err)
+	}
+	roundLinks, err := submissionLinks(ctx, tx, taskID, reviewRound)
+	if err != nil {
+		return err
+	}
+	for _, link := range roundLinks {
+		if link.Kind == "commit" {
+			return conflict("LANDING_REQUIRED", fmt.Sprintf("this task's reviewed work is local_commit commit %s, which must land on its branch before the task is done; approve it with `odonian approve %s`", link.Value, taskID))
+		}
+	}
+	return nil
+}
+
+// BeginLanding reserves an approved task for `odonian approve` to land the work reviewed in
+// reviewRound (the reviewed commit is recorded alongside). It is atomic and conditional: it fails
+// with NOT_APPROVED unless the task is approved, and with STALE_REVIEW_ROUND unless reviewRound is
+// still the task's current review round — so a task reworked and re-approved while approve ran its
+// merge gate is never finalised with the version approve prepared. Until the task transitions,
+// it can only move to done. attempt identifies the approve making the reservation; re-reserving
+// the same round and commit (a resumed approve) succeeds and makes attempt the owner, so only it
+// can cancel the reservation (see CancelLanding). A different round or commit is a
+// LANDING_IN_PROGRESS conflict. Returns ErrNotFound for an unknown task.
+func (s *sqliteStore) BeginLanding(ctx context.Context, taskID string, reviewRound int, commit, attempt string) error {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var taskState string
+	var currentRound int
+	var landingRound sql.NullInt64
+	var landingCommit sql.NullString
+	err = tx.QueryRowContext(ctx, "SELECT state, review_round, landing_round, landing_commit FROM task WHERE id = ?", taskID).Scan(&taskState, &currentRound, &landingRound, &landingCommit)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("failed to load task: %w", err)
+	}
+	if taskState != "approved" {
+		return conflict("NOT_APPROVED", fmt.Sprintf("task is in %q state, expected approved", taskState))
+	}
+	if currentRound != reviewRound {
+		return conflict("STALE_REVIEW_ROUND", fmt.Sprintf("task has been reviewed again since this approve read it (it is in review round %d, the approve prepared round %d)", currentRound, reviewRound))
+	}
+	if landingRound.Valid {
+		if int(landingRound.Int64) != reviewRound || landingCommit.String != commit {
+			return conflict("LANDING_IN_PROGRESS", fmt.Sprintf("another approve is landing round %d (commit %s)", landingRound.Int64, landingCommit.String))
+		}
+		// A resumed approve: it takes over the reservation.
+		if _, err := tx.ExecContext(ctx, "UPDATE task SET landing_attempt=? WHERE id=?", attempt, taskID); err != nil {
+			return fmt.Errorf("failed to take over landing reservation: %w", err)
+		}
+		return tx.Commit()
+	}
+	if err := checkReviewedCommit(ctx, tx, taskID, reviewRound, commit); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE task SET landing_round=?, landing_commit=?, landing_attempt=? WHERE id=? AND state='approved' AND review_round=?
+	`, reviewRound, commit, attempt, taskID, reviewRound); err != nil {
+		return fmt.Errorf("failed to reserve task for landing: %w", err)
+	}
+	return tx.Commit()
+}
+
+// checkReviewedCommit returns an UNREVIEWED_COMMIT conflict unless commit is the commit submitted
+// for review round reviewRound, so approve lands exactly what the reviewers approved. A round that
+// submitted no commit (including a no_op) has nothing to land. A task submitted before links
+// carried their round passes only with exactly one commit link.
+func checkReviewedCommit(ctx context.Context, tx *sql.Tx, taskID string, reviewRound int, commit string) error {
+	roundLinks, err := submissionLinks(ctx, tx, taskID, reviewRound)
+	if err != nil {
+		return err
+	}
+	var reviewedCommits []string
+	var noOp, untagged bool
+	for _, link := range roundLinks {
+		untagged = untagged || link.ReviewRound == nil
+		switch link.Kind {
+		case "commit":
+			reviewedCommits = append(reviewedCommits, link.Value)
+		case "no_op":
+			noOp = true
+		}
+	}
+	if untagged && len(reviewedCommits) > 1 {
+		// Submitted before links carried their round, and reworked: any of these may be an
+		// earlier, rejected round's commit, so none of them can be landed as the reviewed one.
+		return conflict("UNREVIEWED_COMMIT", fmt.Sprintf("the task's %d commit links (%s) predate links recording their review round, so which one round %d reviewed is unknown; reject it and re-submit to record it", len(reviewedCommits), strings.Join(reviewedCommits, ", "), reviewRound))
+	}
+	if slices.Contains(reviewedCommits, commit) {
+		return nil
+	}
+	if len(reviewedCommits) == 0 && noOp {
+		return conflict("UNREVIEWED_COMMIT", fmt.Sprintf("review round %d was a no-op submission, so there is nothing reviewed to land", reviewRound))
+	}
+	if len(reviewedCommits) == 0 {
+		return conflict("UNREVIEWED_COMMIT", fmt.Sprintf("review round %d has no submitted commit, so there is nothing reviewed to land", reviewRound))
+	}
+	return conflict("UNREVIEWED_COMMIT", fmt.Sprintf("commit %s is not the commit reviewed in round %d (%s); the task's wip branch has changed since it was submitted", commit, reviewRound, strings.Join(reviewedCommits, ", ")))
+}
+
+// CancelLanding drops a landing reservation, but only if attempt still owns it: an approve that
+// stalled and was replaced (the replacement re-reserved and so took ownership) gets a
+// LANDING_ATTEMPT_MISMATCH conflict instead of clearing its replacement's reservation. Only safe
+// when the reserved work has not reached the branch, which the server cannot see: callers check
+// that first. Cancelling an unreserved task is a no-op. Returns ErrNotFound for an unknown task.
+func (s *sqliteStore) CancelLanding(ctx context.Context, taskID, attempt string) error {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var landingRound sql.NullInt64
+	var landingAttempt sql.NullString
+	err = tx.QueryRowContext(ctx, "SELECT landing_round, landing_attempt FROM task WHERE id = ?", taskID).Scan(&landingRound, &landingAttempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("failed to load landing reservation: %w", err)
+	}
+	if !landingRound.Valid {
+		return nil
+	}
+	if landingAttempt.String != attempt {
+		return conflict("LANDING_ATTEMPT_MISMATCH", "the landing reservation now belongs to another approve attempt, so it was not cancelled")
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE task SET landing_round=NULL, landing_commit=NULL, landing_attempt=NULL WHERE id=? AND landing_attempt=?", taskID, attempt); err != nil {
+		return fmt.Errorf("failed to cancel landing: %w", err)
+	}
+	return tx.Commit()
+}
+
 // HoldTask sets the held flag on a task, preventing it from being claimed or auto-transitioned.
 // Hold works from any state (it is an orthogonal lock, not a state transition).
 // Returns the updated Task on success.
@@ -4976,9 +5289,9 @@ func (s *sqliteStore) HoldTask(ctx context.Context, taskID string) (Task, error)
 	var t Task
 	var reviewModelsJSON *string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to fetch held task: %w", err)
 	}
@@ -5032,9 +5345,9 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 	var t Task
 	var reviewModelsJSON *string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to fetch released task: %w", err)
 	}
@@ -5069,9 +5382,9 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 
 			// Re-fetch the task to get the updated state
 			err = tx.QueryRowContext(ctx, `
-				SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+				SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 				FROM task WHERE id = ?
-			`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+			`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 			if err != nil {
 				return Task{}, fmt.Errorf("failed to fetch task after aggregation: %w", err)
 			}
@@ -5148,9 +5461,9 @@ func (s *sqliteStore) UpdateTaskDependsOn(ctx context.Context, taskID string, de
 	var t Task
 	var reviewModelsJSON *string
 	err = s.conn.QueryRowContext(ctx, `
-		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, created_at, updated_at, archived_at, superseded_by
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
-	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Task{}, ErrNotFound
 	}
