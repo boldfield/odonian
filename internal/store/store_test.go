@@ -18814,6 +18814,11 @@ func TestContinuationInfoCreatedChildren(t *testing.T) {
 		t.Errorf("research child: expected 2 claim IDs, got %d", len(researchChild.ClaimIDs))
 	}
 
+	// Verify dependency status (should be empty since no dependencies)
+	if researchChild.DependencyStatus != "" {
+		t.Errorf("research child: expected no dependency status, got '%s'", researchChild.DependencyStatus)
+	}
+
 	// Verify build child details
 	if buildChild.State != "backlog" {
 		t.Errorf("build child: expected state 'backlog', got '%s'", buildChild.State)
@@ -19188,6 +19193,125 @@ func TestContinuationInfoProposedChildren(t *testing.T) {
 
 	if buildProposed.InitialState != "backlog" {
 		t.Errorf("build child: expected initial state 'backlog', got '%s'", buildProposed.InitialState)
+	}
+}
+
+// TestContinuationInfoDeferredClaimOwner verifies that deferred claim owners from the manifest are exposed.
+func TestContinuationInfoDeferredClaimOwner(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project and document
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a parent task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Parent Task",
+			Spec:         "Parent spec\n## continuation manifest\nTest manifest",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create parent task: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	// Create a manifest with a child and a carried_forward pending candidate
+	m := &manifest.Manifest{
+		Version:      1,
+		ParentTaskID: parentID,
+		Children: []manifest.Child{
+			{
+				Key:                "child1",
+				Title:              "Child One",
+				Spec:               "Child spec",
+				Track:              "research",
+				Model:              "haiku",
+				ReviewModels:       []string{"opus", "sonnet"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"assigned-claim-1"},
+				SourceStartPoints:  []string{"source1"},
+				FileScope:          []string{"f1.go"},
+				AcceptanceCriteria: []string{"criteria1"},
+			},
+		},
+		PendingCandidates: []manifest.PendingCandidate{
+			{ClaimID: "assigned-claim-1", Disposition: "assigned"},
+			{ClaimID: "deferred-claim-1", Disposition: "carried_forward", Owner: ptrString("john.doe@example.com")},
+		},
+	}
+
+	ss := store.(*sqliteStore)
+	canonicalM, err := ss.canonicalizeManifest(
+		json.RawMessage(mustMarshalJSON(t, m)), parentID)
+	if err != nil {
+		t.Fatalf("failed to canonicalize manifest: %v", err)
+	}
+
+	// Insert the submission manifest into the database
+	_, err = ss.conn.ExecContext(ctx, `
+		INSERT INTO task_submission_manifest (id, task_id, review_round, parent_task_id, manifest_json, manifest_digest, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, GenerateID(), parentID, 1, parentID, canonicalM.json, canonicalM.digest, nowTimestamp())
+	if err != nil {
+		t.Fatalf("failed to insert submission manifest: %v", err)
+	}
+
+	// Create child via manifest
+	tx, err := ss.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	_, err = ss.InsertManifestChildren(
+		ctx, tx, m, canonicalM.digest, parentID, proj.ID, doc.ID, nowTimestamp())
+	if err != nil {
+		t.Fatalf("failed to insert manifest children: %v", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		t.Fatalf("failed to commit transaction: %v", err)
+	}
+
+	// Get parent and verify deferred claims are exposed
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+
+	if parent.Continuation == nil {
+		t.Fatalf("expected continuation info on parent")
+	}
+
+	if len(parent.Continuation.DeferredClaims) == 0 {
+		t.Fatalf("expected deferred claims in continuation info")
+	}
+
+	deferredClaim := parent.Continuation.DeferredClaims[0]
+	if deferredClaim.ClaimID != "deferred-claim-1" {
+		t.Errorf("expected deferred claim ID 'deferred-claim-1', got '%s'", deferredClaim.ClaimID)
+	}
+	if deferredClaim.Owner != "john.doe@example.com" {
+		t.Errorf("expected deferred claim owner 'john.doe@example.com', got '%s'", deferredClaim.Owner)
 	}
 }
 

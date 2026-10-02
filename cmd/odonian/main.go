@@ -727,6 +727,9 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 					fmt.Fprintf(out, "      Parent: %s\n", child.ParentTaskID)
 					fmt.Fprintf(out, "      State: %s, Track: %s\n", child.State, child.Track)
 					fmt.Fprintf(out, "      Manifest Digest: %s\n", child.ManifestDigest)
+					if child.DependencyStatus != "" {
+						fmt.Fprintf(out, "      Dependency Status: %s\n", child.DependencyStatus)
+					}
 					if len(child.ClaimIDs) > 0 {
 						fmt.Fprintf(out, "      Claim IDs: %s\n", strings.Join(child.ClaimIDs, ", "))
 					}
@@ -738,6 +741,18 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 					}
 					if len(child.AcceptanceCriteria) > 0 {
 						fmt.Fprintf(out, "      Acceptance Criteria: %s\n", strings.Join(child.AcceptanceCriteria, ", "))
+					}
+				}
+			}
+			if len(task.Continuation.DeferredClaims) > 0 {
+				fmt.Fprintf(out, "  Deferred Claims (not assigned to children):\n")
+				for _, claim := range task.Continuation.DeferredClaims {
+					fmt.Fprintf(out, "    - Claim: %s\n", claim.ClaimID)
+					if claim.Owner != "" {
+						fmt.Fprintf(out, "      Owner: %s\n", claim.Owner)
+					}
+					if claim.Reason != "" {
+						fmt.Fprintf(out, "      Reason: %s\n", claim.Reason)
 					}
 				}
 			}

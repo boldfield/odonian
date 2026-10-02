@@ -693,6 +693,14 @@ type CreatedChild struct {
 	SourceStartPoints  []string `json:"source_start_points,omitempty"`
 	FileScope          []string `json:"file_scope,omitempty"`
 	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+	DependencyStatus   string   `json:"dependency_status,omitempty"` // "blocked", "ready", or empty if no dependencies
+}
+
+// DeferredClaim represents a pending claim that was not assigned to any child in the manifest.
+type DeferredClaim struct {
+	ClaimID string `json:"claim_id"`
+	Owner   string `json:"owner"`            // owner responsible for the deferred claim
+	Reason  string `json:"reason,omitempty"` // reason if the claim was excluded
 }
 
 // ActionItem represents an action item for a task (e.g., held dependencies).
@@ -712,6 +720,7 @@ type ParentInfo struct {
 type ContinuationInfo struct {
 	ProposedChildren []ProposedChild `json:"proposed_children,omitempty"`
 	CreatedChildren  []CreatedChild  `json:"created_children,omitempty"`
+	DeferredClaims   []DeferredClaim `json:"deferred_claims,omitempty"` // claims not assigned to any child
 	ActionItems      []ActionItem    `json:"action_items,omitempty"`
 	ParentInfo       *ParentInfo     `json:"parent_info,omitempty"`
 }
@@ -6100,12 +6109,38 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 		ActionItems:      []ActionItem{},
 	}
 
-	// Extract proposed children from the latest manifest (if any)
+	// Extract proposed children and pending candidates from the latest manifest (if any)
 	proposedKeySet := make(map[string]bool)
 	if len(manifests) > 0 {
 		latestManifest := manifests[len(manifests)-1]
 		var m map[string]interface{}
 		if err := json.Unmarshal(latestManifest.ManifestJSON, &m); err == nil {
+			// Extract pending candidates - separate carried_forward and excluded from assigned
+			if candidates, ok := m["pending_candidates"].([]interface{}); ok {
+				for _, cand := range candidates {
+					if candMap, ok := cand.(map[string]interface{}); ok {
+						claimID, _ := candMap["claim_id"].(string)
+						disposition, _ := candMap["disposition"].(string)
+						if disposition == "carried_forward" {
+							if owner, ok := candMap["owner"].(string); ok && owner != "" {
+								info.DeferredClaims = append(info.DeferredClaims, DeferredClaim{
+									ClaimID: claimID,
+									Owner:   owner,
+								})
+							}
+						} else if disposition == "excluded" {
+							if reason, ok := candMap["reason"].(string); ok && reason != "" {
+								info.DeferredClaims = append(info.DeferredClaims, DeferredClaim{
+									ClaimID: claimID,
+									Reason:  reason,
+								})
+							}
+						}
+					}
+				}
+			}
+
+			// Extract proposed children
 			if children, ok := m["children"].([]interface{}); ok {
 				for _, child := range children {
 					if childMap, ok := child.(map[string]interface{}); ok {
@@ -6154,11 +6189,18 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 		state string
 		track string
 	}
+	var childDependencies map[string][]string
+	var childBlockedStatus map[string]bool
+
 	if len(createdChildrenOrder) > 0 {
 		childTaskStates = make(map[string]struct {
 			state string
 			track string
 		})
+		childDependencies = make(map[string][]string)
+		childBlockedStatus = make(map[string]bool)
+
+		// Load task state and track
 		rows, err := db.QueryContext(ctx, `
 			SELECT id, state, track FROM task WHERE id IN (`+strings.TrimSuffix(strings.Repeat("?, ", len(createdChildrenOrder)), ", ")+`)
 		`, func() []interface{} {
@@ -6179,6 +6221,29 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 				}
 			}
 			rows.Close()
+		}
+
+		// Load dependency information for each child
+		for _, childID := range createdChildrenOrder {
+			depRows, err := db.QueryContext(ctx, `
+				SELECT d.depends_on_id, t.state
+				FROM task_dep d
+				JOIN task t ON d.depends_on_id = t.id
+				WHERE d.task_id = ?
+			`, childID)
+			if err == nil {
+				for depRows.Next() {
+					var depID, depState string
+					if depRows.Scan(&depID, &depState) == nil {
+						childDependencies[childID] = append(childDependencies[childID], depID)
+						// If any dependency is not "done", the child is blocked
+						if depState != "done" {
+							childBlockedStatus[childID] = true
+						}
+					}
+				}
+				depRows.Close()
+			}
 		}
 	}
 
@@ -6228,6 +6293,13 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 		if taskState, ok := childTaskStates[childID]; ok {
 			child.State = taskState.state
 			child.Track = taskState.track
+		}
+
+		// Set dependency status
+		if childBlockedStatus[childID] {
+			child.DependencyStatus = "blocked"
+		} else if len(childDependencies[childID]) > 0 {
+			child.DependencyStatus = "ready"
 		}
 
 		info.CreatedChildren = append(info.CreatedChildren, *child)
@@ -6301,7 +6373,7 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 		}
 	}
 
-	if len(info.ProposedChildren) == 0 && len(info.CreatedChildren) == 0 && len(info.ActionItems) == 0 && info.ParentInfo == nil {
+	if len(info.ProposedChildren) == 0 && len(info.CreatedChildren) == 0 && len(info.DeferredClaims) == 0 && len(info.ActionItems) == 0 && info.ParentInfo == nil {
 		return nil
 	}
 

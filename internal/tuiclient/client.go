@@ -123,6 +123,13 @@ type CreatedChild struct {
 	SourceStartPoints  []string `json:"source_start_points,omitempty"`
 	FileScope          []string `json:"file_scope,omitempty"`
 	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+	DependencyStatus   string   `json:"dependency_status,omitempty"`
+}
+
+type DeferredClaim struct {
+	ClaimID string `json:"claim_id"`
+	Owner   string `json:"owner"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 type ActionItem struct {
@@ -139,6 +146,7 @@ type ParentInfo struct {
 type ContinuationInfo struct {
 	ProposedChildren []ProposedChild `json:"proposed_children,omitempty"`
 	CreatedChildren  []CreatedChild  `json:"created_children,omitempty"`
+	DeferredClaims   []DeferredClaim `json:"deferred_claims,omitempty"`
 	ActionItems      []ActionItem    `json:"action_items,omitempty"`
 	ParentInfo       *ParentInfo     `json:"parent_info,omitempty"`
 }
