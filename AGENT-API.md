@@ -242,7 +242,7 @@ When a human transitions an `approved` research parent to `done`:
 1. The server checks if the parent's spec opted in.
 2. The server loads the manifest from the approved review round (the round the task passed review in).
 3. For each child, the server creates a new task with the manifest's fields.
-4. Research-track children start in the `ready` state and are immediately claimable.
+4. Research-track children start in the `ready` state and are claimable if all their dependencies (if any) are satisfied.
 5. Build and design-track children start in the `backlog` state and must be explicitly queued.
 6. Created children are linked to the parent task.
 
@@ -268,9 +268,9 @@ This path ensures every submitted manifest is reviewed and approved before child
 
 ### Idempotency
 
-Child creation is idempotent within a single approved state. If a human transitions an `approved` parent to `done` multiple times via repeated POST requests to `/tasks/{id}/transition {"to":"done"}`, the same children are created (or no duplicate children are added if they were already created in a prior transition). A child is uniquely identified by the parent ID and the manifest digest; a second transition with the same manifest digest will not create duplicates.
+Child creation is idempotent within a single approved-to-done transition. When a human first transitions an `approved` parent to `done`, children are created once. If the same POST request to `/tasks/{id}/transition {"to":"done"}` is retried before the parent reaches a new state, the retry will encounter the parent already in `done` state and fail with a state-transition error. Thus, true retry-safety is enforced at the HTTP level: the first call succeeds and mutates state; retries fail because the parent is no longer `approved`.
 
-However, separate review rounds (after rework) may produce separate manifest versions and separate child sets, each with its own digest.
+Within a single successful approved-to-done transition, each child's identity within the parent is determined by its manifest key; the parent ID and manifest digest together uniquely identify the complete child set (not individual children). Separate review rounds (after rework) produce separate manifest versions and separate child sets, each with its own digest.
 
 ## Task creation
 
