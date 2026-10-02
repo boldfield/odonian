@@ -711,6 +711,11 @@ type TaskWithDepsAndLinks struct {
 	// SubmissionManifests lists the continuation manifest of each review round that carried one,
 	// oldest round first; empty for tasks that never submitted a manifest.
 	SubmissionManifests []SubmissionManifest `json:"submission_manifests"`
+	// Continuation is the planned/created continuation view (docs/features/research-continuations.md);
+	// FindingFollowUps lists tasks born from non-blocking review findings, kept separate because
+	// they are not continuations. Both are absent when there is nothing to show.
+	Continuation     *ContinuationInfo `json:"continuation,omitempty"`
+	FindingFollowUps []FindingFollowUp `json:"finding_follow_ups,omitempty"`
 }
 
 // TaskListFilter contains filters for listing tasks.
@@ -1667,6 +1672,11 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 		return TaskWithDepsAndLinks{}, err
 	}
 
+	continuation, followUps, err := loadContinuationView(ctx, s.readConn, t, links, manifests)
+	if err != nil {
+		return TaskWithDepsAndLinks{}, err
+	}
+
 	return TaskWithDepsAndLinks{
 		ID:                  t.ID,
 		ProjectID:           t.ProjectID,
@@ -1699,6 +1709,8 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 		DependsOn:           dependsOn,
 		Links:               links,
 		SubmissionManifests: manifests,
+		Continuation:        continuation,
+		FindingFollowUps:    followUps,
 	}, nil
 }
 
@@ -4024,11 +4036,7 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 			reviewModelsJSON = &str
 		}
 
-		// Determine initial state based on track
-		state := "backlog"
-		if child.Track == "research" {
-			state = "ready"
-		}
+		state := continuationChildInitialState(child.Track)
 
 		// Resolve defaults for agent_merge and escalate
 		agentMerge := false

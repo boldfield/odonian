@@ -829,6 +829,22 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
   `submitted_at`; `[]` when none). A rework round adds a new entry and leaves earlier rounds'
   entries untouched. The CLI sends it with `odonian submit --manifest-file <path>`.
 
+  `GET /tasks/{id}` also returns a read-only `continuation` object (omitted when empty), shown
+  by `odonian show` under "Research Continuation": `manifest_digest` of the current round's
+  manifest; `proposed_children` (`key`, `title`, `track`, `model`, `initial_state` — `ready` for
+  research, `backlog` otherwise —, `dependencies`, and `status`: `pending` before the parent's
+  verified merge, `created` with `created_task_id` after it, `not_created` if the parent finished
+  without creating it); `created_children` (`id`, `key`, `parent_task_id`, `manifest_digest`,
+  current `state`, `track`, `dependency_status` of `none`/`satisfied`/`blocked`, `depends_on`,
+  `blocked_by`, `claimable`, and the claim/source/file-scope/acceptance metadata);
+  `deferred_claims` (carried-forward candidates and their `owner`) and `excluded_claims` (out of
+  scope, with a `reason` and no owner), reported exactly as the manifest states them with no
+  coverage inferred; `action_items` (`legacy_held_follow_up`, `held_dependent`) naming held legacy
+  tasks or dependents that must be replaced or retargeted by hand, since the server never repoints
+  them; and, on a created child, `parent_info` (`id`, `child_key`, `manifest_digest`). Tasks born
+  from non-blocking review findings are not continuations: they are listed separately as
+  `finding_follow_ups` (`id`, `title`, `state`, `track`, `held`).
+
   A dispute never alters the finding it names. It is recorded on the submission's own event and
   delivered, in the next round, to the review task of the reviewer who raised that finding — the
   raising reviewer re-evaluates the finding against the evidence and either withdraws it (reports

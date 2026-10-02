@@ -8645,3 +8645,49 @@ func TestSubmitWithContinuationManifest(t *testing.T) {
 		}
 	})
 }
+
+func TestGetTaskExposesPlannedContinuation(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}}
+
+	id := createClaimedResearchTask(t, server, authHeader, "Verify.\n\n## Continuation manifest\n")
+	if code, body := apiSubmit(t, server, authHeader, id, map[string]interface{}{
+		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": apiTestManifest(id),
+	}); code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	}
+
+	task := apiGetTask(t, server, authHeader, id)
+	if task.Continuation == nil || len(task.Continuation.ProposedChildren) != 1 {
+		t.Fatalf("expected one proposed child on GET /tasks/{id}, got %+v", task.Continuation)
+	}
+	p := task.Continuation.ProposedChildren[0]
+	if p.Key != "c1" || p.Status != "pending" || p.InitialState != "ready" || p.CreatedTaskID != "" {
+		t.Errorf("proposed child = %+v, want c1 pending ready with no created task", p)
+	}
+	if len(task.Continuation.CreatedChildren) != 0 {
+		t.Errorf("nothing may be created before the merge, got %+v", task.Continuation.CreatedChildren)
+	}
+	if task.Continuation.ManifestDigest != task.SubmissionManifests[0].ManifestDigest {
+		t.Errorf("continuation digest %q != stored manifest digest %q", task.Continuation.ManifestDigest, task.SubmissionManifests[0].ManifestDigest)
+	}
+	if len(task.FindingFollowUps) != 0 {
+		t.Errorf("no finding follow-ups exist, got %+v", task.FindingFollowUps)
+	}
+
+	plain := createClaimedResearchTask(t, server, authHeader, "Verify the claims.")
+	req := httptest.NewRequest("GET", "/tasks/"+plain, nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(w.Body).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"continuation", "finding_follow_ups"} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("a task without continuations must omit %q, got %s", key, raw[key])
+		}
+	}
+}

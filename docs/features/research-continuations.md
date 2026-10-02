@@ -93,6 +93,18 @@ When a parent task's PR is merged:
 6. Explicit parent dependencies may be specified in the manifest's dependencies field if needed.
 7. The parent task's final result event lists the created child task IDs.
 
+#### Seeing proposals and created children
+
+`GET /tasks/{id}` (and `odonian show`) reports a `continuation` view so an operator can see
+exactly which children will be created before the merge and which were created after it, with
+their ready/backlog state, dependency status and manifest digest. Each proposal carries a status
+(`pending`, `created as <id>`, or `not_created`), created children carry their parent link and the
+digest that created them, carried-forward claims show their owner, and excluded claims are listed
+separately with their reason. The view makes no coverage claim from the candidate inventory.
+Held legacy follow-ups and held dependents of a continuation parent appear as action items for
+manual replacement; they are never retargeted automatically. Review-finding follow-ups are a
+different thing and are listed separately as `finding_follow_ups`.
+
 ### 6. Limits and ceilings
 
 - **Children per manifest**: At most 3.

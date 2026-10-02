@@ -94,6 +94,88 @@ type TaskDetail struct {
 	DependsOn           []string             `json:"depends_on"`
 	Links               []TaskLink           `json:"links"`
 	SubmissionManifests []SubmissionManifest `json:"submission_manifests"`
+	Continuation        *ContinuationInfo    `json:"continuation,omitempty"`
+	FindingFollowUps    []FindingFollowUp    `json:"finding_follow_ups,omitempty"`
+}
+
+// ContinuationInfo mirrors store.ContinuationInfo: the planned and created research
+// continuation children of a task, separate from review-finding follow-ups.
+type ContinuationInfo struct {
+	ManifestDigest   string                    `json:"manifest_digest,omitempty"`
+	ProposedChildren []ProposedChild           `json:"proposed_children,omitempty"`
+	CreatedChildren  []CreatedContinuationTask `json:"created_children,omitempty"`
+	DeferredClaims   []DeferredClaim           `json:"deferred_claims,omitempty"`
+	ExcludedClaims   []ExcludedClaim           `json:"excluded_claims,omitempty"`
+	ActionItems      []ActionItem              `json:"action_items,omitempty"`
+	ParentInfo       *ContinuationParent       `json:"parent_info,omitempty"`
+}
+
+type ContinuationDependency struct {
+	Kind string `json:"kind"`
+	Ref  string `json:"ref"`
+}
+
+type ProposedChild struct {
+	Key           string                   `json:"key"`
+	Title         string                   `json:"title"`
+	Track         string                   `json:"track"`
+	Model         string                   `json:"model"`
+	InitialState  string                   `json:"initial_state"`
+	Dependencies  []ContinuationDependency `json:"dependencies"`
+	Status        string                   `json:"status"`
+	CreatedTaskID string                   `json:"created_task_id,omitempty"`
+}
+
+type CreatedContinuationTask struct {
+	ID                 string   `json:"id"`
+	Key                string   `json:"key,omitempty"`
+	Title              string   `json:"title"`
+	ParentTaskID       string   `json:"parent_task_id"`
+	ManifestDigest     string   `json:"manifest_digest"`
+	State              string   `json:"state"`
+	Track              string   `json:"track"`
+	DependencyStatus   string   `json:"dependency_status"`
+	DependsOn          []string `json:"depends_on"`
+	BlockedBy          []string `json:"blocked_by"`
+	Claimable          bool     `json:"claimable"`
+	ClaimIDs           []string `json:"claim_ids,omitempty"`
+	SourceStartPoints  []string `json:"source_start_points,omitempty"`
+	FileScope          []string `json:"file_scope,omitempty"`
+	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+}
+
+type DeferredClaim struct {
+	ClaimID string `json:"claim_id"`
+	Owner   string `json:"owner"`
+}
+
+type ExcludedClaim struct {
+	ClaimID string `json:"claim_id"`
+	Reason  string `json:"reason"`
+}
+
+type ActionItem struct {
+	Type        string `json:"type"`
+	TaskID      string `json:"task_id"`
+	Title       string `json:"title"`
+	State       string `json:"state"`
+	Description string `json:"description"`
+}
+
+type ContinuationParent struct {
+	ID             string `json:"id"`
+	ChildKey       string `json:"child_key,omitempty"`
+	ManifestDigest string `json:"manifest_digest,omitempty"`
+}
+
+// FindingFollowUp mirrors store.FindingFollowUp: a task born from a non-blocking review
+// finding, which is not a planned continuation.
+type FindingFollowUp struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	State string `json:"state"`
+	Track string `json:"track"`
+	Held  bool   `json:"held"`
 }
 
 type SubmissionManifest struct {

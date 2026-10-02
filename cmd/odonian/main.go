@@ -705,6 +705,7 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 				}
 			}
 		}
+		printContinuation(out, task)
 		if len(reviewFindings) > 0 {
 			fmt.Fprintf(out, "Review Findings:\n")
 			for _, finding := range reviewFindings {
@@ -1862,4 +1863,79 @@ func resolveAgentIdentity(agentFlag, modelFlag string) (agentID, model string, e
 	}
 
 	return agentID, model, nil
+}
+
+// printContinuation prints the planned/created research continuation view and, under its own
+// heading, the review-finding follow-ups; the two are different things and are never mixed.
+func printContinuation(out io.Writer, task tuiclient.TaskDetail) {
+	if c := task.Continuation; c != nil {
+		fmt.Fprintf(out, "Research Continuation (planned children from the parent's manifest):\n")
+		if c.ParentInfo != nil {
+			fmt.Fprintf(out, "  Created from continuation parent: %s\n", c.ParentInfo.ID)
+			if c.ParentInfo.ChildKey != "" {
+				fmt.Fprintf(out, "    Manifest Key: %s\n", c.ParentInfo.ChildKey)
+			}
+			if c.ParentInfo.ManifestDigest != "" {
+				fmt.Fprintf(out, "    Manifest Digest: %s\n", c.ParentInfo.ManifestDigest)
+			}
+		}
+		if len(c.ProposedChildren) > 0 {
+			fmt.Fprintf(out, "  Proposed Children (manifest %s):\n", c.ManifestDigest)
+			for _, p := range c.ProposedChildren {
+				fmt.Fprintf(out, "    - %s: %s [%s]\n", p.Key, p.Title, p.Status)
+				fmt.Fprintf(out, "      Track: %s, Model: %s, Initial State: %s\n", p.Track, p.Model, p.InitialState)
+				if p.CreatedTaskID != "" {
+					fmt.Fprintf(out, "      Created As: %s\n", p.CreatedTaskID)
+				}
+				for _, d := range p.Dependencies {
+					fmt.Fprintf(out, "      Depends On: %s %s\n", d.Kind, d.Ref)
+				}
+			}
+		}
+		if len(c.CreatedChildren) > 0 {
+			fmt.Fprintf(out, "  Created Children:\n")
+			for _, ch := range c.CreatedChildren {
+				fmt.Fprintf(out, "    - %s: %s\n", ch.ID, ch.Title)
+				fmt.Fprintf(out, "      Parent: %s\n", ch.ParentTaskID)
+				fmt.Fprintf(out, "      Manifest Digest: %s\n", ch.ManifestDigest)
+				fmt.Fprintf(out, "      State: %s, Track: %s, Claimable: %t\n", ch.State, ch.Track, ch.Claimable)
+				fmt.Fprintf(out, "      Dependency Status: %s\n", ch.DependencyStatus)
+				if len(ch.BlockedBy) > 0 {
+					fmt.Fprintf(out, "      Blocked By: %s\n", strings.Join(ch.BlockedBy, ", "))
+				}
+				if len(ch.ClaimIDs) > 0 {
+					fmt.Fprintf(out, "      Claims: %s\n", strings.Join(ch.ClaimIDs, ", "))
+				}
+			}
+		}
+		if len(c.DeferredClaims) > 0 {
+			fmt.Fprintf(out, "  Deferred Claims (carried forward, owned):\n")
+			for _, d := range c.DeferredClaims {
+				fmt.Fprintf(out, "    - %s (owner: %s)\n", d.ClaimID, d.Owner)
+			}
+		}
+		if len(c.ExcludedClaims) > 0 {
+			fmt.Fprintf(out, "  Excluded Claims (out of scope, no owner):\n")
+			for _, e := range c.ExcludedClaims {
+				fmt.Fprintf(out, "    - %s (reason: %s)\n", e.ClaimID, e.Reason)
+			}
+		}
+		if len(c.ActionItems) > 0 {
+			fmt.Fprintf(out, "  Action Items (manual replacement needed):\n")
+			for _, a := range c.ActionItems {
+				fmt.Fprintf(out, "    - [%s] %s: %s (%s)\n", a.Type, a.TaskID, a.Title, a.State)
+				fmt.Fprintf(out, "      %s\n", a.Description)
+			}
+		}
+	}
+	if len(task.FindingFollowUps) > 0 {
+		fmt.Fprintf(out, "Review-Finding Follow-Ups (not continuations):\n")
+		for _, f := range task.FindingFollowUps {
+			held := ""
+			if f.Held {
+				held = ", held"
+			}
+			fmt.Fprintf(out, "  - %s: %s (%s%s)\n", f.ID, f.Title, f.State, held)
+		}
+	}
 }
