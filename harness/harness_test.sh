@@ -329,6 +329,45 @@ else
   test_fail "research review prompt does not correctly exclude P3 from blocking"
 fi
 
+# Test 28: Check that research implement prompt covers continuation manifest submission
+echo "Test 28: research implement prompt covers continuation manifest submission"
+_ri_prompt="$HARNESS_DIR/prompts/pull_request/research/implement.md"
+if grep -q '## continuation manifest' "$_ri_prompt" && \
+   grep -q 'commit the versioned manifest file in the PR' "$_ri_prompt" && \
+   grep -q -- '--manifest-file' "$_ri_prompt"; then
+  test_pass "research implement prompt covers manifest submission and commitment"
+else
+  test_fail "research implement prompt missing manifest submission guidance"
+fi
+
+# Test 29: Check that research review prompt covers submission manifests and blocking rules
+echo "Test 29: research review prompt covers submission manifests and blocking rules"
+if grep -q 'submission_manifests' "$_rr_prompt" && \
+   grep -q 'File equality check.*BLOCKING' "$_rr_prompt" && \
+   grep -q 'missing committed manifest file' "$_rr_prompt" && \
+   grep -q 'Digest check' "$_rr_prompt" && \
+   grep -q 'jq -jc --argjson r' "$_rr_prompt" && \
+   grep -q 'sha256sum /tmp/stored-manifest.json' "$_rr_prompt" && \
+   grep -q 'jq -S . /tmp/stored-manifest.json' "$_rr_prompt" && \
+   ! grep -q 'printf .%s. .<Canonical line>.' "$_rr_prompt" && \
+   grep -q 'per child at most 6 claims' "$_rr_prompt" && \
+   grep -q '`task` (an existing task ID)' "$_rr_prompt" && \
+   grep -q 'Oversized scope is a \*\*P1 finding' "$_rr_prompt" && \
+   grep -q 'Manifest findings blocking rule' "$_rr_prompt" && \
+   grep -q 'always blocks in every round' "$_rr_prompt"; then
+  test_pass "research review prompt covers manifest inspection and blocking"
+else
+  test_fail "research review prompt missing manifest coverage or blocking rules"
+fi
+
+# Test 30: Check that research review prompt forbids reviewers from creating child tasks
+echo "Test 30: research review prompt forbids reviewers from creating child tasks"
+if grep -q 'Reviewers must never create child tasks' "$_rr_prompt"; then
+  test_pass "research review prompt forbids child task creation"
+else
+  test_fail "research review prompt missing prohibition on child task creation"
+fi
+
 echo ""
 echo "=== Test Summary ==="
 echo "Total: $test_count | Passed: $pass_count | Failed: $fail_count"

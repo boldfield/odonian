@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -592,6 +593,20 @@ func executeTasks(ctx context.Context, baseURL, token string, jsonOutput bool, a
 	return nil
 }
 
+// marshalNoHTMLEscape marshals v without escaping &, < and > so stored manifest bytes keep their digest.
+func marshalNoHTMLEscape(v interface{}, indent string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent != "" {
+		enc.SetIndent("", indent)
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
 func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, args []string, out io.Writer) error {
 	if baseURL == "" {
 		return fmt.Errorf("ODONIAN_URL environment variable not set")
@@ -632,8 +647,8 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 
 	if jsonOutput {
 		// Build output with review findings added to the task
-		output := map[string]interface{}{}
-		taskJSON, err := json.Marshal(task)
+		output := map[string]json.RawMessage{}
+		taskJSON, err := marshalNoHTMLEscape(task, "")
 		if err != nil {
 			return fmt.Errorf("failed to marshal task: %w", err)
 		}
@@ -641,9 +656,13 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			return fmt.Errorf("failed to unmarshal task: %w", err)
 		}
 		if len(reviewFindings) > 0 {
-			output["review_findings"] = reviewFindings
+			findingsJSON, err := marshalNoHTMLEscape(reviewFindings, "")
+			if err != nil {
+				return fmt.Errorf("failed to marshal review findings: %w", err)
+			}
+			output["review_findings"] = findingsJSON
 		}
-		finalOutput, err := json.MarshalIndent(output, "", "  ")
+		finalOutput, err := marshalNoHTMLEscape(output, "  ")
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
@@ -668,6 +687,22 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			fmt.Fprintf(out, "Links:\n")
 			for _, link := range task.Links {
 				fmt.Fprintf(out, "  - %s: %s%s\n", link.Kind, link.Value, linkRoundLabel(task, link))
+			}
+		}
+		if len(task.SubmissionManifests) > 0 {
+			fmt.Fprintf(out, "Submission Manifests:\n")
+			for _, manifest := range task.SubmissionManifests {
+				fmt.Fprintf(out, "  - Round %d:\n", manifest.ReviewRound)
+				fmt.Fprintf(out, "    Parent Task ID: %s\n", manifest.ParentTaskID)
+				fmt.Fprintf(out, "    Digest: %s\n", manifest.ManifestDigest)
+				fmt.Fprintf(out, "    Submitted At: %s\n", manifest.SubmittedAt)
+				if len(manifest.ManifestJSON) > 0 {
+					// Print the raw canonical manifest bytes (matching the stored digest)
+					fmt.Fprintf(out, "    Canonical:\n")
+					for _, line := range strings.Split(strings.TrimSpace(string(manifest.ManifestJSON)), "\n") {
+						fmt.Fprintf(out, "      %s\n", line)
+					}
+				}
 			}
 		}
 		if len(reviewFindings) > 0 {
