@@ -3886,11 +3886,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 // Returns created task IDs in manifest order. All-or-nothing: on any error, the transaction
 // should be rolled back and nothing is created.
 func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m *manifest.Manifest, manifestDigest string, parentID, parentProjectID, parentDocumentID string, now string) ([]string, error) {
-	if m == nil || len(m.Children) == 0 {
-		return []string{}, nil
-	}
-
-	// Validate the manifest against store rules
+	// Validate the manifest against store rules (rejects nil and empty manifests too)
 	if err := m.Validate(s.allowedModelsM, validTracks); err != nil {
 		if validationErr, ok := err.(manifest.ValidationError); ok {
 			return nil, invalid(validationErr.Code, validationErr.Message)

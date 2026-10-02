@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/boldfield/odonian/internal/manifest"
@@ -675,15 +676,12 @@ func TestInsertManifestChildrenEmptyManifest(t *testing.T) {
 
 	sqlStore := store.(*sqliteStore)
 	createdIDs, err := sqlStore.InsertManifestChildren(ctx, tx, m, "digest_empty", parentID, proj.ID, doc.ID, nowTimestamp())
-	if err != nil {
-		t.Fatalf("failed to insert empty manifest children: %v", err)
-	}
-
+	assertValidationCode(t, err, "NO_CHILDREN")
 	if len(createdIDs) != 0 {
 		t.Errorf("expected no children from empty manifest, got %d", len(createdIDs))
 	}
-
-	tx.Commit()
+	tx.Rollback()
+	assertNoContinuationRows(t, store, proj.ID)
 }
 
 func TestInsertManifestChildrenParentLink(t *testing.T) {
@@ -912,15 +910,12 @@ func TestInsertManifestChildrenNilManifest(t *testing.T) {
 
 	sqlStore := store.(*sqliteStore)
 	createdIDs, err := sqlStore.InsertManifestChildren(ctx, tx, nil, "digest_nil", parentID, proj.ID, doc.ID, nowTimestamp())
-	if err != nil {
-		t.Fatalf("failed to insert nil manifest children: %v", err)
-	}
-
+	assertValidationCode(t, err, "NIL_MANIFEST")
 	if len(createdIDs) != 0 {
 		t.Errorf("expected no children from nil manifest, got %d", len(createdIDs))
 	}
-
-	tx.Commit()
+	tx.Rollback()
+	assertNoContinuationRows(t, store, proj.ID)
 }
 
 // TestInsertManifestChildrenMultipleChildren tests manifest with multiple children.
@@ -1167,19 +1162,10 @@ func TestInsertManifestChildrenMismatchedParentID(t *testing.T) {
 	defer tx.Rollback()
 
 	_, err = sqlStore.InsertManifestChildren(ctx, tx, m, "digest_mismatch", parentID, proj.ID, doc.ID, nowTimestamp())
-	if err == nil {
-		t.Fatal("expected error for mismatched parent ID, got none")
-	}
+	assertValidationCode(t, err, "MISMATCHED_PARENT_ID")
 
-	// Verify no child was created
 	tx.Rollback()
-	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
-	if err != nil {
-		t.Fatalf("failed to list tasks: %v", err)
-	}
-	if len(allTasks) != 1 {
-		t.Errorf("expected only parent task, got %d tasks", len(allTasks))
-	}
+	assertNoContinuationRows(t, store, proj.ID)
 }
 
 // TestInsertManifestChildrenParentNotFound tests that non-existent parent is rejected
@@ -1229,9 +1215,10 @@ func TestInsertManifestChildrenParentNotFound(t *testing.T) {
 	defer tx.Rollback()
 
 	_, err = sqlStore.InsertManifestChildren(ctx, tx, m, "digest_notfound", nonExistentParentID, proj.ID, doc.ID, nowTimestamp())
-	if err == nil {
-		t.Fatal("expected error for parent not found, got none")
-	}
+	assertValidationCode(t, err, "PARENT_NOT_FOUND")
+
+	tx.Rollback()
+	assertNoContinuationRows(t, store, proj.ID)
 }
 
 // TestInsertManifestChildrenMismatchedParentProjectDocument tests project/document mismatch is rejected
@@ -1299,19 +1286,11 @@ func TestInsertManifestChildrenMismatchedParentProjectDocument(t *testing.T) {
 
 	// Pass wrong project/document IDs
 	_, err = sqlStore.InsertManifestChildren(ctx, tx, m, "digest_mismatch_proj", parentID, proj2.ID, doc2.ID, nowTimestamp())
-	if err == nil {
-		t.Fatal("expected error for mismatched project/document, got none")
-	}
+	assertValidationCode(t, err, "MISMATCHED_PARENT_PROJECT_DOCUMENT")
 
-	// Verify no child was created
 	tx.Rollback()
-	allTasks, err := store.ListTasks(ctx, proj2.ID, TaskListFilter{})
-	if err != nil {
-		t.Fatalf("failed to list tasks: %v", err)
-	}
-	if len(allTasks) != 0 {
-		t.Errorf("expected no tasks in proj2, got %d", len(allTasks))
-	}
+	assertNoContinuationRows(t, store, proj1.ID)
+	assertNoContinuationRows(t, store, proj2.ID)
 }
 
 // TestInsertManifestChildrenChildMetadata tests that child metadata is persisted
@@ -1451,5 +1430,114 @@ func TestInsertManifestChildrenChildMetadata(t *testing.T) {
 	}
 	if len(criteria) != 2 || criteria[0] != "criterion1" || criteria[1] != "criterion2" {
 		t.Errorf("expected acceptance_criteria [criterion1, criterion2], got %v", criteria)
+	}
+}
+
+func assertValidationCode(t *testing.T, err error, code string) {
+	t.Helper()
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *ValidationError with code %s, got %v", code, err)
+	}
+	if ve.Code != code {
+		t.Fatalf("expected validation code %s, got %s (%s)", code, ve.Code, ve.Message)
+	}
+}
+
+// assertNoContinuationRows asserts the project holds only its parent task(s): no
+// generated children, no continuation links, and no dependency edges.
+func assertNoContinuationRows(t *testing.T, st Store, projectID string) {
+	t.Helper()
+	ctx := context.Background()
+	tasks, err := st.ListTasks(ctx, projectID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	for _, task := range tasks {
+		if task.Title != "Parent Task" {
+			t.Errorf("unexpected task %q left behind", task.Title)
+		}
+	}
+	var n int
+	if err := st.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM task_link WHERE kind LIKE 'continuation_child%'`).Scan(&n); err != nil {
+		t.Fatalf("failed to count continuation links: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected no continuation links, got %d", n)
+	}
+	if err := st.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM task_dep`).Scan(&n); err != nil {
+		t.Fatalf("failed to count task deps: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected no task deps, got %d", n)
+	}
+}
+
+// TestInsertManifestChildrenRejectsUnvalidatedManifest passes manifests that were never
+// run through Validate and expects the helper's own validation to reject them.
+func TestInsertManifestChildrenRejectsUnvalidatedManifest(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(c *manifest.Child)
+	}{
+		{"unknown track", func(c *manifest.Child) { c.Track = "bogus" }},
+		{"missing claim ids", func(c *manifest.Child) { c.ClaimIDs = nil }},
+		{"missing acceptance criteria", func(c *manifest.Child) { c.AcceptanceCriteria = nil }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, err := Open(t.TempDir()+"/test.db", defaultTestAllowedModels())
+			if err != nil {
+				t.Fatalf("failed to open database: %v", err)
+			}
+			defer st.Close()
+			ctx := context.Background()
+			proj, err := st.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+			if err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+			doc, err := st.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+			if err != nil {
+				t.Fatalf("failed to create document: %v", err)
+			}
+			tasks, err := st.CreateTasks(ctx, proj.ID, []TaskInput{
+				{Title: "Parent Task", Spec: "Parent spec", DocumentID: doc.ID, Track: "research"},
+			})
+			if err != nil {
+				t.Fatalf("failed to create parent task: %v", err)
+			}
+			parentID := tasks[0].ID
+
+			child := testChild("child1", "Child", "Child spec", "research", "haiku", "file1.go")
+			tc.mutate(&child)
+			m := &manifest.Manifest{
+				Version:           1,
+				ParentTaskID:      parentID,
+				Children:          []manifest.Child{child},
+				PendingCandidates: testPendingCandidates("claim1"),
+			}
+			if err := m.Validate(testManifestValidation, validTracks); err == nil {
+				t.Fatal("test setup error: mutated manifest unexpectedly valid")
+			}
+
+			tx, err := st.Conn().BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatalf("failed to begin transaction: %v", err)
+			}
+			defer tx.Rollback()
+			ids, err := st.(*sqliteStore).InsertManifestChildren(ctx, tx, m, "digest_unvalidated", parentID, proj.ID, doc.ID, nowTimestamp())
+			if err == nil {
+				t.Fatal("expected unvalidated manifest to be rejected")
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+			}
+			if len(ids) != 0 {
+				t.Errorf("expected no created ids, got %d", len(ids))
+			}
+			tx.Rollback()
+			assertNoContinuationRows(t, st, proj.ID)
+		})
 	}
 }
