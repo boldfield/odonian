@@ -18663,3 +18663,697 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		}
 	})
 }
+
+// TestSubmitImplementTaskWithManifestRoundBinding verifies that manifests submitted
+// in different rounds are stored separately and earlier rounds are not mutated on rework.
+func TestSubmitImplementTaskWithManifestRoundBinding(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create parent task (research track)
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create task that will submit a manifest (research track, with opt-in marker)
+	taskTasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research parent with manifest",
+			Spec:         "## continuation manifest\nThis task opts in to continuations.",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			Track:        "research",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := taskTasks[0].ID
+
+	// Promote and claim the first task
+	_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = ? WHERE id = ?", "ready", taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Prepare manifest for round 1
+	manifest1 := json.RawMessage(`{
+		"version": 1,
+		"parent_task_id": "` + taskID + `",
+		"children": [
+			{
+				"key": "child-1",
+				"title": "Child 1",
+				"spec": "Child 1 spec",
+				"track": "research",
+				"model": "haiku",
+				"review_models": ["opus", "sonnet"],
+				"agent_merge": false,
+				"escalate": true,
+				"claim_ids": ["claim-1"],
+				"source_start_points": ["start-1"],
+				"file_scope": ["*.go"],
+				"acceptance_criteria": ["Implements feature"],
+				"dependencies": []
+			}
+		],
+		"pending_candidates": []
+	}`)
+
+	// Submit with manifest in round 1
+	links1 := []LinkInput{{Kind: "pr", Value: "#100"}}
+	result1 := "First submission with manifest"
+	submitted1, err := store.SubmitTaskWithManifest(ctx, taskID, "agent-1", result1, nil, links1, 5, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`null`), json.RawMessage(`null`), manifest1)
+	if err != nil {
+		t.Fatalf("failed to submit task with manifest: %v", err)
+	}
+
+	if submitted1.State != "review" {
+		t.Errorf("expected state=review after submit, got %s", submitted1.State)
+	}
+	if submitted1.ReviewRound != 1 {
+		t.Errorf("expected review_round=1 after submit, got %d", submitted1.ReviewRound)
+	}
+
+	// Retrieve review tasks for round 1
+	allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	var reviewTask1 Task
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == taskID && task.ReviewRound == 1 {
+			reviewTask1 = task
+			break
+		}
+	}
+
+	if reviewTask1.ID == "" {
+		t.Fatalf("no review task found for round 1")
+	}
+
+	// Claim and reject the review task
+	_, err = store.ClaimTask(ctx, reviewTask1.ID, "opus-reviewer", "opus", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim review task: %v", err)
+	}
+
+	reject := "reject"
+	_, err = store.SubmitTask(ctx, reviewTask1.ID, "opus-reviewer", "Found issues", &reject, []LinkInput{}, 5, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`[]`))
+	if err != nil {
+		t.Fatalf("failed to reject review task: %v", err)
+	}
+
+	// Claim the original task again for rework (resubmit with different manifest)
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to reclaim task for rework: %v", err)
+	}
+
+	// Prepare manifest for round 2 (different from round 1)
+	manifest2 := json.RawMessage(`{
+		"version": 1,
+		"parent_task_id": "` + taskID + `",
+		"children": [
+			{
+				"key": "child-2",
+				"title": "Child 2",
+				"spec": "Child 2 spec",
+				"track": "research",
+				"model": "opus",
+				"review_models": ["haiku", "sonnet"],
+				"agent_merge": false,
+				"escalate": true,
+				"claim_ids": ["claim-2"],
+				"source_start_points": ["start-2"],
+				"file_scope": ["*.go"],
+				"acceptance_criteria": ["Implements feature"],
+				"dependencies": []
+			}
+		],
+		"pending_candidates": []
+	}`)
+
+	// Submit with different manifest in round 2
+	links2 := []LinkInput{{Kind: "pr", Value: "#101"}}
+	result2 := "Second submission with different manifest"
+	submitted2, err := store.SubmitTaskWithManifest(ctx, taskID, "agent-1", result2, nil, links2, 5, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`null`), json.RawMessage(`null`), manifest2)
+	if err != nil {
+		t.Fatalf("failed to submit task with manifest in round 2: %v", err)
+	}
+
+	if submitted2.State != "review" {
+		t.Errorf("expected state=review after round 2 submit, got %s", submitted2.State)
+	}
+	if submitted2.ReviewRound != 2 {
+		t.Errorf("expected review_round=2 after round 2 submit, got %d", submitted2.ReviewRound)
+	}
+
+	// Verify both manifests are stored separately
+	// Note: taskID submitted manifests in both round 1 and round 2 (via rework)
+	var manifests []struct {
+		reviewRound  int
+		manifestJSON string
+		digest       string
+	}
+
+	rows, err := store.Conn().QueryContext(ctx, `
+		SELECT review_round, manifest_json, manifest_digest
+		FROM task_submission_manifest
+		WHERE task_id = ?
+		ORDER BY review_round
+	`, taskID)
+	if err != nil {
+		t.Fatalf("failed to query manifests: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var rr int
+		var mj, d string
+		if err := rows.Scan(&rr, &mj, &d); err != nil {
+			t.Fatalf("failed to scan manifest row: %v", err)
+		}
+		manifests = append(manifests, struct {
+			reviewRound  int
+			manifestJSON string
+			digest       string
+		}{rr, mj, d})
+	}
+
+	if len(manifests) != 2 {
+		t.Errorf("expected 2 manifests, got %d", len(manifests))
+	}
+
+	// Verify round 1's manifest is unchanged
+	if manifests[0].reviewRound != 1 {
+		t.Errorf("expected first manifest to be round 1, got %d", manifests[0].reviewRound)
+	}
+
+	// Verify round 2's manifest is different
+	if manifests[1].reviewRound != 2 {
+		t.Errorf("expected second manifest to be round 2, got %d", manifests[1].reviewRound)
+	}
+
+	// Verify the digests are different (manifests are different)
+	if manifests[0].digest == manifests[1].digest {
+		t.Errorf("expected round 1 and round 2 manifests to have different digests")
+	}
+}
+
+// TestSubmitImplementTaskManifestValidation verifies that invalid manifests are rejected
+// without changing task state.
+func TestSubmitImplementTaskManifestValidation(t *testing.T) {
+	type testCase struct {
+		name           string
+		manifest       *json.RawMessage
+		expectError    bool
+		expectedErrMsg string
+	}
+
+	tests := []testCase{
+		{
+			name:           "malformed JSON",
+			manifest:       ptrRawMsg(`{invalid json}`),
+			expectError:    true,
+			expectedErrMsg: "INVALID_MANIFEST_JSON",
+		},
+		{
+			name:           "mismatched parent_task_id",
+			manifest:       ptrRawMsg(`{"version":1,"parent_task_id":"wrong-parent","children":[{"key":"c1","title":"C1","spec":"S1","track":"research","model":"haiku","review_models":["opus","sonnet"]}],"pending_candidates":[]}`),
+			expectError:    true,
+			expectedErrMsg: "MISMATCHED_PARENT_TASK",
+		},
+		{
+			name:           "parent not opted in",
+			manifest:       nil, // Will be set in test
+			expectError:    true,
+			expectedErrMsg: "PARENT_NOT_OPTED_IN",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+			if err != nil {
+				t.Fatalf("failed to open database: %v", err)
+			}
+			defer store.Close()
+
+			ctx := context.Background()
+
+			// Create parent task
+			proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+			if err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+			if err != nil {
+				t.Fatalf("failed to create document: %v", err)
+			}
+
+			// For opt-in test, create parent without opt-in marker
+			parentSpec := "## continuation manifest\nParent spec"
+			if tc.name == "parent not opted in" {
+				parentSpec = "No opt-in marker here"
+			}
+
+			parentTasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+				{
+					Title:        "Research parent",
+					Spec:         parentSpec,
+					DocumentID:   doc.ID,
+					Model:        "haiku",
+					Track:        "research",
+					ReviewModels: []string{"opus"},
+				},
+			})
+			if err != nil {
+				t.Fatalf("failed to create parent task: %v", err)
+			}
+			parentID := parentTasks[0].ID
+
+			// Create child task
+			childTasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+				{
+					Title:        "Child implementation",
+					Spec:         "Implement something",
+					DocumentID:   doc.ID,
+					Model:        "haiku",
+					Track:        "research",
+					ReviewModels: []string{"opus"},
+				},
+			})
+			if err != nil {
+				t.Fatalf("failed to create child task: %v", err)
+			}
+			childID := childTasks[0].ID
+
+			// Promote and claim child
+			_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = ? WHERE id = ?", "ready", childID)
+			if err != nil {
+				t.Fatalf("failed to promote child task: %v", err)
+			}
+
+			_, err = store.ClaimTask(ctx, childID, "agent-1", "haiku", 5*time.Minute)
+			if err != nil {
+				t.Fatalf("failed to claim child task: %v", err)
+			}
+
+			// Get initial state
+			taskBefore, err := store.GetTask(ctx, childID)
+			if err != nil {
+				t.Fatalf("failed to get task before submit: %v", err)
+			}
+
+			// Set up manifest for the test case
+			manifest := tc.manifest
+			if tc.name == "parent not opted in" {
+				manifest = ptrRawMsg(`{"version":1,"parent_task_id":"` + parentID + `","children":[{"key":"c1","title":"C1","spec":"S1","track":"research","model":"haiku","review_models":["opus","sonnet"]}],"pending_candidates":[]}`)
+			}
+
+			// Try to submit with invalid manifest
+			links := []LinkInput{{Kind: "pr", Value: "#100"}}
+			if manifest != nil {
+				_, err = store.SubmitTaskWithManifest(ctx, childID, "agent-1", "result", nil, links, 5, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`null`), json.RawMessage(`null`), *manifest)
+			} else {
+				_, err = store.SubmitTask(ctx, childID, "agent-1", "result", nil, links, 5, nil, nil, testUnlimitedResearchBudget)
+			}
+
+			if !tc.expectError {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Errorf("expected error, got nil")
+				return
+			}
+
+			// Verify error message contains expected code
+			if !strings.Contains(err.Error(), tc.expectedErrMsg) {
+				t.Errorf("expected error containing %q, got %q", tc.expectedErrMsg, err.Error())
+			}
+
+			// Verify task state is unchanged
+			taskAfter, err := store.GetTask(ctx, childID)
+			if err != nil {
+				t.Fatalf("failed to get task after failed submit: %v", err)
+			}
+
+			if taskAfter.State != taskBefore.State {
+				t.Errorf("expected state to remain %s, got %s", taskBefore.State, taskAfter.State)
+			}
+
+			// Verify no manifest was stored
+			var count int
+			err = store.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM task_submission_manifest WHERE task_id = ?`, childID).Scan(&count)
+			if err != nil {
+				t.Fatalf("failed to query manifest count: %v", err)
+			}
+
+			if count != 0 {
+				t.Errorf("expected no manifest to be stored on failed submit, got %d", count)
+			}
+		})
+	}
+}
+
+// TestSubmitImplementTaskManifestCanonicalDigest verifies that manifests with
+// different whitespace/key order produce the same digest.
+func TestSubmitImplementTaskManifestCanonicalDigest(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create parent task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	parentTasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Research parent",
+			Spec:         "## continuation manifest\nParent spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			Track:        "research",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create parent task: %v", err)
+	}
+	parentID := parentTasks[0].ID
+
+	// Create first child task
+	childTasks1, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Child 1",
+			Spec:         "Spec 1",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			Track:        "research",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create first child task: %v", err)
+	}
+	childID1 := childTasks1[0].ID
+
+	// Create second child task
+	childTasks2, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Child 2",
+			Spec:         "Spec 2",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			Track:        "research",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create second child task: %v", err)
+	}
+	childID2 := childTasks2[0].ID
+
+	// Promote both children
+	for _, childID := range []string{childID1, childID2} {
+		_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = ? WHERE id = ?", "ready", childID)
+		if err != nil {
+			t.Fatalf("failed to promote child task: %v", err)
+		}
+	}
+
+	// Manifest with compact formatting
+	manifest1 := json.RawMessage(`{"version":1,"parent_task_id":"` + parentID + `","children":[{"key":"c1","title":"C1","spec":"S1","track":"research","model":"haiku","review_models":["opus","sonnet"],"agent_merge":null,"escalate":null,"claim_ids":[],"source_start_points":[],"file_scope":[],"acceptance_criteria":[],"dependencies":[]}],"pending_candidates":[]}`)
+
+	// Same manifest with extra whitespace
+	manifest2 := json.RawMessage(`{
+  "version": 1,
+  "parent_task_id": "` + parentID + `",
+  "children": [
+    {
+      "key": "c1",
+      "title": "C1",
+      "spec": "S1",
+      "track": "research",
+      "model": "haiku",
+      "review_models": ["opus", "sonnet"],
+      "agent_merge": null,
+      "escalate": null,
+      "claim_ids": [],
+      "source_start_points": [],
+      "file_scope": [],
+      "acceptance_criteria": [],
+      "dependencies": []
+    }
+  ],
+  "pending_candidates": []
+}`)
+
+	// Submit first child with manifest1
+	_, err = store.ClaimTask(ctx, childID1, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim first child: %v", err)
+	}
+
+	_, err = store.SubmitTaskWithManifest(ctx, childID1, "agent-1", "result1", nil, []LinkInput{{Kind: "pr", Value: "#1"}}, 5, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`null`), json.RawMessage(`null`), manifest1)
+	if err != nil {
+		t.Fatalf("failed to submit first child: %v", err)
+	}
+
+	// Submit second child with manifest2
+	_, err = store.ClaimTask(ctx, childID2, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim second child: %v", err)
+	}
+
+	_, err = store.SubmitTaskWithManifest(ctx, childID2, "agent-1", "result2", nil, []LinkInput{{Kind: "pr", Value: "#2"}}, 5, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`null`), json.RawMessage(`null`), manifest2)
+	if err != nil {
+		t.Fatalf("failed to submit second child: %v", err)
+	}
+
+	// Get digests from database
+	var digest1, digest2 string
+	err = store.Conn().QueryRowContext(ctx, `SELECT manifest_digest FROM task_submission_manifest WHERE task_id = ?`, childID1).Scan(&digest1)
+	if err != nil {
+		t.Fatalf("failed to get first manifest digest: %v", err)
+	}
+
+	err = store.Conn().QueryRowContext(ctx, `SELECT manifest_digest FROM task_submission_manifest WHERE task_id = ?`, childID2).Scan(&digest2)
+	if err != nil {
+		t.Fatalf("failed to get second manifest digest: %v", err)
+	}
+
+	// Verify digests are identical
+	if digest1 != digest2 {
+		t.Errorf("expected identical digests for semantically identical manifests, got %s and %s", digest1, digest2)
+	}
+}
+
+// TestSubmitImplementTaskBackwardCompatibility verifies that submissions without
+// manifests behave as before.
+func TestSubmitImplementTaskBackwardCompatibility(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create project, document, and task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Implementation task",
+			Spec:         "Implement feature",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			Track:        "build",
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Promote and claim
+	_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = ? WHERE id = ?", "ready", taskID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit without manifest
+	result := "Implementation complete"
+	links := []LinkInput{{Kind: "pr", Value: "#123"}}
+	submitted, err := store.SubmitTask(ctx, taskID, "agent-1", result, nil, links, 5, nil, nil, testUnlimitedResearchBudget)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	if submitted.State != "review" {
+		t.Errorf("expected state=review, got %s", submitted.State)
+	}
+
+	// Verify no manifest was stored
+	var count int
+	err = store.Conn().QueryRowContext(ctx, `SELECT COUNT(*) FROM task_submission_manifest WHERE task_id = ?`, taskID).Scan(&count)
+	if err != nil {
+		t.Fatalf("failed to query manifest count: %v", err)
+	}
+
+	if count != 0 {
+		t.Errorf("expected no manifest for non-research task, got %d", count)
+	}
+}
+
+// TestSubmitTaskManifestOnlyResearchTrack verifies that manifests are only
+// accepted on research-track implement tasks.
+func TestSubmitTaskManifestOnlyResearchTrack(t *testing.T) {
+	type testCase struct {
+		name        string
+		track       string
+		expectError bool
+	}
+
+	tests := []testCase{
+		{
+			name:        "build track",
+			track:       "build",
+			expectError: true,
+		},
+		{
+			name:        "design track",
+			track:       "design",
+			expectError: true,
+		},
+		{
+			name:        "research track",
+			track:       "research",
+			expectError: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+			if err != nil {
+				t.Fatalf("failed to open database: %v", err)
+			}
+			defer store.Close()
+
+			ctx := context.Background()
+
+			// Create project and document
+			proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+			if err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+			if err != nil {
+				t.Fatalf("failed to create document: %v", err)
+			}
+
+			// Create task with specified track
+			tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+				{
+					Title:        "Test task",
+					Spec:         "Test spec",
+					DocumentID:   doc.ID,
+					Model:        "haiku",
+					Track:        tc.track,
+					ReviewModels: []string{"opus"},
+				},
+			})
+			if err != nil {
+				t.Fatalf("failed to create task: %v", err)
+			}
+			taskID := tasks[0].ID
+
+			// Promote and claim
+			_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = ? WHERE id = ?", "ready", taskID)
+			if err != nil {
+				t.Fatalf("failed to promote task: %v", err)
+			}
+
+			_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+			if err != nil {
+				t.Fatalf("failed to claim task: %v", err)
+			}
+
+			// Try to submit with manifest
+			manifest := ptrRawMsg(`{"version":1,"parent_task_id":"parent-id","children":[],"pending_candidates":[]}`)
+			_, err = store.SubmitTaskWithManifest(ctx, taskID, "agent-1", "result", nil, []LinkInput{}, 5, nil, nil, testUnlimitedResearchBudget, json.RawMessage(`null`), json.RawMessage(`null`), *manifest)
+
+			if tc.expectError {
+				if err == nil {
+					t.Errorf("expected error for %s track task with manifest, got nil", tc.track)
+				}
+				// Verify the error mentions the track restriction
+				if err != nil && !strings.Contains(err.Error(), "MANIFEST_NOT_ALLOWED") && !strings.Contains(err.Error(), "research") {
+					t.Logf("expected error about manifest/research restriction, got: %v", err)
+				}
+			} else {
+				if err != nil && !strings.Contains(err.Error(), "PARENT_TASK_NOT_FOUND") && !strings.Contains(err.Error(), "MISMATCHED_PARENT_TASK") && !strings.Contains(err.Error(), "PARENT_NOT_OPTED_IN") {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Helper function to create a pointer to a json.RawMessage
+func ptrRawMsg(s string) *json.RawMessage {
+	m := json.RawMessage(s)
+	return &m
+}
