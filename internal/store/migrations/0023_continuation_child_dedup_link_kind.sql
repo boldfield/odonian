@@ -1,6 +1,7 @@
 -- Add new task_link kinds for continuation manifest child deduplication and parent link.
 -- SQLite doesn't support dropping inline CHECK constraints, so we recreate the table.
-PRAGMA foreign_keys=OFF;
+-- The runner disables foreign key enforcement outside the transaction (store.go:236),
+-- so constraint checks happen on commit as though they were deferred. We rebuild the index.
 
 CREATE TABLE task_link_new (
   id TEXT PRIMARY KEY,
@@ -17,5 +18,3 @@ DROP TABLE task_link;
 ALTER TABLE task_link_new RENAME TO task_link;
 
 CREATE INDEX idx_task_link_kind_value ON task_link(kind, value);
-
-PRAGMA foreign_keys=ON;

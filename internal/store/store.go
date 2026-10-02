@@ -3890,6 +3890,14 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 		return []string{}, nil
 	}
 
+	// Validate the manifest against store rules
+	if err := m.Validate(s.allowedModelsM, validTracks); err != nil {
+		if validationErr, ok := err.(manifest.ValidationError); ok {
+			return nil, invalid(validationErr.Code, validationErr.Message)
+		}
+		return nil, fmt.Errorf("manifest validation failed: %w", err)
+	}
+
 	// Validate that manifest's parent_task_id matches the provided parentID
 	if m.ParentTaskID != parentID {
 		return nil, invalid("MISMATCHED_PARENT_ID", fmt.Sprintf("manifest parent_task_id %q does not match provided parentID %q", m.ParentTaskID, parentID))
@@ -3963,25 +3971,17 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 
 	// Second pass: insert new children (those not already present from this manifest)
 	for _, child := range m.Children {
+		// Skip if already created
+		if !newChildKeys[child.Key] {
+			continue
+		}
+
+		taskID := keyToID[child.Key]
+
 		dupKey, err := dedupKey(child.Key)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build dedup key: %w", err)
 		}
-
-		// Skip if already created
-		var existingID string
-		err = tx.QueryRowContext(ctx, `
-			SELECT task_id FROM task_link
-			WHERE kind = 'continuation_child_dedup' AND value = ? AND tombstoned_at IS NULL
-			LIMIT 1
-		`, dupKey).Scan(&existingID)
-		if err == nil {
-			continue // Already created
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("failed to check existing child (retry): %w", err)
-		}
-
-		taskID := keyToID[child.Key]
 
 		// Sanitize free text
 		child.Title = sanitizeFreeText(child.Title)
@@ -4070,6 +4070,63 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 		`, GenerateID(), taskID, parentID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert parent link: %w", err)
+		}
+
+		// Store child metadata as JSON links for provenance
+		if len(child.ClaimIDs) > 0 {
+			data, err := json.Marshal(child.ClaimIDs)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal claim_ids: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO task_link (id, task_id, kind, value)
+				VALUES (?, ?, 'continuation_child_claim_ids', ?)
+			`, GenerateID(), taskID, string(data))
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert claim_ids link: %w", err)
+			}
+		}
+
+		if len(child.SourceStartPoints) > 0 {
+			data, err := json.Marshal(child.SourceStartPoints)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal source_start_points: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO task_link (id, task_id, kind, value)
+				VALUES (?, ?, 'continuation_child_source_start_points', ?)
+			`, GenerateID(), taskID, string(data))
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert source_start_points link: %w", err)
+			}
+		}
+
+		if len(child.FileScope) > 0 {
+			data, err := json.Marshal(child.FileScope)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal file_scope: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO task_link (id, task_id, kind, value)
+				VALUES (?, ?, 'continuation_child_file_scope', ?)
+			`, GenerateID(), taskID, string(data))
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert file_scope link: %w", err)
+			}
+		}
+
+		if len(child.AcceptanceCriteria) > 0 {
+			data, err := json.Marshal(child.AcceptanceCriteria)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal acceptance_criteria: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO task_link (id, task_id, kind, value)
+				VALUES (?, ?, 'continuation_child_acceptance_criteria', ?)
+			`, GenerateID(), taskID, string(data))
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert acceptance_criteria link: %w", err)
+			}
 		}
 	}
 
