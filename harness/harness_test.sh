@@ -346,8 +346,12 @@ if grep -q 'submission_manifests' "$_rr_prompt" && \
    grep -q 'File equality check.*BLOCKING' "$_rr_prompt" && \
    grep -q 'missing committed manifest file' "$_rr_prompt" && \
    grep -q 'Digest check' "$_rr_prompt" && \
-   grep -q 'printf .%s. .<Canonical line>. | sha256sum' "$_rr_prompt" && \
-   grep -q 'jq -S' "$_rr_prompt" && \
+   grep -q 'jq -jc --argjson r' "$_rr_prompt" && \
+   grep -q 'sha256sum /tmp/stored-manifest.json' "$_rr_prompt" && \
+   grep -q 'jq -S . /tmp/stored-manifest.json' "$_rr_prompt" && \
+   ! grep -q 'printf .%s. .<Canonical line>.' "$_rr_prompt" && \
+   grep -q 'per child at most 6 claims' "$_rr_prompt" && \
+   grep -q '`task` (an existing task ID)' "$_rr_prompt" && \
    grep -q 'Oversized scope is a \*\*P1 finding' "$_rr_prompt" && \
    grep -q 'Manifest findings blocking rule' "$_rr_prompt" && \
    grep -q 'always blocks in every round' "$_rr_prompt"; then

@@ -500,6 +500,48 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 	}
 }
 
+func TestExecuteShowManifestWithHTMLCharsHashesToDigest(t *testing.T) {
+	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[{"title":"A & B <= 3 > 1","spec":"parent's claim"}],"pending_candidates":[]}`)
+	sum := sha256.Sum256(manifestJSON)
+	digest := fmt.Sprintf("%x", sum)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetEscapeHTML(false)
+		enc.Encode(tuiclient.TaskDetail{
+			ID:    "task-1",
+			State: "in_progress",
+			SubmissionManifests: []tuiclient.SubmissionManifest{
+				{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: digest},
+			},
+		})
+	}))
+	defer server.Close()
+
+	text := &bytes.Buffer{}
+	if err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, text); err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+	lines := strings.Split(text.String(), "\n")
+	canonical := ""
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "Canonical:" && i+1 < len(lines) {
+			canonical = strings.TrimSpace(lines[i+1])
+		}
+	}
+	if canonical != string(manifestJSON) {
+		t.Errorf("text show altered manifest bytes: got %q want %q", canonical, manifestJSON)
+	}
+
+	js := &bytes.Buffer{}
+	if err := executeShow(context.Background(), server.URL, "test-token", true, []string{"task-1"}, js); err != nil {
+		t.Fatalf("executeShow --json failed: %v", err)
+	}
+	if !strings.Contains(js.String(), "A & B <= 3 > 1") || strings.Contains(js.String(), `\u0026`) {
+		t.Errorf("show --json HTML-escaped the manifest: %s", js.String())
+	}
+}
+
 func TestExecuteShowJSONPreservesManifestKeyOrder(t *testing.T) {
 	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}`)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

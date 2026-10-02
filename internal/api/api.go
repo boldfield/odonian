@@ -283,7 +283,10 @@ func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, v interface{
 func (s *Server) encodeJSON(w http.ResponseWriter, statusCode int, v interface{}) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	return json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	// Stored manifest bytes are digested without HTML escaping; escaping here would change them.
+	enc.SetEscapeHTML(false)
+	return enc.Encode(v)
 }
 
 // errorResponse writes a consistent error response.

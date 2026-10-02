@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -592,6 +593,20 @@ func executeTasks(ctx context.Context, baseURL, token string, jsonOutput bool, a
 	return nil
 }
 
+// marshalNoHTMLEscape marshals v without escaping &, < and > so stored manifest bytes keep their digest.
+func marshalNoHTMLEscape(v interface{}, indent string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent != "" {
+		enc.SetIndent("", indent)
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
 func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, args []string, out io.Writer) error {
 	if baseURL == "" {
 		return fmt.Errorf("ODONIAN_URL environment variable not set")
@@ -633,7 +648,7 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 	if jsonOutput {
 		// Build output with review findings added to the task
 		output := map[string]json.RawMessage{}
-		taskJSON, err := json.Marshal(task)
+		taskJSON, err := marshalNoHTMLEscape(task, "")
 		if err != nil {
 			return fmt.Errorf("failed to marshal task: %w", err)
 		}
@@ -641,13 +656,13 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			return fmt.Errorf("failed to unmarshal task: %w", err)
 		}
 		if len(reviewFindings) > 0 {
-			findingsJSON, err := json.Marshal(reviewFindings)
+			findingsJSON, err := marshalNoHTMLEscape(reviewFindings, "")
 			if err != nil {
 				return fmt.Errorf("failed to marshal review findings: %w", err)
 			}
 			output["review_findings"] = findingsJSON
 		}
-		finalOutput, err := json.MarshalIndent(output, "", "  ")
+		finalOutput, err := marshalNoHTMLEscape(output, "  ")
 		if err != nil {
 			return fmt.Errorf("failed to marshal JSON: %w", err)
 		}
