@@ -2,41 +2,60 @@ package manifest
 
 import (
 	"fmt"
+	"path/filepath"
+	"slices"
 	"strings"
 )
 
-// ChildDisposition represents the disposition of a child task in the manifest
-type ChildDisposition string
+const CurrentVersion = 1
+
+// Disposition represents the disposition of a candidate claim in the manifest
+type Disposition string
 
 const (
-	ChildAssigned       ChildDisposition = "assigned"
-	ChildCarriedForward ChildDisposition = "carried_forward"
-	ChildExcluded       ChildDisposition = "excluded"
+	Assigned       Disposition = "assigned"
+	CarriedForward Disposition = "carried_forward"
+	Excluded       Disposition = "excluded"
 )
+
+// DependencyKind represents the type of dependency
+type DependencyKind string
+
+const (
+	DependencyParent DependencyKind = "parent"
+	DependencyChild  DependencyKind = "child"
+	DependencyTask   DependencyKind = "task"
+)
+
+// Dependency represents a typed dependency reference
+type Dependency struct {
+	Kind DependencyKind `json:"kind"` // parent, child, or task
+	Ref  string         `json:"ref"`  // reference (key or task ID)
+}
 
 // Child represents a fully specified child task in a research continuation manifest
 type Child struct {
-	Key                string   `json:"key"`                 // stable parent-scoped key
-	Title              string   `json:"title"`               // short title
-	Spec               string   `json:"spec"`                // full prose specification
-	Track              string   `json:"track"`               // "research", "build", or "design"
-	Model              string   `json:"model"`               // model name
-	ReviewModels       []string `json:"review_models"`       // pair of reviewer models
-	AgentMerge         bool     `json:"agent_merge"`         // whether agent can merge
-	Escalate           bool     `json:"escalate"`            // whether escalation is enabled
-	ClaimIDs           []string `json:"claim_ids"`           // exact claim IDs this task will verify
-	SourceStartPoints  []string `json:"source_start_points"` // starting references for sources
-	FileScope          []string `json:"file_scope"`          // files this task touches
-	AcceptanceCriteria []string `json:"acceptance_criteria"` // acceptance criteria as strings
-	Dependencies       []string `json:"dependencies"`        // task IDs or keys this depends on
+	Key                string       `json:"key"`                 // stable parent-scoped key
+	Title              string       `json:"title"`               // short title
+	Spec               string       `json:"spec"`                // full prose specification
+	Track              string       `json:"track"`               // "research", "build", or "design"
+	Model              string       `json:"model"`               // model name
+	ReviewModels       []string     `json:"review_models"`       // exactly 2 distinct reviewer models
+	AgentMerge         *bool        `json:"agent_merge"`         // whether agent can merge
+	Escalate           *bool        `json:"escalate"`            // whether escalation is enabled
+	ClaimIDs           []string     `json:"claim_ids"`           // exact claim IDs this task will verify
+	SourceStartPoints  []string     `json:"source_start_points"` // starting references for sources
+	FileScope          []string     `json:"file_scope"`          // files this task touches
+	AcceptanceCriteria []string     `json:"acceptance_criteria"` // acceptance criteria as strings
+	Dependencies       []Dependency `json:"dependencies"`        // typed dependencies with kind
 }
 
 // PendingCandidate represents a pending candidate claim and its disposition
 type PendingCandidate struct {
-	ClaimID     string           `json:"claim_id"`
-	Disposition ChildDisposition `json:"disposition"`
-	Owner       *string          `json:"owner,omitempty"`  // for carried_forward
-	Reason      *string          `json:"reason,omitempty"` // for excluded
+	ClaimID     string      `json:"claim_id"`
+	Disposition Disposition `json:"disposition"`
+	Owner       *string     `json:"owner,omitempty"`  // for carried_forward
+	Reason      *string     `json:"reason,omitempty"` // for excluded
 }
 
 // Manifest represents a versioned research continuation manifest
@@ -63,8 +82,8 @@ func (m *Manifest) Validate(allowedModels, allowedTracks map[string]bool) error 
 		return ValidationError{"NIL_MANIFEST", "manifest cannot be nil"}
 	}
 
-	if m.Version == 0 {
-		return ValidationError{"INVALID_VERSION", "manifest version must be > 0"}
+	if m.Version != CurrentVersion {
+		return ValidationError{"INVALID_VERSION", fmt.Sprintf("manifest version must be %d, got %d", CurrentVersion, m.Version)}
 	}
 
 	if strings.TrimSpace(m.ParentTaskID) == "" {
@@ -79,12 +98,13 @@ func (m *Manifest) Validate(allowedModels, allowedTracks map[string]bool) error 
 		return ValidationError{"TOO_MANY_CHILDREN", "manifest cannot have more than 3 children"}
 	}
 
-	// Check for duplicate keys and validate each child
+	// Build index for dependency validation
 	seenKeys := make(map[string]bool)
-	childFileScopes := make(map[string][]string) // track file scopes per child
-	claimCounts := make(map[string]int)          // track claim count per child
-	primarySourceCounts := make(map[string]int)  // track primary source count per child
+	childFileScopes := make(map[string][]string)
+	allChildClaims := make(map[string]string)  // claim ID -> child key that contains it
+	childClaimIDs := make(map[string][]string) // track all claim IDs per child for dedup
 
+	// Validate each child and build indexes
 	for i, child := range m.Children {
 		if err := validateChild(child, allowedModels, allowedTracks, i); err != nil {
 			return err
@@ -96,21 +116,25 @@ func (m *Manifest) Validate(allowedModels, allowedTracks map[string]bool) error 
 		seenKeys[child.Key] = true
 
 		childFileScopes[child.Key] = child.FileScope
-		claimCounts[child.Key] = len(child.ClaimIDs)
-		primarySourceCounts[child.Key] = len(child.SourceStartPoints)
-	}
+		childClaimIDs[child.Key] = child.ClaimIDs
 
-	// Check for six-claim ceiling per child
-	for key, count := range claimCounts {
-		if count > 6 {
-			return ValidationError{"OVERSIZED_CLAIMS", fmt.Sprintf("child %q has %d claims, max is 6", key, count)}
+		// Track where each claim ID appears for cross-checking
+		for _, claimID := range child.ClaimIDs {
+			if existing, exists := allChildClaims[claimID]; exists {
+				return ValidationError{"DUPLICATE_CLAIM_ASSIGNMENT", fmt.Sprintf("claim ID %q appears in both child %q and child %q", claimID, existing, child.Key)}
+			}
+			allChildClaims[claimID] = child.Key
 		}
-	}
 
-	// Check for four-primary-source ceiling per child
-	for key, count := range primarySourceCounts {
-		if count > 4 {
-			return ValidationError{"OVERSIZED_SOURCES", fmt.Sprintf("child %q has %d primary sources, max is 4", key, count)}
+		// Check for oversized claims per child
+		if len(child.ClaimIDs) > 6 {
+			return ValidationError{"OVERSIZED_CLAIMS", fmt.Sprintf("child %q has %d claims, max is 6", child.Key, len(child.ClaimIDs))}
+		}
+
+		// Check for oversized sources per child (with dedup count)
+		distinctSources := countDistinct(child.SourceStartPoints)
+		if distinctSources > 4 {
+			return ValidationError{"OVERSIZED_SOURCES", fmt.Sprintf("child %q has %d distinct primary sources, max is 4", child.Key, distinctSources)}
 		}
 	}
 
@@ -119,31 +143,14 @@ func (m *Manifest) Validate(allowedModels, allowedTracks map[string]bool) error 
 		return err
 	}
 
-	// Check for dependency cycles
-	if err := checkDependencyCycles(m.Children, seenKeys); err != nil {
+	// Check for dependency cycles and validate dependency references
+	if err := checkDependencies(m.Children, seenKeys); err != nil {
 		return err
 	}
 
-	// Validate pending candidates
-	for _, candidate := range m.PendingCandidates {
-		if strings.TrimSpace(candidate.ClaimID) == "" {
-			return ValidationError{"INVALID_CANDIDATE", "claim_id is required for all candidates"}
-		}
-
-		switch candidate.Disposition {
-		case ChildAssigned:
-			// Valid, no additional checks
-		case ChildCarriedForward:
-			if candidate.Owner == nil || strings.TrimSpace(*candidate.Owner) == "" {
-				return ValidationError{"MISSING_OWNER", fmt.Sprintf("claim %q marked carried_forward must have an owner", candidate.ClaimID)}
-			}
-		case ChildExcluded:
-			if candidate.Reason == nil || strings.TrimSpace(*candidate.Reason) == "" {
-				return ValidationError{"MISSING_REASON", fmt.Sprintf("claim %q marked excluded must have a reason", candidate.ClaimID)}
-			}
-		default:
-			return ValidationError{"INVALID_DISPOSITION", fmt.Sprintf("unknown disposition %q for claim %q", candidate.Disposition, candidate.ClaimID)}
-		}
+	// Validate pending candidates and cross-check with children
+	if err := validatePendingCandidates(m.PendingCandidates, allChildClaims); err != nil {
+		return err
 	}
 
 	return nil
@@ -180,12 +187,13 @@ func validateChild(child Child, allowedModels, allowedTracks map[string]bool, in
 		return ValidationError{"UNKNOWN_MODEL", fmt.Sprintf("%s: unknown model %q", prefix, child.Model)}
 	}
 
-	if len(child.ReviewModels) == 0 {
-		return ValidationError{"MISSING_REVIEW_MODELS", fmt.Sprintf("%s: review_models is required and must have at least one entry", prefix)}
+	// Reviewer pair must be exactly 2 distinct models
+	if len(child.ReviewModels) != 2 {
+		return ValidationError{"INVALID_REVIEW_MODELS", fmt.Sprintf("%s: review_models must have exactly 2 entries, got %d", prefix, len(child.ReviewModels))}
 	}
 
-	if len(child.ReviewModels) > 2 {
-		return ValidationError{"TOO_MANY_REVIEW_MODELS", fmt.Sprintf("%s: review_models cannot have more than 2 entries", prefix)}
+	if child.ReviewModels[0] == child.ReviewModels[1] {
+		return ValidationError{"DUPLICATE_REVIEW_MODELS", fmt.Sprintf("%s: review_models must be distinct, got duplicate %q", prefix, child.ReviewModels[0])}
 	}
 
 	for _, model := range child.ReviewModels {
@@ -194,18 +202,58 @@ func validateChild(child Child, allowedModels, allowedTracks map[string]bool, in
 		}
 	}
 
+	// Check agent_merge and escalate are present
+	if child.AgentMerge == nil {
+		return ValidationError{"MISSING_AGENT_MERGE", fmt.Sprintf("%s: agent_merge is required", prefix)}
+	}
+
+	if child.Escalate == nil {
+		return ValidationError{"MISSING_ESCALATE", fmt.Sprintf("%s: escalate is required", prefix)}
+	}
+
+	// Validate claim IDs
 	if len(child.ClaimIDs) == 0 {
 		return ValidationError{"MISSING_CLAIMS", fmt.Sprintf("%s: claim_ids is required and must have at least one entry", prefix)}
 	}
 
+	for i, claimID := range child.ClaimIDs {
+		if strings.TrimSpace(claimID) == "" {
+			return ValidationError{"BLANK_CLAIM_ID", fmt.Sprintf("%s: claim_ids[%d] is blank", prefix, i)}
+		}
+	}
+
+	// Check for duplicate claim IDs within a child
+	claimSet := make(map[string]bool)
+	for _, claimID := range child.ClaimIDs {
+		if claimSet[claimID] {
+			return ValidationError{"DUPLICATE_CLAIM_ID", fmt.Sprintf("%s: claim ID %q appears multiple times", prefix, claimID)}
+		}
+		claimSet[claimID] = true
+	}
+
+	// Validate source start points
 	if len(child.SourceStartPoints) == 0 {
 		return ValidationError{"MISSING_SOURCES", fmt.Sprintf("%s: source_start_points is required and must have at least one entry", prefix)}
 	}
 
+	for i, source := range child.SourceStartPoints {
+		if strings.TrimSpace(source) == "" {
+			return ValidationError{"BLANK_SOURCE", fmt.Sprintf("%s: source_start_points[%d] is blank", prefix, i)}
+		}
+	}
+
+	// Validate file scope
 	if len(child.FileScope) == 0 {
 		return ValidationError{"MISSING_FILE_SCOPE", fmt.Sprintf("%s: file_scope is required and must have at least one entry", prefix)}
 	}
 
+	for i, file := range child.FileScope {
+		if strings.TrimSpace(file) == "" {
+			return ValidationError{"BLANK_FILE", fmt.Sprintf("%s: file_scope[%d] is blank", prefix, i)}
+		}
+	}
+
+	// Validate acceptance criteria
 	if len(child.AcceptanceCriteria) == 0 {
 		return ValidationError{"MISSING_ACCEPTANCE_CRITERIA", fmt.Sprintf("%s: acceptance_criteria is required and must have at least one entry", prefix)}
 	}
@@ -214,59 +262,170 @@ func validateChild(child Child, allowedModels, allowedTracks map[string]bool, in
 }
 
 func checkFileOverlaps(fileScopes map[string][]string) error {
-	fileToChild := make(map[string][]string)
+	fileToChildren := make(map[string][]string)
 
 	for child, files := range fileScopes {
 		for _, file := range files {
-			fileToChild[file] = append(fileToChild[file], child)
+			// Normalize path
+			normalizedFile := filepath.Clean(file)
+			fileToChildren[normalizedFile] = append(fileToChildren[normalizedFile], child)
 		}
 	}
 
-	for file, children := range fileToChild {
+	// Collect overlapping files for deterministic error message
+	var overlappingFiles []string
+	for file, children := range fileToChildren {
 		if len(children) > 1 {
-			return ValidationError{"OVERLAPPING_FILES", fmt.Sprintf("file %q is in multiple children: %v", file, children)}
+			overlappingFiles = append(overlappingFiles, file)
 		}
+	}
+
+	if len(overlappingFiles) > 0 {
+		slices.Sort(overlappingFiles)
+		details := make([]string, 0, len(overlappingFiles))
+		for _, file := range overlappingFiles {
+			childList := fileToChildren[file]
+			slices.Sort(childList)
+			details = append(details, fmt.Sprintf("%q -> %v", file, childList))
+		}
+		return ValidationError{"OVERLAPPING_FILES", fmt.Sprintf("unsupported overlapping file writes: %s", strings.Join(details, "; "))}
 	}
 
 	return nil
 }
 
-func checkDependencyCycles(children []Child, seenKeys map[string]bool) error {
+func checkDependencies(children []Child, seenKeys map[string]bool) error {
+	// Build key->index map for efficiency
+	keyToIndex := make(map[string]int)
+	for i, child := range children {
+		keyToIndex[child.Key] = i
+	}
+
+	// Validate each dependency reference
 	for _, child := range children {
-		visited := make(map[string]bool)
-		if hasCycle(child.Key, children, visited, seenKeys) {
-			return ValidationError{"DEPENDENCY_CYCLE", fmt.Sprintf("dependency cycle detected starting at child %q", child.Key)}
+		for _, dep := range child.Dependencies {
+			if strings.TrimSpace(dep.Ref) == "" {
+				return ValidationError{"BLANK_DEPENDENCY_REF", fmt.Sprintf("child %q: dependency ref cannot be blank", child.Key)}
+			}
+
+			switch dep.Kind {
+			case DependencyParent:
+				// Parent dependencies are always valid (the parent task ID)
+			case DependencyChild:
+				// Child dependency must reference an existing sibling key
+				if !seenKeys[dep.Ref] {
+					return ValidationError{"UNKNOWN_CHILD_DEPENDENCY", fmt.Sprintf("child %q: unknown child dependency %q", child.Key, dep.Ref)}
+				}
+			case DependencyTask:
+				// External task ID must be well-formed (non-empty, valid UUID-like format)
+				if !isValidTaskID(dep.Ref) {
+					return ValidationError{"INVALID_TASK_ID", fmt.Sprintf("child %q: invalid task ID %q", child.Key, dep.Ref)}
+				}
+			default:
+				return ValidationError{"UNKNOWN_DEPENDENCY_KIND", fmt.Sprintf("child %q: unknown dependency kind %q", child.Key, dep.Kind)}
+			}
 		}
 	}
+
+	// Check for dependency cycles (only among child dependencies)
+	visited := make(map[string]int) // -1: visiting, 0: unvisited, 1: visited
+	for _, child := range children {
+		if visited[child.Key] == 0 {
+			if hasCycleDFS(child.Key, children, keyToIndex, visited) {
+				return ValidationError{"DEPENDENCY_CYCLE", fmt.Sprintf("dependency cycle detected involving child %q", child.Key)}
+			}
+		}
+	}
+
 	return nil
 }
 
-func hasCycle(nodeKey string, children []Child, visited, seenKeys map[string]bool) bool {
-	if visited[nodeKey] {
-		return true
-	}
+func hasCycleDFS(nodeKey string, children []Child, keyToIndex map[string]int, visited map[string]int) bool {
+	visited[nodeKey] = -1 // mark as visiting
 
-	visited[nodeKey] = true
-
-	var node *Child
-	for i := range children {
-		if children[i].Key == nodeKey {
-			node = &children[i]
-			break
-		}
-	}
-
-	if node == nil {
-		return false
-	}
+	nodeIdx := keyToIndex[nodeKey]
+	node := children[nodeIdx]
 
 	for _, dep := range node.Dependencies {
-		// Only check dependencies within this child set
-		if seenKeys[dep] && hasCycle(dep, children, visited, seenKeys) {
-			return true
+		// Only check child dependencies for cycles
+		if dep.Kind != DependencyChild {
+			continue
+		}
+
+		if visited[dep.Ref] == -1 {
+			return true // back edge, cycle detected
+		}
+
+		if visited[dep.Ref] == 0 {
+			if hasCycleDFS(dep.Ref, children, keyToIndex, visited) {
+				return true
+			}
 		}
 	}
 
-	delete(visited, nodeKey)
+	visited[nodeKey] = 1 // mark as visited
 	return false
+}
+
+func isValidTaskID(taskID string) bool {
+	// Task IDs should be non-empty and follow UUID format (basic check)
+	// Format: 8 hex chars - 4 hex chars - 4 hex chars - 4 hex chars - 12 hex chars
+	if len(taskID) < 8 {
+		return false
+	}
+	parts := strings.Split(taskID, "-")
+	if len(parts) != 5 {
+		return false
+	}
+	return len(parts[0]) == 8 && len(parts[1]) == 4 && len(parts[2]) == 4 && len(parts[3]) == 4 && len(parts[4]) == 12
+}
+
+func validatePendingCandidates(candidates []PendingCandidate, allChildClaims map[string]string) error {
+	// Check for unique candidate IDs
+	seenCandidates := make(map[string]bool)
+
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.ClaimID) == "" {
+			return ValidationError{"INVALID_CANDIDATE", "claim_id is required for all candidates"}
+		}
+
+		// Check for duplicate candidates
+		if seenCandidates[candidate.ClaimID] {
+			return ValidationError{"DUPLICATE_CANDIDATE", fmt.Sprintf("claim %q appears multiple times in pending_candidates", candidate.ClaimID)}
+		}
+		seenCandidates[candidate.ClaimID] = true
+
+		switch candidate.Disposition {
+		case Assigned:
+			// Assigned candidate must appear in exactly one child
+			childKey, exists := allChildClaims[candidate.ClaimID]
+			if !exists {
+				return ValidationError{"UNASSIGNED_CANDIDATE", fmt.Sprintf("claim %q marked assigned but not found in any child", candidate.ClaimID)}
+			}
+			// Verify the claim is actually in the child's claim_ids
+			if childKey == "" {
+				return ValidationError{"ORPHAN_CLAIM", fmt.Sprintf("claim %q is marked assigned but has no parent child", candidate.ClaimID)}
+			}
+		case CarriedForward:
+			if candidate.Owner == nil || strings.TrimSpace(*candidate.Owner) == "" {
+				return ValidationError{"MISSING_OWNER", fmt.Sprintf("claim %q marked carried_forward must have an owner", candidate.ClaimID)}
+			}
+		case Excluded:
+			if candidate.Reason == nil || strings.TrimSpace(*candidate.Reason) == "" {
+				return ValidationError{"MISSING_REASON", fmt.Sprintf("claim %q marked excluded must have a reason", candidate.ClaimID)}
+			}
+		default:
+			return ValidationError{"INVALID_DISPOSITION", fmt.Sprintf("unknown disposition %q for claim %q", candidate.Disposition, candidate.ClaimID)}
+		}
+	}
+
+	return nil
+}
+
+func countDistinct(items []string) int {
+	seen := make(map[string]bool)
+	for _, item := range items {
+		seen[item] = true
+	}
+	return len(seen)
 }
