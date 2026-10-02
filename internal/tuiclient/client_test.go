@@ -1352,3 +1352,42 @@ func TestGetResearchReviewerScorecards_Error(t *testing.T) {
 		t.Errorf("expected StatusCode 500, got %d", apiErr.StatusCode)
 	}
 }
+
+func TestSubmitTaskWithManifest(t *testing.T) {
+	manifest := json.RawMessage(`{"version":1,"parent_task_id":"task123"}`)
+	var sawManifest bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req submitTaskRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("failed to decode request body: %v", err)
+		}
+		sawManifest = string(req.Manifest) == string(manifest)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	links := []LinkInput{{Kind: "pr", Value: "https://github.com/test/pr"}}
+	if err := client.SubmitTaskWithManifest(context.Background(), "task123", "agent123", "done", nil, links, nil, nil, manifest); err != nil {
+		t.Fatalf("SubmitTaskWithManifest failed: %v", err)
+	}
+	if !sawManifest {
+		t.Errorf("expected the manifest to be forwarded in the request body")
+	}
+
+	// Without a manifest the field is omitted entirely.
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var raw map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Errorf("failed to decode request body: %v", err)
+		}
+		if _, ok := raw["manifest"]; ok {
+			t.Errorf("expected no manifest field when none is supplied")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server2.Close()
+	if err := NewHTTPClient(server2.URL, "testtoken").SubmitTask(context.Background(), "task123", "agent123", "done", nil, links); err != nil {
+		t.Fatalf("SubmitTask failed: %v", err)
+	}
+}

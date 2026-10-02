@@ -819,6 +819,15 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
     been raised by exactly one reviewer in that round — an id two reviewers both used is
     ambiguous and rejected.
   - `evidence` (required): Non-empty string citing the source evidence the dispute relies on.
+- `manifest` (optional, research-track implement only): A research continuation manifest, per
+  docs/features/research-continuations.md. Only accepted on an `implement`-kind, `research`-track
+  task whose spec opts in with a `## continuation manifest` heading line. Its `parent_task_id`
+  must be the submitted task. Omitting the field, or sending an explicit `null`, behaves exactly
+  as before. The server canonicalises the manifest and stores it, with its SHA-256 digest, for the
+  review round the submission starts; every round's manifest is returned by `GET /tasks/{id}` as
+  `submission_manifests` (`review_round`, `parent_task_id`, `manifest_json`, `manifest_digest`,
+  `submitted_at`; `[]` when none). A rework round adds a new entry and leaves earlier rounds'
+  entries untouched. The CLI sends it with `odonian submit --manifest-file <path>`.
 
   A dispute never alters the finding it names. It is recorded on the submission's own event and
   delivered, in the next round, to the review task of the reviewer who raised that finding — the
@@ -966,6 +975,15 @@ it. See docs/features/research-track.md §3 for the full blocking rules.
   `finding_id`/`evidence` missing, or a `finding_id` repeated in the same submission)
 - `400 DISPUTES_NOT_ALLOWED`: disputes were provided on a task that is not a research-track
   implement rework submission
+- `400 MANIFEST_NOT_ALLOWED`: a manifest was provided on a task that is not a research-track
+  implement submission
+- `400 PARENT_NOT_OPTED_IN`: a manifest was provided but the task spec has no
+  `## continuation manifest` heading line
+- `400 MISMATCHED_PARENT_TASK`: the manifest's `parent_task_id` is not the submitted task
+- `400 INVALID_MANIFEST_JSON`: the manifest is not a JSON object matching the manifest schema
+  (unknown fields and trailing data are rejected)
+- `400` with a manifest validator code (for example `UNKNOWN_MODEL`, `UNKNOWN_TRACK`,
+  `TOO_MANY_CHILDREN`): the manifest is outside the child envelope
 - `400 NO_PRIOR_ROUND`: disputes were provided on a research-track task's first implement
   submission, which has no prior review round to dispute a finding from
 - `400 UNKNOWN_FINDING_ID`: a disputed `finding_id` was not raised by any reviewer in the round

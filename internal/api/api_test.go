@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -8486,4 +8488,133 @@ func TestCompleteLandingEndpoint(t *testing.T) {
 	if recorder := call("POST", "/tasks/"+taskID+"/landing/complete", map[string]string{"attempt": "attempt-1", "note": "landed"}); recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"state":"done"`) {
 		t.Fatalf("complete by the owner: expected 200 done, got %d %s", recorder.Code, recorder.Body.String())
 	}
+}
+
+// createClaimedResearchTask creates, promotes and claims a research task with the given spec.
+func createClaimedResearchTask(t *testing.T, server *Server, authHeader, spec string) string {
+	t.Helper()
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+	taskBody, _ := json.Marshal([]store.TaskInput{
+		{Title: "Verify claims", Spec: spec, DocumentID: docID, Model: "haiku", ReviewModels: []string{"opus", "sonnet"}, Track: "research"},
+	})
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	var created []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil || len(created) != 1 {
+		t.Fatalf("failed to create task: %v; body: %s", err, createW.Body.String())
+	}
+	id := created[0].ID
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+id+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	server.mux.ServeHTTP(httptest.NewRecorder(), promoteReq)
+	apiClaimTask(t, server, authHeader, id, "agent-1", "haiku")
+	return id
+}
+
+func apiGetTask(t *testing.T, server *Server, authHeader, id string) store.TaskWithDepsAndLinks {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/tasks/"+id, nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET task: status %d; body: %s", w.Code, w.Body.String())
+	}
+	var task store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(w.Body).Decode(&task); err != nil {
+		t.Fatalf("failed to decode task: %v", err)
+	}
+	return task
+}
+
+func apiTestManifest(parentID string) map[string]interface{} {
+	return map[string]interface{}{
+		"version":        1,
+		"parent_task_id": parentID,
+		"children": []map[string]interface{}{{
+			"key": "c1", "title": "Verify c", "spec": "Check c against primary sources",
+			"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+			"agent_merge": false, "escalate": true, "claim_ids": []string{"c"},
+			"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/c.md"},
+			"acceptance_criteria": []string{"claim verified"},
+			"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+		}},
+		"pending_candidates": []map[string]string{{"claim_id": "c", "disposition": "assigned"}},
+	}
+}
+
+func TestSubmitWithContinuationManifest(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}}
+
+	t.Run("accepted manifest is exposed per round with its digest", func(t *testing.T) {
+		id := createClaimedResearchTask(t, server, authHeader, "Verify.\n\n## Continuation manifest\n")
+		code, body := apiSubmit(t, server, authHeader, id, map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": apiTestManifest(id),
+		})
+		if code != http.StatusOK {
+			t.Fatalf("expected 200, got %d; body: %s", code, body)
+		}
+
+		task := apiGetTask(t, server, authHeader, id)
+		if len(task.SubmissionManifests) != 1 {
+			t.Fatalf("expected 1 submission manifest, got %d", len(task.SubmissionManifests))
+		}
+		m := task.SubmissionManifests[0]
+		sum := sha256.Sum256(m.ManifestJSON)
+		if m.ReviewRound != task.ReviewRound || m.ParentTaskID != id || m.ManifestDigest != hex.EncodeToString(sum[:]) {
+			t.Errorf("manifest not bound to its round and digest: %+v (task round %d)", m, task.ReviewRound)
+		}
+	})
+
+	t.Run("rejections return 400 and leave the task unchanged", func(t *testing.T) {
+		id := createClaimedResearchTask(t, server, authHeader, "Verify the claims.")
+		code, body := apiSubmit(t, server, authHeader, id, map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": apiTestManifest(id),
+		})
+		if code != http.StatusBadRequest || apiErrorCode(t, body) != "PARENT_NOT_OPTED_IN" {
+			t.Fatalf("expected 400 PARENT_NOT_OPTED_IN, got %d: %s", code, body)
+		}
+		optedIn := createClaimedResearchTask(t, server, authHeader, "Verify.\n\n## Continuation manifest\n")
+		code, body = apiSubmit(t, server, authHeader, optedIn, map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": apiTestManifest("someone-else"),
+		})
+		if code != http.StatusBadRequest || apiErrorCode(t, body) != "MISMATCHED_PARENT_TASK" {
+			t.Fatalf("expected 400 MISMATCHED_PARENT_TASK, got %d: %s", code, body)
+		}
+		for _, taskID := range []string{id, optedIn} {
+			task := apiGetTask(t, server, authHeader, taskID)
+			if task.State != "in_progress" || task.ReviewRound != 0 || len(task.Links) != 0 || len(task.SubmissionManifests) != 0 {
+				t.Errorf("task %s changed by rejected submissions: %+v", taskID, task)
+			}
+		}
+	})
+
+	t.Run("submissions without a manifest are unchanged", func(t *testing.T) {
+		for name, extra := range map[string]map[string]interface{}{"absent": {}, "null": {"manifest": nil}} {
+			id := createClaimedResearchTask(t, server, authHeader, "Verify the claims.")
+			payload := map[string]interface{}{"agent_id": "agent-1", "result": "Implemented", "links": prLinks}
+			for k, v := range extra {
+				payload[k] = v
+			}
+			if code, body := apiSubmit(t, server, authHeader, id, payload); code != http.StatusOK {
+				t.Fatalf("%s: expected 200, got %d; body: %s", name, code, body)
+			}
+			req := httptest.NewRequest("GET", "/tasks/"+id, nil)
+			req.Header.Set("Authorization", authHeader)
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+			var raw map[string]json.RawMessage
+			if err := json.NewDecoder(w.Body).Decode(&raw); err != nil {
+				t.Fatal(err)
+			}
+			if string(raw["submission_manifests"]) != "[]" {
+				t.Errorf("%s: expected submission_manifests [], got %s", name, raw["submission_manifests"])
+			}
+		}
+	})
 }

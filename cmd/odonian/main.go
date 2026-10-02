@@ -830,6 +830,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	agentFlag := fs.String("agent", "", "agent ID")
 	findingsFileFlag := fs.String("findings-file", "", "path to JSON file with structured findings")
 	disputesFileFlag := fs.String("disputes-file", "", "path to JSON file with finding disputes (research-track rework only)")
+	manifestFileFlag := fs.String("manifest-file", "", "path to JSON file with a research continuation manifest (research implement only; the task spec must opt in)")
 	skipFeedbackGateFlag := fs.Bool("skip-feedback-gate", false, "bypass the mechanical PR-feedback rework gate (humans/emergencies only)")
 	positionals, err := parseFlagsWithPositionals(fs, args)
 	if err != nil {
@@ -895,6 +896,26 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		}
 
 		disputes = fileData
+	}
+
+	// Validate manifest file early, before any HTTP requests
+	var manifestBody []byte
+	if *manifestFileFlag != "" {
+		fileData, err := os.ReadFile(*manifestFileFlag)
+		if err != nil {
+			return fmt.Errorf("failed to read manifest file: %w", err)
+		}
+
+		var m interface{}
+		if err := json.Unmarshal(fileData, &m); err != nil {
+			return fmt.Errorf("manifest file is not valid JSON: %w", err)
+		}
+
+		if _, isObject := m.(map[string]interface{}); !isObject {
+			return fmt.Errorf("manifest file must be a JSON object")
+		}
+
+		manifestBody = fileData
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
@@ -1001,7 +1022,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		verdict = verdictFlag
 	}
 
-	if err := client.SubmitTaskWithDisputesAndFindings(ctx, taskID, agentID, *resultFlag, verdict, links, findings, disputes); err != nil {
+	if err := client.SubmitTaskWithManifest(ctx, taskID, agentID, *resultFlag, verdict, links, findings, disputes, manifestBody); err != nil {
 		return fmt.Errorf("failed to submit task: %w", err)
 	}
 
