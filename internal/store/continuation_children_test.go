@@ -360,7 +360,7 @@ func TestInsertManifestChildrenIdempotency(t *testing.T) {
 		Version:      1,
 		ParentTaskID: parentID,
 		Children: []manifest.Child{
-		testChild("child1", "Research Child", "Child spec", "research", "haiku", "file1.go"),
+			testChild("child1", "Research Child", "Child spec", "research", "haiku", "file1.go"),
 		},
 		PendingCandidates: testPendingCandidates("claim1"),
 	}
@@ -595,7 +595,7 @@ func TestInsertManifestChildrenParentLink(t *testing.T) {
 		Version:      1,
 		ParentTaskID: parentID,
 		Children: []manifest.Child{
-		testChild("child1", "Child", "Child spec", "research", "haiku", "file1.go"),
+			testChild("child1", "Child", "Child spec", "research", "haiku", "file1.go"),
 		},
 		PendingCandidates: testPendingCandidates("claim1"),
 	}
