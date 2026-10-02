@@ -3880,6 +3880,319 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 	return createdIDs, nil
 }
 
+// InsertManifestChildren validates and inserts children from a manifest within a caller-owned
+// transaction. Research children enter ready state; generated build/design children enter backlog.
+// Deduplicates by (parentID, childKey, manifestDigest) to ensure idempotent calls with the same manifest.
+// Returns created task IDs in manifest order. All-or-nothing: on any error, the transaction
+// should be rolled back and nothing is created.
+func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m *manifest.Manifest, manifestDigest string, parentID, parentProjectID, parentDocumentID string, now string) ([]string, error) {
+	// Validate the manifest against store rules (rejects nil and empty manifests too)
+	if err := m.Validate(s.allowedModelsM, validTracks); err != nil {
+		if validationErr, ok := err.(manifest.ValidationError); ok {
+			return nil, invalid(validationErr.Code, validationErr.Message)
+		}
+		return nil, fmt.Errorf("manifest validation failed: %w", err)
+	}
+
+	// Validate that manifest's parent_task_id matches the provided parentID
+	if m.ParentTaskID != parentID {
+		return nil, invalid("MISMATCHED_PARENT_ID", fmt.Sprintf("manifest parent_task_id %q does not match provided parentID %q", m.ParentTaskID, parentID))
+	}
+
+	// Load parent task to verify it exists and belongs to the correct project/document
+	var actualProjectID, actualDocumentID string
+	err := tx.QueryRowContext(ctx, `
+		SELECT project_id, document_id FROM task WHERE id = ?
+	`, parentID).Scan(&actualProjectID, &actualDocumentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, invalid("PARENT_NOT_FOUND", fmt.Sprintf("parent task %q not found", parentID))
+		}
+		return nil, fmt.Errorf("failed to load parent task: %w", err)
+	}
+
+	// Verify the parent belongs to the expected project and document
+	if actualProjectID != parentProjectID || actualDocumentID != parentDocumentID {
+		return nil, invalid("MISMATCHED_PARENT_PROJECT_DOCUMENT", fmt.Sprintf("parent task %q belongs to project %q document %q, not %q %q", parentID, actualProjectID, actualDocumentID, parentProjectID, parentDocumentID))
+	}
+
+	// Deduplicate check: for each child, see if we've already created it from this exact manifest.
+	// If so, reuse it. Only skip already-created children if they're from the same manifest digest.
+	dedupKey := func(childKey string) (string, error) {
+		key := map[string]interface{}{
+			"parent_id":       parentID,
+			"child_key":       childKey,
+			"manifest_digest": manifestDigest,
+		}
+		data, err := json.Marshal(key)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+
+	keyToID := make(map[string]string)
+	createdTasks := make([]string, 0, len(m.Children))
+	newChildKeys := make(map[string]bool)
+
+	// First pass: check for already-created children and generate IDs for new ones
+	for _, child := range m.Children {
+		dupKey, err := dedupKey(child.Key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build dedup key: %w", err)
+		}
+
+		// Check if this child was already created from this exact manifest
+		var existingID string
+		err = tx.QueryRowContext(ctx, `
+			SELECT task_id FROM task_link
+			WHERE kind = 'continuation_child_dedup' AND value = ? AND tombstoned_at IS NULL
+			LIMIT 1
+		`, dupKey).Scan(&existingID)
+		if err == nil {
+			// Already created from this manifest
+			keyToID[child.Key] = existingID
+			createdTasks = append(createdTasks, existingID)
+			continue
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("failed to check existing child: %w", err)
+		}
+
+		// New child: generate ID
+		taskID := GenerateID()
+		keyToID[child.Key] = taskID
+		createdTasks = append(createdTasks, taskID)
+		newChildKeys[child.Key] = true
+	}
+
+	// Second pass: insert new children (those not already present from this manifest)
+	for _, child := range m.Children {
+		// Skip if already created
+		if !newChildKeys[child.Key] {
+			continue
+		}
+
+		taskID := keyToID[child.Key]
+
+		dupKey, err := dedupKey(child.Key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build dedup key: %w", err)
+		}
+
+		// Sanitize free text
+		child.Title = sanitizeFreeText(child.Title)
+		child.Spec = sanitizeFreeText(child.Spec)
+
+		// Validate title and spec are non-empty
+		if strings.TrimSpace(child.Title) == "" {
+			return nil, invalid("EMPTY_TITLE", "child title is required")
+		}
+		if strings.TrimSpace(child.Spec) == "" {
+			return nil, invalid("EMPTY_SPEC", "child spec is required")
+		}
+
+		// Resolve model
+		model := child.Model
+		if model == "" {
+			if child.Track == "research" && s.researchDefaultModel != "" {
+				model = s.researchDefaultModel
+			} else {
+				model = s.getDefaultModel()
+			}
+		}
+
+		// Validate model is in allowlist (should already be validated by manifest.Validate, but double-check)
+		if !s.allowedModelsM[model] {
+			return nil, invalid("UNKNOWN_MODEL", fmt.Sprintf("unknown model: %s", model))
+		}
+
+		// Validate review_models
+		for _, reviewModel := range child.ReviewModels {
+			if !s.allowedModelsM[reviewModel] {
+				return nil, invalid("UNKNOWN_MODEL", fmt.Sprintf("unknown review model: %s", reviewModel))
+			}
+		}
+
+		// Encode review_models to JSON
+		var reviewModelsJSON *string
+		if len(child.ReviewModels) > 0 {
+			data, err := json.Marshal(child.ReviewModels)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal review_models: %w", err)
+			}
+			str := string(data)
+			reviewModelsJSON = &str
+		}
+
+		// Determine initial state based on track
+		state := "backlog"
+		if child.Track == "research" {
+			state = "ready"
+		}
+
+		// Resolve defaults for agent_merge and escalate
+		agentMerge := false
+		if child.AgentMerge != nil {
+			agentMerge = *child.AgentMerge
+		}
+
+		escalate := true
+		if child.Escalate != nil {
+			escalate = *child.Escalate
+		}
+
+		// Insert the child task
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, track, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 'implement', ?, 0, ?, ?, ?, ?, ?)
+		`, taskID, parentProjectID, parentDocumentID, child.Title, child.Spec, state, model, reviewModelsJSON, agentMerge, escalate, child.Track, now, now)
+		if err != nil {
+			return nil, fmt.Errorf("failed to insert child task: %w", err)
+		}
+
+		// Add dedup link to prevent re-creation with the same manifest
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO task_link (id, task_id, kind, value)
+			VALUES (?, ?, 'continuation_child_dedup', ?)
+		`, GenerateID(), taskID, dupKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to insert dedup link: %w", err)
+		}
+
+		// Add parent link
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO task_link (id, task_id, kind, value)
+			VALUES (?, ?, 'continuation_parent', ?)
+		`, GenerateID(), taskID, parentID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to insert parent link: %w", err)
+		}
+
+		// Store child metadata as JSON links for provenance
+		if len(child.ClaimIDs) > 0 {
+			data, err := json.Marshal(child.ClaimIDs)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal claim_ids: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO task_link (id, task_id, kind, value)
+				VALUES (?, ?, 'continuation_child_claim_ids', ?)
+			`, GenerateID(), taskID, string(data))
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert claim_ids link: %w", err)
+			}
+		}
+
+		if len(child.SourceStartPoints) > 0 {
+			data, err := json.Marshal(child.SourceStartPoints)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal source_start_points: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO task_link (id, task_id, kind, value)
+				VALUES (?, ?, 'continuation_child_source_start_points', ?)
+			`, GenerateID(), taskID, string(data))
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert source_start_points link: %w", err)
+			}
+		}
+
+		if len(child.FileScope) > 0 {
+			data, err := json.Marshal(child.FileScope)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal file_scope: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO task_link (id, task_id, kind, value)
+				VALUES (?, ?, 'continuation_child_file_scope', ?)
+			`, GenerateID(), taskID, string(data))
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert file_scope link: %w", err)
+			}
+		}
+
+		if len(child.AcceptanceCriteria) > 0 {
+			data, err := json.Marshal(child.AcceptanceCriteria)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal acceptance_criteria: %w", err)
+			}
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO task_link (id, task_id, kind, value)
+				VALUES (?, ?, 'continuation_child_acceptance_criteria', ?)
+			`, GenerateID(), taskID, string(data))
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert acceptance_criteria link: %w", err)
+			}
+		}
+	}
+
+	// Third pass: insert task dependencies (after all child IDs are known)
+	// Only insert dependencies for newly created children to maintain idempotency
+	for _, child := range m.Children {
+		if len(child.Dependencies) == 0 {
+			continue
+		}
+
+		// Skip dependencies for already-existing children (idempotency)
+		if !newChildKeys[child.Key] {
+			continue
+		}
+
+		taskID := keyToID[child.Key]
+
+		for _, dep := range child.Dependencies {
+			var dependsOnID string
+
+			switch dep.Kind {
+			case manifest.DependencyParent:
+				// Dependency on the parent task
+				if dep.Ref != m.ParentTaskID {
+					return nil, invalid("MISMATCHED_PARENT_DEPENDENCY", "parent dependency ref must match manifest parent_task_id")
+				}
+				dependsOnID = parentID
+
+			case manifest.DependencyChild:
+				// Dependency on another child in this manifest (by key)
+				id, exists := keyToID[dep.Ref]
+				if !exists {
+					return nil, invalid("UNKNOWN_CHILD_DEPENDENCY", fmt.Sprintf("child dependency references unknown child key %q", dep.Ref))
+				}
+				dependsOnID = id
+
+			case manifest.DependencyTask:
+				// Dependency on an external task by ID
+				// Verify the task exists and is in the same project
+				var existingProjectID string
+				err := tx.QueryRowContext(ctx, "SELECT project_id FROM task WHERE id = ?", dep.Ref).Scan(&existingProjectID)
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, invalid("UNKNOWN_TASK_DEPENDENCY", fmt.Sprintf("task dependency references non-existent task %q", dep.Ref))
+				}
+				if err != nil {
+					return nil, fmt.Errorf("failed to verify task dependency: %w", err)
+				}
+				if existingProjectID != parentProjectID {
+					return nil, invalid("DEPENDENCY_NOT_IN_PROJECT", "task dependency references a task in another project")
+				}
+				dependsOnID = dep.Ref
+
+			default:
+				return nil, invalid("UNKNOWN_DEPENDENCY_KIND", fmt.Sprintf("unknown dependency kind: %s", dep.Kind))
+			}
+
+			// Insert dependency edge
+			_, err := tx.ExecContext(ctx, `
+				INSERT INTO task_dep (task_id, depends_on_id)
+				VALUES (?, ?)
+			`, taskID, dependsOnID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to insert task dependency: %w", err)
+			}
+		}
+	}
+
+	return createdTasks, nil
+}
+
 // aggregateReviewRound tallies all review tasks for a parent in the current round and determines the new parent state.
 // It handles: verdict counting, merge task spawning (if approved with agent_merge),
 // escalation (if rejected and threshold exceeded), and blocking. Returns the new parent state.
