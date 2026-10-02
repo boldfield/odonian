@@ -8691,3 +8691,243 @@ func TestGetTaskExposesPlannedContinuation(t *testing.T) {
 		}
 	}
 }
+
+func apiListTasks(t *testing.T, server *Server, authHeader, projectID string) []store.Task {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list tasks: status %d; body: %s", w.Code, w.Body.String())
+	}
+	var tasks []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode tasks: %v", err)
+	}
+	return tasks
+}
+
+func TestResearchContinuationEndToEnd(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create an opt-in research parent task
+	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+
+	// Get the parent task to extract the projectID
+	parent := apiGetTask(t, server, authHeader, parentID)
+	projectID := parent.ProjectID
+
+	// Create a two-child manifest
+	twoChildManifest := map[string]interface{}{
+		"version":        1,
+		"parent_task_id": parentID,
+		"children": []map[string]interface{}{
+			{
+				"key": "source-a", "title": "Analyze source A", "spec": "Source-only analysis of reference A",
+				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-a"},
+				"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
+				"acceptance_criteria": []string{"source A verified"},
+				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+			},
+			{
+				"key": "source-b", "title": "Analyze source B", "spec": "Source-only analysis of reference B",
+				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-b"},
+				"source_start_points": []string{"https://example.com/b"}, "file_scope": []string{"docs/b.md"},
+				"acceptance_criteria": []string{"source B verified"},
+				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+			},
+		},
+		"pending_candidates": []map[string]string{
+			{"claim_id": "claim-a", "disposition": "assigned"},
+			{"claim_id": "claim-b", "disposition": "assigned"},
+		},
+	}
+
+	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}}
+
+	// Submit the manifest
+	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": twoChildManifest,
+	}); code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	}
+
+	// Verify parent is in review state
+	parentAfterSubmit := apiGetTask(t, server, authHeader, parentID)
+	if parentAfterSubmit.State != "review" {
+		t.Fatalf("expected parent state 'review' after submit, got %q", parentAfterSubmit.State)
+	}
+
+	// Verify continuation shows 2 proposed children
+	if parentAfterSubmit.Continuation == nil || len(parentAfterSubmit.Continuation.ProposedChildren) != 2 {
+		t.Fatalf("expected 2 proposed children, got %+v", parentAfterSubmit.Continuation)
+	}
+	if len(parentAfterSubmit.Continuation.CreatedChildren) != 0 {
+		t.Fatalf("nothing should be created before merge, got %+v", parentAfterSubmit.Continuation.CreatedChildren)
+	}
+
+	// Find review tasks
+	allTasks := apiListTasks(t, server, authHeader, projectID)
+	reviewTasksByModel := make(map[string][]string)
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == parentID {
+			reviewTasksByModel[task.Model] = append(reviewTasksByModel[task.Model], task.ID)
+		}
+	}
+
+	if len(reviewTasksByModel) != 2 {
+		t.Fatalf("expected review tasks from 2 models, got %d", len(reviewTasksByModel))
+	}
+
+	// Get one review task from each model
+	var opusReviewID, sonnetReviewID string
+	for model, taskIDs := range reviewTasksByModel {
+		if len(taskIDs) > 0 {
+			if model == "opus" {
+				opusReviewID = taskIDs[0]
+			} else if model == "sonnet" {
+				sonnetReviewID = taskIDs[0]
+			}
+		}
+	}
+
+	if opusReviewID == "" || sonnetReviewID == "" {
+		t.Fatalf("could not find review tasks from both models")
+	}
+
+	// Approve from opus reviewer
+	opusClaimPayload := map[string]string{"agent_id": "reviewer-opus", "model": "opus"}
+	opusClaimBody, _ := json.Marshal(opusClaimPayload)
+	opusClaimReq := httptest.NewRequest("POST", "/tasks/"+opusReviewID+"/claim", bytes.NewReader(opusClaimBody))
+	opusClaimReq.Header.Set("Authorization", authHeader)
+	opusClaimReq.Header.Set("Content-Type", "application/json")
+	opusClaimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(opusClaimW, opusClaimReq)
+
+	if opusClaimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim opus review task: got status %d", opusClaimW.Code)
+	}
+
+	opusSubmitPayload := map[string]interface{}{
+		"agent_id": "reviewer-opus",
+		"result":   "Manifest looks good from opus perspective",
+		"verdict":  "approve",
+		"findings": []interface{}{},
+	}
+	opusSubmitBody, _ := json.Marshal(opusSubmitPayload)
+	opusSubmitReq := httptest.NewRequest("POST", "/tasks/"+opusReviewID+"/submit", bytes.NewReader(opusSubmitBody))
+	opusSubmitReq.Header.Set("Authorization", authHeader)
+	opusSubmitReq.Header.Set("Content-Type", "application/json")
+	opusSubmitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(opusSubmitW, opusSubmitReq)
+
+	if opusSubmitW.Code != http.StatusOK {
+		t.Fatalf("failed to submit opus review: got status %d; body: %s", opusSubmitW.Code, opusSubmitW.Body.String())
+	}
+
+	// Parent should still be in review after first approval
+	parentAfterFirstApproval := apiGetTask(t, server, authHeader, parentID)
+	if parentAfterFirstApproval.State != "review" {
+		t.Fatalf("parent should still be in review after one approval, got %q", parentAfterFirstApproval.State)
+	}
+
+	// Approve from sonnet reviewer
+	sonnetClaimPayload := map[string]string{"agent_id": "reviewer-sonnet", "model": "sonnet"}
+	sonnetClaimBody, _ := json.Marshal(sonnetClaimPayload)
+	sonnetClaimReq := httptest.NewRequest("POST", "/tasks/"+sonnetReviewID+"/claim", bytes.NewReader(sonnetClaimBody))
+	sonnetClaimReq.Header.Set("Authorization", authHeader)
+	sonnetClaimReq.Header.Set("Content-Type", "application/json")
+	sonnetClaimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(sonnetClaimW, sonnetClaimReq)
+
+	if sonnetClaimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim sonnet review task: got status %d", sonnetClaimW.Code)
+	}
+
+	sonnetSubmitPayload := map[string]interface{}{
+		"agent_id": "reviewer-sonnet",
+		"result":   "Manifest looks good from sonnet perspective",
+		"verdict":  "approve",
+		"findings": []interface{}{},
+	}
+	sonnetSubmitBody, _ := json.Marshal(sonnetSubmitPayload)
+	sonnetSubmitReq := httptest.NewRequest("POST", "/tasks/"+sonnetReviewID+"/submit", bytes.NewReader(sonnetSubmitBody))
+	sonnetSubmitReq.Header.Set("Authorization", authHeader)
+	sonnetSubmitReq.Header.Set("Content-Type", "application/json")
+	sonnetSubmitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(sonnetSubmitW, sonnetSubmitReq)
+
+	if sonnetSubmitW.Code != http.StatusOK {
+		t.Fatalf("failed to submit sonnet review: got status %d; body: %s", sonnetSubmitW.Code, sonnetSubmitW.Body.String())
+	}
+
+	// After both reviewers approve, parent should move to approved
+	parentAfterApprovals := apiGetTask(t, server, authHeader, parentID)
+	if parentAfterApprovals.State != "approved" {
+		t.Fatalf("parent should be in approved state after all approvals, got %q", parentAfterApprovals.State)
+	}
+
+	// No children created yet (before merge)
+	if len(parentAfterApprovals.Continuation.CreatedChildren) != 0 {
+		t.Fatalf("children should not exist before merge, got %d", len(parentAfterApprovals.Continuation.CreatedChildren))
+	}
+
+	// Transition to done (simulating human merge) - this should trigger child creation
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+parentID+"/transition", bytes.NewReader([]byte(`{"to":"done"}`)))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("failed to transition to done: got status %d; body: %s", transitionW.Code, transitionW.Body.String())
+	}
+
+	// Parent should be done and children created
+	parentAfterMerge := apiGetTask(t, server, authHeader, parentID)
+	if parentAfterMerge.State != "done" {
+		t.Fatalf("parent should be done after transition, got %q", parentAfterMerge.State)
+	}
+
+	if parentAfterMerge.Continuation == nil || len(parentAfterMerge.Continuation.CreatedChildren) != 2 {
+		t.Fatalf("expected 2 created children after merge, got %+v", parentAfterMerge.Continuation)
+	}
+
+	// Verify created children properties
+	for i, child := range parentAfterMerge.Continuation.CreatedChildren {
+		if child.ID == "" {
+			t.Errorf("child %d should have an ID", i)
+		}
+		if child.State == "" {
+			t.Errorf("child %d should have a state", i)
+		}
+		if child.Track != "research" {
+			t.Errorf("child %d track should be research, got %q", i, child.Track)
+		}
+	}
+
+	// Verify children are claimable
+	claimableAfterMerge := apiListTasks(t, server, authHeader, projectID)
+	claimableByID := make(map[string]bool)
+	for _, task := range claimableAfterMerge {
+		if task.State == "ready" && (task.Assignee == nil || *task.Assignee == "") {
+			claimableByID[task.ID] = true
+		}
+	}
+
+	for _, child := range parentAfterMerge.Continuation.CreatedChildren {
+		if !claimableByID[child.ID] {
+			t.Errorf("created child %s should be claimable", child.ID)
+		}
+	}
+
+	// Verify idempotency
+	parentAfterIdempotency := apiGetTask(t, server, authHeader, parentID)
+	if len(parentAfterIdempotency.Continuation.CreatedChildren) != 2 {
+		t.Fatalf("idempotency: expected 2 children, got %d", len(parentAfterIdempotency.Continuation.CreatedChildren))
+	}
+}

@@ -207,6 +207,53 @@ transitions. `approved → done` / `approved → ready` are the merge gate.
 When `agent_merge` is `false`, the parent waits in `approved` for the **human** merge gate. In no
 case does a reviewer run `gh pr merge` or transition the parent.
 
+## Research continuation manifests (opt-in)
+
+Research-track implement tasks may carry a **continuation manifest** in their PR, proposing a set of child tasks to be created when the parent is merged. This allows controlled, reviewed task breakdown.
+
+### Opt-in contract
+
+A research task's spec must contain a line that reads exactly `## Continuation manifest` (trimmed, case-insensitive). The line must be a standalone heading (not mid-line), not nested (no `###`), and not just prose mentioning the phrase. Only tasks with this opt-in line may submit a manifest.
+
+### Worker submission
+
+When submitting a research-track task, include a `manifest` field in the submission body. The manifest is a JSON object (defined in `internal/manifest/manifest.go`) with:
+
+- **version**: Always 1 (the schema version).
+- **parent_task_id**: Must match the submitted task's ID.
+- **children**: Array of up to 3 child specifications. Each child has `key`, `title`, `spec`, `track` ("research", "build", or "design"), `model`, `review_models` (exactly 2 distinct models), `agent_merge` (boolean), `escalate` (boolean), `claim_ids` (1–6 claims), `source_start_points` (up to 4 sources), `file_scope` (non-overlapping file paths), `acceptance_criteria` (1+ criteria), and `dependencies` (other children or the parent).
+- **pending_candidates**: Optional. Maps each claim to a disposition: `assigned`, `carried_forward` (with owner), or `excluded` (with reason).
+
+The server rejects the submission (`400` with an error code) if:
+- The parent spec does not opt in.
+- The manifest names a different parent task ID.
+- The manifest fails validation (unknown models, overlapping files, circular dependencies, etc.).
+
+On rejection, the task remains in `in_progress`, and no state changes occur.
+
+### Review duties
+
+Both reviewers examine the **exact manifest** alongside the parent's implementation. A reviewer can flag issues with the proposed children as review findings on the parent task. The manifest is shown in the `GET /tasks/{id}` response under `submission_manifests` for each review round, including the exact JSON and a SHA-256 digest.
+
+### Merge-time creation
+
+When a human transitions an `approved` research parent to `done`:
+
+1. The server checks if the parent's spec opted in.
+2. The server loads the manifest from the approved review round (the round the task passed review in).
+3. For each child, the server creates a new task with the manifest's fields.
+4. Research-track children start in the `ready` state and are immediately claimable.
+5. Build and design-track children start in the `backlog` state and must be explicitly queued.
+6. Created children are linked to the parent task.
+
+The `GET /tasks/{id}` response shows both proposed and created children in the `continuation` view, with status (`pending` or `created`) and manifest digest.
+
+### Recovery from invalid manifests
+
+If the stored manifest digest does not match when the parent reaches `done`, the merge transition fails and rolls back. The parent remains in `approved`, allowing retry. Validate the manifest offline, correct the stored digest, and retry the transition.
+
+Retry idempotency is guaranteed: calling the child-creation logic twice with the same manifest and digest does not create duplicates.
+
 ## Task creation
 
 ```json
