@@ -3890,6 +3890,28 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 		return []string{}, nil
 	}
 
+	// Validate that manifest's parent_task_id matches the provided parentID
+	if m.ParentTaskID != parentID {
+		return nil, invalid("MISMATCHED_PARENT_ID", fmt.Sprintf("manifest parent_task_id %q does not match provided parentID %q", m.ParentTaskID, parentID))
+	}
+
+	// Load parent task to verify it exists and belongs to the correct project/document
+	var actualProjectID, actualDocumentID string
+	err := tx.QueryRowContext(ctx, `
+		SELECT project_id, document_id FROM task WHERE id = ?
+	`, parentID).Scan(&actualProjectID, &actualDocumentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, invalid("PARENT_NOT_FOUND", fmt.Sprintf("parent task %q not found", parentID))
+		}
+		return nil, fmt.Errorf("failed to load parent task: %w", err)
+	}
+
+	// Verify the parent belongs to the expected project and document
+	if actualProjectID != parentProjectID || actualDocumentID != parentDocumentID {
+		return nil, invalid("MISMATCHED_PARENT_PROJECT_DOCUMENT", fmt.Sprintf("parent task %q belongs to project %q document %q, not %q %q", parentID, actualProjectID, actualDocumentID, parentProjectID, parentDocumentID))
+	}
+
 	// Deduplicate check: for each child, see if we've already created it from this exact manifest.
 	// If so, reuse it. Only skip already-created children if they're from the same manifest digest.
 	dedupKey := func(childKey string) (string, error) {
