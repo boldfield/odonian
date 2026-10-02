@@ -3,8 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -247,7 +245,7 @@ func helperSubmitManifest(t *testing.T, store Store, ctx context.Context, taskID
 	return parent
 }
 
-// helperApproveAndTransitionToReady force-approves a task and transitions it to ready.
+// helperApproveParent force-approves a task in the given review round.
 func helperApproveParent(t *testing.T, store Store, ctx context.Context, taskID string, reviewRound int) {
 	t.Helper()
 	if _, err := store.Conn().ExecContext(ctx, "UPDATE task SET state = 'approved', review_round = ? WHERE id = ?", reviewRound, taskID); err != nil {
@@ -300,49 +298,24 @@ func helperSeedManifestForTask(t *testing.T, store Store, ctx context.Context, t
 	t.Helper()
 	m.ParentTaskID = taskID
 
-	// Compute canonical form (matching canonicalizeManifest logic for nil normalization)
-	if m.Children == nil {
-		m.Children = []manifest.Child{}
-	}
-	if m.PendingCandidates == nil {
-		m.PendingCandidates = []manifest.PendingCandidate{}
-	}
-	for i := range m.Children {
-		c := &m.Children[i]
-		if c.ReviewModels == nil {
-			c.ReviewModels = []string{}
-		}
-		if c.ClaimIDs == nil {
-			c.ClaimIDs = []string{}
-		}
-		if c.SourceStartPoints == nil {
-			c.SourceStartPoints = []string{}
-		}
-		if c.FileScope == nil {
-			c.FileScope = []string{}
-		}
-		if c.AcceptanceCriteria == nil {
-			c.AcceptanceCriteria = []string{}
-		}
-		if c.Dependencies == nil {
-			c.Dependencies = []manifest.Dependency{}
-		}
-	}
-
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(m); err != nil {
 		t.Fatalf("failed to encode manifest: %v", err)
 	}
-	canonicalJSON := strings.TrimSuffix(buf.String(), "\n")
-	sum := sha256.Sum256([]byte(canonicalJSON))
-	digest := hex.EncodeToString(sum[:])
+	rawJSON := json.RawMessage(strings.TrimSuffix(buf.String(), "\n"))
 
-	_, err := store.Conn().ExecContext(ctx, `
+	s := store.(*sqliteStore)
+	cm, err := s.canonicalizeManifest(rawJSON, taskID)
+	if err != nil {
+		t.Fatalf("failed to canonicalize manifest: %v", err)
+	}
+
+	_, err = store.Conn().ExecContext(ctx, `
 		INSERT INTO task_submission_manifest (id, task_id, review_round, parent_task_id, manifest_json, manifest_digest, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, GenerateID(), taskID, reviewRound, taskID, canonicalJSON, digest, nowTimestamp())
+	`, GenerateID(), taskID, reviewRound, taskID, cm.json, cm.digest, nowTimestamp())
 	if err != nil {
 		t.Fatalf("failed to seed manifest: %v", err)
 	}
@@ -531,50 +504,26 @@ func TestRetryAndIdempotency(t *testing.T) {
 		t.Errorf("after failed landing, expected 0 children, got %d", childCount)
 	}
 
-	// Restore the correct digest
+	// Restore the correct digest by re-canonicalizing the manifest
 	m.ParentTaskID = parentID
-	if m.Children == nil {
-		m.Children = []manifest.Child{}
-	}
-	if m.PendingCandidates == nil {
-		m.PendingCandidates = []manifest.PendingCandidate{}
-	}
-	for i := range m.Children {
-		c := &m.Children[i]
-		if c.ReviewModels == nil {
-			c.ReviewModels = []string{}
-		}
-		if c.ClaimIDs == nil {
-			c.ClaimIDs = []string{}
-		}
-		if c.SourceStartPoints == nil {
-			c.SourceStartPoints = []string{}
-		}
-		if c.FileScope == nil {
-			c.FileScope = []string{}
-		}
-		if c.AcceptanceCriteria == nil {
-			c.AcceptanceCriteria = []string{}
-		}
-		if c.Dependencies == nil {
-			c.Dependencies = []manifest.Dependency{}
-		}
-	}
-
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(m); err != nil {
 		t.Fatalf("failed to encode manifest: %v", err)
 	}
-	canonicalJSON := strings.TrimSuffix(buf.String(), "\n")
-	sum := sha256.Sum256([]byte(canonicalJSON))
-	correctDigest := hex.EncodeToString(sum[:])
+	rawJSON := json.RawMessage(strings.TrimSuffix(buf.String(), "\n"))
+
+	s := store.(*sqliteStore)
+	cm, err := s.canonicalizeManifest(rawJSON, parentID)
+	if err != nil {
+		t.Fatalf("failed to canonicalize manifest: %v", err)
+	}
 
 	_, err = store.Conn().ExecContext(ctx, `
 		UPDATE task_submission_manifest SET manifest_digest = ?, manifest_json = ?
 		WHERE task_id = ? AND review_round = ?
-	`, correctDigest, canonicalJSON, parentID, reviewRound)
+	`, cm.digest, cm.json, parentID, reviewRound)
 	if err != nil {
 		t.Fatalf("failed to restore digest: %v", err)
 	}
@@ -604,15 +553,32 @@ func TestRetryAndIdempotency(t *testing.T) {
 	}
 
 	// Test idempotency - calling InsertManifestChildren again should not create duplicates
-	children := helperGetChildTaskIDs(t, store, ctx, parentID)
-	if len(children) != 1 {
-		t.Fatalf("expected 1 child before second insert, got %d", len(children))
+	// Get the parent to retrieve projectID and documentID for the re-insertion
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("GetTask for parent: %v", err)
 	}
 
-	// Manually test idempotent re-insertion by re-querying and attempting to insert again
+	// Begin a transaction and call InsertManifestChildren again with the same manifest and digest
+	tx, err := store.Conn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx for idempotency test: %v", err)
+	}
+
+	_, err = s.InsertManifestChildren(ctx, tx, m, cm.digest, parentID, parent.ProjectID, parent.DocumentID, nowTimestamp())
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("InsertManifestChildren second call: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit idempotency transaction: %v", err)
+	}
+
+	// Verify there is still exactly 1 child (dedup prevented duplicate creation)
 	childCount = helperCountChildren(t, store, ctx, parentID)
 	if childCount != 1 {
-		t.Errorf("after idempotent check, expected 1 child, got %d", childCount)
+		t.Errorf("after idempotent re-insertion, expected 1 child, got %d", childCount)
 	}
 }
 
