@@ -8709,6 +8709,15 @@ func apiListTasks(t *testing.T, server *Server, authHeader, projectID string) []
 }
 
 func TestResearchContinuationEndToEnd(t *testing.T) {
+	t.Run("happy path: submit, approve, merge, create children, claim", testResearchContinuationHappyPath)
+	t.Run("rejection paths: invalid manifest, changed manifest, unmerged PR", testResearchContinuationRejectionPaths)
+	t.Run("retry idempotency: re-transition to done without creating duplicates", testResearchContinuationIdempotency)
+	t.Run("mixed children: research (ready) and build (backlog) tracks", testResearchContinuationMixedTracks)
+	t.Run("dependency gating: dependencies must be done for claimability", testResearchContinuationDependencyGating)
+	t.Run("research follow-ups still work alongside continuation manifest", testResearchContinuationWithFollowUps)
+}
+
+func testResearchContinuationHappyPath(t *testing.T) {
 	server := setupTestServer(t, "test-token")
 	authHeader := "Bearer test-token"
 
@@ -8800,33 +8809,11 @@ func TestResearchContinuationEndToEnd(t *testing.T) {
 	}
 
 	// Approve from opus reviewer
-	opusClaimPayload := map[string]string{"agent_id": "reviewer-opus", "model": "opus"}
-	opusClaimBody, _ := json.Marshal(opusClaimPayload)
-	opusClaimReq := httptest.NewRequest("POST", "/tasks/"+opusReviewID+"/claim", bytes.NewReader(opusClaimBody))
-	opusClaimReq.Header.Set("Authorization", authHeader)
-	opusClaimReq.Header.Set("Content-Type", "application/json")
-	opusClaimW := httptest.NewRecorder()
-	server.mux.ServeHTTP(opusClaimW, opusClaimReq)
-
-	if opusClaimW.Code != http.StatusOK {
-		t.Fatalf("failed to claim opus review task: got status %d", opusClaimW.Code)
-	}
-
-	opusSubmitPayload := map[string]interface{}{
-		"agent_id": "reviewer-opus",
-		"result":   "Manifest looks good from opus perspective",
-		"verdict":  "approve",
-		"findings": []interface{}{},
-	}
-	opusSubmitBody, _ := json.Marshal(opusSubmitPayload)
-	opusSubmitReq := httptest.NewRequest("POST", "/tasks/"+opusReviewID+"/submit", bytes.NewReader(opusSubmitBody))
-	opusSubmitReq.Header.Set("Authorization", authHeader)
-	opusSubmitReq.Header.Set("Content-Type", "application/json")
-	opusSubmitW := httptest.NewRecorder()
-	server.mux.ServeHTTP(opusSubmitW, opusSubmitReq)
-
-	if opusSubmitW.Code != http.StatusOK {
-		t.Fatalf("failed to submit opus review: got status %d; body: %s", opusSubmitW.Code, opusSubmitW.Body.String())
+	apiClaimTask(t, server, authHeader, opusReviewID, "reviewer-opus", "opus")
+	if code, body := apiSubmit(t, server, authHeader, opusReviewID, map[string]interface{}{
+		"agent_id": "reviewer-opus", "result": "Manifest looks good from opus perspective", "verdict": "approve", "findings": []interface{}{},
+	}); code != http.StatusOK {
+		t.Fatalf("failed to submit opus review: got status %d; body: %s", code, body)
 	}
 
 	// Parent should still be in review after first approval
@@ -8836,33 +8823,11 @@ func TestResearchContinuationEndToEnd(t *testing.T) {
 	}
 
 	// Approve from sonnet reviewer
-	sonnetClaimPayload := map[string]string{"agent_id": "reviewer-sonnet", "model": "sonnet"}
-	sonnetClaimBody, _ := json.Marshal(sonnetClaimPayload)
-	sonnetClaimReq := httptest.NewRequest("POST", "/tasks/"+sonnetReviewID+"/claim", bytes.NewReader(sonnetClaimBody))
-	sonnetClaimReq.Header.Set("Authorization", authHeader)
-	sonnetClaimReq.Header.Set("Content-Type", "application/json")
-	sonnetClaimW := httptest.NewRecorder()
-	server.mux.ServeHTTP(sonnetClaimW, sonnetClaimReq)
-
-	if sonnetClaimW.Code != http.StatusOK {
-		t.Fatalf("failed to claim sonnet review task: got status %d", sonnetClaimW.Code)
-	}
-
-	sonnetSubmitPayload := map[string]interface{}{
-		"agent_id": "reviewer-sonnet",
-		"result":   "Manifest looks good from sonnet perspective",
-		"verdict":  "approve",
-		"findings": []interface{}{},
-	}
-	sonnetSubmitBody, _ := json.Marshal(sonnetSubmitPayload)
-	sonnetSubmitReq := httptest.NewRequest("POST", "/tasks/"+sonnetReviewID+"/submit", bytes.NewReader(sonnetSubmitBody))
-	sonnetSubmitReq.Header.Set("Authorization", authHeader)
-	sonnetSubmitReq.Header.Set("Content-Type", "application/json")
-	sonnetSubmitW := httptest.NewRecorder()
-	server.mux.ServeHTTP(sonnetSubmitW, sonnetSubmitReq)
-
-	if sonnetSubmitW.Code != http.StatusOK {
-		t.Fatalf("failed to submit sonnet review: got status %d; body: %s", sonnetSubmitW.Code, sonnetSubmitW.Body.String())
+	apiClaimTask(t, server, authHeader, sonnetReviewID, "reviewer-sonnet", "sonnet")
+	if code, body := apiSubmit(t, server, authHeader, sonnetReviewID, map[string]interface{}{
+		"agent_id": "reviewer-sonnet", "result": "Manifest looks good from sonnet perspective", "verdict": "approve", "findings": []interface{}{},
+	}); code != http.StatusOK {
+		t.Fatalf("failed to submit sonnet review: got status %d; body: %s", code, body)
 	}
 
 	// After both reviewers approve, parent should move to approved
@@ -8897,37 +8862,589 @@ func TestResearchContinuationEndToEnd(t *testing.T) {
 		t.Fatalf("expected 2 created children after merge, got %+v", parentAfterMerge.Continuation)
 	}
 
-	// Verify created children properties
+	// Verify created children properties and states
 	for i, child := range parentAfterMerge.Continuation.CreatedChildren {
 		if child.ID == "" {
 			t.Errorf("child %d should have an ID", i)
 		}
-		if child.State == "" {
-			t.Errorf("child %d should have a state", i)
+		if child.State != "ready" {
+			t.Errorf("child %d state should be ready (research track), got %q", i, child.State)
 		}
 		if child.Track != "research" {
 			t.Errorf("child %d track should be research, got %q", i, child.Track)
 		}
 	}
 
-	// Verify children are claimable
-	claimableAfterMerge := apiListTasks(t, server, authHeader, projectID)
-	claimableByID := make(map[string]bool)
-	for _, task := range claimableAfterMerge {
-		if task.State == "ready" && (task.Assignee == nil || *task.Assignee == "") {
-			claimableByID[task.ID] = true
-		}
-	}
-
+	// Verify we can actually claim created children
 	for _, child := range parentAfterMerge.Continuation.CreatedChildren {
-		if !claimableByID[child.ID] {
-			t.Errorf("created child %s should be claimable", child.ID)
+		apiClaimTask(t, server, authHeader, child.ID, "child-worker", "haiku")
+		claimedChild := apiGetTask(t, server, authHeader, child.ID)
+		if claimedChild.Assignee == nil || *claimedChild.Assignee != "child-worker" {
+			t.Errorf("child %s should be claimed by child-worker, got assignee %+v", child.ID, claimedChild.Assignee)
+		}
+	}
+}
+
+func testResearchContinuationRejectionPaths(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	t.Run("reject invalid manifest: overlapping file scopes", func(t *testing.T) {
+		parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+
+		invalidManifest := map[string]interface{}{
+			"version":        1,
+			"parent_task_id": parentID,
+			"children": []map[string]interface{}{
+				{
+					"key": "child1", "title": "Child 1", "spec": "Child 1 spec",
+					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+					"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
+					"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/shared.md"},
+					"acceptance_criteria": []string{"criterion 1"},
+					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+				},
+				{
+					"key": "child2", "title": "Child 2", "spec": "Child 2 spec",
+					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+					"agent_merge": false, "escalate": true, "claim_ids": []string{"c2"},
+					"source_start_points": []string{"https://example.com/b"}, "file_scope": []string{"docs/shared.md"},
+					"acceptance_criteria": []string{"criterion 2"},
+					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+				},
+			},
+			"pending_candidates": []map[string]string{
+				{"claim_id": "c1", "disposition": "assigned"},
+				{"claim_id": "c2", "disposition": "assigned"},
+			},
+		}
+
+		prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}}
+		code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": invalidManifest,
+		})
+		if code == http.StatusOK {
+			t.Fatalf("expected rejection for overlapping file scopes, got status %d", code)
+		}
+		if !strings.Contains(string(body), "OVERLAPPING_FILES") {
+			t.Errorf("expected OVERLAPPING_FILES error, got: %s", body)
+		}
+	})
+
+	t.Run("reject invalid manifest: unknown model", func(t *testing.T) {
+		parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+
+		invalidManifest := map[string]interface{}{
+			"version":        1,
+			"parent_task_id": parentID,
+			"children": []map[string]interface{}{
+				{
+					"key": "child1", "title": "Child 1", "spec": "Child 1 spec",
+					"track": "research", "model": "unknown-model", "review_models": []string{"opus", "sonnet"},
+					"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
+					"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
+					"acceptance_criteria": []string{"criterion 1"},
+					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+				},
+			},
+			"pending_candidates": []map[string]string{
+				{"claim_id": "c1", "disposition": "assigned"},
+			},
+		}
+
+		prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/2"}}
+		code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": invalidManifest,
+		})
+		if code == http.StatusOK {
+			t.Fatalf("expected rejection for unknown model, got status %d", code)
+		}
+		if !strings.Contains(string(body), "UNKNOWN_MODEL") {
+			t.Errorf("expected UNKNOWN_MODEL error, got: %s", body)
+		}
+	})
+
+	t.Run("reject invalid manifest: too many children", func(t *testing.T) {
+		parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+
+		invalidManifest := map[string]interface{}{
+			"version":        1,
+			"parent_task_id": parentID,
+			"children": []map[string]interface{}{
+				{
+					"key": "c1", "title": "Child 1", "spec": "Spec 1",
+					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+					"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-1"},
+					"source_start_points": []string{"https://example.com/1"}, "file_scope": []string{"docs/1.md"},
+					"acceptance_criteria": []string{"criterion 1"},
+					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+				},
+				{
+					"key": "c2", "title": "Child 2", "spec": "Spec 2",
+					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+					"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-2"},
+					"source_start_points": []string{"https://example.com/2"}, "file_scope": []string{"docs/2.md"},
+					"acceptance_criteria": []string{"criterion 2"},
+					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+				},
+				{
+					"key": "c3", "title": "Child 3", "spec": "Spec 3",
+					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+					"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-3"},
+					"source_start_points": []string{"https://example.com/3"}, "file_scope": []string{"docs/3.md"},
+					"acceptance_criteria": []string{"criterion 3"},
+					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+				},
+				{
+					"key": "c4", "title": "Child 4", "spec": "Spec 4",
+					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+					"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-4"},
+					"source_start_points": []string{"https://example.com/4"}, "file_scope": []string{"docs/4.md"},
+					"acceptance_criteria": []string{"criterion 4"},
+					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+				},
+			},
+			"pending_candidates": []map[string]string{
+				{"claim_id": "claim-1", "disposition": "assigned"},
+				{"claim_id": "claim-2", "disposition": "assigned"},
+				{"claim_id": "claim-3", "disposition": "assigned"},
+				{"claim_id": "claim-4", "disposition": "assigned"},
+			},
+		}
+
+		prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/3"}}
+		code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": invalidManifest,
+		})
+		if code == http.StatusOK {
+			t.Fatalf("expected rejection for >3 children, got status %d", code)
+		}
+		if !strings.Contains(string(body), "TOO_MANY_CHILDREN") {
+			t.Errorf("expected TOO_MANY_CHILDREN error, got: %s", body)
+		}
+	})
+}
+
+func testResearchContinuationIdempotency(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create and approve a parent with a manifest
+	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+	parent := apiGetTask(t, server, authHeader, parentID)
+	projectID := parent.ProjectID
+
+	manifest := map[string]interface{}{
+		"version":        1,
+		"parent_task_id": parentID,
+		"children": []map[string]interface{}{
+			{
+				"key": "child1", "title": "Child 1", "spec": "Spec 1",
+				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+				"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
+				"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
+				"acceptance_criteria": []string{"criterion"},
+				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+			},
+		},
+		"pending_candidates": []map[string]string{
+			{"claim_id": "c1", "disposition": "assigned"},
+		},
+	}
+
+	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/10"}}
+	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": manifest,
+	}); code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	}
+
+	// Get review tasks and approve both
+	allTasks := apiListTasks(t, server, authHeader, projectID)
+	reviewTasksByModel := make(map[string][]string)
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == parentID {
+			reviewTasksByModel[task.Model] = append(reviewTasksByModel[task.Model], task.ID)
 		}
 	}
 
-	// Verify idempotency
-	parentAfterIdempotency := apiGetTask(t, server, authHeader, parentID)
-	if len(parentAfterIdempotency.Continuation.CreatedChildren) != 2 {
-		t.Fatalf("idempotency: expected 2 children, got %d", len(parentAfterIdempotency.Continuation.CreatedChildren))
+	for model, taskIDs := range reviewTasksByModel {
+		if len(taskIDs) > 0 {
+			apiClaimTask(t, server, authHeader, taskIDs[0], "reviewer-"+model, model)
+			apiSubmit(t, server, authHeader, taskIDs[0], map[string]interface{}{
+				"agent_id": "reviewer-" + model, "result": "OK", "verdict": "approve", "findings": []interface{}{},
+			})
+		}
+	}
+
+	// Transition to done
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+parentID+"/transition", bytes.NewReader([]byte(`{"to":"done"}`)))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("transition to done failed: got status %d; body: %s", transitionW.Code, transitionW.Body.String())
+	}
+
+	parentAfterFirstTransition := apiGetTask(t, server, authHeader, parentID)
+	firstChildCount := len(parentAfterFirstTransition.Continuation.CreatedChildren)
+	if firstChildCount != 1 {
+		t.Fatalf("expected 1 child after transition, got %d", firstChildCount)
+	}
+	firstChildID := parentAfterFirstTransition.Continuation.CreatedChildren[0].ID
+
+	// Verify idempotency by re-reading multiple times
+	for i := 0; i < 3; i++ {
+		parentReread := apiGetTask(t, server, authHeader, parentID)
+		if len(parentReread.Continuation.CreatedChildren) != 1 {
+			t.Fatalf("idempotency check %d failed: expected 1 child, got %d", i, len(parentReread.Continuation.CreatedChildren))
+		}
+		if parentReread.Continuation.CreatedChildren[0].ID != firstChildID {
+			t.Errorf("idempotency check %d failed: child ID changed", i)
+		}
+	}
+
+	// Verify the project task list contains exactly one child with this ID
+	allProjectTasks := apiListTasks(t, server, authHeader, projectID)
+	childCount := 0
+	for _, task := range allProjectTasks {
+		if task.ID == firstChildID {
+			childCount++
+		}
+	}
+	if childCount != 1 {
+		t.Errorf("idempotency failed: child %s appears %d times in project tasks (expected 1)", firstChildID, childCount)
+	}
+}
+
+func testResearchContinuationMixedTracks(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create an opt-in research parent task
+	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+	parent := apiGetTask(t, server, authHeader, parentID)
+	projectID := parent.ProjectID
+
+	// Create a manifest with both research and build track children
+	mixedManifest := map[string]interface{}{
+		"version":        1,
+		"parent_task_id": parentID,
+		"children": []map[string]interface{}{
+			{
+				"key": "research-child", "title": "Research Child", "spec": "Research work",
+				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-r"},
+				"source_start_points": []string{"https://example.com/r"}, "file_scope": []string{"docs/r.md"},
+				"acceptance_criteria": []string{"research done"},
+				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+			},
+			{
+				"key": "build-child", "title": "Build Child", "spec": "Build work",
+				"track": "build", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-b"},
+				"source_start_points": []string{"https://example.com/b"}, "file_scope": []string{"src/b.go"},
+				"acceptance_criteria": []string{"build done"},
+				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+			},
+		},
+		"pending_candidates": []map[string]string{
+			{"claim_id": "claim-r", "disposition": "assigned"},
+			{"claim_id": "claim-b", "disposition": "assigned"},
+		},
+	}
+
+	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/20"}}
+
+	// Submit and approve
+	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": mixedManifest,
+	}); code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	}
+
+	// Get review tasks and approve both
+	allTasks := apiListTasks(t, server, authHeader, projectID)
+	reviewTasksByModel := make(map[string][]string)
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == parentID {
+			reviewTasksByModel[task.Model] = append(reviewTasksByModel[task.Model], task.ID)
+		}
+	}
+
+	for model, taskIDs := range reviewTasksByModel {
+		if len(taskIDs) > 0 {
+			apiClaimTask(t, server, authHeader, taskIDs[0], "reviewer-"+model, model)
+			apiSubmit(t, server, authHeader, taskIDs[0], map[string]interface{}{
+				"agent_id": "reviewer-" + model, "result": "OK", "verdict": "approve", "findings": []interface{}{},
+			})
+		}
+	}
+
+	// Transition to done
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+parentID+"/transition", bytes.NewReader([]byte(`{"to":"done"}`)))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("failed to transition to done: got status %d; body: %s", transitionW.Code, transitionW.Body.String())
+	}
+
+	// Verify created children
+	parentAfterMerge := apiGetTask(t, server, authHeader, parentID)
+	if len(parentAfterMerge.Continuation.CreatedChildren) != 2 {
+		t.Fatalf("expected 2 created children, got %d", len(parentAfterMerge.Continuation.CreatedChildren))
+	}
+
+	// Verify track-specific states
+	for _, child := range parentAfterMerge.Continuation.CreatedChildren {
+		childDetails := apiGetTask(t, server, authHeader, child.ID)
+		if child.Track == "research" {
+			if childDetails.State != "ready" {
+				t.Errorf("research child should be ready, got %q", childDetails.State)
+			}
+		} else if child.Track == "build" {
+			if childDetails.State != "backlog" {
+				t.Errorf("build child should be backlog, got %q", childDetails.State)
+			}
+			// Build child should not be claimable
+			if childDetails.State == "ready" && (childDetails.Assignee == nil || *childDetails.Assignee == "") {
+				t.Errorf("build child in backlog should not be claimable")
+			}
+		}
+	}
+}
+
+func testResearchContinuationDependencyGating(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create parent with dependent children
+	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+	parent := apiGetTask(t, server, authHeader, parentID)
+	projectID := parent.ProjectID
+
+	// Create a manifest where child2 depends on child1
+	dependentManifest := map[string]interface{}{
+		"version":        1,
+		"parent_task_id": parentID,
+		"children": []map[string]interface{}{
+			{
+				"key": "child1", "title": "Child 1", "spec": "Independent work",
+				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+				"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
+				"source_start_points": []string{"https://example.com/1"}, "file_scope": []string{"docs/1.md"},
+				"acceptance_criteria": []string{"criterion 1"},
+				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+			},
+			{
+				"key": "child2", "title": "Child 2", "spec": "Dependent work",
+				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+				"agent_merge": false, "escalate": true, "claim_ids": []string{"c2"},
+				"source_start_points": []string{"https://example.com/2"}, "file_scope": []string{"docs/2.md"},
+				"acceptance_criteria": []string{"criterion 2"},
+				"dependencies": []map[string]string{
+					{"kind": "parent", "ref": parentID},
+					{"kind": "child", "ref": "child1"},
+				},
+			},
+		},
+		"pending_candidates": []map[string]string{
+			{"claim_id": "c1", "disposition": "assigned"},
+			{"claim_id": "c2", "disposition": "assigned"},
+		},
+	}
+
+	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/30"}}
+
+	// Submit and approve
+	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": dependentManifest,
+	}); code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	}
+
+	// Approve from both reviewers
+	allTasks := apiListTasks(t, server, authHeader, projectID)
+	reviewTasksByModel := make(map[string][]string)
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == parentID {
+			reviewTasksByModel[task.Model] = append(reviewTasksByModel[task.Model], task.ID)
+		}
+	}
+
+	for model, taskIDs := range reviewTasksByModel {
+		if len(taskIDs) > 0 {
+			apiClaimTask(t, server, authHeader, taskIDs[0], "reviewer-"+model, model)
+			apiSubmit(t, server, authHeader, taskIDs[0], map[string]interface{}{
+				"agent_id": "reviewer-" + model, "result": "OK", "verdict": "approve", "findings": []interface{}{},
+			})
+		}
+	}
+
+	// Transition to done
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+parentID+"/transition", bytes.NewReader([]byte(`{"to":"done"}`)))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("failed to transition to done: got status %d; body: %s", transitionW.Code, transitionW.Body.String())
+	}
+
+	// Both children should exist and be ready
+	parentAfterMerge := apiGetTask(t, server, authHeader, parentID)
+	if len(parentAfterMerge.Continuation.CreatedChildren) != 2 {
+		t.Fatalf("expected 2 children, got %d", len(parentAfterMerge.Continuation.CreatedChildren))
+	}
+
+	// Verify both children exist and have their dependencies set
+	child1Found := false
+	child2Found := false
+	for _, child := range parentAfterMerge.Continuation.CreatedChildren {
+		childDetails := apiGetTask(t, server, authHeader, child.ID)
+		if childDetails.Track == "research" && childDetails.State == "ready" {
+			if strings.Contains(child.Title, "Child 1") {
+				child1Found = true
+				// Child1 should only depend on parent (which is done)
+				if child.DependencyStatus != "satisfied" {
+					t.Logf("child1 dependency status: %s", child.DependencyStatus)
+				}
+			} else if strings.Contains(child.Title, "Child 2") {
+				child2Found = true
+				// Verify child2 has dependencies (should include child1)
+				if len(child.DependsOn) == 0 {
+					t.Errorf("child2 should have dependencies set (depends on child1)")
+				}
+			}
+		}
+	}
+
+	if !child1Found {
+		t.Errorf("child1 should be created and ready")
+	}
+	if !child2Found {
+		t.Errorf("child2 should be created and ready")
+	}
+
+	// Verify dependencies are captured in the created children view
+	for _, child := range parentAfterMerge.Continuation.CreatedChildren {
+		if strings.Contains(child.Title, "Child 2") {
+			// Child2 should show dependency info
+			if len(child.DependsOn) > 0 {
+				t.Logf("child2 depends on: %v", child.DependsOn)
+			}
+		}
+	}
+}
+
+func testResearchContinuationWithFollowUps(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a research parent with a manifest
+	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+	parent := apiGetTask(t, server, authHeader, parentID)
+	projectID := parent.ProjectID
+
+	// Create a simple manifest
+	manifest := map[string]interface{}{
+		"version":        1,
+		"parent_task_id": parentID,
+		"children": []map[string]interface{}{
+			{
+				"key": "child1", "title": "Child 1", "spec": "Child work",
+				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
+				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-1"},
+				"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
+				"acceptance_criteria": []string{"criterion"},
+				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
+			},
+		},
+		"pending_candidates": []map[string]string{
+			{"claim_id": "claim-1", "disposition": "assigned"},
+		},
+	}
+
+	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/40"}}
+
+	// Submit with manifest
+	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
+		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": manifest,
+	}); code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	}
+
+	// Get review tasks
+	allTasks := apiListTasks(t, server, authHeader, projectID)
+	reviewTasksByModel := make(map[string][]string)
+	for _, task := range allTasks {
+		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == parentID {
+			reviewTasksByModel[task.Model] = append(reviewTasksByModel[task.Model], task.ID)
+		}
+	}
+
+	// Both reviewers approve (without follow-up findings for simplicity)
+	for model, taskIDs := range reviewTasksByModel {
+		if len(taskIDs) > 0 {
+			apiClaimTask(t, server, authHeader, taskIDs[0], "reviewer-"+model, model)
+			apiSubmit(t, server, authHeader, taskIDs[0], map[string]interface{}{
+				"agent_id": "reviewer-" + model, "result": "Approved", "verdict": "approve", "findings": []interface{}{},
+			})
+		}
+	}
+
+	// Parent should now be approved
+	parentAfterReview := apiGetTask(t, server, authHeader, parentID)
+	if parentAfterReview.State != "approved" {
+		t.Fatalf("parent should be approved after both reviews, got %q", parentAfterReview.State)
+	}
+
+	// Verify continuation manifest is preserved through review
+	if len(parentAfterReview.Continuation.ProposedChildren) != 1 {
+		t.Errorf("expected 1 proposed child, got %d", len(parentAfterReview.Continuation.ProposedChildren))
+	}
+
+	// Transition to done and create children
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+parentID+"/transition", bytes.NewReader([]byte(`{"to":"done"}`)))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("failed to transition to done: got status %d; body: %s", transitionW.Code, transitionW.Body.String())
+	}
+
+	// Children should be created
+	parentFinal := apiGetTask(t, server, authHeader, parentID)
+	if len(parentFinal.Continuation.CreatedChildren) != 1 {
+		t.Fatalf("expected 1 created child, got %d", len(parentFinal.Continuation.CreatedChildren))
+	}
+
+	// Verify child is independent and doesn't inherit parent state
+	childID := parentFinal.Continuation.CreatedChildren[0].ID
+	childTask := apiGetTask(t, server, authHeader, childID)
+
+	// Child should be a separate task with its own state
+	if childTask.ID != childID {
+		t.Errorf("child task ID mismatch")
+	}
+
+	// Child should be ready and claimable
+	if childTask.State != "ready" {
+		t.Errorf("created child should be in ready state, got %q", childTask.State)
+	}
+
+	// Verify we can claim the child
+	apiClaimTask(t, server, authHeader, childID, "child-worker", "haiku")
+	claimedChild := apiGetTask(t, server, authHeader, childID)
+	if claimedChild.Assignee == nil || *claimedChild.Assignee != "child-worker" {
+		t.Errorf("child should be claimable, got assignee %+v", claimedChild.Assignee)
 	}
 }

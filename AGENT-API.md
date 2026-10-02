@@ -250,9 +250,19 @@ The `GET /tasks/{id}` response shows both proposed and created children in the `
 
 ### Recovery from invalid manifests
 
-If the stored manifest digest does not match when the parent reaches `done`, the merge transition fails and rolls back. The parent remains in `approved`, allowing retry. Validate the manifest offline, correct the stored digest, and retry the transition.
+If the stored manifest fails validation when the parent reaches `done` (digest mismatch, canonicalization errors, or other validation failures), the merge transition fails and rolls back. The parent remains in `approved`.
 
-Retry idempotency is guaranteed: calling the child-creation logic twice with the same manifest and digest does not create duplicates.
+To recover:
+
+1. The parent's worker or a human operator rejects the parent back to `ready` (via a manual transition or an operator action).
+2. The parent re-enters the claim queue and the worker claims it for a new review round.
+3. The worker submits a corrected manifest in the new review round.
+4. Both reviewers examine and approve the corrected manifest.
+5. Only then can a human merge the parent and create children with the new manifest.
+
+This path ensures every submitted manifest is reviewed and approved before child creation. There is no operator procedure to edit a stored digest in place.
+
+Idempotency within a single merge: calling child creation logic twice with the same approved manifest and digest from the same approved round does not create duplicate children. However, separate review rounds (after rework) may create separate manifest versions and separate child sets.
 
 ## Task creation
 
