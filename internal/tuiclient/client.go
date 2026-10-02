@@ -97,11 +97,11 @@ type TaskDetail struct {
 }
 
 type SubmissionManifest struct {
-	ReviewRound    int         `json:"review_round"`
-	ParentTaskID   string      `json:"parent_task_id"`
-	ManifestJSON   interface{} `json:"manifest_json"`
-	ManifestDigest string      `json:"manifest_digest"`
-	SubmittedAt    string      `json:"submitted_at"`
+	ReviewRound    int             `json:"review_round"`
+	ParentTaskID   string          `json:"parent_task_id"`
+	ManifestJSON   json.RawMessage `json:"manifest_json"`
+	ManifestDigest string          `json:"manifest_digest"`
+	SubmittedAt    string          `json:"submitted_at"`
 }
 
 type TaskLink struct {
