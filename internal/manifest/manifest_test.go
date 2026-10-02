@@ -1321,6 +1321,35 @@ func TestDuplicateParentDependencyWithinChild(t *testing.T) {
 
 	err := manifest.Validate(validModels, validTracks)
 	assertErrorCode(t, err, "MULTIPLE_PARENT_DEPENDENCIES")
+	if err != nil && !strings.Contains(err.Error(), `child "child-1"`) {
+		t.Errorf("expected message to name the child, got %v", err)
+	}
+}
+
+func TestDuplicateChildAndTaskDependencyWithinChild(t *testing.T) {
+	taskID := "12345678-1234-1234-1234-123456789abc"
+	cases := map[string]Dependency{
+		"child": {Kind: DependencyChild, Ref: "child-1"},
+		"task":  {Kind: DependencyTask, Ref: taskID},
+	}
+	for name, dep := range cases {
+		t.Run(name, func(t *testing.T) {
+			c1 := createValidChild("child-1", []string{"file-1.md"})
+			c2 := createValidChild("child-2", []string{"file-2.md"})
+			c2.Dependencies = []Dependency{dep, dep}
+			manifest := &Manifest{
+				Version:      1,
+				ParentTaskID: "parent-123",
+				Children:     []Child{c1, c2},
+				PendingCandidates: []PendingCandidate{
+					{ClaimID: "claim-child-1", Disposition: Assigned},
+					{ClaimID: "claim-child-2", Disposition: Assigned},
+				},
+			}
+			err := manifest.Validate(validModels, validTracks)
+			assertErrorCode(t, err, "DUPLICATE_DEPENDENCY")
+		})
+	}
 }
 
 func TestInvalidFileScope(t *testing.T) {

@@ -339,6 +339,7 @@ func checkDependencies(parentTaskID string, children []Child, seenKeys map[strin
 	// Validate each dependency reference
 	for _, child := range children {
 		parentDepCount := 0
+		seenDeps := make(map[Dependency]bool)
 		for _, dep := range child.Dependencies {
 			if strings.TrimSpace(dep.Ref) == "" {
 				return ValidationError{"BLANK_DEPENDENCY_REF", fmt.Sprintf("child %q: dependency ref cannot be blank", child.Key)}
@@ -352,18 +353,26 @@ func checkDependencies(parentTaskID string, children []Child, seenKeys map[strin
 				}
 				parentDepCount++
 				if parentDepCount > 1 {
-					return ValidationError{"MULTIPLE_PARENT_DEPENDENCIES", "at most one parent dependency per manifest"}
+					return ValidationError{"MULTIPLE_PARENT_DEPENDENCIES", fmt.Sprintf("child %q: parent dependency listed more than once", child.Key)}
 				}
 			case DependencyChild:
 				// Child dependency must reference an existing sibling key
 				if !seenKeys[dep.Ref] {
 					return ValidationError{"UNKNOWN_CHILD_DEPENDENCY", fmt.Sprintf("child %q: unknown child dependency %q", child.Key, dep.Ref)}
 				}
+				if seenDeps[dep] {
+					return ValidationError{"DUPLICATE_DEPENDENCY", fmt.Sprintf("child %q: duplicate child dependency %q", child.Key, dep.Ref)}
+				}
+				seenDeps[dep] = true
 			case DependencyTask:
 				// External task ID must be well-formed (non-empty, valid UUID-like format)
 				if !isValidTaskID(dep.Ref) {
 					return ValidationError{"INVALID_TASK_ID", fmt.Sprintf("child %q: invalid task ID %q", child.Key, dep.Ref)}
 				}
+				if seenDeps[dep] {
+					return ValidationError{"DUPLICATE_DEPENDENCY", fmt.Sprintf("child %q: duplicate task dependency %q", child.Key, dep.Ref)}
+				}
+				seenDeps[dep] = true
 			default:
 				return ValidationError{"UNKNOWN_DEPENDENCY_KIND", fmt.Sprintf("child %q: unknown dependency kind %q", child.Key, dep.Kind)}
 			}

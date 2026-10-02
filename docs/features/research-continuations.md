@@ -52,7 +52,7 @@ The manifest validator checks:
 - **Type correctness**: Models and tracks are in the allowlist. Dispositions are valid.
 - **Uniqueness**: Child keys are unique within the manifest. Files don't overlap between children.
 - **Sizing**: No more than six claims per child, no more than four primary sources per child. At most three children per manifest.
-- **Dependencies**: No cycles within the intra-manifest dependency graph. Dependencies reference only other children or external task IDs.
+- **Dependencies**: No cycles within the intra-manifest dependency graph. Every dependency is a `parent` (the manifest's parent task), `child` (a sibling key in this manifest), or `task` (an existing task ID) reference, and a child may not list the same dependency twice.
 - **Candidate consistency**: Carried-forward claims have an owner; excluded claims have a reason.
 
 Validation is independent of task creation and existing review-finding follow-ups. It applies the rules above without knowledge of prior tasks or project-specific contracts.
@@ -159,6 +159,7 @@ The validator returns specific error codes for different validation failures. Co
 - **MISSING_REASON**: an excluded candidate lacks a reason
 - **BLANK_CRITERION**: an acceptance criterion is blank or whitespace-only
 - **MULTIPLE_PARENT_DEPENDENCIES**: a single child lists the parent dependency more than once
+- **DUPLICATE_DEPENDENCY**: a single child lists the same `child` or `task` dependency more than once
 - **INVALID_FILE_SCOPE**: a `file_scope` entry is absolute, escapes the repository via `..`, or is `.` (the whole tree)
 - **UNMATCHED_CHILD_CLAIM**: a child's claim has no assigned candidate entry
 - **UNKNOWN_DEPENDENCY_KIND**: a dependency has an unknown or invalid kind
