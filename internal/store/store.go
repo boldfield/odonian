@@ -687,6 +687,8 @@ type CreatedChild struct {
 	ID                 string   `json:"id"`
 	ParentTaskID       string   `json:"parent_task_id"`
 	ManifestDigest     string   `json:"manifest_digest"`
+	State              string   `json:"state"` // actual state: "ready" or "backlog"
+	Track              string   `json:"track"` // track: "research", "build", or "design"
 	ClaimIDs           []string `json:"claim_ids,omitempty"`
 	SourceStartPoints  []string `json:"source_start_points,omitempty"`
 	FileScope          []string `json:"file_scope,omitempty"`
@@ -1690,6 +1692,52 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	if err := linkRows.Err(); err != nil {
 		return TaskWithDepsAndLinks{}, fmt.Errorf("error iterating links: %w", err)
 	}
+
+	// Fetch reverse continuation links (child tasks that point back to this parent)
+	reverseRows, err := s.readConn.QueryContext(ctx, `
+		SELECT id, task_id, kind, value, tombstoned_at, review_round FROM task_link
+		WHERE kind = 'continuation_parent' AND value = ? AND tombstoned_at IS NULL ORDER BY task_id
+	`, id)
+	if err != nil {
+		return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query reverse continuation links: %w", err)
+	}
+	defer reverseRows.Close()
+
+	childTaskIDs := make(map[string]bool)
+	for reverseRows.Next() {
+		var link TaskLink
+		if err := reverseRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt, &link.ReviewRound); err != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to scan reverse link: %w", err)
+		}
+		childTaskIDs[link.TaskID] = true
+	}
+	if err := reverseRows.Err(); err != nil {
+		return TaskWithDepsAndLinks{}, fmt.Errorf("error iterating reverse links: %w", err)
+	}
+
+	// Load all child continuation links if this is a parent task
+	childLinks := make([]TaskLink, 0)
+	if len(childTaskIDs) > 0 {
+		for childID := range childTaskIDs {
+			childLinkRows, err := s.readConn.QueryContext(ctx, `
+				SELECT id, task_id, kind, value, tombstoned_at, review_round FROM task_link
+				WHERE task_id = ? AND kind LIKE 'continuation_child_%' AND tombstoned_at IS NULL ORDER BY kind, id
+			`, childID)
+			if err != nil {
+				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to query child continuation links: %w", err)
+			}
+			for childLinkRows.Next() {
+				var link TaskLink
+				if err := childLinkRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt, &link.ReviewRound); err != nil {
+					childLinkRows.Close()
+					return TaskWithDepsAndLinks{}, fmt.Errorf("failed to scan child link: %w", err)
+				}
+				childLinks = append(childLinks, link)
+			}
+			childLinkRows.Close()
+		}
+	}
+
 	currentRoundLinks, err := submissionLinks(ctx, s.readConn, id, t.ReviewRound)
 	if err != nil {
 		return TaskWithDepsAndLinks{}, err
@@ -1703,7 +1751,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 		return TaskWithDepsAndLinks{}, err
 	}
 
-	continuation := extractContinuationInfo(manifests, links)
+	continuation := extractContinuationInfo(ctx, s.readConn, manifests, links, childLinks, id)
 
 	return TaskWithDepsAndLinks{
 		ID:                  t.ID,
@@ -6028,8 +6076,10 @@ func listSubmissionManifests(ctx context.Context, q eventQuerier, taskID string)
 }
 
 // extractContinuationInfo extracts continuation information (proposed and created children) from manifests and links.
-func extractContinuationInfo(manifests []SubmissionManifest, links []TaskLink) *ContinuationInfo {
-	if len(manifests) == 0 && len(links) == 0 {
+// For parents (when childLinks is non-empty), it loads created children from child task continuation links.
+// For children, it loads parent information from their own links.
+func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []SubmissionManifest, links []TaskLink, childLinks []TaskLink, parentID string) *ContinuationInfo {
+	if len(manifests) == 0 && len(links) == 0 && len(childLinks) == 0 {
 		return nil
 	}
 
@@ -6040,6 +6090,7 @@ func extractContinuationInfo(manifests []SubmissionManifest, links []TaskLink) *
 	}
 
 	// Extract proposed children from the latest manifest (if any)
+	proposedKeySet := make(map[string]bool)
 	if len(manifests) > 0 {
 		latestManifest := manifests[len(manifests)-1]
 		var m map[string]interface{}
@@ -6062,84 +6113,145 @@ func extractContinuationInfo(manifests []SubmissionManifest, links []TaskLink) *
 							Model:        model,
 							InitialState: initialState,
 						})
+						proposedKeySet[key] = true
 					}
 				}
 			}
 		}
 	}
 
-	// Extract created children from continuation_parent links
-	createdChildrenMap := make(map[string]*CreatedChild)
+	// Extract created children from childLinks (these are links on child tasks pointing back to parent)
+	// Group links by child task ID
+	childLinksByID := make(map[string][]TaskLink)
 	createdChildrenOrder := []string{}
-	for _, link := range links {
+	seen := make(map[string]bool)
+
+	for _, link := range childLinks {
 		if link.TombstonedAt != nil {
 			continue
 		}
-		switch link.Kind {
-		case "continuation_parent":
-			childID := link.TaskID
-			if _, ok := createdChildrenMap[childID]; !ok {
-				createdChildrenMap[childID] = &CreatedChild{
-					ID:           childID,
-					ParentTaskID: link.Value,
-				}
-				createdChildrenOrder = append(createdChildrenOrder, childID)
-			}
-		case "continuation_child_claim_ids":
-			childID := link.TaskID
-			if _, ok := createdChildrenMap[childID]; !ok {
-				createdChildrenMap[childID] = &CreatedChild{ID: childID}
-			}
-			var claimIDs []string
-			if err := json.Unmarshal([]byte(link.Value), &claimIDs); err == nil {
-				createdChildrenMap[childID].ClaimIDs = claimIDs
-			}
-		case "continuation_child_source_start_points":
-			childID := link.TaskID
-			if _, ok := createdChildrenMap[childID]; !ok {
-				createdChildrenMap[childID] = &CreatedChild{ID: childID}
-			}
-			var sources []string
-			if err := json.Unmarshal([]byte(link.Value), &sources); err == nil {
-				createdChildrenMap[childID].SourceStartPoints = sources
-			}
-		case "continuation_child_file_scope":
-			childID := link.TaskID
-			if _, ok := createdChildrenMap[childID]; !ok {
-				createdChildrenMap[childID] = &CreatedChild{ID: childID}
-			}
-			var fileScope []string
-			if err := json.Unmarshal([]byte(link.Value), &fileScope); err == nil {
-				createdChildrenMap[childID].FileScope = fileScope
-			}
-		case "continuation_child_acceptance_criteria":
-			childID := link.TaskID
-			if _, ok := createdChildrenMap[childID]; !ok {
-				createdChildrenMap[childID] = &CreatedChild{ID: childID}
-			}
-			var criteria []string
-			if err := json.Unmarshal([]byte(link.Value), &criteria); err == nil {
-				createdChildrenMap[childID].AcceptanceCriteria = criteria
-			}
+		childID := link.TaskID
+		childLinksByID[childID] = append(childLinksByID[childID], link)
+		if !seen[childID] {
+			createdChildrenOrder = append(createdChildrenOrder, childID)
+			seen[childID] = true
 		}
 	}
 
-	// Add created children in the order they were discovered
+	// Build created children from grouped links
 	for _, childID := range createdChildrenOrder {
-		if child, ok := createdChildrenMap[childID]; ok {
-			// Extract manifest digest from the latest manifest that created this child
-			if len(manifests) > 0 {
-				child.ManifestDigest = manifests[len(manifests)-1].ManifestDigest
+		links := childLinksByID[childID]
+		child := &CreatedChild{
+			ID:           childID,
+			ParentTaskID: parentID,
+		}
+
+		// Extract data from links
+		for _, link := range links {
+			switch link.Kind {
+			case "continuation_child_dedup":
+				// Parse dedup key to get manifest digest
+				var dedupKey map[string]interface{}
+				if err := json.Unmarshal([]byte(link.Value), &dedupKey); err == nil {
+					if digest, ok := dedupKey["manifest_digest"].(string); ok {
+						child.ManifestDigest = digest
+					}
+				}
+			case "continuation_child_claim_ids":
+				var claimIDs []string
+				if err := json.Unmarshal([]byte(link.Value), &claimIDs); err == nil {
+					child.ClaimIDs = claimIDs
+				}
+			case "continuation_child_source_start_points":
+				var sources []string
+				if err := json.Unmarshal([]byte(link.Value), &sources); err == nil {
+					child.SourceStartPoints = sources
+				}
+			case "continuation_child_file_scope":
+				var fileScope []string
+				if err := json.Unmarshal([]byte(link.Value), &fileScope); err == nil {
+					child.FileScope = fileScope
+				}
+			case "continuation_child_acceptance_criteria":
+				var criteria []string
+				if err := json.Unmarshal([]byte(link.Value), &criteria); err == nil {
+					child.AcceptanceCriteria = criteria
+				}
 			}
-			info.CreatedChildren = append(info.CreatedChildren, *child)
+		}
+
+		// Load child task details (state, track) from database
+		var state, track string
+		err := db.QueryRowContext(ctx, `
+			SELECT state, track FROM task WHERE id = ?
+		`, childID).Scan(&state, &track)
+		if err == nil {
+			child.State = state
+			child.Track = track
+		}
+
+		info.CreatedChildren = append(info.CreatedChildren, *child)
+	}
+
+	// Populate action items for held dependencies and dependents
+	// Query for held tasks that depend on this task (held dependents)
+	if len(parentID) > 0 {
+		// Check if this task has any dependencies that are held
+		depRows, err := db.QueryContext(ctx, `
+			SELECT d.depends_on_id, t.title, t.held FROM task_dep d
+			JOIN task t ON d.depends_on_id = t.id
+			WHERE d.task_id = ? AND t.held = 1
+		`, parentID)
+		if err == nil {
+			for depRows.Next() {
+				var depID, title string
+				var held int
+				if depRows.Scan(&depID, &title, &held) == nil && held == 1 {
+					info.ActionItems = append(info.ActionItems, ActionItem{
+						Type:        "held_dependency",
+						Description: fmt.Sprintf("Task %s (%s) is held and blocks progress", truncateID(depID), title),
+						TaskID:      depID,
+					})
+				}
+			}
+			depRows.Close()
+		}
+
+		// Check if this task has any dependents that are held
+		depRows2, err := db.QueryContext(ctx, `
+			SELECT d.task_id, t.title, t.held FROM task_dep d
+			JOIN task t ON d.task_id = t.id
+			WHERE d.depends_on_id = ? AND t.held = 1
+		`, parentID)
+		if err == nil {
+			for depRows2.Next() {
+				var depID, title string
+				var held int
+				if depRows2.Scan(&depID, &title, &held) == nil && held == 1 {
+					info.ActionItems = append(info.ActionItems, ActionItem{
+						Type:        "held_dependent",
+						Description: fmt.Sprintf("Task %s (%s) depends on this task and is held", truncateID(depID), title),
+						TaskID:      depID,
+					})
+				}
+			}
+			depRows2.Close()
 		}
 	}
 
-	if len(info.ProposedChildren) == 0 && len(info.CreatedChildren) == 0 {
+	if len(info.ProposedChildren) == 0 && len(info.CreatedChildren) == 0 && len(info.ActionItems) == 0 {
 		return nil
 	}
 
 	return info
+}
+
+// truncateID returns the first 8 characters of a task ID for display.
+func truncateID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // continuationOptInHeading is the exact line a research task's spec must contain, on a line of

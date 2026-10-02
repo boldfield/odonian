@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/boldfield/odonian/internal/forge"
+	"github.com/boldfield/odonian/internal/manifest"
 )
 
 // defaultTestAllowedModels returns the default allowed models for tests (matching main.go default).
@@ -18662,4 +18663,299 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Errorf("expected approved state (not auto-merged), got %s", parent.State)
 		}
 	})
+}
+
+// TestContinuationInfoCreatedChildren verifies that created children appear on the parent task
+// with correct state, track, and manifest digest after InsertManifestChildren is called.
+func TestContinuationInfoCreatedChildren(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project, document, and parent task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Parent Task",
+			Spec:         "Parent spec\n## continuation manifest\nTest manifest",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create parent task: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	// Create a manifest with research and build children
+	m := &manifest.Manifest{
+		Version:      1,
+		ParentTaskID: parentID,
+		Children: []manifest.Child{
+			{
+				Key:                "research-child",
+				Title:              "Research Child",
+				Spec:               "Research child spec",
+				Track:              "research",
+				Model:              "haiku",
+				ReviewModels:       []string{"opus", "sonnet"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"claim1", "claim2"},
+				SourceStartPoints:  []string{"source1"},
+				FileScope:          []string{"dir1/file1.go"},
+				AcceptanceCriteria: []string{"criterion1"},
+			},
+			{
+				Key:                "build-child",
+				Title:              "Build Child",
+				Spec:               "Build child spec",
+				Track:              "build",
+				Model:              "sonnet",
+				ReviewModels:       []string{"opus", "haiku"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"claim3"},
+				SourceStartPoints:  []string{"source2"},
+				FileScope:          []string{"dir2/file2.go"},
+				AcceptanceCriteria: []string{"criterion2"},
+			},
+		},
+		PendingCandidates: []manifest.PendingCandidate{
+			{ClaimID: "claim1", Disposition: "assigned"},
+			{ClaimID: "claim2", Disposition: "assigned"},
+			{ClaimID: "claim3", Disposition: "assigned"},
+		},
+	}
+
+	// Get canonical manifest
+	ss := store.(*sqliteStore)
+	canonicalM, err := ss.canonicalizeManifest(
+		json.RawMessage(mustMarshalJSON(t, m)), parentID)
+	if err != nil {
+		t.Fatalf("failed to canonicalize manifest: %v", err)
+	}
+
+	// Create a transaction and insert manifest children
+	tx, err := ss.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	childIDs, err := ss.InsertManifestChildren(
+		ctx, tx, m, canonicalM.digest, parentID, proj.ID, doc.ID, nowTimestamp())
+	if err != nil {
+		t.Fatalf("failed to insert manifest children: %v", err)
+	}
+	if len(childIDs) != 2 {
+		t.Fatalf("expected 2 children, got %d", len(childIDs))
+	}
+
+	if err = tx.Commit(); err != nil {
+		t.Fatalf("failed to commit transaction: %v", err)
+	}
+
+	// Get parent task and verify continuation info
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+
+	if parent.Continuation == nil {
+		t.Fatalf("expected continuation info on parent, got nil")
+	}
+
+	if len(parent.Continuation.CreatedChildren) != 2 {
+		t.Fatalf("expected 2 created children, got %d", len(parent.Continuation.CreatedChildren))
+	}
+
+	// Verify research child
+	var researchChild, buildChild *CreatedChild
+	for i := range parent.Continuation.CreatedChildren {
+		child := &parent.Continuation.CreatedChildren[i]
+		if child.ID == childIDs[0] {
+			researchChild = child
+		} else if child.ID == childIDs[1] {
+			buildChild = child
+		}
+	}
+
+	if researchChild == nil || buildChild == nil {
+		t.Fatalf("expected to find both children in continuation info")
+	}
+
+	// Verify research child details
+	if researchChild.State != "ready" {
+		t.Errorf("research child: expected state 'ready', got '%s'", researchChild.State)
+	}
+	if researchChild.Track != "research" {
+		t.Errorf("research child: expected track 'research', got '%s'", researchChild.Track)
+	}
+	if researchChild.ManifestDigest != canonicalM.digest {
+		t.Errorf("research child: expected manifest digest '%s', got '%s'", canonicalM.digest, researchChild.ManifestDigest)
+	}
+	if len(researchChild.ClaimIDs) != 2 {
+		t.Errorf("research child: expected 2 claim IDs, got %d", len(researchChild.ClaimIDs))
+	}
+
+	// Verify build child details
+	if buildChild.State != "backlog" {
+		t.Errorf("build child: expected state 'backlog', got '%s'", buildChild.State)
+	}
+	if buildChild.Track != "build" {
+		t.Errorf("build child: expected track 'build', got '%s'", buildChild.Track)
+	}
+	if buildChild.ManifestDigest != canonicalM.digest {
+		t.Errorf("build child: expected manifest digest '%s', got '%s'", canonicalM.digest, buildChild.ManifestDigest)
+	}
+	if len(buildChild.ClaimIDs) != 1 {
+		t.Errorf("build child: expected 1 claim ID, got %d", len(buildChild.ClaimIDs))
+	}
+}
+
+// TestContinuationInfoDistinguishesProposedAndCreated verifies that proposed children (from
+// manifests) and created children (from links) are both tracked and distinguished.
+func TestContinuationInfoDistinguishesProposedAndCreated(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project, document, and parent task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Parent Task",
+			Spec:         "Parent spec",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus", "sonnet"},
+			Track:        "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create parent task: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	// Verify no continuation info yet
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent task: %v", err)
+	}
+
+	if parent.Continuation != nil {
+		t.Errorf("expected no continuation info initially, got %+v", parent.Continuation)
+	}
+
+	// Create a manifest with children
+	ss := store.(*sqliteStore)
+	m := &manifest.Manifest{
+		Version:      1,
+		ParentTaskID: parentID,
+		Children: []manifest.Child{
+			{
+				Key:                "child1",
+				Title:              "Child One",
+				Spec:               "Child spec 1",
+				Track:              "research",
+				Model:              "haiku",
+				ReviewModels:       []string{"opus", "sonnet"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"c1"},
+				SourceStartPoints:  []string{"source1"},
+				FileScope:          []string{"f1.go"},
+				AcceptanceCriteria: []string{"criteria1"},
+			},
+		},
+		PendingCandidates: []manifest.PendingCandidate{
+			{ClaimID: "c1", Disposition: "assigned"},
+		},
+	}
+
+	canonicalM, err := ss.canonicalizeManifest(
+		json.RawMessage(mustMarshalJSON(t, m)), parentID)
+	if err != nil {
+		t.Fatalf("failed to canonicalize manifest: %v", err)
+	}
+
+	// Insert manifest children
+	tx, err := ss.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	childIDs, err := ss.InsertManifestChildren(
+		ctx, tx, m, canonicalM.digest, parentID, proj.ID, doc.ID, nowTimestamp())
+	if err != nil {
+		t.Fatalf("failed to insert manifest children: %v", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		t.Fatalf("failed to commit transaction: %v", err)
+	}
+
+	// Now verify created children show up on parent
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("failed to get parent task after creating children: %v", err)
+	}
+
+	if parent.Continuation == nil {
+		t.Fatalf("expected continuation info after creating children, got nil")
+	}
+
+	if len(parent.Continuation.CreatedChildren) != 1 {
+		t.Fatalf("expected 1 created child, got %d", len(parent.Continuation.CreatedChildren))
+	}
+
+	created := parent.Continuation.CreatedChildren[0]
+	if created.ID != childIDs[0] {
+		t.Errorf("expected created child ID %s, got %s", childIDs[0], created.ID)
+	}
+	if created.Track != "research" {
+		t.Errorf("expected created child track 'research', got '%s'", created.Track)
+	}
+	if created.State != "ready" {
+		t.Errorf("expected created child state 'ready', got '%s'", created.State)
+	}
+}
+
+// mustMarshalJSON marshals v to JSON or fails the test.
+func mustMarshalJSON(t *testing.T, v interface{}) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("failed to marshal JSON: %v", err)
+	}
+	return data
 }
