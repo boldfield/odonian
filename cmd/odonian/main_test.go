@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -434,6 +435,8 @@ func TestExecuteShowJSON(t *testing.T) {
 
 func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}`)
+	// Real SHA-256 digest of the manifest bytes: printf '{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}' | sha256sum
+	realDigest := "461bf9e337f7d640ca135d4743755ab5538b777442eddafed2c5dfb38b1279be"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/tasks/") {
 			w.Header().Set("Content-Type", "application/json")
@@ -449,7 +452,7 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 						ReviewRound:    1,
 						ParentTaskID:   "task-1",
 						ManifestJSON:   manifestJSON,
-						ManifestDigest: "abc123def456",
+						ManifestDigest: realDigest,
 						SubmittedAt:    "2026-10-02T12:00:00Z",
 					},
 				},
@@ -474,14 +477,45 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 	if !strings.Contains(output, "Parent Task ID: task-1") {
 		t.Errorf("expected 'Parent Task ID: task-1' in output, got: %s", output)
 	}
-	if !strings.Contains(output, "Digest: abc123def456") {
-		t.Errorf("expected 'Digest: abc123def456' in output, got: %s", output)
+	if !strings.Contains(output, fmt.Sprintf("Digest: %s", realDigest)) {
+		t.Errorf("expected 'Digest: %s' in output, got: %s", realDigest, output)
 	}
-	if !strings.Contains(output, "Manifest:") {
-		t.Errorf("expected 'Manifest:' header in output, got: %s", output)
+	if !strings.Contains(output, "Canonical:") {
+		t.Errorf("expected 'Canonical:' header in output, got: %s", output)
 	}
 	if !strings.Contains(output, "\"parent_task_id\": \"task-1\"") {
 		t.Errorf("expected manifest body with parent_task_id in output, got: %s", output)
+	}
+	// Verify that the shown canonical bytes hash to the displayed digest
+	lines := strings.Split(output, "\n")
+	var canonicalStart int
+	for i, line := range lines {
+		if strings.Contains(line, "Canonical:") {
+			canonicalStart = i
+			break
+		}
+	}
+	if canonicalStart > 0 {
+		// Extract canonical JSON (skip the "Canonical:" line and any empty lines)
+		var canonicalLines []string
+		for i := canonicalStart + 1; i < len(lines); i++ {
+			line := strings.TrimSpace(lines[i])
+			if line == "" || strings.HasPrefix(line, "-") || strings.HasPrefix(lines[i], "  ") && !strings.Contains(line, "{") && !strings.Contains(line, "}") && i > canonicalStart+1 {
+				break
+			}
+			if strings.Contains(line, "{") || strings.Contains(line, "}") || strings.HasPrefix(line, "\"") {
+				canonicalLines = append(canonicalLines, line)
+			}
+		}
+		if len(canonicalLines) > 0 {
+			canonicalStr := strings.Join(canonicalLines, "")
+			// Compute SHA-256 of the canonical bytes
+			digest := sha256.Sum256([]byte(canonicalStr))
+			computedHash := fmt.Sprintf("%x", digest)
+			if computedHash != realDigest {
+				t.Errorf("canonical bytes hash mismatch: expected %s, got %s; canonical: %s", realDigest, computedHash, canonicalStr)
+			}
+		}
 	}
 }
 
