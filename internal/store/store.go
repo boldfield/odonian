@@ -1,9 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,10 +26,15 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/boldfield/odonian/internal/forge"
+	"github.com/boldfield/odonian/internal/manifest"
 )
 
 //go:embed migrations
 var migrationsFS embed.FS
+
+// validTracks is the set of task tracks. Task creation and continuation-manifest
+// validation both read it, so the two cannot disagree about which tracks exist.
+var validTracks = map[string]bool{"build": true, "design": true, "research": true}
 
 // validBranch is the shape of a task's optional shared branch name: exactly what
 // localcommit.Slugify produces, so wi/<branch> is always a safe git ref.
@@ -56,6 +64,7 @@ type Store interface {
 	PromoteTask(ctx context.Context, taskID string) (Task, error)
 	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error)
 	SubmitTaskWithDisputes(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage) (TaskWithDepsAndLinks, error)
+	SubmitTaskWithManifest(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
@@ -631,6 +640,18 @@ type TaskLink struct {
 	ReviewRound  *int    `db:"review_round" json:"review_round"`   // the review round an implement submission added it in; nil for older links and other task kinds
 }
 
+// SubmissionManifest is the continuation manifest a research implement task submitted in one
+// review round (docs/features/research-continuations.md). Rows are written once, in the
+// submitting transaction, and never updated: a rework round adds a new row and earlier
+// rounds' reviewed evidence stays as it was.
+type SubmissionManifest struct {
+	ReviewRound    int             `json:"review_round"`    // the review round this submission started
+	ParentTaskID   string          `json:"parent_task_id"`  // the parent whose children the manifest proposes
+	ManifestJSON   json.RawMessage `json:"manifest_json"`   // canonical JSON, exactly what was digested
+	ManifestDigest string          `json:"manifest_digest"` // hex SHA-256 of ManifestJSON
+	SubmittedAt    string          `json:"submitted_at"`
+}
+
 // TaskInput is the input format for bulk task creation.
 type TaskInput struct {
 	Key          string   `json:"key"` // optional client-provided key for intra-batch deps
@@ -687,6 +708,9 @@ type TaskWithDepsAndLinks struct {
 	SupersededBy      *string    `json:"superseded_by"`
 	DependsOn         []string   `json:"depends_on"`
 	Links             []TaskLink `json:"links"`
+	// SubmissionManifests lists the continuation manifest of each review round that carried one,
+	// oldest round first; empty for tasks that never submitted a manifest.
+	SubmissionManifests []SubmissionManifest `json:"submission_manifests"`
 }
 
 // TaskListFilter contains filters for listing tasks.
@@ -1399,7 +1423,7 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, projectID string, tasks [
 
 		track := "build"
 		if input.Track != "" {
-			if input.Track != "build" && input.Track != "design" && input.Track != "research" {
+			if !validTracks[input.Track] {
 				return nil, invalid("UNKNOWN_TRACK", fmt.Sprintf("unknown track: %s", input.Track))
 			}
 			track = input.Track
@@ -1638,37 +1662,43 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 		currentRoundLinks = []TaskLink{}
 	}
 
+	manifests, err := listSubmissionManifests(ctx, s.readConn, id)
+	if err != nil {
+		return TaskWithDepsAndLinks{}, err
+	}
+
 	return TaskWithDepsAndLinks{
-		ID:                t.ID,
-		ProjectID:         t.ProjectID,
-		DocumentID:        t.DocumentID,
-		Title:             t.Title,
-		Spec:              t.Spec,
-		State:             t.State,
-		Assignee:          t.Assignee,
-		LeaseExpiresAt:    t.LeaseExpiresAt,
-		Result:            t.Result,
-		Model:             t.Model,
-		Kind:              t.Kind,
-		ReviewModels:      t.ReviewModels,
-		ReviewRound:       t.ReviewRound,
-		TargetTaskID:      t.TargetTaskID,
-		Verdict:           t.Verdict,
-		AgentMerge:        t.AgentMerge,
-		Held:              t.Held,
-		Escalate:          t.Escalate,
-		Track:             t.Track,
-		Branch:            t.Branch,
-		LandingRound:      landingRound,
-		LandingCommit:     landingCommit,
-		LandingAttempt:    landingAttempt,
-		CurrentRoundLinks: currentRoundLinks,
-		CreatedAt:         t.CreatedAt,
-		UpdatedAt:         t.UpdatedAt,
-		ArchivedAt:        t.ArchivedAt,
-		SupersededBy:      t.SupersededBy,
-		DependsOn:         dependsOn,
-		Links:             links,
+		ID:                  t.ID,
+		ProjectID:           t.ProjectID,
+		DocumentID:          t.DocumentID,
+		Title:               t.Title,
+		Spec:                t.Spec,
+		State:               t.State,
+		Assignee:            t.Assignee,
+		LeaseExpiresAt:      t.LeaseExpiresAt,
+		Result:              t.Result,
+		Model:               t.Model,
+		Kind:                t.Kind,
+		ReviewModels:        t.ReviewModels,
+		ReviewRound:         t.ReviewRound,
+		TargetTaskID:        t.TargetTaskID,
+		Verdict:             t.Verdict,
+		AgentMerge:          t.AgentMerge,
+		Held:                t.Held,
+		Escalate:            t.Escalate,
+		Track:               t.Track,
+		Branch:              t.Branch,
+		LandingRound:        landingRound,
+		LandingCommit:       landingCommit,
+		LandingAttempt:      landingAttempt,
+		CurrentRoundLinks:   currentRoundLinks,
+		CreatedAt:           t.CreatedAt,
+		UpdatedAt:           t.UpdatedAt,
+		ArchivedAt:          t.ArchivedAt,
+		SupersededBy:        t.SupersededBy,
+		DependsOn:           dependsOn,
+		Links:               links,
+		SubmissionManifests: manifests,
 	}, nil
 }
 
@@ -2094,7 +2124,7 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 	if len(findings) > 0 {
 		f = findings[0]
 	}
-	return s.submitTask(ctx, taskID, agentID, result, verdict, links, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, f, nil)
+	return s.submitTask(ctx, taskID, agentID, result, verdict, links, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, f, nil, nil)
 }
 
 // SubmitTaskWithDisputes submits a task result along with a disputes payload: a
@@ -2102,10 +2132,18 @@ func (s *sqliteStore) SubmitTask(ctx context.Context, taskID, agentID, result st
 // the round it is reworking, per docs/features/research-track.md section 5. See
 // submitTask for the full behavior.
 func (s *sqliteStore) SubmitTaskWithDisputes(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage) (TaskWithDepsAndLinks, error) {
-	return s.submitTask(ctx, taskID, agentID, result, verdict, links, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, findings, disputes)
+	return s.submitTask(ctx, taskID, agentID, result, verdict, links, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, findings, disputes, nil)
 }
 
-func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage) (TaskWithDepsAndLinks, error) {
+// SubmitTaskWithManifest is SubmitTaskWithDisputes plus an optional continuation manifest
+// (docs/features/research-continuations.md): a research-track implement task whose spec opts in
+// may carry the children it proposes. The manifest is validated, canonicalised and stored for
+// the review round this submission starts, in the same transaction as the submission itself.
+func (s *sqliteStore) SubmitTaskWithManifest(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage, manifestInput json.RawMessage) (TaskWithDepsAndLinks, error) {
+	return s.submitTask(ctx, taskID, agentID, result, verdict, links, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, findings, disputes, manifestInput)
+}
+
+func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage, manifestInput json.RawMessage) (TaskWithDepsAndLinks, error) {
 	// Validate link kinds first (before mutating anything).
 	// "no_op" marks a review-verified no-op resolution: a worker that finds the
 	// acceptance criteria already satisfied on main with no diff submits with a
@@ -2280,6 +2318,28 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 		disputesToStore = marshaled
 	}
 
+	// Validate the continuation manifest. It is optional and explicit null is treated as absent,
+	// so submissions without one are unaffected. Only a research-track implement task whose spec
+	// opts in may carry one, and it must name the submitted task as its parent.
+	var submittedManifest *canonicalManifest
+	if len(manifestInput) > 0 && string(manifestInput) != "null" {
+		if taskKind != "implement" || taskTrack != "research" {
+			return TaskWithDepsAndLinks{}, invalid("MANIFEST_NOT_ALLOWED", "a continuation manifest is only allowed on research-track implement submissions")
+		}
+		var spec string
+		if err := tx.QueryRowContext(ctx, `SELECT spec FROM task WHERE id = ?`, taskID).Scan(&spec); err != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to read task spec: %w", err)
+		}
+		if !specOptsIntoContinuations(spec) {
+			return TaskWithDepsAndLinks{}, invalid("PARENT_NOT_OPTED_IN", fmt.Sprintf("task spec does not opt in to continuation manifests (it needs a line reading %q)", continuationOptInHeading))
+		}
+		cm, merr := s.canonicalizeManifest(manifestInput, taskID)
+		if merr != nil {
+			return TaskWithDepsAndLinks{}, merr
+		}
+		submittedManifest = cm
+	}
+
 	// Determine the next state based on task kind
 	var nextState string
 	if taskKind == "review" {
@@ -2390,6 +2450,15 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			`, newReviewRound, taskID)
 			if err != nil {
 				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to increment review_round: %w", err)
+			}
+
+			if submittedManifest != nil {
+				if _, err := tx.ExecContext(ctx, `
+					INSERT INTO task_submission_manifest (id, task_id, review_round, parent_task_id, manifest_json, manifest_digest, created_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)
+				`, GenerateID(), taskID, newReviewRound, submittedManifest.parentTaskID, submittedManifest.json, submittedManifest.digest, now); err != nil {
+					return TaskWithDepsAndLinks{}, fmt.Errorf("failed to store submission manifest: %w", err)
+				}
 			}
 
 			// Extract PR link and any no_op marker from the submitted links.
@@ -2533,6 +2602,11 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			return TaskWithDepsAndLinks{}, fmt.Errorf("error iterating links: %w", err)
 		}
 
+		manifests, err := listSubmissionManifests(ctx, tx, taskID)
+		if err != nil {
+			return TaskWithDepsAndLinks{}, err
+		}
+
 		if err := tx.Commit(); err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to commit transaction: %w", err)
 		}
@@ -2564,6 +2638,8 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			SupersededBy:   t.SupersededBy,
 			DependsOn:      dependsOn,
 			Links:          fetchedLinks,
+
+			SubmissionManifests: manifests,
 		}, nil
 	}
 
@@ -5514,4 +5590,118 @@ func (s *sqliteStore) PruneEvents(ctx context.Context, terminalRetentionDays int
 	}
 
 	return rowsAffected, nil
+}
+
+// listSubmissionManifests returns taskID's stored continuation manifests, oldest round first
+// (never nil, so it serialises as []).
+func listSubmissionManifests(ctx context.Context, q eventQuerier, taskID string) ([]SubmissionManifest, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT review_round, parent_task_id, manifest_json, manifest_digest, created_at
+		FROM task_submission_manifest WHERE task_id = ? ORDER BY review_round
+	`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query submission manifests: %w", err)
+	}
+	defer rows.Close()
+	manifests := []SubmissionManifest{}
+	for rows.Next() {
+		var sm SubmissionManifest
+		var manifestJSON string
+		if err := rows.Scan(&sm.ReviewRound, &sm.ParentTaskID, &manifestJSON, &sm.ManifestDigest, &sm.SubmittedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan submission manifest: %w", err)
+		}
+		sm.ManifestJSON = json.RawMessage(manifestJSON)
+		manifests = append(manifests, sm)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating submission manifests: %w", err)
+	}
+	return manifests, nil
+}
+
+// continuationOptInHeading is the exact line a research task's spec must contain, on a line of
+// its own, to opt in to carrying a continuation manifest. Matching ignores case and surrounding
+// whitespace but nothing else, so prose that mentions the phrase, or a deeper heading such as
+// "### continuation manifest", does not opt a task in.
+const continuationOptInHeading = "## continuation manifest"
+
+func specOptsIntoContinuations(spec string) bool {
+	for _, line := range strings.Split(spec, "\n") {
+		if strings.EqualFold(strings.TrimSpace(line), continuationOptInHeading) {
+			return true
+		}
+	}
+	return false
+}
+
+type canonicalManifest struct {
+	parentTaskID string
+	json         string
+	digest       string
+}
+
+// canonicalizeManifest parses raw strictly (unknown fields and trailing data are rejected),
+// requires its parent_task_id to be taskID, validates it against the child envelope (the
+// deployment's model allowlist, the task tracks, and the manifest package's limits), and
+// returns its canonical JSON with that JSON's SHA-256. The canonical form is the manifest
+// re-encoded from its struct with nil lists normalised to empty, so documents that differ only
+// in whitespace, key order, or null-versus-empty lists share one JSON text and one digest.
+func (s *sqliteStore) canonicalizeManifest(raw json.RawMessage, taskID string) (*canonicalManifest, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var m manifest.Manifest
+	if err := dec.Decode(&m); err != nil {
+		return nil, invalid("INVALID_MANIFEST_JSON", fmt.Sprintf("manifest is not a valid continuation manifest: %v", err))
+	}
+	if dec.More() {
+		return nil, invalid("INVALID_MANIFEST_JSON", "manifest has trailing data after the JSON object")
+	}
+	if m.ParentTaskID != taskID {
+		return nil, invalid("MISMATCHED_PARENT_TASK", fmt.Sprintf("manifest parent_task_id %q must be the submitted task %q", m.ParentTaskID, taskID))
+	}
+	if err := m.Validate(s.allowedModelsM, validTracks); err != nil {
+		var ve manifest.ValidationError
+		if errors.As(err, &ve) {
+			return nil, invalid(ve.Code, ve.Message)
+		}
+		return nil, invalid("INVALID_MANIFEST", err.Error())
+	}
+
+	if m.Children == nil {
+		m.Children = []manifest.Child{}
+	}
+	if m.PendingCandidates == nil {
+		m.PendingCandidates = []manifest.PendingCandidate{}
+	}
+	for i := range m.Children {
+		c := &m.Children[i]
+		if c.ReviewModels == nil {
+			c.ReviewModels = []string{}
+		}
+		if c.ClaimIDs == nil {
+			c.ClaimIDs = []string{}
+		}
+		if c.SourceStartPoints == nil {
+			c.SourceStartPoints = []string{}
+		}
+		if c.FileScope == nil {
+			c.FileScope = []string{}
+		}
+		if c.AcceptanceCriteria == nil {
+			c.AcceptanceCriteria = []string{}
+		}
+		if c.Dependencies == nil {
+			c.Dependencies = []manifest.Dependency{}
+		}
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
+		return nil, fmt.Errorf("failed to encode canonical manifest: %w", err)
+	}
+	canonical := strings.TrimSuffix(buf.String(), "\n")
+	sum := sha256.Sum256([]byte(canonical))
+	return &canonicalManifest{parentTaskID: m.ParentTaskID, json: canonical, digest: hex.EncodeToString(sum[:])}, nil
 }

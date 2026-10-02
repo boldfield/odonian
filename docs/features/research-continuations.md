@@ -17,6 +17,30 @@ A parent research task may carry a continuation manifest in its PR. The manifest
 - **Reviewed by both reviewers**: The manifest is examined alongside the parent's implementation. A reviewer can flag issues with the proposed children as findings on the parent task.
 - **Gated by human merge**: Children are created only when a human merges the parent's PR, not when the parent's work is approved.
 
+#### Submitting and persisting the manifest
+
+A research-track `implement` task submits its manifest with the rest of its submission
+(`manifest` in the submit body, `odonian submit --manifest-file`). The server accepts it only when:
+
+- **The spec opts in.** Some line of the task's spec, trimmed and compared case-insensitively, is
+  exactly `## continuation manifest`. Prose mentioning the phrase, a deeper heading such as
+  `### continuation manifest`, or the phrase mid-line does not opt in.
+- **The manifest names the submitted task** as its `parent_task_id`.
+- **It sits inside the approved child envelope.** The envelope is the manifest validator (section
+  4) run with the deployment's model allowlist and the same task tracks task creation accepts:
+  at most 3 children, 6 claims and 4 sources per child, non-overlapping file scopes, and so on.
+  The spec's opt-in carries no further per-parent limits.
+- Unknown fields and trailing data are rejected, and any failure leaves the task, its events and
+  its links untouched.
+
+An accepted manifest is stored as canonical JSON (re-encoded from the parsed manifest, nil lists
+normalised to empty, so whitespace, key order and null-versus-empty differences vanish) with its
+SHA-256 digest, the parent task ID and the review round the submission starts, in the same
+transaction as the submission. A rework submission adds a row for its new round; earlier rounds'
+rows are never rewritten. `GET /tasks/{id}` returns them as `submission_manifests`, so a reviewer
+can name the exact manifest and digest of the round under review. Persisting a manifest creates
+no children; that remains the job of the verified human merge (section 5).
+
 ### 2. Child specification
 
 Each proposed child has:
@@ -175,7 +199,6 @@ The validator returns specific error codes for different validation failures. Co
 
 The manifest contract defined here supports future work:
 
-- **Manifest persistence**: Storing manifests with parent tasks so they can be audited and traced.
 - **Child creation implementation**: Extending the store's `CreateTasks` to populate child specifications from manifests.
 - **Manifest revisions**: Allowing parents to update manifests on rework and tracking changes, via a separate revision field (the schema `version` stays fixed).
 - **Claim traceability**: Linking created children back to the claims in the manifest and the parent's sources.

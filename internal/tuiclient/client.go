@@ -610,6 +610,7 @@ type submitTaskRequest struct {
 	Links    []LinkInput     `json:"links"`
 	Findings json.RawMessage `json:"findings,omitempty"`
 	Disputes json.RawMessage `json:"disputes,omitempty"`
+	Manifest json.RawMessage `json:"manifest,omitempty"`
 }
 
 // SubmitTask submits a task result with optional verdict and links.
@@ -626,6 +627,12 @@ func (c *HTTPClient) SubmitTaskWithFindings(ctx context.Context, id, agentID, re
 // links, structured findings (review-kind tasks), and disputes (research-track
 // implement rework, per docs/features/research-track.md section 5).
 func (c *HTTPClient) SubmitTaskWithDisputesAndFindings(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage) error {
+	return c.SubmitTaskWithManifest(ctx, id, agentID, result, verdict, links, findings, disputes, nil)
+}
+
+// SubmitTaskWithManifest is SubmitTaskWithDisputesAndFindings plus an optional research
+// continuation manifest (research-track implement, per docs/features/research-continuations.md).
+func (c *HTTPClient) SubmitTaskWithManifest(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) error {
 	body := submitTaskRequest{
 		AgentID:  agentID,
 		Result:   result,
@@ -633,6 +640,7 @@ func (c *HTTPClient) SubmitTaskWithDisputesAndFindings(ctx context.Context, id, 
 		Links:    links,
 		Findings: findings,
 		Disputes: disputes,
+		Manifest: manifest,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/submit", id), body)

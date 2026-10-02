@@ -5435,3 +5435,82 @@ func TestValidateResearchDefaultModel(t *testing.T) {
 func strPtr(s string) *string {
 	return &s
 }
+
+func TestExecuteSubmitWithManifestFile(t *testing.T) {
+	manifestBody := `{"version":1,"parent_task_id":"task123","children":[],"pending_candidates":[]}`
+	tmpFile := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(tmpFile, []byte(manifestBody), 0o600); err != nil {
+		t.Fatalf("failed to write manifest file: %v", err)
+	}
+
+	var gotManifest json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/tasks/task123" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task123", "review_round": 0, "links": []map[string]string{}})
+			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/tasks/task123/submit" {
+			var req struct {
+				Manifest json.RawMessage `json:"manifest"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			gotManifest = req.Manifest
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+		"--result", "done",
+		"--manifest-file", tmpFile,
+		"--pr", "https://github.com/example/test-repo/pull/1",
+		"--branch", "mr/task123",
+		"task123",
+	})
+	if err != nil {
+		t.Fatalf("executeSubmit failed: %v", err)
+	}
+	if string(gotManifest) != manifestBody {
+		t.Fatalf("expected manifest %s to be sent in the request body, got %s", manifestBody, gotManifest)
+	}
+}
+
+func TestExecuteSubmitManifestFileRejectedBeforeRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request to server: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_ID", "test-agent")
+
+	dir := t.TempDir()
+	notJSON := filepath.Join(dir, "bad.json")
+	notObject := filepath.Join(dir, "array.json")
+	if err := os.WriteFile(notJSON, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notObject, []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, tc := range map[string]struct{ file, want string }{
+		"missing":    {filepath.Join(dir, "nope.json"), "failed to read manifest file"},
+		"not_json":   {notJSON, "manifest file is not valid JSON"},
+		"not_object": {notObject, "manifest file must be a JSON object"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+				"--result", "done", "--manifest-file", tc.file, "task123",
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
