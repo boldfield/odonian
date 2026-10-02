@@ -5660,175 +5660,162 @@ func TestExecuteSubmitManifestFileRejectedBeforeRequest(t *testing.T) {
 	}
 }
 
-func TestExecuteShowContinuationInfo(t *testing.T) {
+func showWithServer(t *testing.T, detail tuiclient.TaskDetail, jsonOutput bool) string {
+	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/tasks/") {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
-				ID:    "parent-task",
-				State: "approved",
-				Model: "haiku",
-				Kind:  "implement",
-				Title: "Parent Task",
-				Spec:  "Parent spec",
-				Continuation: &tuiclient.ContinuationInfo{
-					ProposedChildren: []tuiclient.ProposedChild{
-						{
-							Key:          "child1",
-							Title:        "Child One",
-							Track:        "research",
-							Model:        "haiku",
-							InitialState: "ready",
-						},
-						{
-							Key:          "child2",
-							Title:        "Child Two",
-							Track:        "build",
-							Model:        "opus",
-							InitialState: "backlog",
-						},
-					},
-					CreatedChildren: []tuiclient.CreatedChild{
-						{
-							ID:             "created-child-1",
-							ParentTaskID:   "parent-task",
-							State:          "ready",
-							Track:          "research",
-							ManifestDigest: "abc123def456",
-							ClaimIDs:       []string{"claim1", "claim2"},
-						},
-					},
-					ActionItems: []tuiclient.ActionItem{
-						{
-							Type:        "held_dependency",
-							Description: "Task abc12345 (Some Task) is held",
-							TaskID:      "abc123",
-						},
-					},
-				},
-			})
+			json.NewEncoder(w).Encode(detail)
 		}
 	}))
 	defer server.Close()
-
+	args := []string{detail.ID}
+	if jsonOutput {
+		args = []string{"--json", detail.ID}
+	}
 	buf := &bytes.Buffer{}
-	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"parent-task"}, buf)
-	if err != nil {
+	if err := executeShow(context.Background(), server.URL, "test-token", jsonOutput, args, buf); err != nil {
 		t.Fatalf("executeShow failed: %v", err)
 	}
+	return buf.String()
+}
 
-	output := buf.String()
-
-	// Check for proposed children section
-	if !strings.Contains(output, "Planned Continuations (proposed, before merge)") {
-		t.Errorf("expected 'Planned Continuations' section in output")
-	}
-	if !strings.Contains(output, "child1") {
-		t.Errorf("expected 'child1' in proposed children")
-	}
-	if !strings.Contains(output, "Child One") {
-		t.Errorf("expected 'Child One' in output")
-	}
-	if !strings.Contains(output, "Track: research") {
-		t.Errorf("expected 'Track: research' for proposed child")
-	}
-	if !strings.Contains(output, "Initial State: ready") {
-		t.Errorf("expected 'Initial State: ready' for research child")
-	}
-	if !strings.Contains(output, "child2") {
-		t.Errorf("expected 'child2' in proposed children")
-	}
-	if !strings.Contains(output, "Initial State: backlog") {
-		t.Errorf("expected 'Initial State: backlog' for build child")
-	}
-
-	// Check for created children section
-	if !strings.Contains(output, "Created Children (after merge)") {
-		t.Errorf("expected 'Created Children' section in output")
-	}
-	if !strings.Contains(output, "created-child-1") {
-		t.Errorf("expected created child ID in output")
-	}
-	if !strings.Contains(output, "State: ready, Track: research") {
-		t.Errorf("expected 'State: ready, Track: research' for created child")
-	}
-	if !strings.Contains(output, "Manifest Digest: abc123def456") {
-		t.Errorf("expected manifest digest in output")
-	}
-	if !strings.Contains(output, "claim1, claim2") {
-		t.Errorf("expected claim IDs formatted with comma separator, got: %s", output)
-	}
-
-	// Check for action items
-	if !strings.Contains(output, "Action Items") {
-		t.Errorf("expected 'Action Items' section in output")
-	}
-	if !strings.Contains(output, "held_dependency") {
-		t.Errorf("expected action item type in output")
+func requireContains(t *testing.T, output string, wants ...string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(output, want) {
+			t.Errorf("expected %q in output:\n%s", want, output)
+		}
 	}
 }
 
-func TestExecuteShowContinuationInfoJSON(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
-				ID:    "parent-task",
-				State: "approved",
-				Model: "haiku",
-				Kind:  "implement",
-				Title: "Parent Task",
-				Spec:  "Parent spec",
-				Continuation: &tuiclient.ContinuationInfo{
-					ProposedChildren: []tuiclient.ProposedChild{
-						{
-							Key:          "child1",
-							Title:        "Child One",
-							Track:        "research",
-							Model:        "haiku",
-							InitialState: "ready",
-						},
-					},
-					CreatedChildren: []tuiclient.CreatedChild{
-						{
-							ID:             "created-child-1",
-							ParentTaskID:   "parent-task",
-							State:          "ready",
-							Track:          "research",
-							ManifestDigest: "abc123def456",
-						},
-					},
-				},
-			})
-		}
-	}))
-	defer server.Close()
-
-	buf := &bytes.Buffer{}
-	err := executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "parent-task"}, buf)
-	if err != nil {
-		t.Fatalf("executeShow --json failed: %v", err)
+func plannedContinuationDetail() tuiclient.TaskDetail {
+	return tuiclient.TaskDetail{
+		ID: "parent-1", State: "approved", Model: "haiku", Kind: "implement", Title: "Parent", Spec: "spec",
+		Continuation: &tuiclient.ContinuationInfo{
+			ManifestDigest: "digest-1",
+			ProposedChildren: []tuiclient.ProposedChild{
+				{Key: "a", Title: "Child A", Track: "research", Model: "haiku", InitialState: "ready", Status: "pending"},
+				{Key: "b", Title: "Child B", Track: "build", Model: "sonnet", InitialState: "backlog", Status: "pending",
+					Dependencies: []tuiclient.ContinuationDependency{{Kind: "child", Ref: "a"}}},
+			},
+			DeferredClaims: []tuiclient.DeferredClaim{{ClaimID: "c4", Owner: "alice"}},
+			ExcludedClaims: []tuiclient.ExcludedClaim{{ClaimID: "c5", Reason: "out of scope"}},
+			ActionItems: []tuiclient.ActionItem{{
+				Type: "legacy_held_follow_up", TaskID: "fu-1", Title: "Old follow-up", State: "backlog",
+				Description: "replace, retarget or close it manually.",
+			}},
+		},
+		FindingFollowUps: []tuiclient.FindingFollowUp{{ID: "fu-1", Title: "Old follow-up", State: "backlog", Track: "research", Held: true}},
 	}
+}
 
-	output := buf.String()
-	var result tuiclient.TaskDetail
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
+func TestExecuteShowPlannedContinuationBeforeMerge(t *testing.T) {
+	out := showWithServer(t, plannedContinuationDetail(), false)
+	requireContains(t, out,
+		"Research Continuation",
+		"Proposed Children (manifest digest-1):",
+		"- a: Child A [pending]",
+		"Track: research, Model: haiku, Initial State: ready",
+		"- b: Child B [pending]",
+		"Initial State: backlog",
+		"Depends On: child a",
+		"Deferred Claims (carried forward, owned):",
+		"- c4 (owner: alice)",
+		"Excluded Claims (out of scope, no owner):",
+		"- c5 (reason: out of scope)",
+		"Action Items (manual replacement needed):",
+		"[legacy_held_follow_up] fu-1: Old follow-up (backlog)",
+		"Review-Finding Follow-Ups (not continuations):",
+		"- fu-1: Old follow-up (backlog, held)",
+	)
+	if strings.Contains(out, "Created Children") {
+		t.Errorf("nothing is created before the merge:\n%s", out)
+	}
+	// The finding follow-up is listed only under its own heading, never among the proposals.
+	idx := strings.Index(out, "Review-Finding Follow-Ups")
+	if strings.Contains(out[:idx], "- fu-1: Old follow-up (backlog, held)") {
+		t.Errorf("follow-up listed outside its own section:\n%s", out)
+	}
+}
+
+func TestExecuteShowCreatedContinuationAfterMerge(t *testing.T) {
+	detail := plannedContinuationDetail()
+	c := detail.Continuation
+	c.ProposedChildren[0].Status = "created"
+	c.ProposedChildren[0].CreatedTaskID = "child-a-id"
+	c.ProposedChildren[1].Status = "created"
+	c.ProposedChildren[1].CreatedTaskID = "child-b-id"
+	c.CreatedChildren = []tuiclient.CreatedContinuationTask{
+		{ID: "child-a-id", Key: "a", Title: "Child A", ParentTaskID: "parent-1", ManifestDigest: "digest-1", State: "ready", Track: "research",
+			DependencyStatus: "satisfied", DependsOn: []string{"parent-1"}, Claimable: true, ClaimIDs: []string{"c1"}},
+		{ID: "child-b-id", Key: "b", Title: "Child B", ParentTaskID: "parent-1", ManifestDigest: "digest-1", State: "backlog", Track: "build",
+			DependencyStatus: "blocked", DependsOn: []string{"child-a-id"}, BlockedBy: []string{"child-a-id"}},
+	}
+	out := showWithServer(t, detail, false)
+	requireContains(t, out,
+		"- a: Child A [created]",
+		"Created As: child-a-id",
+		"Created Children:",
+		"- child-a-id: Child A",
+		"Parent: parent-1",
+		"Manifest Digest: digest-1",
+		"State: ready, Track: research, Claimable: true",
+		"Dependency Status: satisfied",
+		"Claims: c1",
+		"- child-b-id: Child B",
+		"State: backlog, Track: build, Claimable: false",
+		"Dependency Status: blocked",
+		"Blocked By: child-a-id",
+		"Review-Finding Follow-Ups (not continuations):",
+	)
+}
+
+func TestExecuteShowCreatedChildShowsParentProvenance(t *testing.T) {
+	out := showWithServer(t, tuiclient.TaskDetail{
+		ID: "child-b-id", State: "backlog", Model: "sonnet", Kind: "implement", Title: "Child B", Spec: "spec",
+		Continuation: &tuiclient.ContinuationInfo{ParentInfo: &tuiclient.ContinuationParent{ID: "parent-1", ChildKey: "b", ManifestDigest: "digest-1"}},
+	}, false)
+	requireContains(t, out, "Created from continuation parent: parent-1", "Manifest Key: b", "Manifest Digest: digest-1")
+	if strings.Contains(out, "Review-Finding Follow-Ups") {
+		t.Errorf("unexpected follow-up section:\n%s", out)
+	}
+}
+
+func TestExecuteShowOmitsContinuationSectionsWhenAbsent(t *testing.T) {
+	out := showWithServer(t, tuiclient.TaskDetail{ID: "t-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Plain", Spec: "spec"}, false)
+	if strings.Contains(out, "Continuation") || strings.Contains(out, "Follow-Ups") {
+		t.Errorf("plain task shows continuation sections:\n%s", out)
+	}
+}
+
+func TestExecuteShowJSONKeepsContinuationAndFollowUpsSeparate(t *testing.T) {
+	detail := plannedContinuationDetail()
+	detail.Continuation.CreatedChildren = []tuiclient.CreatedContinuationTask{
+		{ID: "child-a-id", Key: "a", Title: "Child A", State: "ready", Track: "research", DependencyStatus: "none", Claimable: true},
+	}
+	out := showWithServer(t, detail, true)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
 		t.Fatalf("output is not valid JSON: %v", err)
 	}
-
-	if result.Continuation == nil {
-		t.Fatalf("expected continuation info in JSON output")
+	var got tuiclient.TaskDetail
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
-	if len(result.Continuation.ProposedChildren) != 1 {
-		t.Errorf("expected 1 proposed child, got %d", len(result.Continuation.ProposedChildren))
+	if got.Continuation == nil || len(got.Continuation.ProposedChildren) != 2 || len(got.Continuation.CreatedChildren) != 1 {
+		t.Fatalf("continuation lost in --json: %+v", got.Continuation)
 	}
-	if len(result.Continuation.CreatedChildren) != 1 {
-		t.Errorf("expected 1 created child, got %d", len(result.Continuation.CreatedChildren))
+	if got.Continuation.CreatedChildren[0].State != "ready" || got.Continuation.DeferredClaims[0].Owner != "alice" {
+		t.Errorf("created child state / deferred owner lost: %+v", got.Continuation)
 	}
-	if result.Continuation.CreatedChildren[0].State != "ready" {
-		t.Errorf("expected created child state 'ready', got %q", result.Continuation.CreatedChildren[0].State)
+	if len(got.FindingFollowUps) != 1 || got.FindingFollowUps[0].ID != "fu-1" {
+		t.Errorf("finding follow-ups lost in --json: %+v", got.FindingFollowUps)
 	}
-	if result.Continuation.CreatedChildren[0].Track != "research" {
-		t.Errorf("expected created child track 'research', got %q", result.Continuation.CreatedChildren[0].Track)
+	if _, ok := raw["continuation"]; !ok {
+		t.Errorf("--json has no continuation key")
+	}
+	if _, ok := raw["finding_follow_ups"]; !ok {
+		t.Errorf("--json has no finding_follow_ups key")
 	}
 }
