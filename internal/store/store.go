@@ -6149,6 +6149,39 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 		}
 	}
 
+	// Load all child task details (state, track) in one query to avoid N+1
+	var childTaskStates map[string]struct {
+		state string
+		track string
+	}
+	if len(createdChildrenOrder) > 0 {
+		childTaskStates = make(map[string]struct {
+			state string
+			track string
+		})
+		rows, err := db.QueryContext(ctx, `
+			SELECT id, state, track FROM task WHERE id IN (`+strings.TrimSuffix(strings.Repeat("?, ", len(createdChildrenOrder)), ", ")+`)
+		`, func() []interface{} {
+			result := make([]interface{}, len(createdChildrenOrder))
+			for i, id := range createdChildrenOrder {
+				result[i] = id
+			}
+			return result
+		}()...)
+		if err == nil {
+			for rows.Next() {
+				var id, state, track string
+				if rows.Scan(&id, &state, &track) == nil {
+					childTaskStates[id] = struct {
+						state string
+						track string
+					}{state, track}
+				}
+			}
+			rows.Close()
+		}
+	}
+
 	// Build created children from grouped links
 	for _, childID := range createdChildrenOrder {
 		links := childLinksByID[childID]
@@ -6191,14 +6224,10 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 			}
 		}
 
-		// Load child task details (state, track) from database
-		var state, track string
-		err := db.QueryRowContext(ctx, `
-			SELECT state, track FROM task WHERE id = ?
-		`, childID).Scan(&state, &track)
-		if err == nil {
-			child.State = state
-			child.Track = track
+		// Get child task details from the loaded map
+		if taskState, ok := childTaskStates[childID]; ok {
+			child.State = taskState.state
+			child.Track = taskState.track
 		}
 
 		info.CreatedChildren = append(info.CreatedChildren, *child)
@@ -6272,7 +6301,7 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 		}
 	}
 
-	if len(info.ProposedChildren) == 0 && len(info.CreatedChildren) == 0 && len(info.ActionItems) == 0 {
+	if len(info.ProposedChildren) == 0 && len(info.CreatedChildren) == 0 && len(info.ActionItems) == 0 && info.ParentInfo == nil {
 		return nil
 	}
 
