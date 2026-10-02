@@ -4659,16 +4659,21 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 			}
 
 			if manifestToUse != nil {
-				// Parse the manifest
+				// Canonicalize and verify the manifest digest using strict validation
+				cm, err := s.canonicalizeManifest(json.RawMessage(manifestToUse.ManifestJSON), taskID)
+				if err != nil {
+					return Task{}, fmt.Errorf("failed to validate manifest for materialization: %w", err)
+				}
+
+				// Verify the digest matches what was stored
+				if cm.digest != manifestToUse.ManifestDigest {
+					return Task{}, fmt.Errorf("manifest digest mismatch: stored %q does not match canonical %q", manifestToUse.ManifestDigest, cm.digest)
+				}
+
+				// Parse the manifest for insertion
 				m := &manifest.Manifest{}
 				if err := json.Unmarshal(manifestToUse.ManifestJSON, m); err != nil {
 					return Task{}, fmt.Errorf("failed to parse manifest: %w", err)
-				}
-
-				// Verify the manifest digest matches the canonical digest
-				_, computedDigest := s.computeManifestCanonicalForm(m)
-				if computedDigest != manifestToUse.ManifestDigest {
-					return Task{}, fmt.Errorf("manifest digest mismatch: stored %q does not match canonical %q", manifestToUse.ManifestDigest, computedDigest)
 				}
 
 				// Insert continuation children with idempotency
