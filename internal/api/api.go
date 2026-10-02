@@ -768,6 +768,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		Links    []store.LinkInput `json:"links"`
 		Findings json.RawMessage   `json:"findings"`
 		Disputes json.RawMessage   `json:"disputes"`
+		Manifest json.RawMessage   `json:"manifest"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
@@ -781,7 +782,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Submit the task
-	task, err := s.store.SubmitTaskWithDisputes(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget, payload.Findings, payload.Disputes)
+	task, err := s.store.SubmitTaskWithManifest(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget, payload.Findings, payload.Disputes, payload.Manifest)
 	if err != nil {
 		// Check if it's a ValidationError (invalid link kind)
 		var validationErr *store.ValidationError
