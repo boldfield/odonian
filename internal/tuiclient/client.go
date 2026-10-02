@@ -81,18 +81,27 @@ type TaskDetail struct {
 	LandingCommit  *string `json:"landing_commit"`
 	LandingAttempt *string `json:"landing_attempt"`
 	// CurrentRoundLinks is the submission under review, as the server determines it.
-	CurrentRoundLinks []TaskLink `json:"current_round_links"`
-	Assignee          *string    `json:"assignee"`
-	LeaseExpiresAt    *string    `json:"lease_expires_at"`
-	Result            *string    `json:"result"`
-	Held              bool       `json:"held"`
-	ReviewRound       int        `json:"review_round"`
-	TargetTaskID      *string    `json:"target_task_id"`
-	AgentMerge        bool       `json:"agent_merge"`
-	CreatedAt         string     `json:"created_at"`
-	UpdatedAt         string     `json:"updated_at"`
-	DependsOn         []string   `json:"depends_on"`
-	Links             []TaskLink `json:"links"`
+	CurrentRoundLinks   []TaskLink           `json:"current_round_links"`
+	Assignee            *string              `json:"assignee"`
+	LeaseExpiresAt      *string              `json:"lease_expires_at"`
+	Result              *string              `json:"result"`
+	Held                bool                 `json:"held"`
+	ReviewRound         int                  `json:"review_round"`
+	TargetTaskID        *string              `json:"target_task_id"`
+	AgentMerge          bool                 `json:"agent_merge"`
+	CreatedAt           string               `json:"created_at"`
+	UpdatedAt           string               `json:"updated_at"`
+	DependsOn           []string             `json:"depends_on"`
+	Links               []TaskLink           `json:"links"`
+	SubmissionManifests []SubmissionManifest `json:"submission_manifests"`
+}
+
+type SubmissionManifest struct {
+	ReviewRound    int             `json:"review_round"`
+	ParentTaskID   string          `json:"parent_task_id"`
+	ManifestJSON   json.RawMessage `json:"manifest_json"`
+	ManifestDigest string          `json:"manifest_digest"`
+	SubmittedAt    string          `json:"submitted_at"`
 }
 
 type TaskLink struct {

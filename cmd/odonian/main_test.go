@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -429,6 +430,150 @@ func TestExecuteShowJSON(t *testing.T) {
 	}
 	if result.Title != "Test Task" {
 		t.Errorf("expected title 'Test Task', got %q", result.Title)
+	}
+}
+
+func TestExecuteShowWithSubmissionManifests(t *testing.T) {
+	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}`)
+	// Real SHA-256 digest of the manifest bytes: printf '{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}' | sha256sum
+	realDigest := "461bf9e337f7d640ca135d4743755ab5538b777442eddafed2c5dfb38b1279be"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:    "task-1",
+				State: "in_progress",
+				Model: "haiku",
+				Kind:  "implement",
+				Title: "Test Task",
+				Spec:  "Test spec",
+				SubmissionManifests: []tuiclient.SubmissionManifest{
+					{
+						ReviewRound:    1,
+						ParentTaskID:   "task-1",
+						ManifestJSON:   manifestJSON,
+						ManifestDigest: realDigest,
+						SubmittedAt:    "2026-10-02T12:00:00Z",
+					},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Submission Manifests:") {
+		t.Errorf("expected 'Submission Manifests:' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "Round 1:") {
+		t.Errorf("expected 'Round 1:' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "Parent Task ID: task-1") {
+		t.Errorf("expected 'Parent Task ID: task-1' in output, got: %s", output)
+	}
+	if !strings.Contains(output, fmt.Sprintf("Digest: %s", realDigest)) {
+		t.Errorf("expected 'Digest: %s' in output, got: %s", realDigest, output)
+	}
+	if !strings.Contains(output, "Canonical:") {
+		t.Errorf("expected 'Canonical:' header in output, got: %s", output)
+	}
+	lines := strings.Split(output, "\n")
+	canonical := ""
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "Canonical:" && i+1 < len(lines) {
+			canonical = strings.TrimSpace(lines[i+1])
+			break
+		}
+	}
+	if canonical != string(manifestJSON) {
+		t.Fatalf("expected canonical manifest bytes %s verbatim after 'Canonical:', got %q in output: %s", manifestJSON, canonical, output)
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	if got := fmt.Sprintf("%x", sum); got != realDigest {
+		t.Errorf("shown canonical bytes hash to %s, want displayed digest %s", got, realDigest)
+	}
+}
+
+func TestExecuteShowManifestWithHTMLCharsHashesToDigest(t *testing.T) {
+	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[{"title":"A & B <= 3 > 1","spec":"parent's claim"}],"pending_candidates":[]}`)
+	sum := sha256.Sum256(manifestJSON)
+	digest := fmt.Sprintf("%x", sum)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetEscapeHTML(false)
+		enc.Encode(tuiclient.TaskDetail{
+			ID:    "task-1",
+			State: "in_progress",
+			SubmissionManifests: []tuiclient.SubmissionManifest{
+				{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: digest},
+			},
+		})
+	}))
+	defer server.Close()
+
+	text := &bytes.Buffer{}
+	if err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, text); err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+	lines := strings.Split(text.String(), "\n")
+	canonical := ""
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "Canonical:" && i+1 < len(lines) {
+			canonical = strings.TrimSpace(lines[i+1])
+		}
+	}
+	if canonical != string(manifestJSON) {
+		t.Errorf("text show altered manifest bytes: got %q want %q", canonical, manifestJSON)
+	}
+
+	js := &bytes.Buffer{}
+	if err := executeShow(context.Background(), server.URL, "test-token", true, []string{"task-1"}, js); err != nil {
+		t.Fatalf("executeShow --json failed: %v", err)
+	}
+	if !strings.Contains(js.String(), "A & B <= 3 > 1") || strings.Contains(js.String(), `\u0026`) {
+		t.Errorf("show --json HTML-escaped the manifest: %s", js.String())
+	}
+}
+
+func TestExecuteShowJSONPreservesManifestKeyOrder(t *testing.T) {
+	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+			ID:    "task-1",
+			State: "in_progress",
+			SubmissionManifests: []tuiclient.SubmissionManifest{
+				{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: "d"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	if err := executeShow(context.Background(), server.URL, "test-token", true, []string{"task-1"}, buf); err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+	var out struct {
+		Manifests []struct {
+			ManifestJSON json.RawMessage `json:"manifest_json"`
+		} `json:"submission_manifests"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil || len(out.Manifests) != 1 {
+		t.Fatalf("bad show --json output (%v): %s", err, buf.String())
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, out.Manifests[0].ManifestJSON); err != nil {
+		t.Fatal(err)
+	}
+	if compact.String() != string(manifestJSON) {
+		t.Errorf("manifest_json in --json output differs from stored bytes: got %s want %s", compact.String(), manifestJSON)
 	}
 }
 

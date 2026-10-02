@@ -8571,6 +8571,33 @@ func TestSubmitWithContinuationManifest(t *testing.T) {
 		}
 	})
 
+	t.Run("manifest with HTML-sensitive characters is served byte-for-byte", func(t *testing.T) {
+		id := createClaimedResearchTask(t, server, authHeader, "Verify.\n\n## Continuation manifest\n")
+		manifest := apiTestManifest(id)
+		child := manifest["children"].([]map[string]interface{})[0]
+		child["title"] = "Verify A & B <= 3 > 1"
+		child["spec"] = "Check the parent's claim about a<b && c>d"
+		code, body := apiSubmit(t, server, authHeader, id, map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": manifest,
+		})
+		if code != http.StatusOK {
+			t.Fatalf("expected 200, got %d; body: %s", code, body)
+		}
+
+		task := apiGetTask(t, server, authHeader, id)
+		if len(task.SubmissionManifests) != 1 {
+			t.Fatalf("expected 1 submission manifest, got %d", len(task.SubmissionManifests))
+		}
+		m := task.SubmissionManifests[0]
+		if !strings.Contains(string(m.ManifestJSON), "A & B <= 3 > 1") {
+			t.Errorf("manifest bytes were HTML-escaped: %s", m.ManifestJSON)
+		}
+		sum := sha256.Sum256(m.ManifestJSON)
+		if m.ManifestDigest != hex.EncodeToString(sum[:]) {
+			t.Errorf("served manifest bytes hash to %x, want digest %s", sum, m.ManifestDigest)
+		}
+	})
+
 	t.Run("rejections return 400 and leave the task unchanged", func(t *testing.T) {
 		id := createClaimedResearchTask(t, server, authHeader, "Verify the claims.")
 		code, body := apiSubmit(t, server, authHeader, id, map[string]interface{}{
