@@ -2332,6 +2332,7 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 	manifestAbsent := manifestInput == nil || string(manifestInput) == "null"
 	var manifestToStore json.RawMessage
 	var manifestDigest string
+	var manifestParentTaskID string
 	if !manifestAbsent {
 		// Manifests are only allowed on implement tasks
 		if taskKind != "implement" {
@@ -2348,6 +2349,27 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			return TaskWithDepsAndLinks{}, invalid("INVALID_MANIFEST_JSON", fmt.Sprintf("failed to parse manifest: %v", err))
 		}
 
+		// Verify parent_task_id matches the submitted task
+		if parsedManifest.ParentTaskID != taskID {
+			return TaskWithDepsAndLinks{}, invalid("MISMATCHED_PARENT_TASK", fmt.Sprintf("manifest parent_task_id %q does not match submitted task %q", parsedManifest.ParentTaskID, taskID))
+		}
+		manifestParentTaskID = parsedManifest.ParentTaskID
+
+		// Fetch the parent task to verify it opts in to continuations
+		var parentSpec string
+		err := tx.QueryRowContext(ctx, `SELECT spec FROM task WHERE id = ?`, manifestParentTaskID).Scan(&parentSpec)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return TaskWithDepsAndLinks{}, invalid("PARENT_TASK_NOT_FOUND", fmt.Sprintf("parent task %q not found", manifestParentTaskID))
+			}
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to fetch parent task: %w", err)
+		}
+
+		// Check if parent spec opts in (contains "continuation manifest" indicator)
+		if !strings.Contains(strings.ToLower(parentSpec), "continuation manifest") {
+			return TaskWithDepsAndLinks{}, invalid("PARENT_NOT_OPTED_IN", fmt.Sprintf("parent task %q does not opt in to continuation manifests", manifestParentTaskID))
+		}
+
 		// Validate the manifest using the manifest validator
 		// Get allowed models and tracks from the server config (for now, use reasonable defaults)
 		allowedModels := map[string]bool{"haiku": true, "sonnet": true, "opus": true, "gpt-5.5": true}
@@ -2360,12 +2382,16 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			return TaskWithDepsAndLinks{}, invalid("MANIFEST_VALIDATION_ERROR", verr.Error())
 		}
 
-		// Compute the digest of the canonical JSON
-		digest := sha256.Sum256(manifestInput)
+		// Compute the digest of the canonical JSON by re-marshaling the parsed manifest
+		canonicalJSON, err := json.Marshal(parsedManifest)
+		if err != nil {
+			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to marshal manifest for canonical JSON: %w", err)
+		}
+		digest := sha256.Sum256(canonicalJSON)
 		manifestDigest = hex.EncodeToString(digest[:])
 
-		// Store the manifest JSON
-		manifestToStore = manifestInput
+		// Store the canonical manifest JSON
+		manifestToStore = canonicalJSON
 	}
 
 	// Determine the next state based on task kind
@@ -2484,9 +2510,9 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			if manifestToStore != nil {
 				manifestID := GenerateID()
 				_, err := tx.ExecContext(ctx, `
-					INSERT INTO task_submission_manifest (id, task_id, review_round, manifest_json, manifest_digest, created_at)
-					VALUES (?, ?, ?, ?, ?, ?)
-				`, manifestID, taskID, newReviewRound, string(manifestToStore), manifestDigest, now)
+					INSERT INTO task_submission_manifest (id, task_id, review_round, manifest_json, manifest_digest, parent_task_id, created_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)
+				`, manifestID, taskID, newReviewRound, string(manifestToStore), manifestDigest, manifestParentTaskID, now)
 				if err != nil {
 					return TaskWithDepsAndLinks{}, fmt.Errorf("failed to store manifest: %w", err)
 				}
