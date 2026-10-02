@@ -705,6 +705,45 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 				}
 			}
 		}
+		if task.Continuation != nil {
+			fmt.Fprintf(out, "Continuation:\n")
+			if len(task.Continuation.ProposedChildren) > 0 {
+				fmt.Fprintf(out, "  Planned Continuations (proposed, before merge):\n")
+				for _, child := range task.Continuation.ProposedChildren {
+					fmt.Fprintf(out, "    - %s (%s)\n", child.Key, child.Title)
+					fmt.Fprintf(out, "      Track: %s, Model: %s, Initial State: %s\n", child.Track, child.Model, child.InitialState)
+				}
+			}
+			if len(task.Continuation.CreatedChildren) > 0 {
+				fmt.Fprintf(out, "  Created Children (after merge):\n")
+				for _, child := range task.Continuation.CreatedChildren {
+					fmt.Fprintf(out, "    - ID: %s\n", child.ID)
+					fmt.Fprintf(out, "      Parent: %s\n", child.ParentTaskID)
+					fmt.Fprintf(out, "      Manifest Digest: %s\n", child.ManifestDigest)
+					if len(child.ClaimIDs) > 0 {
+						fmt.Fprintf(out, "      Claim IDs: %v\n", child.ClaimIDs)
+					}
+					if len(child.SourceStartPoints) > 0 {
+						fmt.Fprintf(out, "      Source Start Points: %v\n", child.SourceStartPoints)
+					}
+					if len(child.FileScope) > 0 {
+						fmt.Fprintf(out, "      File Scope: %v\n", child.FileScope)
+					}
+					if len(child.AcceptanceCriteria) > 0 {
+						fmt.Fprintf(out, "      Acceptance Criteria: %v\n", child.AcceptanceCriteria)
+					}
+				}
+			}
+			if len(task.Continuation.ActionItems) > 0 {
+				fmt.Fprintf(out, "  Action Items:\n")
+				for _, item := range task.Continuation.ActionItems {
+					fmt.Fprintf(out, "    - [%s] %s\n", item.Type, item.Description)
+					if item.TaskID != "" {
+						fmt.Fprintf(out, "      Task: %s\n", item.TaskID)
+					}
+				}
+			}
+		}
 		if len(reviewFindings) > 0 {
 			fmt.Fprintf(out, "Review Findings:\n")
 			for _, finding := range reviewFindings {

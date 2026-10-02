@@ -673,6 +673,40 @@ type LinkInput struct {
 	Value string `json:"value"`
 }
 
+// ProposedChild represents a child proposed in a continuation manifest.
+type ProposedChild struct {
+	Key          string `json:"key"`
+	Title        string `json:"title"`
+	Track        string `json:"track"`
+	Model        string `json:"model"`
+	InitialState string `json:"initial_state"` // "ready" for research, "backlog" for build/design
+}
+
+// CreatedChild represents a child created from a continuation manifest.
+type CreatedChild struct {
+	ID                 string   `json:"id"`
+	ParentTaskID       string   `json:"parent_task_id"`
+	ManifestDigest     string   `json:"manifest_digest"`
+	ClaimIDs           []string `json:"claim_ids,omitempty"`
+	SourceStartPoints  []string `json:"source_start_points,omitempty"`
+	FileScope          []string `json:"file_scope,omitempty"`
+	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+}
+
+// ActionItem represents an action item for a task (e.g., held dependencies).
+type ActionItem struct {
+	Type        string `json:"type"` // "held_dependency", "held_dependent", etc.
+	Description string `json:"description"`
+	TaskID      string `json:"task_id,omitempty"`
+}
+
+// ContinuationInfo groups proposed and created children.
+type ContinuationInfo struct {
+	ProposedChildren []ProposedChild `json:"proposed_children,omitempty"`
+	CreatedChildren  []CreatedChild  `json:"created_children,omitempty"`
+	ActionItems      []ActionItem    `json:"action_items,omitempty"`
+}
+
 // TaskWithDepsAndLinks combines a Task with its dependencies and links.
 type TaskWithDepsAndLinks struct {
 	ID             string   `json:"id"`
@@ -711,6 +745,8 @@ type TaskWithDepsAndLinks struct {
 	// SubmissionManifests lists the continuation manifest of each review round that carried one,
 	// oldest round first; empty for tasks that never submitted a manifest.
 	SubmissionManifests []SubmissionManifest `json:"submission_manifests"`
+	// Continuation information: proposed children, created children, and action items.
+	Continuation *ContinuationInfo `json:"continuation,omitempty"`
 }
 
 // TaskListFilter contains filters for listing tasks.
@@ -1667,6 +1703,8 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 		return TaskWithDepsAndLinks{}, err
 	}
 
+	continuation := extractContinuationInfo(manifests, links)
+
 	return TaskWithDepsAndLinks{
 		ID:                  t.ID,
 		ProjectID:           t.ProjectID,
@@ -1699,6 +1737,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 		DependsOn:           dependsOn,
 		Links:               links,
 		SubmissionManifests: manifests,
+		Continuation:        continuation,
 	}, nil
 }
 
@@ -5986,6 +6025,121 @@ func listSubmissionManifests(ctx context.Context, q eventQuerier, taskID string)
 		return nil, fmt.Errorf("error iterating submission manifests: %w", err)
 	}
 	return manifests, nil
+}
+
+// extractContinuationInfo extracts continuation information (proposed and created children) from manifests and links.
+func extractContinuationInfo(manifests []SubmissionManifest, links []TaskLink) *ContinuationInfo {
+	if len(manifests) == 0 && len(links) == 0 {
+		return nil
+	}
+
+	info := &ContinuationInfo{
+		ProposedChildren: []ProposedChild{},
+		CreatedChildren:  []CreatedChild{},
+		ActionItems:      []ActionItem{},
+	}
+
+	// Extract proposed children from the latest manifest (if any)
+	if len(manifests) > 0 {
+		latestManifest := manifests[len(manifests)-1]
+		var m map[string]interface{}
+		if err := json.Unmarshal(latestManifest.ManifestJSON, &m); err == nil {
+			if children, ok := m["children"].([]interface{}); ok {
+				for _, child := range children {
+					if childMap, ok := child.(map[string]interface{}); ok {
+						key, _ := childMap["key"].(string)
+						title, _ := childMap["title"].(string)
+						track, _ := childMap["track"].(string)
+						model, _ := childMap["model"].(string)
+						initialState := "backlog"
+						if track == "research" {
+							initialState = "ready"
+						}
+						info.ProposedChildren = append(info.ProposedChildren, ProposedChild{
+							Key:          key,
+							Title:        title,
+							Track:        track,
+							Model:        model,
+							InitialState: initialState,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	// Extract created children from continuation_parent links
+	createdChildrenMap := make(map[string]*CreatedChild)
+	createdChildrenOrder := []string{}
+	for _, link := range links {
+		if link.TombstonedAt != nil {
+			continue
+		}
+		switch link.Kind {
+		case "continuation_parent":
+			childID := link.TaskID
+			if _, ok := createdChildrenMap[childID]; !ok {
+				createdChildrenMap[childID] = &CreatedChild{
+					ID:           childID,
+					ParentTaskID: link.Value,
+				}
+				createdChildrenOrder = append(createdChildrenOrder, childID)
+			}
+		case "continuation_child_claim_ids":
+			childID := link.TaskID
+			if _, ok := createdChildrenMap[childID]; !ok {
+				createdChildrenMap[childID] = &CreatedChild{ID: childID}
+			}
+			var claimIDs []string
+			if err := json.Unmarshal([]byte(link.Value), &claimIDs); err == nil {
+				createdChildrenMap[childID].ClaimIDs = claimIDs
+			}
+		case "continuation_child_source_start_points":
+			childID := link.TaskID
+			if _, ok := createdChildrenMap[childID]; !ok {
+				createdChildrenMap[childID] = &CreatedChild{ID: childID}
+			}
+			var sources []string
+			if err := json.Unmarshal([]byte(link.Value), &sources); err == nil {
+				createdChildrenMap[childID].SourceStartPoints = sources
+			}
+		case "continuation_child_file_scope":
+			childID := link.TaskID
+			if _, ok := createdChildrenMap[childID]; !ok {
+				createdChildrenMap[childID] = &CreatedChild{ID: childID}
+			}
+			var fileScope []string
+			if err := json.Unmarshal([]byte(link.Value), &fileScope); err == nil {
+				createdChildrenMap[childID].FileScope = fileScope
+			}
+		case "continuation_child_acceptance_criteria":
+			childID := link.TaskID
+			if _, ok := createdChildrenMap[childID]; !ok {
+				createdChildrenMap[childID] = &CreatedChild{ID: childID}
+			}
+			var criteria []string
+			if err := json.Unmarshal([]byte(link.Value), &criteria); err == nil {
+				createdChildrenMap[childID].AcceptanceCriteria = criteria
+			}
+		}
+	}
+
+	// Add created children in the order they were discovered
+	for _, childID := range createdChildrenOrder {
+		if child, ok := createdChildrenMap[childID]; ok {
+			// Extract manifest digest from the latest manifest that created this child
+			if len(manifests) > 0 {
+				child.ManifestDigest = manifests[len(manifests)-1].ManifestDigest
+			}
+			info.CreatedChildren = append(info.CreatedChildren, *child)
+		}
+	}
+
+	if len(info.ProposedChildren) == 0 && len(info.CreatedChildren) == 0 {
+		return nil
+	}
+
+	return info
 }
 
 // continuationOptInHeading is the exact line a research task's spec must contain, on a line of

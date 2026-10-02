@@ -94,6 +94,7 @@ type TaskDetail struct {
 	DependsOn           []string             `json:"depends_on"`
 	Links               []TaskLink           `json:"links"`
 	SubmissionManifests []SubmissionManifest `json:"submission_manifests"`
+	Continuation        *ContinuationInfo    `json:"continuation,omitempty"`
 }
 
 type SubmissionManifest struct {
@@ -102,6 +103,36 @@ type SubmissionManifest struct {
 	ManifestJSON   json.RawMessage `json:"manifest_json"`
 	ManifestDigest string          `json:"manifest_digest"`
 	SubmittedAt    string          `json:"submitted_at"`
+}
+
+type ProposedChild struct {
+	Key          string `json:"key"`
+	Title        string `json:"title"`
+	Track        string `json:"track"`
+	Model        string `json:"model"`
+	InitialState string `json:"initial_state"`
+}
+
+type CreatedChild struct {
+	ID                 string   `json:"id"`
+	ParentTaskID       string   `json:"parent_task_id"`
+	ManifestDigest     string   `json:"manifest_digest"`
+	ClaimIDs           []string `json:"claim_ids,omitempty"`
+	SourceStartPoints  []string `json:"source_start_points,omitempty"`
+	FileScope          []string `json:"file_scope,omitempty"`
+	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+}
+
+type ActionItem struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
+	TaskID      string `json:"task_id,omitempty"`
+}
+
+type ContinuationInfo struct {
+	ProposedChildren []ProposedChild `json:"proposed_children,omitempty"`
+	CreatedChildren  []CreatedChild  `json:"created_children,omitempty"`
+	ActionItems      []ActionItem    `json:"action_items,omitempty"`
 }
 
 type TaskLink struct {
