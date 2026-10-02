@@ -44,7 +44,9 @@ func testPendingCandidates(claimIDs ...string) []manifest.PendingCandidate {
 }
 
 func TestInsertManifestChildrenBasic(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -104,7 +106,9 @@ func TestInsertManifestChildrenBasic(t *testing.T) {
 		t.Errorf("expected 1 created child, got %d", len(createdIDs))
 	}
 
-	// Verify the child was created
+	tx.Commit()
+
+	// Verify the child was created (after commit to avoid deadlock)
 	child, err := store.GetTask(ctx, createdIDs[0])
 	if err != nil {
 		t.Fatalf("failed to get child task: %v", err)
@@ -127,12 +131,12 @@ func TestInsertManifestChildrenBasic(t *testing.T) {
 	if len(child.ReviewModels) != 2 {
 		t.Errorf("expected 2 review models, got %d", len(child.ReviewModels))
 	}
-
-	tx.Commit()
 }
 
 func TestInsertManifestChildrenBuildStartsBacklog(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -192,7 +196,9 @@ func TestInsertManifestChildrenBuildStartsBacklog(t *testing.T) {
 		t.Errorf("expected 1 created child, got %d", len(createdIDs))
 	}
 
-	// Verify the build child starts in backlog state
+	tx.Commit()
+
+	// Verify the build child starts in backlog state (after commit to avoid deadlock)
 	child, err := store.GetTask(ctx, createdIDs[0])
 	if err != nil {
 		t.Fatalf("failed to get child task: %v", err)
@@ -201,12 +207,12 @@ func TestInsertManifestChildrenBuildStartsBacklog(t *testing.T) {
 	if child.State != "backlog" {
 		t.Errorf("expected build child state='backlog', got '%s'", child.State)
 	}
-
-	tx.Commit()
 }
 
 func TestInsertManifestChildrenDependencies(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -236,41 +242,25 @@ func TestInsertManifestChildrenDependencies(t *testing.T) {
 	externalTaskID := tasks[1].ID
 
 	// Create a manifest with children and dependencies
+	child1 := testChild("child1", "Child 1", "Child 1 spec", "research", "haiku", "file1.go")
+	child1.Dependencies = []manifest.Dependency{
+		{Kind: manifest.DependencyParent, Ref: parentID},
+	}
+
+	child2 := testChild("child2", "Child 2", "Child 2 spec", "research", "haiku", "file2.go")
+	child2.ClaimIDs = []string{"claim2"}
+	child2.SourceStartPoints = []string{"source2"}
+	child2.Dependencies = []manifest.Dependency{
+		{Kind: manifest.DependencyChild, Ref: "child1"},
+		{Kind: manifest.DependencyTask, Ref: externalTaskID},
+	}
+
 	m := &manifest.Manifest{
 		Version:      1,
 		ParentTaskID: parentID,
 		Children: []manifest.Child{
-			{
-				Key:                "child1",
-				Title:              "Child 1",
-				Spec:               "Child 1 spec",
-				Track:              "research",
-				Model:              "haiku",
-				ReviewModels:       []string{"opus", "sonnet"},
-				ClaimIDs:           []string{"claim1"},
-				SourceStartPoints:  []string{"source1"},
-				FileScope:          []string{"file1.go"},
-				AcceptanceCriteria: []string{"criterion1"},
-				Dependencies: []manifest.Dependency{
-					{Kind: manifest.DependencyParent, Ref: parentID},
-				},
-			},
-			{
-				Key:                "child2",
-				Title:              "Child 2",
-				Spec:               "Child 2 spec",
-				Track:              "research",
-				Model:              "haiku",
-				ReviewModels:       []string{"opus", "sonnet"},
-				ClaimIDs:           []string{"claim2"},
-				SourceStartPoints:  []string{"source2"},
-				FileScope:          []string{"file2.go"},
-				AcceptanceCriteria: []string{"criterion2"},
-				Dependencies: []manifest.Dependency{
-					{Kind: manifest.DependencyChild, Ref: "child1"},
-					{Kind: manifest.DependencyTask, Ref: externalTaskID},
-				},
-			},
+			child1,
+			child2,
 		},
 		PendingCandidates: testPendingCandidates("claim1", "claim2"),
 	}
@@ -298,37 +288,39 @@ func TestInsertManifestChildrenDependencies(t *testing.T) {
 		t.Errorf("expected 2 created children, got %d", len(createdIDs))
 	}
 
-	// Verify dependencies were created
+	tx.Commit()
+
+	// Verify dependencies were created (after commit to avoid deadlock)
 	child1ID := createdIDs[0]
 	child2ID := createdIDs[1]
 
-	child1, err := store.GetTask(ctx, child1ID)
+	task1, err := store.GetTask(ctx, child1ID)
 	if err != nil {
 		t.Fatalf("failed to get child1: %v", err)
 	}
 
 	// Child1 depends on parent
-	if len(child1.DependsOn) != 1 {
-		t.Errorf("expected child1 to depend on 1 task, got %d", len(child1.DependsOn))
-	} else if child1.DependsOn[0] != parentID {
-		t.Errorf("expected child1 to depend on parent %s, got %s", parentID, child1.DependsOn[0])
+	if len(task1.DependsOn) != 1 {
+		t.Errorf("expected child1 to depend on 1 task, got %d", len(task1.DependsOn))
+	} else if task1.DependsOn[0] != parentID {
+		t.Errorf("expected child1 to depend on parent %s, got %s", parentID, task1.DependsOn[0])
 	}
 
-	child2, err := store.GetTask(ctx, child2ID)
+	task2, err := store.GetTask(ctx, child2ID)
 	if err != nil {
 		t.Fatalf("failed to get child2: %v", err)
 	}
 
 	// Child2 depends on child1 and external task (in creation order: child1, then external)
-	if len(child2.DependsOn) != 2 {
-		t.Errorf("expected child2 to depend on 2 tasks, got %d", len(child2.DependsOn))
+	if len(task2.DependsOn) != 2 {
+		t.Errorf("expected child2 to depend on 2 tasks, got %d", len(task2.DependsOn))
 	}
-
-	tx.Commit()
 }
 
 func TestInsertManifestChildrenIdempotency(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -421,8 +413,11 @@ func TestInsertManifestChildrenIdempotency(t *testing.T) {
 	}
 }
 
-func TestInsertManifestChildrenAllOrNothing(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+// TestInsertManifestChildrenIdempotencyWithDependencies tests idempotency when children have dependencies
+func TestInsertManifestChildrenIdempotencyWithDependencies(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -449,26 +444,120 @@ func TestInsertManifestChildrenAllOrNothing(t *testing.T) {
 	}
 	parentID := tasks[0].ID
 
-	// Create a manifest with an invalid external task dependency
+	// Create a manifest with a child that has dependencies
+	child := testChild("child1", "Child with dependencies", "Child spec", "research", "haiku", "file1.go")
+	child.Dependencies = []manifest.Dependency{
+		{Kind: manifest.DependencyParent, Ref: parentID},
+	}
+
 	m := &manifest.Manifest{
 		Version:      1,
 		ParentTaskID: parentID,
 		Children: []manifest.Child{
-			{
-				Key:                "child1",
-				Title:              "Research Child",
-				Spec:               "Child spec",
-				Track:              "research",
-				Model:              "haiku",
-				ReviewModels:       []string{"opus", "sonnet"},
-				ClaimIDs:           []string{"claim1"},
-				SourceStartPoints:  []string{"source1"},
-				FileScope:          []string{"file1.go"},
-				AcceptanceCriteria: []string{"criterion1"},
-				Dependencies: []manifest.Dependency{
-					{Kind: manifest.DependencyTask, Ref: "invalid-task-id"},
-				},
-			},
+			child,
+		},
+		PendingCandidates: testPendingCandidates("claim1"),
+	}
+
+	if err := m.Validate(testManifestValidation, validTracks); err != nil {
+		t.Fatalf("manifest validation failed: %v", err)
+	}
+
+	// Insert children first time
+	conn := store.Conn()
+	tx1, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+
+	sqlStore := store.(*sqliteStore)
+	createdIDs1, err := sqlStore.InsertManifestChildren(ctx, tx1, m, "digest_dep", parentID, proj.ID, doc.ID, nowTimestamp())
+	if err != nil {
+		tx1.Rollback()
+		t.Fatalf("failed to insert children first time: %v", err)
+	}
+	tx1.Commit()
+
+	if len(createdIDs1) != 1 {
+		t.Errorf("expected 1 created child on first call, got %d", len(createdIDs1))
+	}
+
+	// Insert children again with same manifest and dependencies (should be idempotent)
+	tx2, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+
+	createdIDs2, err := sqlStore.InsertManifestChildren(ctx, tx2, m, "digest_dep", parentID, proj.ID, doc.ID, nowTimestamp())
+	if err != nil {
+		tx2.Rollback()
+		t.Fatalf("failed to insert children second time: %v", err)
+	}
+	tx2.Commit()
+
+	if len(createdIDs2) != 1 {
+		t.Errorf("expected 1 created child on second call, got %d", len(createdIDs2))
+	}
+
+	if createdIDs1[0] != createdIDs2[0] {
+		t.Errorf("expected idempotent call to return same ID: first=%s, second=%s", createdIDs1[0], createdIDs2[0])
+	}
+
+	// Verify only one child was created and it has exactly one dependency
+	childTask, err := store.GetTask(ctx, createdIDs1[0])
+	if err != nil {
+		t.Fatalf("failed to get child: %v", err)
+	}
+
+	if len(childTask.DependsOn) != 1 {
+		t.Errorf("expected child to have 1 dependency, got %d", len(childTask.DependsOn))
+	}
+}
+
+func TestInsertManifestChildrenAllOrNothing(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project, document, and parent task
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Parent Task", Spec: "Parent spec", DocumentID: doc.ID, Track: "research"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create parent task: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	// Create a manifest with a non-existent external task dependency
+	// Use a valid-format but non-existent task ID
+	nonExistentTaskID := "00000000-0000-0000-0000-000000000000"
+
+	child := testChild("child1", "Research Child", "Child spec", "research", "haiku", "file1.go")
+	child.Dependencies = []manifest.Dependency{
+		{Kind: manifest.DependencyTask, Ref: nonExistentTaskID},
+	}
+
+	m := &manifest.Manifest{
+		Version:      1,
+		ParentTaskID: parentID,
+		Children: []manifest.Child{
+			child,
 		},
 		PendingCandidates: testPendingCandidates("claim1"),
 	}
@@ -506,7 +595,9 @@ func TestInsertManifestChildrenAllOrNothing(t *testing.T) {
 }
 
 func TestInsertManifestChildrenEmptyManifest(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -563,7 +654,9 @@ func TestInsertManifestChildrenEmptyManifest(t *testing.T) {
 }
 
 func TestInsertManifestChildrenParentLink(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -623,7 +716,7 @@ func TestInsertManifestChildrenParentLink(t *testing.T) {
 		t.Errorf("expected 1 created child, got %d", len(createdIDs))
 	}
 
-	// Get the child and verify it has a continuation_parent link
+	// Get the child and verify it has a continuation_parent link (after commit to avoid deadlock)
 	child, err := store.GetTask(ctx, createdIDs[0])
 	if err != nil {
 		t.Fatalf("failed to get child task: %v", err)
@@ -644,7 +737,9 @@ func TestInsertManifestChildrenParentLink(t *testing.T) {
 }
 
 func TestInsertManifestChildrenAgentMergeEscalate(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -675,36 +770,20 @@ func TestInsertManifestChildrenAgentMergeEscalate(t *testing.T) {
 	trueBool := true
 	falseBool := false
 
+	child1 := testChild("child_agent_merge_true", "Child 1", "Child spec", "research", "haiku", "file1.go")
+	child1.AgentMerge = &trueBool
+	child1.Escalate = &falseBool
+	child1.ClaimIDs = []string{"claim1"}
+
+	child2 := testChild("child_defaults", "Child 2", "Child spec", "research", "haiku", "file2.go")
+	child2.ClaimIDs = []string{"claim2"}
+
 	m := &manifest.Manifest{
 		Version:      1,
 		ParentTaskID: parentID,
 		Children: []manifest.Child{
-			{
-				Key:                "child_agent_merge_true",
-				Title:              "Child 1",
-				Spec:               "Child spec",
-				Track:              "research",
-				Model:              "haiku",
-				ReviewModels:       []string{"opus", "sonnet"},
-				AgentMerge:         &trueBool,
-				Escalate:           &falseBool,
-				ClaimIDs:           []string{"claim1"},
-				SourceStartPoints:  []string{"source1"},
-				FileScope:          []string{"file1.go"},
-				AcceptanceCriteria: []string{"criterion1"},
-			},
-			{
-				Key:                "child_defaults",
-				Title:              "Child 2",
-				Spec:               "Child spec",
-				Track:              "research",
-				Model:              "haiku",
-				ReviewModels:       []string{"opus", "sonnet"},
-				ClaimIDs:           []string{"claim2"},
-				SourceStartPoints:  []string{"source2"},
-				FileScope:          []string{"file2.go"},
-				AcceptanceCriteria: []string{"criterion2"},
-			},
+			child1,
+			child2,
 		},
 		PendingCandidates: testPendingCandidates("claim1", "claim2"),
 	}
@@ -732,36 +811,38 @@ func TestInsertManifestChildrenAgentMergeEscalate(t *testing.T) {
 		t.Errorf("expected 2 created children, got %d", len(createdIDs))
 	}
 
-	// Verify agent_merge and escalate flags
-	child1, err := store.GetTask(ctx, createdIDs[0])
+	// Verify agent_merge and escalate flags (after commit to avoid deadlock)
+	task1, err := store.GetTask(ctx, createdIDs[0])
 	if err != nil {
 		t.Fatalf("failed to get child1: %v", err)
 	}
 
-	if !child1.AgentMerge {
-		t.Errorf("expected child1 agent_merge=true, got %v", child1.AgentMerge)
+	if !task1.AgentMerge {
+		t.Errorf("expected child1 agent_merge=true, got %v", task1.AgentMerge)
 	}
-	if child1.Escalate {
-		t.Errorf("expected child1 escalate=false, got %v", child1.Escalate)
+	if task1.Escalate {
+		t.Errorf("expected child1 escalate=false, got %v", task1.Escalate)
 	}
 
-	child2, err := store.GetTask(ctx, createdIDs[1])
+	task2, err := store.GetTask(ctx, createdIDs[1])
 	if err != nil {
 		t.Fatalf("failed to get child2: %v", err)
 	}
 
 	// Default escalate should be true, agent_merge should be false
-	if child2.AgentMerge {
-		t.Errorf("expected child2 agent_merge=false, got %v", child2.AgentMerge)
+	if task2.AgentMerge {
+		t.Errorf("expected child2 agent_merge=false, got %v", task2.AgentMerge)
 	}
-	if !child2.Escalate {
-		t.Errorf("expected child2 escalate=true (default), got %v", child2.Escalate)
+	if !task2.Escalate {
+		t.Errorf("expected child2 escalate=true (default), got %v", task2.Escalate)
 	}
 }
 
 // TestInsertManifestChildrenNilManifest tests that a nil manifest returns empty result.
 func TestInsertManifestChildrenNilManifest(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -811,7 +892,9 @@ func TestInsertManifestChildrenNilManifest(t *testing.T) {
 
 // TestInsertManifestChildrenMultipleChildren tests manifest with multiple children.
 func TestInsertManifestChildrenMultipleChildren(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -839,15 +922,23 @@ func TestInsertManifestChildrenMultipleChildren(t *testing.T) {
 	parentID := tasks[0].ID
 
 	// Create manifest with 3 children
+	child1 := testChild("research_child", "Research Child", "Spec 1", "research", "haiku", "file1.go")
+	child2 := testChild("build_child", "Build Child", "Spec 2", "build", "haiku", "file2.go")
+	child3 := testChild("design_child", "Design Child", "Spec 3", "design", "haiku", "file3.go")
+	// Update claim IDs to be unique
+	child1.ClaimIDs = []string{"claim1"}
+	child2.ClaimIDs = []string{"claim2"}
+	child3.ClaimIDs = []string{"claim3"}
+
 	m := &manifest.Manifest{
 		Version:      1,
 		ParentTaskID: parentID,
 		Children: []manifest.Child{
-			testChild("research_child", "Research Child", "Spec 1", "research", "haiku", "file1.go"),
-			testChild("build_child", "Build Child", "Spec 2", "build", "haiku", "file2.go"),
-			testChild("design_child", "Design Child", "Spec 3", "design", "haiku", "file3.go"),
+			child1,
+			child2,
+			child3,
 		},
-		PendingCandidates: testPendingCandidates("claim1"),
+		PendingCandidates: testPendingCandidates("claim1", "claim2", "claim3"),
 	}
 
 	if err := m.Validate(testManifestValidation, validTracks); err != nil {
@@ -873,7 +964,7 @@ func TestInsertManifestChildrenMultipleChildren(t *testing.T) {
 		t.Errorf("expected 3 created children, got %d", len(createdIDs))
 	}
 
-	// Verify each child has correct state
+	// Verify each child has correct state (after commit to avoid deadlock)
 	expectedStates := map[int]string{
 		0: "ready",   // research
 		1: "backlog", // build
@@ -896,7 +987,9 @@ func TestInsertManifestChildrenMultipleChildren(t *testing.T) {
 // TestInsertManifestChildrenSelfDependencyError tests that dependencies don't cause issues.
 // (Self-dependencies are validated by the manifest validator, not the store helper)
 func TestInsertManifestChildrenExternalTaskNotInProject(t *testing.T) {
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	store, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -944,25 +1037,16 @@ func TestInsertManifestChildrenExternalTaskNotInProject(t *testing.T) {
 	externalTaskID := tasks2[0].ID
 
 	// Create manifest with dependency on external project's task
+	child := testChild("child1", "Child", "Child spec", "research", "haiku", "file1.go")
+	child.Dependencies = []manifest.Dependency{
+		{Kind: manifest.DependencyTask, Ref: externalTaskID},
+	}
+
 	m := &manifest.Manifest{
 		Version:      1,
 		ParentTaskID: parentID,
 		Children: []manifest.Child{
-			{
-				Key:                "child1",
-				Title:              "Child",
-				Spec:               "Child spec",
-				Track:              "research",
-				Model:              "haiku",
-				ReviewModels:       []string{"opus", "sonnet"},
-				ClaimIDs:           []string{"claim1"},
-				SourceStartPoints:  []string{"source1"},
-				FileScope:          []string{"file1.go"},
-				AcceptanceCriteria: []string{"criterion1"},
-				Dependencies: []manifest.Dependency{
-					{Kind: manifest.DependencyTask, Ref: externalTaskID},
-				},
-			},
+			child,
 		},
 		PendingCandidates: testPendingCandidates("claim1"),
 	}

@@ -3907,6 +3907,7 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 
 	keyToID := make(map[string]string)
 	createdTasks := make([]string, 0, len(m.Children))
+	newChildKeys := make(map[string]bool)
 
 	// First pass: check for already-created children and generate IDs for new ones
 	for _, child := range m.Children {
@@ -3935,6 +3936,7 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 		taskID := GenerateID()
 		keyToID[child.Key] = taskID
 		createdTasks = append(createdTasks, taskID)
+		newChildKeys[child.Key] = true
 	}
 
 	// Second pass: insert new children (those not already present from this manifest)
@@ -4050,8 +4052,14 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 	}
 
 	// Third pass: insert task dependencies (after all child IDs are known)
+	// Only insert dependencies for newly created children to maintain idempotency
 	for _, child := range m.Children {
 		if len(child.Dependencies) == 0 {
+			continue
+		}
+
+		// Skip dependencies for already-existing children (idempotency)
+		if !newChildKeys[child.Key] {
 			continue
 		}
 
