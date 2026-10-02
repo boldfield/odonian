@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -1279,6 +1280,176 @@ func TestBlankAcceptanceCriteria(t *testing.T) {
 
 	err := manifest.Validate(validModels, validTracks)
 	assertErrorCode(t, err, "BLANK_CRITERION")
+}
+
+// Regression test for multiple parent dependencies in a manifest
+func TestMultipleParentDependencies(t *testing.T) {
+	manifest := &Manifest{
+		Version:      1,
+		ParentTaskID: "parent-123",
+		Children: []Child{
+			{
+				Key:                "child-1",
+				Title:              "Test 1",
+				Spec:               "Test spec 1",
+				Track:              "research",
+				Model:              "claude-opus-5-5",
+				ReviewModels:       []string{"claude-sonnet-5", "gpt-5-5"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"claim-1"},
+				SourceStartPoints:  []string{"source-1"},
+				FileScope:          []string{"file-1.md"},
+				AcceptanceCriteria: []string{"criterion-1"},
+				Dependencies: []Dependency{
+					{Kind: DependencyParent, Ref: "parent-123"},
+				},
+			},
+			{
+				Key:                "child-2",
+				Title:              "Test 2",
+				Spec:               "Test spec 2",
+				Track:              "research",
+				Model:              "claude-opus-5-5",
+				ReviewModels:       []string{"claude-sonnet-5", "gpt-5-5"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"claim-2"},
+				SourceStartPoints:  []string{"source-2"},
+				FileScope:          []string{"file-2.md"},
+				AcceptanceCriteria: []string{"criterion-2"},
+				Dependencies: []Dependency{
+					{Kind: DependencyParent, Ref: "parent-123"}, // Second parent dependency
+				},
+			},
+		},
+		PendingCandidates: []PendingCandidate{
+			{ClaimID: "claim-1", Disposition: Assigned},
+			{ClaimID: "claim-2", Disposition: Assigned},
+		},
+	}
+
+	err := manifest.Validate(validModels, validTracks)
+	assertErrorCode(t, err, "MULTIPLE_PARENT_DEPENDENCIES")
+}
+
+// Regression test for unmatched child claim (no assigned candidate entry)
+func TestUnmatchedChildClaim(t *testing.T) {
+	manifest := &Manifest{
+		Version:      1,
+		ParentTaskID: "parent-123",
+		Children: []Child{
+			createValidChild("child-1", []string{"file.md"}),
+		},
+		PendingCandidates: []PendingCandidate{
+			// claim-child-1 is in the child's claim_ids but has no candidate entry
+		},
+	}
+
+	err := manifest.Validate(validModels, validTracks)
+	assertErrorCode(t, err, "UNMATCHED_CHILD_CLAIM")
+}
+
+// Regression test for unknown dependency kind
+func TestUnknownDependencyKind(t *testing.T) {
+	manifest := &Manifest{
+		Version:      1,
+		ParentTaskID: "parent-123",
+		Children: []Child{
+			{
+				Key:                "child-1",
+				Title:              "Test",
+				Spec:               "Test spec",
+				Track:              "research",
+				Model:              "claude-opus-5-5",
+				ReviewModels:       []string{"claude-sonnet-5", "gpt-5-5"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"claim-1"},
+				SourceStartPoints:  []string{"source-1"},
+				FileScope:          []string{"file.md"},
+				AcceptanceCriteria: []string{"criterion"},
+				Dependencies: []Dependency{
+					{Kind: DependencyKind("invalid-kind"), Ref: "some-ref"},
+				},
+			},
+		},
+		PendingCandidates: []PendingCandidate{
+			{ClaimID: "claim-1", Disposition: Assigned},
+		},
+	}
+
+	err := manifest.Validate(validModels, validTracks)
+	assertErrorCode(t, err, "UNKNOWN_DEPENDENCY_KIND")
+}
+
+// Regression test for file overlap with correct child attribution
+func TestFileOverlapAttributionDeterministic(t *testing.T) {
+	manifest := &Manifest{
+		Version:      1,
+		ParentTaskID: "parent-123",
+		Children: []Child{
+			{
+				Key:                "child-a",
+				Title:              "Test A",
+				Spec:               "Test spec A",
+				Track:              "research",
+				Model:              "claude-opus-5-5",
+				ReviewModels:       []string{"claude-sonnet-5", "gpt-5-5"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"claim-a"},
+				SourceStartPoints:  []string{"source-a"},
+				FileScope:          []string{"x/a.md"},
+				AcceptanceCriteria: []string{"criterion-a"},
+				Dependencies:       []Dependency{},
+			},
+			{
+				Key:                "child-b",
+				Title:              "Test B",
+				Spec:               "Test spec B",
+				Track:              "research",
+				Model:              "claude-opus-5-5",
+				ReviewModels:       []string{"claude-sonnet-5", "gpt-5-5"},
+				AgentMerge:         ptrBool(false),
+				Escalate:           ptrBool(true),
+				ClaimIDs:           []string{"claim-b"},
+				SourceStartPoints:  []string{"source-b"},
+				FileScope:          []string{"x"},
+				AcceptanceCriteria: []string{"criterion-b"},
+				Dependencies:       []Dependency{},
+			},
+		},
+		PendingCandidates: []PendingCandidate{
+			{ClaimID: "claim-a", Disposition: Assigned},
+			{ClaimID: "claim-b", Disposition: Assigned},
+		},
+	}
+
+	// Run multiple times to check for nondeterminism
+	for i := 0; i < 10; i++ {
+		err := manifest.Validate(validModels, validTracks)
+		if err == nil {
+			t.Errorf("iteration %d: expected overlap error, got nil", i)
+			continue
+		}
+
+		var valErr ValidationError
+		if !errors.As(err, &valErr) {
+			t.Errorf("iteration %d: expected ValidationError, got %T", i, err)
+			continue
+		}
+
+		if valErr.Code != "OVERLAPPING_FILES" {
+			t.Errorf("iteration %d: expected OVERLAPPING_FILES, got %s", i, valErr.Code)
+			continue
+		}
+
+		// Check that the error message correctly attributes x/a.md to child-a and x to child-b
+		if !strings.Contains(valErr.Message, "(child \"child-a\")") || !strings.Contains(valErr.Message, "(child \"child-b\")") {
+			t.Errorf("iteration %d: error message missing expected child attributions: %s", i, valErr.Message)
+		}
+	}
 }
 
 // Regression test for file overlap with prefix

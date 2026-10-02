@@ -10,7 +10,7 @@ Research continuation manifests enable controlled creation of child tasks from a
 
 A parent research task may carry a continuation manifest in its PR. The manifest is:
 
-- **Versioned**: Each manifest has an integer version, starting at 1. When a parent task is reworked, the manifest version increments if it changes.
+- **Versioned**: Each manifest has an integer version, equal to the schema version (currently 1). The version enables future schema changes.
 - **Fully specified**: Every proposed child has a complete specification. No implicit defaults or inheriting field values from the parent.
 - **Scoped to the parent**: Keys are stable within the parent task, not globally unique.
 - **Proposed by the worker**: The worker proposes children alongside their implementation of the parent task.
@@ -136,7 +136,7 @@ The validator in `internal/manifest/manifest.go` is used by later store and API 
 
 Dependencies are typed with one of three kinds:
 
-- **parent**: A reference to the parent task. Exactly one per manifest if used. The `ref` field must match the manifest's `parent_task_id`.
+- **parent**: A reference to the parent task. At most one per manifest. The `ref` field must match the manifest's `parent_task_id`.
 - **child**: A reference to another child in the same manifest, by key. Used for intra-manifest dependencies. The `ref` field must be an existing child key.
 - **task**: A reference to an external task by ID. The `ref` field must be a valid UUID-format task ID.
 
@@ -158,6 +158,9 @@ The validator returns specific error codes for different validation failures. Co
 - **MISSING_OWNER**: a carried_forward candidate lacks an owner
 - **MISSING_REASON**: an excluded candidate lacks a reason
 - **BLANK_CRITERION**: an acceptance criterion is blank or whitespace-only
+- **MULTIPLE_PARENT_DEPENDENCIES**: more than one parent dependency in the manifest
+- **UNMATCHED_CHILD_CLAIM**: a child's claim has no assigned candidate entry
+- **UNKNOWN_DEPENDENCY_KIND**: a dependency has an unknown or invalid kind
 
 ## Constraints
 

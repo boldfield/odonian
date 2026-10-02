@@ -140,7 +140,7 @@ func (m *Manifest) Validate(allowedModels, allowedTracks map[string]bool) error 
 	}
 
 	// Check for overlapping file writes (unsupported)
-	if err := checkFileOverlaps(childFileScopes); err != nil {
+	if err := checkFileOverlaps(m.Children, childFileScopes); err != nil {
 		return err
 	}
 
@@ -150,7 +150,7 @@ func (m *Manifest) Validate(allowedModels, allowedTracks map[string]bool) error 
 	}
 
 	// Validate pending candidates and cross-check with children
-	if err := validatePendingCandidates(m.PendingCandidates, allChildClaims, childClaimIDs); err != nil {
+	if err := validatePendingCandidates(m.Children, m.PendingCandidates, allChildClaims, childClaimIDs); err != nil {
 		return err
 	}
 
@@ -268,39 +268,35 @@ func validateChild(child Child, allowedModels, allowedTracks map[string]bool, in
 	return nil
 }
 
-func checkFileOverlaps(fileScopes map[string][]string) error {
-	// Normalize all paths
+func checkFileOverlaps(children []Child, fileScopes map[string][]string) error {
+	// Build normalized file list from children in order for deterministic iteration
 	type normalizedScope struct {
-		child string
-		files []string
+		childIdx int
+		childKey string
+		files    []string
 	}
 	var allNormalized []normalizedScope
 
-	for child, files := range fileScopes {
-		var normalized []string
-		for _, file := range files {
-			normalized = append(normalized, filepath.Clean(file))
+	for i, child := range children {
+		if files, exists := fileScopes[child.Key]; exists {
+			var normalized []string
+			for _, file := range files {
+				normalized = append(normalized, filepath.Clean(file))
+			}
+			allNormalized = append(allNormalized, normalizedScope{i, child.Key, normalized})
 		}
-		allNormalized = append(allNormalized, normalizedScope{child, normalized})
 	}
 
 	// Check for any overlaps (exact, prefix, or containment)
 	for i := 0; i < len(allNormalized); i++ {
 		for j := i + 1; j < len(allNormalized); j++ {
-			childI := allNormalized[i].child
-			childJ := allNormalized[j].child
+			scopeI := allNormalized[i]
+			scopeJ := allNormalized[j]
 
-			for _, fileI := range allNormalized[i].files {
-				for _, fileJ := range allNormalized[j].files {
+			for _, fileI := range scopeI.files {
+				for _, fileJ := range scopeJ.files {
 					if hasOverlap(fileI, fileJ) {
-						// Sort children for deterministic error message
-						var childA, childB string
-						if childI < childJ {
-							childA, childB = childI, childJ
-						} else {
-							childA, childB = childJ, childI
-						}
-						return ValidationError{"OVERLAPPING_FILES", fmt.Sprintf("unsupported overlapping file writes: %q (child %q) and %q (child %q)", fileI, childA, fileJ, childB)}
+						return ValidationError{"OVERLAPPING_FILES", fmt.Sprintf("unsupported overlapping file writes: %q (child %q) and %q (child %q)", fileI, scopeI.childKey, fileJ, scopeJ.childKey)}
 					}
 				}
 			}
@@ -330,6 +326,9 @@ func checkDependencies(parentTaskID string, children []Child, seenKeys map[strin
 		keyToIndex[child.Key] = i
 	}
 
+	// Track parent dependencies to ensure at most one per manifest
+	parentDepCount := 0
+
 	// Validate each dependency reference
 	for _, child := range children {
 		for _, dep := range child.Dependencies {
@@ -342,6 +341,10 @@ func checkDependencies(parentTaskID string, children []Child, seenKeys map[strin
 				// Parent dependency ref must match the manifest's parent task ID
 				if dep.Ref != parentTaskID {
 					return ValidationError{"MISMATCHED_PARENT_DEPENDENCY", fmt.Sprintf("child %q: parent dependency ref %q does not match parent task ID %q", child.Key, dep.Ref, parentTaskID)}
+				}
+				parentDepCount++
+				if parentDepCount > 1 {
+					return ValidationError{"MULTIPLE_PARENT_DEPENDENCIES", "at most one parent dependency per manifest"}
 				}
 			case DependencyChild:
 				// Child dependency must reference an existing sibling key
@@ -407,7 +410,7 @@ func isValidTaskID(taskID string) bool {
 	return err == nil
 }
 
-func validatePendingCandidates(candidates []PendingCandidate, allChildClaims map[string]string, childClaimIDs map[string][]string) error {
+func validatePendingCandidates(children []Child, candidates []PendingCandidate, allChildClaims map[string]string, childClaimIDs map[string][]string) error {
 	// Check for unique candidate IDs
 	seenCandidates := make(map[string]bool)
 	assignedCandidates := make(map[string]bool)
@@ -452,11 +455,12 @@ func validatePendingCandidates(candidates []PendingCandidate, allChildClaims map
 		}
 	}
 
-	// Ensure every child claim has an assigned candidate
-	for childKey, claimIDs := range childClaimIDs {
+	// Ensure every child claim has an assigned candidate (iterate children in order for determinism)
+	for _, child := range children {
+		claimIDs := childClaimIDs[child.Key]
 		for _, claimID := range claimIDs {
 			if !assignedCandidates[claimID] && !seenCandidates[claimID] {
-				return ValidationError{"UNMATCHED_CHILD_CLAIM", fmt.Sprintf("child %q claim %q has no assigned candidate", childKey, claimID)}
+				return ValidationError{"UNMATCHED_CHILD_CLAIM", fmt.Sprintf("child %q claim %q has no assigned candidate", child.Key, claimID)}
 			}
 		}
 	}
