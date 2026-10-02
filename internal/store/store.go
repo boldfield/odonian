@@ -4665,6 +4665,12 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 					return Task{}, fmt.Errorf("failed to parse manifest: %w", err)
 				}
 
+				// Verify the manifest digest matches the canonical digest
+				_, computedDigest := s.computeManifestCanonicalForm(m)
+				if computedDigest != manifestToUse.ManifestDigest {
+					return Task{}, fmt.Errorf("manifest digest mismatch: stored %q does not match canonical %q", manifestToUse.ManifestDigest, computedDigest)
+				}
+
 				// Insert continuation children with idempotency
 				if _, err := s.InsertManifestChildren(ctx, tx, m, manifestToUse.ManifestDigest, taskID, taskProjectID, taskDocumentID, now); err != nil {
 					return Task{}, fmt.Errorf("failed to insert continuation children: %w", err)
@@ -6062,4 +6068,47 @@ func (s *sqliteStore) canonicalizeManifest(raw json.RawMessage, taskID string) (
 	canonical := strings.TrimSuffix(buf.String(), "\n")
 	sum := sha256.Sum256([]byte(canonical))
 	return &canonicalManifest{parentTaskID: m.ParentTaskID, json: canonical, digest: hex.EncodeToString(sum[:])}, nil
+}
+
+// computeManifestCanonicalForm re-encodes a manifest to canonical form and computes its digest.
+// Used for digest verification when materializing children from a stored manifest.
+func (s *sqliteStore) computeManifestCanonicalForm(m *manifest.Manifest) (string, string) {
+	// Normalize nil slices to empty slices, matching canonicalizeManifest behavior
+	if m.Children == nil {
+		m.Children = []manifest.Child{}
+	}
+	if m.PendingCandidates == nil {
+		m.PendingCandidates = []manifest.PendingCandidate{}
+	}
+	for i := range m.Children {
+		c := &m.Children[i]
+		if c.ReviewModels == nil {
+			c.ReviewModels = []string{}
+		}
+		if c.ClaimIDs == nil {
+			c.ClaimIDs = []string{}
+		}
+		if c.SourceStartPoints == nil {
+			c.SourceStartPoints = []string{}
+		}
+		if c.FileScope == nil {
+			c.FileScope = []string{}
+		}
+		if c.AcceptanceCriteria == nil {
+			c.AcceptanceCriteria = []string{}
+		}
+		if c.Dependencies == nil {
+			c.Dependencies = []manifest.Dependency{}
+		}
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
+		return "", ""
+	}
+	canonical := strings.TrimSuffix(buf.String(), "\n")
+	sum := sha256.Sum256([]byte(canonical))
+	return canonical, hex.EncodeToString(sum[:])
 }

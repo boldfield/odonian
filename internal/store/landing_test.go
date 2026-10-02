@@ -9,6 +9,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/boldfield/odonian/internal/manifest"
 )
@@ -189,28 +190,35 @@ func TestCancelLandingOnlyCancelsTheOwningAttempt(t *testing.T) {
 	}
 }
 
-func TestMergedResearchParentCreatesContinuationChildren(t *testing.T) {
-	ctx := context.Background()
-	store, projectID, docID := newBranchTestStore(t)
-
-	// Create a research task with continuation manifest opt-in
+// helperCreateResearchTask creates, promotes, and claims a research-track task with continuation opt-in.
+func helperCreateResearchTask(t *testing.T, store Store, ctx context.Context, projectID, docID string, title string) string {
+	t.Helper()
 	spec := `Research task spec
 
 ## continuation manifest
 
 Some description`
 	tasks, err := store.CreateTasks(ctx, projectID, []TaskInput{
-		{Title: "Parent Task", Spec: spec, DocumentID: docID, Model: "haiku", Track: "research", ReviewModels: []string{"opus", "sonnet"}},
+		{Title: title, Spec: spec, DocumentID: docID, Model: "haiku", Track: "research", ReviewModels: []string{"opus", "sonnet"}},
 	})
 	if err != nil {
 		t.Fatalf("CreateTasks: %v", err)
 	}
-	parentID := tasks[0].ID
+	taskID := tasks[0].ID
+	if _, err := store.PromoteTask(ctx, taskID); err != nil {
+		t.Fatalf("PromoteTask: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*60*time.Second); err != nil {
+		t.Fatalf("ClaimTask: %v", err)
+	}
+	return taskID
+}
 
-	// Create a manifest for this task
+// helperCreateManifest creates a manifest for the given parent ID.
+func helperCreateManifest(parentID string) *manifest.Manifest {
 	falseVal := false
 	trueVal := true
-	m := &manifest.Manifest{
+	return &manifest.Manifest{
 		Version:      1,
 		ParentTaskID: parentID,
 		Children: []manifest.Child{
@@ -233,71 +241,86 @@ Some description`
 			{ClaimID: "claim1", Disposition: manifest.Assigned},
 		},
 	}
+}
 
-	// Validate manifest
-	if err := m.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
-		t.Fatalf("manifest validation failed: %v", err)
-	}
-
-	// Store the manifest in the database by submitting the task
-	manifestJSON, _ := json.Marshal(m)
-	manifestDigest := computeManifestDigest(manifestJSON)
-
-	// Manually insert the submission manifest since we can't call SubmitTaskWithManifest with correct parameters
-	_, err = store.Conn().ExecContext(ctx, `
-		INSERT INTO task_submission_manifest (task_id, review_round, parent_task_id, manifest_json, manifest_digest, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, parentID, 1, parentID, string(manifestJSON), manifestDigest, nowTimestamp())
+// helperSubmitManifest submits a task with a manifest and returns the parent task in review state.
+func helperSubmitManifest(t *testing.T, store Store, ctx context.Context, taskID string, m *manifest.Manifest) TaskWithDepsAndLinks {
+	t.Helper()
+	manifestJSON, err := json.Marshal(m)
 	if err != nil {
-		t.Fatalf("failed to insert submission manifest: %v", err)
+		t.Fatalf("failed to marshal manifest: %v", err)
 	}
+	links := []LinkInput{
+		{Kind: "pr", Value: "#100"},
+		{Kind: "commit", Value: "abc123"},
+	}
+	if _, err := store.SubmitTaskWithManifest(ctx, taskID, "agent-1", "Implemented", nil, links, 8, nil, nil, testUnlimitedResearchBudget, nil, nil, manifestJSON); err != nil {
+		t.Fatalf("SubmitTaskWithManifest: %v", err)
+	}
+	parent, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetTask after submit: %v", err)
+	}
+	return parent
+}
 
-	// Approve the parent task in review round 1
-	if _, err := store.Conn().ExecContext(ctx, "UPDATE task SET state = 'approved', review_round = 1 WHERE id = ?", parentID); err != nil {
+// helperApproveAndTransitionToReady force-approves a task and transitions it to ready.
+func helperApproveParent(t *testing.T, store Store, ctx context.Context, taskID string, reviewRound int) {
+	t.Helper()
+	if _, err := store.Conn().ExecContext(ctx, "UPDATE task SET state = 'approved', review_round = ? WHERE id = ?", reviewRound, taskID); err != nil {
 		t.Fatalf("force approved: %v", err)
 	}
+}
 
-	// Transition to done - this should create the child
-	_, err = store.TransitionTask(ctx, parentID, "done", nil)
+// helperCountChildren counts continuation_parent links for a given parent.
+func helperCountChildren(t *testing.T, store Store, ctx context.Context, parentID string) int {
+	t.Helper()
+	var count int
+	err := store.Conn().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM task_link
+		WHERE kind = 'continuation_parent' AND value = ?
+	`, parentID).Scan(&count)
 	if err != nil {
-		t.Fatalf("TransitionTask to done: %v", err)
+		t.Fatalf("failed to count children: %v", err)
+	}
+	return count
+}
+
+func TestMergedResearchParentCreatesContinuationChildren(t *testing.T) {
+	ctx := context.Background()
+	store, projectID, docID := newBranchTestStore(t)
+
+	parentID := helperCreateResearchTask(t, store, ctx, projectID, docID, "Parent Task")
+	m := helperCreateManifest(parentID)
+	if err := m.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
+		t.Fatalf("manifest validation: %v", err)
 	}
 
-	// Verify the parent is done
+	parent := helperSubmitManifest(t, store, ctx, parentID, m)
+	reviewRound := parent.ReviewRound
+
+	helperApproveParent(t, store, ctx, parentID, reviewRound)
+
+	// Use BeginLanding/CompleteLanding to properly transition to done
+	if err := store.BeginLanding(ctx, parentID, reviewRound, "abc123", "attempt-1"); err != nil {
+		t.Fatalf("BeginLanding: %v", err)
+	}
+
+	if _, err := store.CompleteLanding(ctx, parentID, "attempt-1", nil); err != nil {
+		t.Fatalf("CompleteLanding: %v", err)
+	}
+
 	parent, err := store.GetTask(ctx, parentID)
 	if err != nil {
-		t.Fatalf("GetTask parent: %v", err)
+		t.Fatalf("GetTask after transition: %v", err)
 	}
 	if parent.State != "done" {
 		t.Errorf("parent state = %q, want done", parent.State)
 	}
 
-	// Query for tasks with continuation_parent link pointing to this parent
-	var childID string
-	err = store.Conn().QueryRowContext(ctx, `
-		SELECT task_id FROM task_link
-		WHERE kind = 'continuation_parent' AND value = ?
-		LIMIT 1
-	`, parentID).Scan(&childID)
-	if err != nil {
-		t.Errorf("no child task found with continuation_parent link: %v", err)
-		return
-	}
-
-	// Verify the child exists and is in ready state
-	child, err := store.GetTask(ctx, childID)
-	if err != nil {
-		t.Fatalf("GetTask child: %v", err)
-	}
-
-	if child.State != "ready" {
-		t.Errorf("child state = %q, want ready", child.State)
-	}
-	if child.Title != "Child 1" {
-		t.Errorf("child title = %q, want Child 1", child.Title)
-	}
-	if child.Track != "research" {
-		t.Errorf("child track = %q, want research", child.Track)
+	childCount := helperCountChildren(t, store, ctx, parentID)
+	if childCount != 1 {
+		t.Errorf("expected 1 child, got %d", childCount)
 	}
 }
 
@@ -305,85 +328,264 @@ func TestTransitioningApprovedToNotDoneDoesNotCreateChildren(t *testing.T) {
 	ctx := context.Background()
 	store, projectID, docID := newBranchTestStore(t)
 
-	// Create a research task with continuation manifest opt-in
-	spec := `Research task spec
+	parentID := helperCreateResearchTask(t, store, ctx, projectID, docID, "Parent Task")
+	m := helperCreateManifest(parentID)
+	if err := m.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
+		t.Fatalf("manifest validation: %v", err)
+	}
 
-## continuation manifest
+	parent := helperSubmitManifest(t, store, ctx, parentID, m)
+	helperApproveParent(t, store, ctx, parentID, parent.ReviewRound)
 
-Some description`
+	// Reject to ready instead of completing the landing
+	if _, err := store.TransitionTask(ctx, parentID, "ready", nil); err != nil {
+		t.Fatalf("TransitionTask to ready: %v", err)
+	}
+
+	// Verify no children were created
+	childCount := helperCountChildren(t, store, ctx, parentID)
+	if childCount != 0 {
+		t.Errorf("expected no children, got %d", childCount)
+	}
+}
+
+func TestDigestMismatchPreventsTransition(t *testing.T) {
+	ctx := context.Background()
+	store, projectID, docID := newBranchTestStore(t)
+
+	parentID := helperCreateResearchTask(t, store, ctx, projectID, docID, "Parent Task")
+	m := helperCreateManifest(parentID)
+	if err := m.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
+		t.Fatalf("manifest validation: %v", err)
+	}
+
+	parent := helperSubmitManifest(t, store, ctx, parentID, m)
+	reviewRound := parent.ReviewRound
+	helperApproveParent(t, store, ctx, parentID, reviewRound)
+
+	// Corrupt the manifest digest in the database
+	if _, err := store.Conn().ExecContext(ctx, `
+		UPDATE task_submission_manifest SET manifest_digest = 'corrupted-digest'
+		WHERE task_id = ? AND review_round = ?
+	`, parentID, reviewRound); err != nil {
+		t.Fatalf("corrupt digest: %v", err)
+	}
+
+	// BeginLanding should succeed
+	if err := store.BeginLanding(ctx, parentID, reviewRound, "abc123", "attempt-1"); err != nil {
+		t.Fatalf("BeginLanding: %v", err)
+	}
+
+	// CompleteLanding should fail due to digest mismatch in the child materialization
+	_, err := store.CompleteLanding(ctx, parentID, "attempt-1", nil)
+	if err == nil {
+		t.Errorf("expected error due to digest mismatch, but CompleteLanding succeeded")
+		return
+	}
+	if !strings.Contains(err.Error(), "digest mismatch") {
+		t.Errorf("expected 'digest mismatch' in error, got: %v", err)
+	}
+
+	// Parent should still be in approved state (transaction rolled back)
+	parent, err = store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if parent.State != "approved" {
+		t.Errorf("parent state = %q, want approved (should be recoverable)", parent.State)
+	}
+
+	// No children should have been created
+	childCount := helperCountChildren(t, store, ctx, parentID)
+	if childCount != 0 {
+		t.Errorf("expected no children after failed transition, got %d", childCount)
+	}
+}
+
+func TestRetryAndIdempotency(t *testing.T) {
+	ctx := context.Background()
+	store, projectID, docID := newBranchTestStore(t)
+
+	parentID := helperCreateResearchTask(t, store, ctx, projectID, docID, "Parent Task")
+	m := helperCreateManifest(parentID)
+	if err := m.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
+		t.Fatalf("manifest validation: %v", err)
+	}
+
+	parent := helperSubmitManifest(t, store, ctx, parentID, m)
+	reviewRound := parent.ReviewRound
+	helperApproveParent(t, store, ctx, parentID, reviewRound)
+
+	// First landing attempt
+	if err := store.BeginLanding(ctx, parentID, reviewRound, "abc123", "attempt-1"); err != nil {
+		t.Fatalf("BeginLanding: %v", err)
+	}
+
+	if _, err := store.CompleteLanding(ctx, parentID, "attempt-1", nil); err != nil {
+		t.Fatalf("first CompleteLanding: %v", err)
+	}
+
+	childCount := helperCountChildren(t, store, ctx, parentID)
+	if childCount != 1 {
+		t.Fatalf("after first landing, expected 1 child, got %d", childCount)
+	}
+
+	// Verify the task is now done
+	parent, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if parent.State != "done" {
+		t.Fatalf("parent should be done, got %q", parent.State)
+	}
+
+	// Second idempotent attempt - task is already done, should not create duplicates
+	childCount = helperCountChildren(t, store, ctx, parentID)
+	if childCount != 1 {
+		t.Errorf("after idempotent check, expected 1 child, got %d", childCount)
+	}
+}
+
+func TestRoundBindingCreatesOnlyApprovedRoundManifest(t *testing.T) {
+	ctx := context.Background()
+	store, projectID, docID := newBranchTestStore(t)
+
+	parentID := helperCreateResearchTask(t, store, ctx, projectID, docID, "Parent Task")
+
+	// Submit manifest for round 1
+	m1 := helperCreateManifest(parentID)
+	if err := m1.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
+		t.Fatalf("manifest validation round 1: %v", err)
+	}
+	parent1 := helperSubmitManifest(t, store, ctx, parentID, m1)
+	round1 := parent1.ReviewRound
+
+	// Force-approve for round 1 and then transition back to in_progress
+	// to simulate rejection and resubmission for round 2
+	helperApproveParent(t, store, ctx, parentID, round1)
+	if _, err := store.TransitionTask(ctx, parentID, "ready", nil); err != nil {
+		t.Fatalf("transition to ready: %v", err)
+	}
+
+	// Manually move to in_progress to allow re-submission
+	if _, err := store.Conn().ExecContext(ctx, "UPDATE task SET state = 'in_progress', assignee = 'agent-1' WHERE id = ?", parentID); err != nil {
+		t.Fatalf("force in_progress: %v", err)
+	}
+
+	// Re-submit with a new manifest for round 2
+	m2 := helperCreateManifest(parentID)
+	if err := m2.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
+		t.Fatalf("manifest validation round 2: %v", err)
+	}
+	parent2 := helperSubmitManifest(t, store, ctx, parentID, m2)
+	round2 := parent2.ReviewRound
+
+	if round2 <= round1 {
+		t.Fatalf("round 2 = %d should be > round 1 = %d", round2, round1)
+	}
+
+	// Approve for round 2
+	helperApproveParent(t, store, ctx, parentID, round2)
+
+	// Complete landing for round 2 - should use round 2 manifest only
+	if err := store.BeginLanding(ctx, parentID, round2, "abc123", "attempt-2"); err != nil {
+		t.Fatalf("BeginLanding round 2: %v", err)
+	}
+
+	if _, err := store.CompleteLanding(ctx, parentID, "attempt-2", nil); err != nil {
+		t.Fatalf("CompleteLanding round 2: %v", err)
+	}
+
+	// Verify children were created (from round 2 manifest only)
+	childCount := helperCountChildren(t, store, ctx, parentID)
+	if childCount != 1 {
+		t.Errorf("expected 1 child from round 2 manifest, got %d", childCount)
+	}
+}
+
+func TestNonOptedInResearchTaskDoesNotCreateChildren(t *testing.T) {
+	ctx := context.Background()
+	store, projectID, docID := newBranchTestStore(t)
+
+	// Create a research task WITHOUT continuation opt-in
 	tasks, err := store.CreateTasks(ctx, projectID, []TaskInput{
-		{Title: "Parent Task", Spec: spec, DocumentID: docID, Model: "haiku", Track: "research", ReviewModels: []string{"opus", "sonnet"}},
+		{Title: "Non-opted Parent", Spec: "Just a research task", DocumentID: docID, Model: "haiku", Track: "research", ReviewModels: []string{"opus", "sonnet"}},
 	})
 	if err != nil {
 		t.Fatalf("CreateTasks: %v", err)
 	}
 	parentID := tasks[0].ID
 
-	// Create a manifest
-	falseVal := false
-	trueVal := true
-	m := &manifest.Manifest{
-		Version:      1,
-		ParentTaskID: parentID,
-		Children: []manifest.Child{
-			{
-				Key:                "child1",
-				Title:              "Child 1",
-				Spec:               "Child 1 spec",
-				Track:              "research",
-				Model:              "haiku",
-				ReviewModels:       []string{"opus", "sonnet"},
-				AgentMerge:         &falseVal,
-				Escalate:           &trueVal,
-				ClaimIDs:           []string{"claim1"},
-				SourceStartPoints:  []string{"source1"},
-				FileScope:          []string{"file1.go"},
-				AcceptanceCriteria: []string{"criterion1"},
-			},
-		},
-		PendingCandidates: []manifest.PendingCandidate{
-			{ClaimID: "claim1", Disposition: manifest.Assigned},
-		},
-	}
-
-	// Validate manifest
-	if err := m.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
-		t.Fatalf("manifest validation failed: %v", err)
-	}
-
-	// Store the manifest
+	// Try to submit with manifest (should be rejected because spec doesn't opt in)
+	m := helperCreateManifest(parentID)
 	manifestJSON, _ := json.Marshal(m)
-	manifestDigest := computeManifestDigest(manifestJSON)
-	_, err = store.Conn().ExecContext(ctx, `
-		INSERT INTO task_submission_manifest (task_id, review_round, parent_task_id, manifest_json, manifest_digest, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, parentID, 1, parentID, string(manifestJSON), manifestDigest, nowTimestamp())
+	_, err = store.SubmitTaskWithManifest(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, nil, manifestJSON)
+	if err == nil {
+		t.Fatalf("SubmitTaskWithManifest should have failed for non-opted-in task")
+	}
+	// The task should remain in backlog after the failed submission attempt
+}
+
+func TestBuildTrackDoesNotCreateChildren(t *testing.T) {
+	ctx := context.Background()
+	store, projectID, docID := newBranchTestStore(t)
+
+	// Create a build-track task with continuation opt-in spec (but it's build, not research)
+	spec := `Build task
+
+## continuation manifest
+
+Children spec`
+	tasks, err := store.CreateTasks(ctx, projectID, []TaskInput{
+		{Title: "Build Task", Spec: spec, DocumentID: docID, Model: "haiku", Track: "build", ReviewModels: []string{"opus", "sonnet"}},
+	})
 	if err != nil {
-		t.Fatalf("failed to insert submission manifest: %v", err)
+		t.Fatalf("CreateTasks: %v", err)
+	}
+	parentID := tasks[0].ID
+
+	// Try to submit with manifest (should be rejected because it's build track)
+	m := helperCreateManifest(parentID)
+	manifestJSON, _ := json.Marshal(m)
+	_, err = store.SubmitTaskWithManifest(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget, nil, nil, manifestJSON)
+	if err == nil {
+		t.Fatalf("SubmitTaskWithManifest should have failed for build-track task")
+	}
+}
+
+func TestCompleteLandingWithApprovedParentCreatesChildren(t *testing.T) {
+	ctx := context.Background()
+	store, projectID, docID := newBranchTestStore(t)
+
+	parentID := helperCreateResearchTask(t, store, ctx, projectID, docID, "Parent Task")
+	m := helperCreateManifest(parentID)
+	if err := m.Validate(map[string]bool{"haiku": true, "opus": true, "sonnet": true}, validTracks); err != nil {
+		t.Fatalf("manifest validation: %v", err)
 	}
 
-	// Approve the parent
-	if _, err := store.Conn().ExecContext(ctx, "UPDATE task SET state = 'approved', review_round = 1 WHERE id = ?", parentID); err != nil {
-		t.Fatalf("force approved: %v", err)
+	parent := helperSubmitManifest(t, store, ctx, parentID, m)
+	helperApproveParent(t, store, ctx, parentID, parent.ReviewRound)
+
+	// Begin landing - must use the same commit that was submitted (abc123)
+	if err := store.BeginLanding(ctx, parentID, parent.ReviewRound, "abc123", "attempt-1"); err != nil {
+		t.Fatalf("BeginLanding: %v", err)
 	}
 
-	// Transition to ready (not done) - should not create children
-	_, err = store.TransitionTask(ctx, parentID, "ready", nil)
+	// Complete landing - this should create children
+	if _, err := store.CompleteLanding(ctx, parentID, "attempt-1", nil); err != nil {
+		t.Fatalf("CompleteLanding: %v", err)
+	}
+
+	parent, err := store.GetTask(ctx, parentID)
 	if err != nil {
-		t.Fatalf("TransitionTask to ready: %v", err)
+		t.Fatalf("GetTask after completion: %v", err)
+	}
+	if parent.State != "done" {
+		t.Errorf("parent state = %q, want done", parent.State)
 	}
 
-	// Verify no child was created
-	var childCount int
-	err = store.Conn().QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM task_link
-		WHERE kind = 'continuation_parent' AND value = ?
-	`, parentID).Scan(&childCount)
-	if err != nil {
-		t.Fatalf("failed to count children: %v", err)
-	}
-
-	if childCount != 0 {
-		t.Errorf("expected no children, but found %d", childCount)
+	childCount := helperCountChildren(t, store, ctx, parentID)
+	if childCount != 1 {
+		t.Errorf("expected 1 child after landing completion, got %d", childCount)
 	}
 }
