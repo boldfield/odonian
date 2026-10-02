@@ -477,6 +477,12 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 	if !strings.Contains(output, "Digest: abc123def456") {
 		t.Errorf("expected 'Digest: abc123def456' in output, got: %s", output)
 	}
+	if !strings.Contains(output, "Manifest:") {
+		t.Errorf("expected 'Manifest:' header in output, got: %s", output)
+	}
+	if !strings.Contains(output, "\"parent_task_id\": \"task-1\"") {
+		t.Errorf("expected manifest body with parent_task_id in output, got: %s", output)
+	}
 }
 
 func TestExecuteShowMissingID(t *testing.T) {

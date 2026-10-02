@@ -67,19 +67,20 @@ type Task struct {
 }
 
 type TaskDetail struct {
-	ID                  string               `json:"id"`
-	ProjectID           string               `json:"project_id"`
-	DocumentID          string               `json:"document_id"`
-	Title               string               `json:"title"`
-	Spec                string               `json:"spec"`
-	State               string               `json:"state"`
-	Model               string               `json:"model"`
-	Kind                string               `json:"kind"`
-	Track               string               `json:"track"`
-	Branch              string               `json:"branch"`
-	LandingRound        *int                 `json:"landing_round"`
-	LandingCommit       *string              `json:"landing_commit"`
-	LandingAttempt      *string              `json:"landing_attempt"`
+	ID             string  `json:"id"`
+	ProjectID      string  `json:"project_id"`
+	DocumentID     string  `json:"document_id"`
+	Title          string  `json:"title"`
+	Spec           string  `json:"spec"`
+	State          string  `json:"state"`
+	Model          string  `json:"model"`
+	Kind           string  `json:"kind"`
+	Track          string  `json:"track"`
+	Branch         string  `json:"branch"`
+	LandingRound   *int    `json:"landing_round"`
+	LandingCommit  *string `json:"landing_commit"`
+	LandingAttempt *string `json:"landing_attempt"`
+	// CurrentRoundLinks is the submission under review, as the server determines it.
 	CurrentRoundLinks   []TaskLink           `json:"current_round_links"`
 	Assignee            *string              `json:"assignee"`
 	LeaseExpiresAt      *string              `json:"lease_expires_at"`

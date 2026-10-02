@@ -678,8 +678,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 				fmt.Fprintf(out, "    Digest: %s\n", manifest.ManifestDigest)
 				fmt.Fprintf(out, "    Submitted At: %s\n", manifest.SubmittedAt)
 				if manifest.ManifestJSON != nil {
-					manifestBytes, _ := json.MarshalIndent(manifest.ManifestJSON, "    ", "  ")
-					fmt.Fprintf(out, "    Manifest:\n%s\n", string(manifestBytes))
+					manifestBytes, _ := json.MarshalIndent(manifest.ManifestJSON, "", "  ")
+					lines := strings.Split(strings.TrimSpace(string(manifestBytes)), "\n")
+					fmt.Fprintf(out, "    Manifest:\n")
+					for _, line := range lines {
+						fmt.Fprintf(out, "    %s\n", line)
+					}
 				}
 			}
 		}
