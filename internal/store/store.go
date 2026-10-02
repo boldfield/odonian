@@ -2365,16 +2365,17 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to fetch parent task: %w", err)
 		}
 
-		// Check if parent spec opts in (contains "continuation manifest" indicator)
-		if !strings.Contains(strings.ToLower(parentSpec), "continuation manifest") {
-			return TaskWithDepsAndLinks{}, invalid("PARENT_NOT_OPTED_IN", fmt.Sprintf("parent task %q does not opt in to continuation manifests", manifestParentTaskID))
+		// Check if parent spec opts in (contains "## continuation manifest" section marker)
+		// The marker must be a section heading to avoid accidental matches in prose.
+		if !strings.Contains(parentSpec, "## continuation manifest") {
+			return TaskWithDepsAndLinks{}, invalid("PARENT_NOT_OPTED_IN", fmt.Sprintf("parent task %q does not opt in to continuation manifests (no '## continuation manifest' section found in spec)", manifestParentTaskID))
 		}
 
 		// Validate the manifest using the manifest validator
-		// Get allowed models and tracks from the server config (for now, use reasonable defaults)
-		allowedModels := map[string]bool{"haiku": true, "sonnet": true, "opus": true, "gpt-5.5": true}
+		// Use the store's configured allowed models and hardcoded allowed tracks
+		// (tracks are not configurable per-server; they are fixed by the schema)
 		allowedTracks := map[string]bool{"research": true, "build": true, "design": true}
-		if verr := parsedManifest.Validate(allowedModels, allowedTracks); verr != nil {
+		if verr := parsedManifest.Validate(s.allowedModelsM, allowedTracks); verr != nil {
 			// Return validation error with the manifest's code
 			if ve, ok := verr.(manifest.ValidationError); ok {
 				return TaskWithDepsAndLinks{}, invalid(ve.Code, ve.Message)

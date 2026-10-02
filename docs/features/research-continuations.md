@@ -8,7 +8,7 @@ Research continuation manifests enable controlled creation of child tasks from a
 
 ### 1. Parent task and manifest
 
-A parent research task may carry a continuation manifest in its PR. The manifest is:
+A parent research implement task may carry a continuation manifest in its PR, but only if the task opts in. A task opts in by including the marker `## continuation manifest` in its spec (as a heading or section). The manifest is:
 
 - **Versioned**: Each manifest has an integer version, equal to the schema version (currently 1). The version enables future schema changes.
 - **Fully specified**: Every proposed child has a complete specification. No implicit defaults or inheriting field values from the parent.

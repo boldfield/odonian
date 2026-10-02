@@ -1242,7 +1242,7 @@ func TestSubmitTaskWithDisputesAndFindings(t *testing.T) {
 	links := []LinkInput{{Kind: "pr", Value: "https://github.com/test/pr"}}
 	findings := json.RawMessage(`[]`)
 	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"cited evidence"}]`)
-	err := client.SubmitTaskWithDisputesAndFindings(context.Background(), "task123", "agent123", "reworked", nil, links, findings, disputes)
+	err := client.SubmitTaskWithDisputesAndFindings(context.Background(), "task123", "agent123", "reworked", nil, links, findings, disputes, nil)
 	if err != nil {
 		t.Fatalf("SubmitTaskWithDisputesAndFindings failed: %v", err)
 	}

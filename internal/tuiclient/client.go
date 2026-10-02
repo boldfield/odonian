@@ -610,6 +610,7 @@ type submitTaskRequest struct {
 	Links    []LinkInput     `json:"links"`
 	Findings json.RawMessage `json:"findings,omitempty"`
 	Disputes json.RawMessage `json:"disputes,omitempty"`
+	Manifest json.RawMessage `json:"manifest,omitempty"`
 }
 
 // SubmitTask submits a task result with optional verdict and links.
@@ -617,15 +618,16 @@ func (c *HTTPClient) SubmitTask(ctx context.Context, id, agentID, result string,
 	return c.SubmitTaskWithFindings(ctx, id, agentID, result, verdict, links, nil)
 }
 
-// SubmitTaskWithFindings submits a task result with optional verdict, links, and findings.
+// SubmitTaskWithFindings submits a task result with optional verdict, links, findings, and manifest.
 func (c *HTTPClient) SubmitTaskWithFindings(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage) error {
-	return c.SubmitTaskWithDisputesAndFindings(ctx, id, agentID, result, verdict, links, findings, nil)
+	return c.SubmitTaskWithDisputesAndFindings(ctx, id, agentID, result, verdict, links, findings, nil, nil)
 }
 
 // SubmitTaskWithDisputesAndFindings submits a task result with optional verdict,
-// links, structured findings (review-kind tasks), and disputes (research-track
-// implement rework, per docs/features/research-track.md section 5).
-func (c *HTTPClient) SubmitTaskWithDisputesAndFindings(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage) error {
+// links, structured findings (review-kind tasks), disputes (research-track
+// implement rework, per docs/features/research-track.md section 5), and manifest
+// (research implement continuation, per docs/features/research-continuations.md).
+func (c *HTTPClient) SubmitTaskWithDisputesAndFindings(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) error {
 	body := submitTaskRequest{
 		AgentID:  agentID,
 		Result:   result,
@@ -633,6 +635,7 @@ func (c *HTTPClient) SubmitTaskWithDisputesAndFindings(ctx context.Context, id, 
 		Links:    links,
 		Findings: findings,
 		Disputes: disputes,
+		Manifest: manifest,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/submit", id), body)
