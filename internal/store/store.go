@@ -4628,6 +4628,51 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 		return Task{}, err
 	}
 
+	// Materialize continuation children only when approved research parent reaches done
+	// and has opted in to the continuation manifest feature
+	if to == "done" && taskState == "approved" {
+		// Load full task to check track and spec for continuation opt-in
+		var taskTrack, taskSpec, taskProjectID, taskDocumentID string
+		var taskReviewRound int
+		err := tx.QueryRowContext(ctx, `
+			SELECT track, spec, project_id, document_id, review_round FROM task WHERE id = ?
+		`, taskID).Scan(&taskTrack, &taskSpec, &taskProjectID, &taskDocumentID, &taskReviewRound)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to load task for continuation check: %w", err)
+		}
+
+		// Only create children for research track tasks that opt in
+		if taskTrack == "research" && specOptsIntoContinuations(taskSpec) {
+			// Load manifests for this task and get the one for the current review round
+			manifests, err := listSubmissionManifests(ctx, tx, taskID)
+			if err != nil {
+				return Task{}, fmt.Errorf("failed to load submission manifests: %w", err)
+			}
+
+			// Find the manifest for the current review round
+			var manifestToUse *SubmissionManifest
+			for i := range manifests {
+				if manifests[i].ReviewRound == taskReviewRound {
+					manifestToUse = &manifests[i]
+					break
+				}
+			}
+
+			if manifestToUse != nil {
+				// Parse the manifest
+				m := &manifest.Manifest{}
+				if err := json.Unmarshal(manifestToUse.ManifestJSON, m); err != nil {
+					return Task{}, fmt.Errorf("failed to parse manifest: %w", err)
+				}
+
+				// Insert continuation children with idempotency
+				if _, err := s.InsertManifestChildren(ctx, tx, m, manifestToUse.ManifestDigest, taskID, taskProjectID, taskDocumentID, now); err != nil {
+					return Task{}, fmt.Errorf("failed to insert continuation children: %w", err)
+				}
+			}
+		}
+	}
+
 	// SELECT the updated task
 	var t Task
 	var reviewModelsJSON *string
