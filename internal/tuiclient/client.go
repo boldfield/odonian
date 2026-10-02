@@ -117,6 +117,8 @@ type CreatedChild struct {
 	ID                 string   `json:"id"`
 	ParentTaskID       string   `json:"parent_task_id"`
 	ManifestDigest     string   `json:"manifest_digest"`
+	State              string   `json:"state"`
+	Track              string   `json:"track"`
 	ClaimIDs           []string `json:"claim_ids,omitempty"`
 	SourceStartPoints  []string `json:"source_start_points,omitempty"`
 	FileScope          []string `json:"file_scope,omitempty"`
@@ -129,10 +131,16 @@ type ActionItem struct {
 	TaskID      string `json:"task_id,omitempty"`
 }
 
+type ParentInfo struct {
+	ID             string `json:"id"`
+	ManifestDigest string `json:"manifest_digest"`
+}
+
 type ContinuationInfo struct {
 	ProposedChildren []ProposedChild `json:"proposed_children,omitempty"`
 	CreatedChildren  []CreatedChild  `json:"created_children,omitempty"`
 	ActionItems      []ActionItem    `json:"action_items,omitempty"`
+	ParentInfo       *ParentInfo     `json:"parent_info,omitempty"`
 }
 
 type TaskLink struct {

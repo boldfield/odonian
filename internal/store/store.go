@@ -702,11 +702,18 @@ type ActionItem struct {
 	TaskID      string `json:"task_id,omitempty"`
 }
 
-// ContinuationInfo groups proposed and created children.
+// ParentInfo shows information about this task's parent (if it's a created child).
+type ParentInfo struct {
+	ID             string `json:"id"`
+	ManifestDigest string `json:"manifest_digest"`
+}
+
+// ContinuationInfo groups proposed and created children, plus parent info for child tasks.
 type ContinuationInfo struct {
 	ProposedChildren []ProposedChild `json:"proposed_children,omitempty"`
 	CreatedChildren  []CreatedChild  `json:"created_children,omitempty"`
 	ActionItems      []ActionItem    `json:"action_items,omitempty"`
+	ParentInfo       *ParentInfo     `json:"parent_info,omitempty"`
 }
 
 // TaskWithDepsAndLinks combines a Task with its dependencies and links.
@@ -1704,12 +1711,16 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	defer reverseRows.Close()
 
 	childTaskIDs := make(map[string]bool)
+	childTaskIDsOrdered := []string{}
 	for reverseRows.Next() {
 		var link TaskLink
 		if err := reverseRows.Scan(&link.ID, &link.TaskID, &link.Kind, &link.Value, &link.TombstonedAt, &link.ReviewRound); err != nil {
 			return TaskWithDepsAndLinks{}, fmt.Errorf("failed to scan reverse link: %w", err)
 		}
-		childTaskIDs[link.TaskID] = true
+		if !childTaskIDs[link.TaskID] {
+			childTaskIDs[link.TaskID] = true
+			childTaskIDsOrdered = append(childTaskIDsOrdered, link.TaskID)
+		}
 	}
 	if err := reverseRows.Err(); err != nil {
 		return TaskWithDepsAndLinks{}, fmt.Errorf("error iterating reverse links: %w", err)
@@ -1718,7 +1729,7 @@ func (s *sqliteStore) GetTask(ctx context.Context, id string) (TaskWithDepsAndLi
 	// Load all child continuation links if this is a parent task
 	childLinks := make([]TaskLink, 0)
 	if len(childTaskIDs) > 0 {
-		for childID := range childTaskIDs {
+		for _, childID := range childTaskIDsOrdered {
 			childLinkRows, err := s.readConn.QueryContext(ctx, `
 				SELECT id, task_id, kind, value, tombstoned_at, review_round FROM task_link
 				WHERE task_id = ? AND kind LIKE 'continuation_child_%' AND tombstoned_at IS NULL ORDER BY kind, id
@@ -6191,6 +6202,28 @@ func extractContinuationInfo(ctx context.Context, db *sql.DB, manifests []Submis
 		}
 
 		info.CreatedChildren = append(info.CreatedChildren, *child)
+	}
+
+	// Extract parent info if this task is a child (has continuation_parent link)
+	for _, link := range links {
+		if link.Kind == "continuation_parent" && link.TombstonedAt == nil {
+			info.ParentInfo = &ParentInfo{
+				ID: link.Value,
+			}
+			// Try to get the manifest digest from a continuation_child_dedup link
+			for _, l := range links {
+				if l.Kind == "continuation_child_dedup" {
+					var dedupKey map[string]interface{}
+					if err := json.Unmarshal([]byte(l.Value), &dedupKey); err == nil {
+						if digest, ok := dedupKey["manifest_digest"].(string); ok {
+							info.ParentInfo.ManifestDigest = digest
+						}
+					}
+					break
+				}
+			}
+			break
+		}
 	}
 
 	// Populate action items for held dependencies and dependents

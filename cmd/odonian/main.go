@@ -707,6 +707,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		}
 		if task.Continuation != nil {
 			fmt.Fprintf(out, "Continuation:\n")
+			if task.Continuation.ParentInfo != nil {
+				fmt.Fprintf(out, "  Parent Task (created from continuation): %s\n", task.Continuation.ParentInfo.ID)
+				if task.Continuation.ParentInfo.ManifestDigest != "" {
+					fmt.Fprintf(out, "    Manifest Digest: %s\n", task.Continuation.ParentInfo.ManifestDigest)
+				}
+			}
 			if len(task.Continuation.ProposedChildren) > 0 {
 				fmt.Fprintf(out, "  Planned Continuations (proposed, before merge):\n")
 				for _, child := range task.Continuation.ProposedChildren {
@@ -719,18 +725,19 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 				for _, child := range task.Continuation.CreatedChildren {
 					fmt.Fprintf(out, "    - ID: %s\n", child.ID)
 					fmt.Fprintf(out, "      Parent: %s\n", child.ParentTaskID)
+					fmt.Fprintf(out, "      State: %s, Track: %s\n", child.State, child.Track)
 					fmt.Fprintf(out, "      Manifest Digest: %s\n", child.ManifestDigest)
 					if len(child.ClaimIDs) > 0 {
-						fmt.Fprintf(out, "      Claim IDs: %v\n", child.ClaimIDs)
+						fmt.Fprintf(out, "      Claim IDs: %s\n", strings.Join(child.ClaimIDs, ", "))
 					}
 					if len(child.SourceStartPoints) > 0 {
-						fmt.Fprintf(out, "      Source Start Points: %v\n", child.SourceStartPoints)
+						fmt.Fprintf(out, "      Source Start Points: %s\n", strings.Join(child.SourceStartPoints, ", "))
 					}
 					if len(child.FileScope) > 0 {
-						fmt.Fprintf(out, "      File Scope: %v\n", child.FileScope)
+						fmt.Fprintf(out, "      File Scope: %s\n", strings.Join(child.FileScope, ", "))
 					}
 					if len(child.AcceptanceCriteria) > 0 {
-						fmt.Fprintf(out, "      Acceptance Criteria: %v\n", child.AcceptanceCriteria)
+						fmt.Fprintf(out, "      Acceptance Criteria: %s\n", strings.Join(child.AcceptanceCriteria, ", "))
 					}
 				}
 			}
