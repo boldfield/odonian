@@ -26,7 +26,7 @@ Each proposed child has:
 - **spec**: Full prose specification of the child's work, complete and independent. Not derived from or dependent on the parent's implementation.
 - **track**: One of `research`, `build`, or `design`. Same validation as parent task tracks.
 - **model**: The model tier for the child's work. Must be an allowlisted model.
-- **review_models**: A pair of reviewer models (1 or 2 entries). Each must be an allowlisted model and differ from the working model (if enforced).
+- **review_models**: Exactly 2 distinct reviewer models. Each must be an allowlisted model.
 - **agent_merge**: Whether the child's worker can merge without human approval.
 - **escalate**: Whether the child allows model escalation on repeated rejection.
 - **claim_ids**: The exact claims this child will verify. A list of claim identifiers from the parent's work or existing sources. Must have at least one; at most six per child.
@@ -66,7 +66,7 @@ When a parent task's PR is merged:
 3. For each child, the server creates a new task with the manifest's fields.
 4. Research-track children start in the `ready` state and are immediately claimable.
 5. Build and design-track children start in the `backlog` state and must be explicitly queued.
-6. Each child has an automatic dependency on the parent task (the parent task must be `done` before the child can be claimed).
+6. Explicit parent dependencies may be specified in the manifest's dependencies field if needed.
 7. The parent task's final result event lists the created child task IDs.
 
 ### 6. Limits and ceilings
@@ -101,38 +101,70 @@ type Manifest struct {
 	PendingCandidates []PendingCandidate `json:"pending_candidates"`
 }
 
+type Dependency struct {
+	Kind DependencyKind `json:"kind"` // parent, child, or task
+	Ref  string         `json:"ref"`  // reference (key or task ID)
+}
+
 type Child struct {
-	Key                string   `json:"key"`
-	Title              string   `json:"title"`
-	Spec               string   `json:"spec"`
-	Track              string   `json:"track"`
-	Model              string   `json:"model"`
-	ReviewModels       []string `json:"review_models"`
-	AgentMerge         bool     `json:"agent_merge"`
-	Escalate           bool     `json:"escalate"`
-	ClaimIDs           []string `json:"claim_ids"`
-	SourceStartPoints  []string `json:"source_start_points"`
-	FileScope          []string `json:"file_scope"`
-	AcceptanceCriteria []string `json:"acceptance_criteria"`
-	Dependencies       []string `json:"dependencies"`
+	Key                string       `json:"key"`
+	Title              string       `json:"title"`
+	Spec               string       `json:"spec"`
+	Track              string       `json:"track"`
+	Model              string       `json:"model"`
+	ReviewModels       []string     `json:"review_models"`     // exactly 2 distinct models
+	AgentMerge         *bool        `json:"agent_merge"`       // presence-aware
+	Escalate           *bool        `json:"escalate"`          // presence-aware
+	ClaimIDs           []string     `json:"claim_ids"`
+	SourceStartPoints  []string     `json:"source_start_points"`
+	FileScope          []string     `json:"file_scope"`
+	AcceptanceCriteria []string     `json:"acceptance_criteria"`
+	Dependencies       []Dependency `json:"dependencies"`
 }
 
 type PendingCandidate struct {
-	ClaimID     string
-	Disposition ChildDisposition
-	Owner       *string
-	Reason      *string
+	ClaimID     string      `json:"claim_id"`
+	Disposition Disposition `json:"disposition"` // assigned, carried_forward, or excluded
+	Owner       *string     `json:"owner,omitempty"`
+	Reason      *string     `json:"reason,omitempty"`
 }
 ```
 
 The validator in `internal/manifest/manifest.go` is used by later store and API work to validate manifests before child creation.
 
+### Dependency kinds
+
+Dependencies are typed with one of three kinds:
+
+- **parent**: A reference to the parent task. Exactly one per manifest if used. The `ref` field must match the manifest's `parent_task_id`.
+- **child**: A reference to another child in the same manifest, by key. Used for intra-manifest dependencies. The `ref` field must be an existing child key.
+- **task**: A reference to an external task by ID. The `ref` field must be a valid UUID-format task ID.
+
+### Manifest versioning
+
+The manifest contract is versioned. `CurrentVersion` is 1. Manifests with any other version are rejected. Version increments enable future schema changes.
+
+### Validation error codes
+
+The validator returns specific error codes for different validation failures. Code values include:
+
+- **INVALID_VERSION**: manifest version is not supported
+- **DUPLICATE_CLAIM_ASSIGNMENT**: a claim ID appears in multiple children
+- **UNASSIGNED_CANDIDATE**: an assigned candidate does not appear in any child
+- **CONTRADICTORY_DISPOSITION**: a non-assigned candidate (carried_forward, excluded) appears in a child
+- **OVERLAPPING_FILES**: children have overlapping or nested file scopes
+- **INVALID_TASK_ID**: an external task dependency is not a valid UUID
+- **MISMATCHED_PARENT_DEPENDENCY**: a parent dependency ref does not match the manifest's parent task ID
+- **MISSING_OWNER**: a carried_forward candidate lacks an owner
+- **MISSING_REASON**: an excluded candidate lacks a reason
+- **BLANK_CRITERION**: an acceptance criterion is blank or whitespace-only
+
 ## Constraints
 
 - **Do not auto-retarget held legacy tasks**: Old tasks held in backlog should not be automatically retargeted when children are created.
-- **Complete a blocked or decompose parent before creating children**: If a parent is blocked for decomposition, the manifest is not applied.
-- **Create children only after merge**: Children are created as part of the merge-completion action, not when the parent's work is approved.
-- **Bypass publication gates only with explicit intent**: The merge gate ensures children are created only with human approval of the exact manifest.
+- **Do not create children from a blocked or decomposed parent**: If a parent is blocked for decomposition, the manifest is not applied; decompose the parent task first.
+- **Create children only after human merge**: Children are created as part of the merge-completion action, not when the parent's work is approved. Only the human's merge gate can trigger child creation.
+- **Do not bypass publication gates**: The merge gate is the only entry point for child creation; children cannot be created through other paths.
 
 ## Future work
 

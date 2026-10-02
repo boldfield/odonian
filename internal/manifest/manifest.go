@@ -3,8 +3,9 @@ package manifest
 import (
 	"fmt"
 	"path/filepath"
-	"slices"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 const CurrentVersion = 1
@@ -144,12 +145,12 @@ func (m *Manifest) Validate(allowedModels, allowedTracks map[string]bool) error 
 	}
 
 	// Check for dependency cycles and validate dependency references
-	if err := checkDependencies(m.Children, seenKeys); err != nil {
+	if err := checkDependencies(m.ParentTaskID, m.Children, seenKeys); err != nil {
 		return err
 	}
 
 	// Validate pending candidates and cross-check with children
-	if err := validatePendingCandidates(m.PendingCandidates, allChildClaims); err != nil {
+	if err := validatePendingCandidates(m.PendingCandidates, allChildClaims, childClaimIDs); err != nil {
 		return err
 	}
 
@@ -258,43 +259,71 @@ func validateChild(child Child, allowedModels, allowedTracks map[string]bool, in
 		return ValidationError{"MISSING_ACCEPTANCE_CRITERIA", fmt.Sprintf("%s: acceptance_criteria is required and must have at least one entry", prefix)}
 	}
 
+	for i, criterion := range child.AcceptanceCriteria {
+		if strings.TrimSpace(criterion) == "" {
+			return ValidationError{"BLANK_CRITERION", fmt.Sprintf("%s: acceptance_criteria[%d] is blank", prefix, i)}
+		}
+	}
+
 	return nil
 }
 
 func checkFileOverlaps(fileScopes map[string][]string) error {
-	fileToChildren := make(map[string][]string)
+	// Normalize all paths
+	type normalizedScope struct {
+		child string
+		files []string
+	}
+	var allNormalized []normalizedScope
 
 	for child, files := range fileScopes {
+		var normalized []string
 		for _, file := range files {
-			// Normalize path
-			normalizedFile := filepath.Clean(file)
-			fileToChildren[normalizedFile] = append(fileToChildren[normalizedFile], child)
+			normalized = append(normalized, filepath.Clean(file))
 		}
+		allNormalized = append(allNormalized, normalizedScope{child, normalized})
 	}
 
-	// Collect overlapping files for deterministic error message
-	var overlappingFiles []string
-	for file, children := range fileToChildren {
-		if len(children) > 1 {
-			overlappingFiles = append(overlappingFiles, file)
-		}
-	}
+	// Check for any overlaps (exact, prefix, or containment)
+	for i := 0; i < len(allNormalized); i++ {
+		for j := i + 1; j < len(allNormalized); j++ {
+			childI := allNormalized[i].child
+			childJ := allNormalized[j].child
 
-	if len(overlappingFiles) > 0 {
-		slices.Sort(overlappingFiles)
-		details := make([]string, 0, len(overlappingFiles))
-		for _, file := range overlappingFiles {
-			childList := fileToChildren[file]
-			slices.Sort(childList)
-			details = append(details, fmt.Sprintf("%q -> %v", file, childList))
+			for _, fileI := range allNormalized[i].files {
+				for _, fileJ := range allNormalized[j].files {
+					if hasOverlap(fileI, fileJ) {
+						// Sort children for deterministic error message
+						var childA, childB string
+						if childI < childJ {
+							childA, childB = childI, childJ
+						} else {
+							childA, childB = childJ, childI
+						}
+						return ValidationError{"OVERLAPPING_FILES", fmt.Sprintf("unsupported overlapping file writes: %q (child %q) and %q (child %q)", fileI, childA, fileJ, childB)}
+					}
+				}
+			}
 		}
-		return ValidationError{"OVERLAPPING_FILES", fmt.Sprintf("unsupported overlapping file writes: %s", strings.Join(details, "; "))}
 	}
 
 	return nil
 }
 
-func checkDependencies(children []Child, seenKeys map[string]bool) error {
+func hasOverlap(fileA, fileB string) bool {
+	// Check for exact match
+	if fileA == fileB {
+		return true
+	}
+	// Check for prefix/containment: one is a prefix of the other
+	// (e.g., "docs" contains "docs/x.md" or vice versa)
+	if strings.HasPrefix(fileA, fileB+"/") || strings.HasPrefix(fileB, fileA+"/") {
+		return true
+	}
+	return false
+}
+
+func checkDependencies(parentTaskID string, children []Child, seenKeys map[string]bool) error {
 	// Build key->index map for efficiency
 	keyToIndex := make(map[string]int)
 	for i, child := range children {
@@ -310,7 +339,10 @@ func checkDependencies(children []Child, seenKeys map[string]bool) error {
 
 			switch dep.Kind {
 			case DependencyParent:
-				// Parent dependencies are always valid (the parent task ID)
+				// Parent dependency ref must match the manifest's parent task ID
+				if dep.Ref != parentTaskID {
+					return ValidationError{"MISMATCHED_PARENT_DEPENDENCY", fmt.Sprintf("child %q: parent dependency ref %q does not match parent task ID %q", child.Key, dep.Ref, parentTaskID)}
+				}
 			case DependencyChild:
 				// Child dependency must reference an existing sibling key
 				if !seenKeys[dep.Ref] {
@@ -368,21 +400,17 @@ func hasCycleDFS(nodeKey string, children []Child, keyToIndex map[string]int, vi
 }
 
 func isValidTaskID(taskID string) bool {
-	// Task IDs should be non-empty and follow UUID format (basic check)
-	// Format: 8 hex chars - 4 hex chars - 4 hex chars - 4 hex chars - 12 hex chars
-	if len(taskID) < 8 {
+	if strings.TrimSpace(taskID) == "" {
 		return false
 	}
-	parts := strings.Split(taskID, "-")
-	if len(parts) != 5 {
-		return false
-	}
-	return len(parts[0]) == 8 && len(parts[1]) == 4 && len(parts[2]) == 4 && len(parts[3]) == 4 && len(parts[4]) == 12
+	_, err := uuid.Parse(taskID)
+	return err == nil
 }
 
-func validatePendingCandidates(candidates []PendingCandidate, allChildClaims map[string]string) error {
+func validatePendingCandidates(candidates []PendingCandidate, allChildClaims map[string]string, childClaimIDs map[string][]string) error {
 	// Check for unique candidate IDs
 	seenCandidates := make(map[string]bool)
+	assignedCandidates := make(map[string]bool)
 
 	for _, candidate := range candidates {
 		if strings.TrimSpace(candidate.ClaimID) == "" {
@@ -398,24 +426,38 @@ func validatePendingCandidates(candidates []PendingCandidate, allChildClaims map
 		switch candidate.Disposition {
 		case Assigned:
 			// Assigned candidate must appear in exactly one child
-			childKey, exists := allChildClaims[candidate.ClaimID]
+			_, exists := allChildClaims[candidate.ClaimID]
 			if !exists {
 				return ValidationError{"UNASSIGNED_CANDIDATE", fmt.Sprintf("claim %q marked assigned but not found in any child", candidate.ClaimID)}
 			}
-			// Verify the claim is actually in the child's claim_ids
-			if childKey == "" {
-				return ValidationError{"ORPHAN_CLAIM", fmt.Sprintf("claim %q is marked assigned but has no parent child", candidate.ClaimID)}
-			}
+			assignedCandidates[candidate.ClaimID] = true
 		case CarriedForward:
+			// Non-assigned candidates must not appear in any child
+			if _, inChild := allChildClaims[candidate.ClaimID]; inChild {
+				return ValidationError{"CONTRADICTORY_DISPOSITION", fmt.Sprintf("claim %q marked carried_forward but appears in a child", candidate.ClaimID)}
+			}
 			if candidate.Owner == nil || strings.TrimSpace(*candidate.Owner) == "" {
 				return ValidationError{"MISSING_OWNER", fmt.Sprintf("claim %q marked carried_forward must have an owner", candidate.ClaimID)}
 			}
 		case Excluded:
+			// Non-assigned candidates must not appear in any child
+			if _, inChild := allChildClaims[candidate.ClaimID]; inChild {
+				return ValidationError{"CONTRADICTORY_DISPOSITION", fmt.Sprintf("claim %q marked excluded but appears in a child", candidate.ClaimID)}
+			}
 			if candidate.Reason == nil || strings.TrimSpace(*candidate.Reason) == "" {
 				return ValidationError{"MISSING_REASON", fmt.Sprintf("claim %q marked excluded must have a reason", candidate.ClaimID)}
 			}
 		default:
 			return ValidationError{"INVALID_DISPOSITION", fmt.Sprintf("unknown disposition %q for claim %q", candidate.Disposition, candidate.ClaimID)}
+		}
+	}
+
+	// Ensure every child claim has an assigned candidate
+	for childKey, claimIDs := range childClaimIDs {
+		for _, claimID := range claimIDs {
+			if !assignedCandidates[claimID] && !seenCandidates[claimID] {
+				return ValidationError{"UNMATCHED_CHILD_CLAIM", fmt.Sprintf("child %q claim %q has no assigned candidate", childKey, claimID)}
+			}
 		}
 	}
 
