@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -8692,959 +8693,729 @@ func TestGetTaskExposesPlannedContinuation(t *testing.T) {
 	}
 }
 
-func apiListTasks(t *testing.T, server *Server, authHeader, projectID string) []store.Task {
+// contEnv drives the reviewed-continuation lifecycle through the HTTP API. Every step asserts its
+// status code, so a broken intermediate step fails where it happens instead of weakening a later
+// check.
+type contEnv struct {
+	t      *testing.T
+	server *Server
+	auth   string
+}
+
+func newContEnv(t *testing.T) *contEnv {
 	t.Helper()
-	req := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
-	req.Header.Set("Authorization", authHeader)
-	w := httptest.NewRecorder()
-	server.mux.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("list tasks: status %d; body: %s", w.Code, w.Body.String())
+	return &contEnv{t: t, server: setupTestServer(t, "test-token"), auth: "Bearer test-token"}
+}
+
+func (e *contEnv) call(method, path string, payload interface{}) (int, []byte) {
+	e.t.Helper()
+	var encoded []byte
+	if payload != nil {
+		encoded, _ = json.Marshal(payload)
 	}
+	req := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+	req.Header.Set("Authorization", e.auth)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	e.server.mux.ServeHTTP(w, req)
+	return w.Code, w.Body.Bytes()
+}
+
+func (e *contEnv) mustCall(method, path string, payload interface{}, want int) []byte {
+	e.t.Helper()
+	code, body := e.call(method, path, payload)
+	if code != want {
+		e.t.Fatalf("%s %s: expected %d, got %d; body: %s", method, path, want, code, body)
+	}
+	return body
+}
+
+func (e *contEnv) get(id string) store.TaskWithDepsAndLinks {
+	e.t.Helper()
+	return apiGetTask(e.t, e.server, e.auth, id)
+}
+
+func (e *contEnv) list(projectID, query string) []store.Task {
+	e.t.Helper()
 	var tasks []store.Task
-	if err := json.NewDecoder(w.Body).Decode(&tasks); err != nil {
-		t.Fatalf("failed to decode tasks: %v", err)
+	if err := json.Unmarshal(e.mustCall("GET", "/projects/"+projectID+"/tasks"+query, nil, http.StatusOK), &tasks); err != nil {
+		e.t.Fatalf("failed to decode task list: %v", err)
 	}
 	return tasks
 }
 
-// Helper to approve all review tasks for a parent task from both required models
-func approveAllReviews(t *testing.T, server *Server, authHeader, projectID, parentID string) {
-	t.Helper()
-	allTasks := apiListTasks(t, server, authHeader, projectID)
-	reviewTasksByModel := make(map[string][]string)
-	for _, task := range allTasks {
-		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == parentID {
-			reviewTasksByModel[task.Model] = append(reviewTasksByModel[task.Model], task.ID)
+// newParent creates a claimed research parent whose spec opts in to continuations.
+func (e *contEnv) newParent() (parentID, projectID string) {
+	e.t.Helper()
+	parentID = createClaimedResearchTask(e.t, e.server, e.auth, "Research the sources.\n\n## Continuation manifest\n")
+	return parentID, e.get(parentID).ProjectID
+}
+
+func (e *contEnv) submit(id, agent string, manifest map[string]interface{}) {
+	e.t.Helper()
+	payload := map[string]interface{}{
+		"agent_id": agent, "result": "Implemented",
+		"links": []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/439"}},
+	}
+	if manifest != nil {
+		payload["manifest"] = manifest
+	}
+	e.mustCall("POST", "/tasks/"+id+"/submit", payload, http.StatusOK)
+}
+
+// openReviews returns the unclaimed review tasks of parentID's current round, keyed by model.
+func (e *contEnv) openReviews(projectID, parentID string) map[string]string {
+	e.t.Helper()
+	out := map[string]string{}
+	for _, task := range e.list(projectID, "") {
+		if task.Kind == "review" && task.State == "ready" && task.TargetTaskID != nil && *task.TargetTaskID == parentID {
+			out[task.Model] = task.ID
 		}
 	}
-
-	if len(reviewTasksByModel) != 2 {
-		t.Fatalf("expected review tasks from 2 models, got %d", len(reviewTasksByModel))
+	if len(out) != 2 {
+		e.t.Fatalf("expected opus and sonnet review tasks for %s, got %v", parentID, out)
 	}
+	return out
+}
 
-	for model, taskIDs := range reviewTasksByModel {
-		if len(taskIDs) > 0 {
-			apiClaimTask(t, server, authHeader, taskIDs[0], "reviewer-"+model, model)
-			if code, body := apiSubmit(t, server, authHeader, taskIDs[0], map[string]interface{}{
-				"agent_id": "reviewer-" + model, "result": "OK", "verdict": "approve", "findings": []interface{}{},
-			}); code != http.StatusOK {
-				t.Fatalf("failed to submit %s review: got status %d; body: %s", model, code, body)
+func (e *contEnv) review(reviewID, model, verdict string, findings []map[string]interface{}) {
+	e.t.Helper()
+	if findings == nil {
+		findings = []map[string]interface{}{}
+	}
+	e.mustCall("POST", "/tasks/"+reviewID+"/claim", map[string]string{"agent_id": "reviewer-" + model, "model": model}, http.StatusOK)
+	e.mustCall("POST", "/tasks/"+reviewID+"/submit", map[string]interface{}{
+		"agent_id": "reviewer-" + model, "result": "review notes", "verdict": verdict, "findings": findings,
+	}, http.StatusOK)
+}
+
+// approveRound has both reviewers approve parentID's open round; opusFindings ride on the opus review.
+func (e *contEnv) approveRound(projectID, parentID string, opusFindings []map[string]interface{}) {
+	e.t.Helper()
+	reviews := e.openReviews(projectID, parentID)
+	e.review(reviews["opus"], "opus", "approve", opusFindings)
+	if state := e.get(parentID).State; state != "review" {
+		e.t.Fatalf("one approval must not move the parent out of review, got %q", state)
+	}
+	e.review(reviews["sonnet"], "sonnet", "approve", nil)
+	if state := e.get(parentID).State; state != "approved" {
+		e.t.Fatalf("two approvals must move the parent to approved, got %q", state)
+	}
+}
+
+// rejectRound has opus reject parentID's open round with a blocking finding and sonnet approve,
+// which bounces the parent back to ready.
+func (e *contEnv) rejectRound(projectID, parentID string) {
+	e.t.Helper()
+	reviews := e.openReviews(projectID, parentID)
+	e.review(reviews["opus"], "opus", "reject", []map[string]interface{}{{
+		"id": "f1", "severity": "P2", "file": "docs/plan.md", "line": 3,
+		"summary": "Proposed split does not cover the claims", "in_changed_text": true, "status": "new",
+	}})
+	e.review(reviews["sonnet"], "sonnet", "approve", nil)
+	if state := e.get(parentID).State; state != "ready" {
+		e.t.Fatalf("a rejected round must bounce the parent to ready, got %q", state)
+	}
+}
+
+func (e *contEnv) merge(id string) (int, []byte) {
+	e.t.Helper()
+	return e.call("POST", "/tasks/"+id+"/transition", map[string]string{"to": "done"})
+}
+
+func (e *contEnv) mustMerge(id string) {
+	e.t.Helper()
+	if code, body := e.merge(id); code != http.StatusOK {
+		e.t.Fatalf("merge of %s: expected 200, got %d; body: %s", id, code, body)
+	}
+}
+
+func (e *contEnv) claimCode(id, agent, model string) int {
+	e.t.Helper()
+	code, _ := e.call("POST", "/tasks/"+id+"/claim", map[string]string{"agent_id": agent, "model": model})
+	return code
+}
+
+// titleCounts counts the implement tasks of the project by title.
+func (e *contEnv) titleCounts(projectID string) map[string]int {
+	e.t.Helper()
+	counts := map[string]int{}
+	for _, task := range e.list(projectID, "") {
+		if task.Kind == "implement" {
+			counts[task.Title]++
+		}
+	}
+	return counts
+}
+
+func (e *contEnv) claimableIDs(projectID string) map[string]bool {
+	e.t.Helper()
+	ids := map[string]bool{}
+	for _, task := range e.list(projectID, "?claimable=true&model=haiku") {
+		ids[task.ID] = true
+	}
+	return ids
+}
+
+func (e *contEnv) execSQL(query string, args ...interface{}) {
+	e.t.Helper()
+	if _, err := e.server.store.Conn().ExecContext(context.Background(), query, args...); err != nil {
+		e.t.Fatalf("sql %q: %v", query, err)
+	}
+}
+
+func contChild(key, track, file string, deps ...map[string]string) map[string]interface{} {
+	return map[string]interface{}{
+		"key": key, "title": "Analyze " + key, "spec": "Source-only analysis for " + key,
+		"track": track, "model": "haiku", "review_models": []string{"opus", "sonnet"},
+		"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-" + key},
+		"source_start_points": []string{"https://example.com/" + key}, "file_scope": []string{file},
+		"acceptance_criteria": []string{key + " verified"}, "dependencies": deps,
+	}
+}
+
+func contParentDep(parentID string) map[string]string {
+	return map[string]string{"kind": "parent", "ref": parentID}
+}
+
+func contManifest(parentID string, children ...map[string]interface{}) map[string]interface{} {
+	candidates := make([]map[string]string, 0, len(children))
+	for _, c := range children {
+		candidates = append(candidates, map[string]string{"claim_id": c["claim_ids"].([]string)[0], "disposition": "assigned"})
+	}
+	return map[string]interface{}{"version": 1, "parent_task_id": parentID, "children": children, "pending_candidates": candidates}
+}
+
+func contTwoSourceManifest(parentID string) map[string]interface{} {
+	return contManifest(parentID,
+		contChild("source-a", "research", "docs/a.md", contParentDep(parentID)),
+		contChild("source-b", "research", "docs/b.md", contParentDep(parentID)))
+}
+
+func contCreatedKeys(task store.TaskWithDepsAndLinks) []string {
+	keys := []string{}
+	if task.Continuation != nil {
+		for _, c := range task.Continuation.CreatedChildren {
+			keys = append(keys, c.Key)
+		}
+	}
+	return keys
+}
+
+func contCreatedByKey(t *testing.T, task store.TaskWithDepsAndLinks, key string) store.CreatedChild {
+	t.Helper()
+	if task.Continuation != nil {
+		for _, c := range task.Continuation.CreatedChildren {
+			if c.Key == key {
+				return c
 			}
 		}
 	}
+	t.Fatalf("no created child with key %q on %s: %+v", key, task.ID, task.Continuation)
+	return store.CreatedChild{}
 }
 
-// Helper to transition a task to done (simulating human merge)
-func transitionToDone(t *testing.T, server *Server, authHeader, taskID string) {
-	t.Helper()
-	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader([]byte(`{"to":"done"}`)))
-	transitionReq.Header.Set("Authorization", authHeader)
-	transitionReq.Header.Set("Content-Type", "application/json")
-	transitionW := httptest.NewRecorder()
-	server.mux.ServeHTTP(transitionW, transitionReq)
-
-	if transitionW.Code != http.StatusOK {
-		t.Fatalf("failed to transition to done: got status %d; body: %s", transitionW.Code, transitionW.Body.String())
-	}
-}
-
-// Helper to attempt claiming a task and check if it succeeds
-func tryClaimTask(t *testing.T, server *Server, authHeader, taskID, agent, model string) bool {
-	t.Helper()
-	req := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader([]byte(`{"agent_id":"`+agent+`","model":"`+model+`"}`)))
-	req.Header.Set("Authorization", authHeader)
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	server.mux.ServeHTTP(w, req)
-	return w.Code == http.StatusOK
-}
-
+// TestResearchContinuationEndToEnd walks an opt-in research parent through the reviewed
+// continuation workflow: submit with a manifest, two independent approvals, the human merge that
+// creates the children, and the paths that must not create children.
 func TestResearchContinuationEndToEnd(t *testing.T) {
-	t.Run("happy path: submit, approve, merge, create children, claim", testResearchContinuationHappyPath)
-	t.Run("rejection paths: invalid manifest, changed manifest, unmerged PR", testResearchContinuationRejectionPaths)
-	t.Run("retry idempotency: re-transition to done without creating duplicates", testResearchContinuationIdempotency)
-	t.Run("mixed children: research (ready) and build (backlog) tracks", testResearchContinuationMixedTracks)
-	t.Run("dependency gating: dependencies must be done for claimability", testResearchContinuationDependencyGating)
-	t.Run("research follow-ups still work alongside continuation manifest", testResearchContinuationWithFollowUps)
-	t.Run("held legacy tasks remain held and not auto-retargeted", testResearchContinuationHeldLegacyTasks)
+	t.Run("submit, two approvals, merge: ready children are claimable with no manual promotion", testContinuationHappyPath)
+	t.Run("invalid splits are refused at submit and a corrected manifest then merges", testContinuationInvalidSplits)
+	t.Run("changed manifest: only the approved round's manifest creates children", testContinuationChangedManifest)
+	t.Run("unmerged work: no merge path other than the verified done creates children", testContinuationUnmerged)
+	t.Run("retry: repeated and rolled-back merges never duplicate children", testContinuationRetryIdempotency)
+	t.Run("dependencies gate claimability and build children start in backlog", testContinuationDependencyGating)
+	t.Run("finding follow-ups still work and stay separate from manifest children", testContinuationFindingFollowUps)
+	t.Run("held legacy tasks stay held and are listed as action items", testContinuationHeldLegacyTasks)
 }
 
-func testResearchContinuationHappyPath(t *testing.T) {
-	server := setupTestServer(t, "test-token")
-	authHeader := "Bearer test-token"
+func testContinuationHappyPath(t *testing.T) {
+	e := newContEnv(t)
+	parentID, projectID := e.newParent()
+	e.submit(parentID, "agent-1", contTwoSourceManifest(parentID))
 
-	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-	parent := apiGetTask(t, server, authHeader, parentID)
-	projectID := parent.ProjectID
-
-	twoChildManifest := map[string]interface{}{
-		"version":        1,
-		"parent_task_id": parentID,
-		"children": []map[string]interface{}{
-			{
-				"key": "source-a", "title": "Analyze source A", "spec": "Source-only analysis of reference A",
-				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-a"},
-				"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
-				"acceptance_criteria": []string{"source A verified"},
-				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-			},
-			{
-				"key": "source-b", "title": "Analyze source B", "spec": "Source-only analysis of reference B",
-				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-b"},
-				"source_start_points": []string{"https://example.com/b"}, "file_scope": []string{"docs/b.md"},
-				"acceptance_criteria": []string{"source B verified"},
-				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-			},
-		},
-		"pending_candidates": []map[string]string{
-			{"claim_id": "claim-a", "disposition": "assigned"},
-			{"claim_id": "claim-b", "disposition": "assigned"},
-		},
+	parent := e.get(parentID)
+	if parent.State != "review" {
+		t.Fatalf("parent after submit: expected review, got %q", parent.State)
 	}
-
-	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}}
-
-	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": twoChildManifest,
-	}); code != http.StatusOK {
-		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	if len(parent.SubmissionManifests) != 1 || parent.Continuation == nil || len(parent.Continuation.ProposedChildren) != 2 {
+		t.Fatalf("expected one stored manifest proposing two children, got %+v", parent)
 	}
-
-	parentAfterSubmit := apiGetTask(t, server, authHeader, parentID)
-	if parentAfterSubmit.State != "review" {
-		t.Fatalf("expected parent state 'review' after submit, got %q", parentAfterSubmit.State)
-	}
-
-	if parentAfterSubmit.Continuation == nil || len(parentAfterSubmit.Continuation.ProposedChildren) != 2 {
-		t.Fatalf("expected 2 proposed children, got %+v", parentAfterSubmit.Continuation)
-	}
-	if len(parentAfterSubmit.Continuation.CreatedChildren) != 0 {
-		t.Fatalf("nothing should be created before merge, got %+v", parentAfterSubmit.Continuation.CreatedChildren)
-	}
-
-	approveAllReviews(t, server, authHeader, projectID, parentID)
-
-	parentAfterApprovals := apiGetTask(t, server, authHeader, parentID)
-	if parentAfterApprovals.State != "approved" {
-		t.Fatalf("parent should be in approved state after all approvals, got %q", parentAfterApprovals.State)
-	}
-
-	if len(parentAfterApprovals.Continuation.CreatedChildren) != 0 {
-		t.Fatalf("children should not exist before merge, got %d", len(parentAfterApprovals.Continuation.CreatedChildren))
-	}
-
-	transitionToDone(t, server, authHeader, parentID)
-
-	parentAfterMerge := apiGetTask(t, server, authHeader, parentID)
-	if parentAfterMerge.State != "done" {
-		t.Fatalf("parent should be done after transition, got %q", parentAfterMerge.State)
-	}
-
-	if parentAfterMerge.Continuation == nil || len(parentAfterMerge.Continuation.CreatedChildren) != 2 {
-		t.Fatalf("expected 2 created children after merge, got %+v", parentAfterMerge.Continuation)
-	}
-
-	for i, child := range parentAfterMerge.Continuation.CreatedChildren {
-		if child.ID == "" {
-			t.Errorf("child %d should have an ID", i)
-		}
-		if child.State != "ready" {
-			t.Errorf("child %d state should be ready (research track), got %q", i, child.State)
-		}
-		if child.Track != "research" {
-			t.Errorf("child %d track should be research, got %q", i, child.Track)
+	digest := parent.SubmissionManifests[0].ManifestDigest
+	for _, p := range parent.Continuation.ProposedChildren {
+		if p.Status != "pending" || p.InitialState != "ready" || p.CreatedTaskID != "" {
+			t.Errorf("proposed child %+v must be pending, start ready and have no task yet", p)
 		}
 	}
 
-	for _, child := range parentAfterMerge.Continuation.CreatedChildren {
-		apiClaimTask(t, server, authHeader, child.ID, "child-worker", "haiku")
-		claimedChild := apiGetTask(t, server, authHeader, child.ID)
-		if claimedChild.Assignee == nil || *claimedChild.Assignee != "child-worker" {
-			t.Errorf("child %s should be claimed by child-worker, got assignee %+v", child.ID, claimedChild.Assignee)
+	e.approveRound(projectID, parentID, nil)
+	approved := e.get(parentID)
+	if got := contCreatedKeys(approved); len(got) != 0 {
+		t.Fatalf("children must not exist before the merge, got %v", got)
+	}
+	if counts := e.titleCounts(projectID); counts["Analyze source-a"] != 0 || counts["Analyze source-b"] != 0 {
+		t.Fatalf("no child task may exist before the merge, got %v", counts)
+	}
+	if approved.Continuation.ManifestDigest != digest {
+		t.Errorf("approved manifest digest %q != submitted digest %q", approved.Continuation.ManifestDigest, digest)
+	}
+
+	e.mustMerge(parentID)
+	done := e.get(parentID)
+	if done.State != "done" {
+		t.Fatalf("parent after merge: expected done, got %q", done.State)
+	}
+	if got := contCreatedKeys(done); !reflect.DeepEqual(got, []string{"source-a", "source-b"}) {
+		t.Fatalf("created children = %v, want [source-a source-b] in manifest order", got)
+	}
+	claimable := e.claimableIDs(projectID)
+	for _, key := range []string{"source-a", "source-b"} {
+		child := contCreatedByKey(t, done, key)
+		if child.State != "ready" || child.Track != "research" || !child.Claimable || child.DependencyStatus != "satisfied" || child.ManifestDigest != digest || child.ParentTaskID != parentID {
+			t.Errorf("created child %s = %+v, want ready research, claimable, satisfied, digest %s", key, child, digest)
+		}
+		if !claimable[child.ID] {
+			t.Errorf("child %s must be in the claimable list without any promotion", key)
+		}
+		if e.claimCode(child.ID, "child-worker-"+key, "haiku") != http.StatusOK {
+			t.Errorf("child %s must be claimable", key)
+		}
+		claimed := e.get(child.ID)
+		if claimed.State != "in_progress" || claimed.Continuation == nil || claimed.Continuation.ParentInfo == nil ||
+			claimed.Continuation.ParentInfo.ID != parentID || claimed.Continuation.ParentInfo.ChildKey != key || claimed.Continuation.ParentInfo.ManifestDigest != digest {
+			t.Errorf("claimed child %s lost its provenance: %+v", key, claimed.Continuation)
+		}
+	}
+	for _, p := range done.Continuation.ProposedChildren {
+		if p.Status != "created" || p.CreatedTaskID == "" {
+			t.Errorf("proposed child %+v must report the task the merge created", p)
 		}
 	}
 }
 
-func testResearchContinuationRejectionPaths(t *testing.T) {
-	server := setupTestServer(t, "test-token")
-	authHeader := "Bearer test-token"
+func testContinuationInvalidSplits(t *testing.T) {
+	e := newContEnv(t)
+	parentID, projectID := e.newParent()
 
-	t.Run("reject invalid manifest: overlapping file scopes", func(t *testing.T) {
-		parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-
-		invalidManifest := map[string]interface{}{
-			"version":        1,
-			"parent_task_id": parentID,
-			"children": []map[string]interface{}{
-				{
-					"key": "child1", "title": "Child 1", "spec": "Child 1 spec",
-					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
-					"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/shared.md"},
-					"acceptance_criteria": []string{"criterion 1"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-				{
-					"key": "child2", "title": "Child 2", "spec": "Child 2 spec",
-					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"c2"},
-					"source_start_points": []string{"https://example.com/b"}, "file_scope": []string{"docs/shared.md"},
-					"acceptance_criteria": []string{"criterion 2"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-			},
-			"pending_candidates": []map[string]string{
-				{"claim_id": "c1", "disposition": "assigned"},
-				{"claim_id": "c2", "disposition": "assigned"},
-			},
+	invalid := map[string]struct {
+		manifest map[string]interface{}
+		code     string
+	}{
+		"overlapping file scopes": {contManifest(parentID,
+			contChild("a", "research", "docs/shared.md", contParentDep(parentID)),
+			contChild("b", "research", "docs/shared.md", contParentDep(parentID))), "OVERLAPPING_FILES"},
+		"more than three children": {contManifest(parentID,
+			contChild("a", "research", "docs/a.md"), contChild("b", "research", "docs/b.md"),
+			contChild("c", "research", "docs/c.md"), contChild("d", "research", "docs/d.md")), "TOO_MANY_CHILDREN"},
+		"unknown child dependency": {contManifest(parentID,
+			contChild("a", "research", "docs/a.md"),
+			contChild("b", "research", "docs/b.md", map[string]string{"kind": "child", "ref": "nope"})), "UNKNOWN_CHILD_DEPENDENCY"},
+		"a single reviewer": {contManifest(parentID, func() map[string]interface{} {
+			c := contChild("a", "research", "docs/a.md")
+			c["review_models"] = []string{"opus"}
+			return c
+		}()), "INVALID_REVIEW_MODELS"},
+	}
+	for name, tc := range invalid {
+		body := e.mustCall("POST", "/tasks/"+parentID+"/submit", map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "manifest": tc.manifest,
+			"links": []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/439"}},
+		}, http.StatusBadRequest)
+		if got := apiErrorCode(t, body); got != tc.code {
+			t.Errorf("%s: expected %s, got %s; body: %s", name, tc.code, got, body)
 		}
-
-		prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}}
-		code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": invalidManifest,
-		})
-		if code == http.StatusOK {
-			t.Fatalf("expected rejection for overlapping file scopes, got status %d", code)
+		task := e.get(parentID)
+		if task.State != "in_progress" || task.ReviewRound != 0 || len(task.SubmissionManifests) != 0 || len(task.Links) != 0 {
+			t.Fatalf("%s: a refused submission must leave the task untouched, got state %s round %d manifests %d links %d", name, task.State, task.ReviewRound, len(task.SubmissionManifests), len(task.Links))
 		}
-		if !strings.Contains(string(body), "OVERLAPPING_FILES") {
-			t.Errorf("expected OVERLAPPING_FILES error, got: %s", body)
+		if len(e.list(projectID, "?kind=review")) != 0 {
+			t.Fatalf("%s: a refused submission must not spawn reviews", name)
 		}
-	})
+	}
 
-	t.Run("reject invalid manifest: unknown model", func(t *testing.T) {
-		parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
+	// The worker corrects the split and resubmits; nothing else is needed to reach the children.
+	e.submit(parentID, "agent-1", contTwoSourceManifest(parentID))
+	e.approveRound(projectID, parentID, nil)
+	e.mustMerge(parentID)
+	if got := contCreatedKeys(e.get(parentID)); !reflect.DeepEqual(got, []string{"source-a", "source-b"}) {
+		t.Fatalf("corrected manifest must create its children, got %v", got)
+	}
+}
 
-		invalidManifest := map[string]interface{}{
-			"version":        1,
-			"parent_task_id": parentID,
-			"children": []map[string]interface{}{
-				{
-					"key": "child1", "title": "Child 1", "spec": "Child 1 spec",
-					"track": "research", "model": "unknown-model", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
-					"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
-					"acceptance_criteria": []string{"criterion 1"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-			},
-			"pending_candidates": []map[string]string{
-				{"claim_id": "c1", "disposition": "assigned"},
-			},
+func testContinuationChangedManifest(t *testing.T) {
+	e := newContEnv(t)
+	parentID, projectID := e.newParent()
+
+	manifestA := contManifest(parentID,
+		contChild("round1-a", "research", "docs/one-a.md", contParentDep(parentID)),
+		contChild("round1-b", "research", "docs/one-b.md", contParentDep(parentID)))
+	e.submit(parentID, "agent-1", manifestA)
+	digestA := e.get(parentID).SubmissionManifests[0].ManifestDigest
+	e.rejectRound(projectID, parentID)
+	if got := contCreatedKeys(e.get(parentID)); len(got) != 0 {
+		t.Fatalf("a rejected round must create no children, got %v", got)
+	}
+	if code, _ := e.merge(parentID); code != http.StatusConflict {
+		t.Fatalf("merging a parent bounced to ready must be refused with 409, got %d", code)
+	}
+
+	manifestB := contManifest(parentID,
+		contChild("round2-a", "research", "docs/two-a.md", contParentDep(parentID)),
+		contChild("round2-b", "research", "docs/two-b.md", contParentDep(parentID)))
+	e.mustCall("POST", "/tasks/"+parentID+"/claim", map[string]string{"agent_id": "agent-1", "model": "haiku"}, http.StatusOK)
+	e.submit(parentID, "agent-1", manifestB)
+	resubmitted := e.get(parentID)
+	if len(resubmitted.SubmissionManifests) != 2 || resubmitted.SubmissionManifests[0].ReviewRound != 1 || resubmitted.SubmissionManifests[1].ReviewRound != 2 {
+		t.Fatalf("expected manifests for rounds 1 and 2, got %+v", resubmitted.SubmissionManifests)
+	}
+	digestB := resubmitted.SubmissionManifests[1].ManifestDigest
+	if digestA == digestB || resubmitted.SubmissionManifests[0].ManifestDigest != digestA {
+		t.Fatalf("round manifests must keep distinct digests, got %s and %s", digestA, digestB)
+	}
+	if resubmitted.Continuation == nil || resubmitted.Continuation.ManifestDigest != digestB {
+		t.Fatalf("the proposal under review must be round 2's manifest, got %+v", resubmitted.Continuation)
+	}
+
+	e.approveRound(projectID, parentID, nil)
+	e.mustMerge(parentID)
+	done := e.get(parentID)
+	if got := contCreatedKeys(done); !reflect.DeepEqual(got, []string{"round2-a", "round2-b"}) {
+		t.Fatalf("only the approved round's children may be created, got %v", got)
+	}
+	for _, c := range done.Continuation.CreatedChildren {
+		if c.ManifestDigest != digestB {
+			t.Errorf("child %s carries digest %s, want round 2's %s", c.Key, c.ManifestDigest, digestB)
 		}
+	}
+	counts := e.titleCounts(projectID)
+	if counts["Analyze round1-a"] != 0 || counts["Analyze round1-b"] != 0 || counts["Analyze round2-a"] != 1 || counts["Analyze round2-b"] != 1 {
+		t.Fatalf("round 1 children must never exist and round 2 children exist once, got %v", counts)
+	}
+}
 
-		prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/2"}}
-		code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": invalidManifest,
-		})
-		if code == http.StatusOK {
-			t.Fatalf("expected rejection for unknown model, got status %d", code)
-		}
-		if !strings.Contains(string(body), "UNKNOWN_MODEL") {
-			t.Errorf("expected UNKNOWN_MODEL error, got: %s", body)
-		}
-	})
+func testContinuationUnmerged(t *testing.T) {
+	e := newContEnv(t)
 
-	t.Run("reject invalid manifest: too many children", func(t *testing.T) {
-		parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-
-		invalidManifest := map[string]interface{}{
-			"version":        1,
-			"parent_task_id": parentID,
-			"children": []map[string]interface{}{
-				{
-					"key": "c1", "title": "Child 1", "spec": "Spec 1",
-					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-1"},
-					"source_start_points": []string{"https://example.com/1"}, "file_scope": []string{"docs/1.md"},
-					"acceptance_criteria": []string{"criterion 1"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-				{
-					"key": "c2", "title": "Child 2", "spec": "Spec 2",
-					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-2"},
-					"source_start_points": []string{"https://example.com/2"}, "file_scope": []string{"docs/2.md"},
-					"acceptance_criteria": []string{"criterion 2"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-				{
-					"key": "c3", "title": "Child 3", "spec": "Spec 3",
-					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-3"},
-					"source_start_points": []string{"https://example.com/3"}, "file_scope": []string{"docs/3.md"},
-					"acceptance_criteria": []string{"criterion 3"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-				{
-					"key": "c4", "title": "Child 4", "spec": "Spec 4",
-					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-4"},
-					"source_start_points": []string{"https://example.com/4"}, "file_scope": []string{"docs/4.md"},
-					"acceptance_criteria": []string{"criterion 4"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-			},
-			"pending_candidates": []map[string]string{
-				{"claim_id": "claim-1", "disposition": "assigned"},
-				{"claim_id": "claim-2", "disposition": "assigned"},
-				{"claim_id": "claim-3", "disposition": "assigned"},
-				{"claim_id": "claim-4", "disposition": "assigned"},
-			},
+	t.Run("not yet approved", func(t *testing.T) {
+		e := newContEnv(t)
+		parentID, projectID := e.newParent()
+		e.submit(parentID, "agent-1", contTwoSourceManifest(parentID))
+		if code, _ := e.merge(parentID); code != http.StatusConflict {
+			t.Fatalf("merge while in review must be refused with 409, got %d", code)
 		}
-
-		prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/3"}}
-		code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": invalidManifest,
-		})
-		if code == http.StatusOK {
-			t.Fatalf("expected rejection for >3 children, got status %d", code)
+		reviews := e.openReviews(projectID, parentID)
+		e.review(reviews["opus"], "opus", "approve", nil)
+		if code, _ := e.merge(parentID); code != http.StatusConflict {
+			t.Fatalf("merge with one approval must be refused with 409, got %d", code)
 		}
-		if !strings.Contains(string(body), "TOO_MANY_CHILDREN") {
-			t.Errorf("expected TOO_MANY_CHILDREN error, got: %s", body)
+		parent := e.get(parentID)
+		if parent.State != "review" || len(contCreatedKeys(parent)) != 0 {
+			t.Fatalf("parent must stay in review with no children, got %q %v", parent.State, contCreatedKeys(parent))
+		}
+		if counts := e.titleCounts(projectID); counts["Analyze source-a"] != 0 {
+			t.Fatalf("no child task may exist, got %v", counts)
 		}
 	})
 
-	t.Run("reject changed manifest between rounds", func(t *testing.T) {
-		// Test that when manifest changes between rounds, only the latest approved manifest's children are created
-		parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-		parent := apiGetTask(t, server, authHeader, parentID)
-		projectID := parent.ProjectID
+	t.Run("approved but the work has not landed", func(t *testing.T) {
+		parentID, projectID := e.newParent()
+		e.mustCall("POST", "/tasks/"+parentID+"/submit", map[string]interface{}{
+			"agent_id": "agent-1", "result": "Implemented", "manifest": contTwoSourceManifest(parentID),
+			"links": []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/439"}, {"kind": "commit", "value": "abc123"}},
+		}, http.StatusOK)
+		e.approveRound(projectID, parentID, nil)
 
-		// Round 1: Submit manifest with 1 child
-		firstManifest := map[string]interface{}{
-			"version":        1,
-			"parent_task_id": parentID,
-			"children": []map[string]interface{}{
-				{
-					"key": "child1", "title": "Child 1", "spec": "Spec 1",
-					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
-					"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
-					"acceptance_criteria": []string{"criterion"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-			},
-			"pending_candidates": []map[string]string{
-				{"claim_id": "c1", "disposition": "assigned"},
-			},
+		code, body := e.merge(parentID)
+		if code != http.StatusConflict || apiErrorCode(t, body) != "LANDING_REQUIRED" {
+			t.Fatalf("done before the reviewed commit lands: expected 409 LANDING_REQUIRED, got %d: %s", code, body)
+		}
+		parent := e.get(parentID)
+		if parent.State != "approved" || len(contCreatedKeys(parent)) != 0 || e.titleCounts(projectID)["Analyze source-a"] != 0 {
+			t.Fatalf("the refused merge must leave the parent approved with no children, got %q %v", parent.State, contCreatedKeys(parent))
 		}
 
-		prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/50"}}
-		if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-			"agent_id": "agent-1", "result": "First submission", "links": prLinks, "manifest": firstManifest,
-		}); code != http.StatusOK {
-			t.Fatalf("first submit failed: %d; body: %s", code, body)
+		e.mustCall("POST", "/tasks/"+parentID+"/landing", map[string]interface{}{"review_round": 1, "commit": "abc123", "attempt": "attempt-1"}, http.StatusNoContent)
+		if got := contCreatedKeys(e.get(parentID)); len(got) != 0 {
+			t.Fatalf("reserving the landing must not create children, got %v", got)
 		}
-
-		// Get and store the first manifest digest before approval
-		afterFirstSubmit := apiGetTask(t, server, authHeader, parentID)
-		firstManifestDigest := ""
-		if len(afterFirstSubmit.Continuation.ProposedChildren) > 0 {
-			firstManifestDigest = afterFirstSubmit.Continuation.ManifestDigest
-		}
-
-		// Both reviewers approve the FIRST manifest
-		approveAllReviews(t, server, authHeader, projectID, parentID)
-
-		// Verify first approval
-		afterFirstApproval := apiGetTask(t, server, authHeader, parentID)
-		if afterFirstApproval.State != "approved" {
-			t.Fatalf("parent should be approved after round 1, got %q", afterFirstApproval.State)
-		}
-
-		// Verify submission manifests are recorded
-		if len(afterFirstApproval.SubmissionManifests) < 1 {
-			t.Errorf("expected at least 1 submission manifest after first round")
-		}
-
-		// Instead of testing actual rejection flow (which has complex state), test manifest change
-		// by verifying only the latest approved manifest is used
-		// This is done by checking that children are created from the currently approved manifest
-
-		// Merge with the first (approved) manifest
-		transitionToDone(t, server, authHeader, parentID)
-
-		afterFirstMerge := apiGetTask(t, server, authHeader, parentID)
-		if len(afterFirstMerge.Continuation.CreatedChildren) != 1 {
-			t.Fatalf("expected 1 created child from first manifest, got %d", len(afterFirstMerge.Continuation.CreatedChildren))
-		}
-
-		// Verify the created child has the expected key
-		if afterFirstMerge.Continuation.CreatedChildren[0].Key != "child1" {
-			t.Errorf("created child should have key 'child1', got %q", afterFirstMerge.Continuation.CreatedChildren[0].Key)
-		}
-
-		// Verify that the created child's provenance matches the manifest digest
-		if afterFirstMerge.Continuation.CreatedChildren[0].ManifestDigest != firstManifestDigest {
-			t.Errorf("created child's digest should match the approved manifest digest")
+		e.mustCall("POST", "/tasks/"+parentID+"/landing/complete", map[string]string{"attempt": "attempt-1"}, http.StatusOK)
+		if got := contCreatedKeys(e.get(parentID)); !reflect.DeepEqual(got, []string{"source-a", "source-b"}) {
+			t.Fatalf("the landed merge must create the children, got %v", got)
 		}
 	})
 
-	t.Run("reject unmerged PR: cannot create children without verified merge", func(t *testing.T) {
-		parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-		parent := apiGetTask(t, server, authHeader, parentID)
-		projectID := parent.ProjectID
-
-		manifest := map[string]interface{}{
-			"version":        1,
-			"parent_task_id": parentID,
-			"children": []map[string]interface{}{
-				{
-					"key": "child1", "title": "Child 1", "spec": "Spec",
-					"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-					"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
-					"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
-					"acceptance_criteria": []string{"criterion"},
-					"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-				},
-			},
-			"pending_candidates": []map[string]string{
-				{"claim_id": "c1", "disposition": "assigned"},
-			},
-		}
-
-		prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/60"}}
-		if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-			"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": manifest,
-		}); code != http.StatusOK {
-			t.Fatalf("submit failed: %d; body: %s", code, body)
-		}
-
-		approveAllReviews(t, server, authHeader, projectID, parentID)
-
-		parentAfterReview := apiGetTask(t, server, authHeader, parentID)
-		if parentAfterReview.State != "approved" {
-			t.Fatalf("parent should be approved, got %q", parentAfterReview.State)
-		}
-
-		// Verify NO children are created while parent is in "approved" state (before merge)
-		if len(parentAfterReview.Continuation.CreatedChildren) != 0 {
-			t.Errorf("no children should be created in approved state, got %d", len(parentAfterReview.Continuation.CreatedChildren))
-		}
-
-		// Now transition to done (simulating verified PR merge by operator)
-		transitionToDone(t, server, authHeader, parentID)
-
-		// After merge, children should be created
-		parentAfterMerge := apiGetTask(t, server, authHeader, parentID)
-		if len(parentAfterMerge.Continuation.CreatedChildren) != 1 {
-			t.Errorf("expected 1 child after merge, got %d", len(parentAfterMerge.Continuation.CreatedChildren))
-		}
-
-		// Verify the child is now claimable
-		if len(parentAfterMerge.Continuation.CreatedChildren) > 0 {
-			childID := parentAfterMerge.Continuation.CreatedChildren[0].ID
-			childTask := apiGetTask(t, server, authHeader, childID)
-			if childTask.State != "ready" {
-				t.Errorf("child should be ready after merge, got %q", childTask.State)
+	t.Run("approved parent that is bounced, blocked or failed", func(t *testing.T) {
+		for _, to := range []string{"ready", "blocked", "failed"} {
+			parentID, projectID := e.newParent()
+			e.submit(parentID, "agent-1", contTwoSourceManifest(parentID))
+			e.approveRound(projectID, parentID, nil)
+			e.mustCall("POST", "/tasks/"+parentID+"/transition", map[string]string{"to": to}, http.StatusOK)
+			parent := e.get(parentID)
+			if parent.State != to || len(contCreatedKeys(parent)) != 0 || e.titleCounts(projectID)["Analyze source-a"] != 0 {
+				t.Fatalf("approved -> %s must not create children, got state %q children %v", to, parent.State, contCreatedKeys(parent))
 			}
-
-			if !tryClaimTask(t, server, authHeader, childID, "child-worker", "haiku") {
-				t.Errorf("child should be claimable after merge")
+			if code, _ := e.merge(parentID); code == http.StatusOK {
+				t.Fatalf("a parent in %s must not be mergeable to done", to)
+			}
+			if len(contCreatedKeys(e.get(parentID))) != 0 {
+				t.Fatalf("a refused merge from %s created children", to)
 			}
 		}
 	})
 }
 
-func testResearchContinuationIdempotency(t *testing.T) {
-	server := setupTestServer(t, "test-token")
-	authHeader := "Bearer test-token"
+func testContinuationRetryIdempotency(t *testing.T) {
+	t.Run("a second done is refused and creates nothing", func(t *testing.T) {
+		e := newContEnv(t)
+		parentID, projectID := e.newParent()
+		e.submit(parentID, "agent-1", contTwoSourceManifest(parentID))
+		e.approveRound(projectID, parentID, nil)
+		e.mustMerge(parentID)
+		first := e.get(parentID)
+		firstIDs := []string{contCreatedByKey(t, first, "source-a").ID, contCreatedByKey(t, first, "source-b").ID}
+		before := len(e.list(projectID, ""))
 
-	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-	parent := apiGetTask(t, server, authHeader, parentID)
-	projectID := parent.ProjectID
-
-	manifest := map[string]interface{}{
-		"version":        1,
-		"parent_task_id": parentID,
-		"children": []map[string]interface{}{
-			{
-				"key": "child1", "title": "Child 1", "spec": "Spec 1",
-				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
-				"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
-				"acceptance_criteria": []string{"criterion"},
-				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-			},
-		},
-		"pending_candidates": []map[string]string{
-			{"claim_id": "c1", "disposition": "assigned"},
-		},
-	}
-
-	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/10"}}
-	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": manifest,
-	}); code != http.StatusOK {
-		t.Fatalf("expected 200, got %d; body: %s", code, body)
-	}
-
-	approveAllReviews(t, server, authHeader, projectID, parentID)
-
-	// First transition to done
-	transitionToDone(t, server, authHeader, parentID)
-
-	parentAfterFirstTransition := apiGetTask(t, server, authHeader, parentID)
-	if len(parentAfterFirstTransition.Continuation.CreatedChildren) != 1 {
-		t.Fatalf("expected 1 child after transition, got %d", len(parentAfterFirstTransition.Continuation.CreatedChildren))
-	}
-	firstChildID := parentAfterFirstTransition.Continuation.CreatedChildren[0].ID
-
-	// Verify the child is in the project task list once
-	allProjectTasks := apiListTasks(t, server, authHeader, projectID)
-	childCount := 0
-	for _, task := range allProjectTasks {
-		if task.ID == firstChildID {
-			childCount++
+		code, body := e.merge(parentID)
+		if code != http.StatusConflict || apiErrorCode(t, body) != "CONFLICT" {
+			t.Fatalf("repeated done: expected 409 CONFLICT, got %d: %s", code, body)
 		}
+		after := e.get(parentID)
+		if after.State != "done" || !reflect.DeepEqual([]string{contCreatedByKey(t, after, "source-a").ID, contCreatedByKey(t, after, "source-b").ID}, firstIDs) || len(after.Continuation.CreatedChildren) != 2 {
+			t.Fatalf("repeated done changed the created children: %+v", after.Continuation.CreatedChildren)
+		}
+		counts := e.titleCounts(projectID)
+		if counts["Analyze source-a"] != 1 || counts["Analyze source-b"] != 1 || len(e.list(projectID, "")) != before {
+			t.Fatalf("repeated done duplicated tasks: %v, %d tasks before, %d after", counts, before, len(e.list(projectID, "")))
+		}
+	})
+
+	t.Run("a rolled-back merge leaves the parent approved and its retry creates the children once", func(t *testing.T) {
+		e := newContEnv(t)
+		parentID, projectID := e.newParent()
+		e.submit(parentID, "agent-1", contTwoSourceManifest(parentID))
+		e.approveRound(projectID, parentID, nil)
+
+		// Alter the stored manifest after review so its digest no longer matches: the merge must
+		// refuse to create children from a manifest the reviewers did not examine.
+		var storedJSON string
+		if err := e.server.store.Conn().QueryRowContext(context.Background(), "SELECT manifest_json FROM task_submission_manifest WHERE task_id = ?", parentID).Scan(&storedJSON); err != nil {
+			t.Fatalf("failed to read stored manifest: %v", err)
+		}
+		other, _ := json.Marshal(contManifest(parentID, contChild("unreviewed", "research", "docs/unreviewed.md", contParentDep(parentID))))
+		e.execSQL("UPDATE task_submission_manifest SET manifest_json = ? WHERE task_id = ?", string(other), parentID)
+
+		if code, body := e.merge(parentID); code != http.StatusInternalServerError {
+			t.Fatalf("merge of an altered manifest: expected 500, got %d: %s", code, body)
+		}
+		parent := e.get(parentID)
+		if parent.State != "approved" || len(contCreatedKeys(parent)) != 0 {
+			t.Fatalf("a failed merge must roll back to approved with no children, got %q %v", parent.State, contCreatedKeys(parent))
+		}
+		counts := e.titleCounts(projectID)
+		if counts["Analyze unreviewed"] != 0 || counts["Analyze source-a"] != 0 || counts["Analyze source-b"] != 0 {
+			t.Fatalf("a failed merge created tasks: %v", counts)
+		}
+
+		e.execSQL("UPDATE task_submission_manifest SET manifest_json = ? WHERE task_id = ?", storedJSON, parentID)
+		e.mustMerge(parentID)
+		done := e.get(parentID)
+		if got := contCreatedKeys(done); !reflect.DeepEqual(got, []string{"source-a", "source-b"}) {
+			t.Fatalf("the retried merge must create the reviewed children, got %v", got)
+		}
+		counts = e.titleCounts(projectID)
+		if counts["Analyze source-a"] != 1 || counts["Analyze source-b"] != 1 || counts["Analyze unreviewed"] != 0 {
+			t.Fatalf("the retried merge must create each child exactly once, got %v", counts)
+		}
+	})
+}
+
+func testContinuationDependencyGating(t *testing.T) {
+	e := newContEnv(t)
+	parentID, projectID := e.newParent()
+	e.submit(parentID, "agent-1", contManifest(parentID,
+		contChild("first", "research", "docs/first.md", contParentDep(parentID)),
+		contChild("second", "research", "docs/second.md", contParentDep(parentID), map[string]string{"kind": "child", "ref": "first"}),
+		contChild("impl", "build", "internal/impl.go", contParentDep(parentID))))
+	e.approveRound(projectID, parentID, nil)
+	e.mustMerge(parentID)
+
+	done := e.get(parentID)
+	first, second, impl := contCreatedByKey(t, done, "first"), contCreatedByKey(t, done, "second"), contCreatedByKey(t, done, "impl")
+	if first.State != "ready" || !first.Claimable {
+		t.Fatalf("first: expected ready and claimable, got %+v", first)
 	}
-	if childCount != 1 {
-		t.Errorf("after first transition: child %s appears %d times (expected 1)", firstChildID, childCount)
+	if second.State != "ready" || second.Claimable || second.DependencyStatus != "blocked" || !reflect.DeepEqual(second.BlockedBy, []string{first.ID}) {
+		t.Fatalf("second: expected ready but blocked by first, got %+v", second)
+	}
+	if impl.State != "backlog" || impl.Claimable || impl.Track != "build" {
+		t.Fatalf("impl: a generated build child must start in backlog and not be claimable, got %+v", impl)
 	}
 
-	// Retry the transition to done (idempotency test)
-	transitionReq := httptest.NewRequest("POST", "/tasks/"+parentID+"/transition", bytes.NewReader([]byte(`{"to":"done"}`)))
-	transitionReq.Header.Set("Authorization", authHeader)
-	transitionReq.Header.Set("Content-Type", "application/json")
-	transitionW := httptest.NewRecorder()
-	server.mux.ServeHTTP(transitionW, transitionReq)
-
-	// Second transition should fail (already done) or succeed idempotently
-	// If it fails, that's fine - the important thing is no duplicate is created
-	if transitionW.Code == http.StatusOK {
-		parentAfterSecondTransition := apiGetTask(t, server, authHeader, parentID)
-		if len(parentAfterSecondTransition.Continuation.CreatedChildren) != 1 {
-			t.Errorf("idempotency failed: expected 1 child after retry, got %d", len(parentAfterSecondTransition.Continuation.CreatedChildren))
-		}
-		if parentAfterSecondTransition.Continuation.CreatedChildren[0].ID != firstChildID {
-			t.Errorf("idempotency failed: child ID changed on retry")
-		}
+	claimable := e.claimableIDs(projectID)
+	if !claimable[first.ID] || claimable[second.ID] || claimable[impl.ID] {
+		t.Fatalf("claimable list must hold only first, got %v (first %s, second %s, impl %s)", claimable, first.ID, second.ID, impl.ID)
+	}
+	if code := e.claimCode(second.ID, "worker-2", "haiku"); code != http.StatusConflict {
+		t.Fatalf("claiming second before first is done: expected 409, got %d", code)
+	}
+	if code := e.claimCode(impl.ID, "worker-3", "haiku"); code != http.StatusConflict {
+		t.Fatalf("claiming a backlog build child: expected 409, got %d", code)
 	}
 
-	// Verify no duplicate in project task list after retry
-	allProjectTasksAfterRetry := apiListTasks(t, server, authHeader, projectID)
-	childCountAfterRetry := 0
-	for _, task := range allProjectTasksAfterRetry {
-		if task.ID == firstChildID {
-			childCountAfterRetry++
-		}
+	// Complete first through its own review and merge; second then becomes claimable.
+	if code := e.claimCode(first.ID, "worker-1", "haiku"); code != http.StatusOK {
+		t.Fatalf("claiming first: expected 200, got %d", code)
 	}
-	if childCountAfterRetry != 1 {
-		t.Errorf("idempotency failed: child %s appears %d times after retry (expected 1)", firstChildID, childCountAfterRetry)
+	e.submit(first.ID, "worker-1", nil)
+	e.approveRound(projectID, first.ID, nil)
+	if got := e.get(second.ID); got.State != "ready" || got.Assignee != nil {
+		t.Fatalf("second must still be unclaimed while first awaits its merge, got %+v", got)
+	}
+	if code := e.claimCode(second.ID, "worker-2", "haiku"); code != http.StatusConflict {
+		t.Fatalf("claiming second while first is only approved: expected 409, got %d", code)
+	}
+	e.mustMerge(first.ID)
+
+	after := contCreatedByKey(t, e.get(parentID), "second")
+	if !after.Claimable || after.DependencyStatus != "satisfied" || len(after.BlockedBy) != 0 {
+		t.Fatalf("second must be claimable once first is done, got %+v", after)
+	}
+	if !e.claimableIDs(projectID)[second.ID] {
+		t.Fatalf("second must appear in the claimable list once first is done")
+	}
+	if code := e.claimCode(second.ID, "worker-2", "haiku"); code != http.StatusOK {
+		t.Fatalf("claiming second after first is done: expected 200, got %d", code)
+	}
+
+	// The build child is queued only by an explicit promotion, and is then claimable.
+	e.mustCall("POST", "/tasks/"+impl.ID+"/promote", nil, http.StatusOK)
+	if code := e.claimCode(impl.ID, "worker-3", "haiku"); code != http.StatusOK {
+		t.Fatalf("claiming the promoted build child: expected 200, got %d", code)
 	}
 }
 
-func testResearchContinuationMixedTracks(t *testing.T) {
-	server := setupTestServer(t, "test-token")
-	authHeader := "Bearer test-token"
+func testContinuationFindingFollowUps(t *testing.T) {
+	e := newContEnv(t)
+	parentID, projectID := e.newParent()
+	e.submit(parentID, "agent-1", contTwoSourceManifest(parentID))
+	e.approveRound(projectID, parentID, []map[string]interface{}{{
+		"id": "f-future", "severity": "P3", "file": "docs/a.md", "line": 10,
+		"summary": "Consider a later survey of related work", "in_changed_text": true, "status": "new",
+	}})
 
-	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-	parent := apiGetTask(t, server, authHeader, parentID)
-	projectID := parent.ProjectID
-
-	mixedManifest := map[string]interface{}{
-		"version":        1,
-		"parent_task_id": parentID,
-		"children": []map[string]interface{}{
-			{
-				"key": "research-child", "title": "Research Child", "spec": "Research work",
-				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-r"},
-				"source_start_points": []string{"https://example.com/r"}, "file_scope": []string{"docs/r.md"},
-				"acceptance_criteria": []string{"research done"},
-				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-			},
-			{
-				"key": "build-child", "title": "Build Child", "spec": "Build work",
-				"track": "build", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-b"},
-				"source_start_points": []string{"https://example.com/b"}, "file_scope": []string{"src/b.go"},
-				"acceptance_criteria": []string{"build done"},
-				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-			},
-		},
-		"pending_candidates": []map[string]string{
-			{"claim_id": "claim-r", "disposition": "assigned"},
-			{"claim_id": "claim-b", "disposition": "assigned"},
-		},
+	approved := e.get(parentID)
+	if len(approved.FindingFollowUps) != 1 {
+		t.Fatalf("a non-blocking finding must create exactly one follow-up when the round passes, got %+v", approved.FindingFollowUps)
+	}
+	followUp := approved.FindingFollowUps[0]
+	if followUp.State != "backlog" || followUp.Track != "research" || followUp.Held {
+		t.Fatalf("follow-up = %+v, want an unheld research task in backlog", followUp)
+	}
+	if got := contCreatedKeys(approved); len(got) != 0 {
+		t.Fatalf("the follow-up must not be a manifest child, and no child exists before the merge, got %v", got)
 	}
 
-	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/20"}}
-
-	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": mixedManifest,
-	}); code != http.StatusOK {
-		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	e.mustMerge(parentID)
+	done := e.get(parentID)
+	if got := contCreatedKeys(done); !reflect.DeepEqual(got, []string{"source-a", "source-b"}) {
+		t.Fatalf("created children = %v, want exactly the two manifest children", got)
 	}
-
-	approveAllReviews(t, server, authHeader, projectID, parentID)
-
-	transitionToDone(t, server, authHeader, parentID)
-
-	parentAfterMerge := apiGetTask(t, server, authHeader, parentID)
-	if len(parentAfterMerge.Continuation.CreatedChildren) != 2 {
-		t.Fatalf("expected 2 created children, got %d", len(parentAfterMerge.Continuation.CreatedChildren))
+	if len(done.FindingFollowUps) != 1 || done.FindingFollowUps[0].ID != followUp.ID || done.FindingFollowUps[0].State != "backlog" {
+		t.Fatalf("the merge must leave the follow-up as it was, got %+v", done.FindingFollowUps)
 	}
-
-	var researchChildID, buildChildID string
-	for _, child := range parentAfterMerge.Continuation.CreatedChildren {
-		if child.Track == "research" {
-			researchChildID = child.ID
-		} else if child.Track == "build" {
-			buildChildID = child.ID
+	for _, c := range done.Continuation.CreatedChildren {
+		if c.ID == followUp.ID {
+			t.Fatalf("follow-up %s must not appear among the created children", followUp.ID)
 		}
 	}
-
-	// Verify track-specific states
-	researchChild := apiGetTask(t, server, authHeader, researchChildID)
-	if researchChild.State != "ready" {
-		t.Errorf("research child should be ready, got %q", researchChild.State)
+	counts := e.titleCounts(projectID)
+	followUpTitles := 0
+	for title, n := range counts {
+		if strings.HasPrefix(title, "Research follow-up:") {
+			followUpTitles += n
+		}
 	}
-
-	buildChild := apiGetTask(t, server, authHeader, buildChildID)
-	if buildChild.State != "backlog" {
-		t.Errorf("build child should be backlog, got %q", buildChild.State)
+	if followUpTitles != 1 || counts["Analyze source-a"] != 1 || counts["Analyze source-b"] != 1 {
+		t.Fatalf("expected one follow-up and one of each child, got %v", counts)
 	}
-
-	// Build child in backlog should not be claimable
-	canClaim := tryClaimTask(t, server, authHeader, buildChildID, "build-worker", "haiku")
-	if canClaim {
-		t.Errorf("build child in backlog should not be claimable, but claim succeeded")
-	}
-
-	// Research child should be claimable
-	canClaimResearch := tryClaimTask(t, server, authHeader, researchChildID, "research-worker", "haiku")
-	if !canClaimResearch {
-		t.Errorf("research child in ready should be claimable, but claim failed")
+	if got := e.get(followUp.ID); got.Continuation != nil && got.Continuation.ParentInfo != nil {
+		t.Fatalf("a finding follow-up is not a continuation child, got parent info %+v", got.Continuation.ParentInfo)
 	}
 }
 
-func testResearchContinuationDependencyGating(t *testing.T) {
-	server := setupTestServer(t, "test-token")
-	authHeader := "Bearer test-token"
+func testContinuationHeldLegacyTasks(t *testing.T) {
+	e := newContEnv(t)
+	parentID, projectID := e.newParent()
 
-	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-	parent := apiGetTask(t, server, authHeader, parentID)
-	projectID := parent.ProjectID
-
-	dependentManifest := map[string]interface{}{
-		"version":        1,
-		"parent_task_id": parentID,
-		"children": []map[string]interface{}{
-			{
-				"key": "child1", "title": "Child 1", "spec": "Independent work",
-				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"c1"},
-				"source_start_points": []string{"https://example.com/1"}, "file_scope": []string{"docs/1.md"},
-				"acceptance_criteria": []string{"criterion 1"},
-				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-			},
-			{
-				"key": "child2", "title": "Child 2", "spec": "Dependent work",
-				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"c2"},
-				"source_start_points": []string{"https://example.com/2"}, "file_scope": []string{"docs/2.md"},
-				"acceptance_criteria": []string{"criterion 2"},
-				"dependencies": []map[string]string{
-					{"kind": "parent", "ref": parentID},
-					{"kind": "child", "ref": "child1"},
-				},
-			},
-		},
-		"pending_candidates": []map[string]string{
-			{"claim_id": "c1", "disposition": "assigned"},
-			{"claim_id": "c2", "disposition": "assigned"},
-		},
+	// A legacy dependent: a build task that already depends on the parent, parked by an operator.
+	var created []store.Task
+	dependent := []store.TaskInput{{Title: "Legacy dependent", Spec: "Waits on the parent", DocumentID: e.get(parentID).DocumentID, Model: "haiku", Track: "build", DependsOn: []string{parentID}}}
+	if err := json.Unmarshal(e.mustCall("POST", "/projects/"+projectID+"/tasks", dependent, http.StatusCreated), &created); err != nil || len(created) != 1 {
+		t.Fatalf("failed to create the legacy dependent: %v", err)
 	}
+	dependentID := created[0].ID
+	e.mustCall("POST", "/tasks/"+dependentID+"/promote", nil, http.StatusOK)
+	e.mustCall("POST", "/tasks/"+dependentID+"/hold", nil, http.StatusOK)
 
-	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/30"}}
-
-	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": dependentManifest,
-	}); code != http.StatusOK {
-		t.Fatalf("expected 200, got %d; body: %s", code, body)
+	e.submit(parentID, "agent-1", contTwoSourceManifest(parentID))
+	e.approveRound(projectID, parentID, []map[string]interface{}{{
+		"id": "f-legacy", "severity": "P3", "file": "docs/a.md", "line": 4,
+		"summary": "Legacy follow-up the operator parked", "in_changed_text": true, "status": "new",
+	}})
+	approved := e.get(parentID)
+	if len(approved.FindingFollowUps) != 1 {
+		t.Fatalf("expected the legacy-style follow-up, got %+v", approved.FindingFollowUps)
 	}
+	followUpID := approved.FindingFollowUps[0].ID
+	e.mustCall("POST", "/tasks/"+followUpID+"/hold", nil, http.StatusOK)
 
-	approveAllReviews(t, server, authHeader, projectID, parentID)
-
-	transitionToDone(t, server, authHeader, parentID)
-
-	parentAfterMerge := apiGetTask(t, server, authHeader, parentID)
-	if len(parentAfterMerge.Continuation.CreatedChildren) != 2 {
-		t.Fatalf("expected 2 children, got %d", len(parentAfterMerge.Continuation.CreatedChildren))
-	}
-
-	var child1ID, child2ID string
-	for _, child := range parentAfterMerge.Continuation.CreatedChildren {
-		if strings.Contains(child.Title, "Child 1") {
-			child1ID = child.ID
-		} else if strings.Contains(child.Title, "Child 2") {
-			child2ID = child.ID
+	before := map[string]store.TaskWithDepsAndLinks{followUpID: e.get(followUpID), dependentID: e.get(dependentID)}
+	for id, task := range before {
+		if !task.Held {
+			t.Fatalf("setup: task %s must be held", id)
 		}
 	}
 
-	if child1ID == "" || child2ID == "" {
-		t.Fatalf("could not find both created children")
+	e.mustMerge(parentID)
+	done := e.get(parentID)
+	childIDs := map[string]bool{}
+	for _, c := range done.Continuation.CreatedChildren {
+		childIDs[c.ID] = true
+	}
+	if len(childIDs) != 2 {
+		t.Fatalf("expected two created children, got %+v", done.Continuation.CreatedChildren)
 	}
 
-	// Both should be ready initially (parent is done)
-	child1Task := apiGetTask(t, server, authHeader, child1ID)
-	if child1Task.State != "ready" {
-		t.Errorf("child1 should be ready, got %q", child1Task.State)
-	}
-
-	// Child2 depends on child1, but child1 is not done yet, so child2 should not be claimable
-	canClaimChild2Before := tryClaimTask(t, server, authHeader, child2ID, "worker-child2", "haiku")
-	if canClaimChild2Before {
-		t.Errorf("child2 should NOT be claimable before child1 is done (dependency gating failed)")
-	}
-
-	// Now complete child1
-	apiClaimTask(t, server, authHeader, child1ID, "worker-child1", "haiku")
-	if code, body := apiSubmit(t, server, authHeader, child1ID, map[string]interface{}{
-		"agent_id": "worker-child1", "result": "Child 1 done", "links": []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/31"}},
-	}); code != http.StatusOK {
-		t.Fatalf("failed to submit child1: %d; body: %s", code, body)
-	}
-
-	// Create review tasks for child1 and approve
-	allTasksAfterChild1 := apiListTasks(t, server, authHeader, projectID)
-	for _, task := range allTasksAfterChild1 {
-		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == child1ID {
-			apiClaimTask(t, server, authHeader, task.ID, "reviewer-"+task.Model, task.Model)
-			if code, body := apiSubmit(t, server, authHeader, task.ID, map[string]interface{}{
-				"agent_id": "reviewer-" + task.Model, "result": "OK", "verdict": "approve", "findings": []interface{}{},
-			}); code != http.StatusOK {
-				t.Fatalf("failed to approve child1 review: %d; body: %s", code, body)
+	claimable := e.claimableIDs(projectID)
+	for id, was := range before {
+		now := e.get(id)
+		if !now.Held || now.State != was.State || now.Assignee != nil || claimable[id] {
+			t.Errorf("held task %s changed or became claimable: before %s/%v, now %s held=%v assignee=%v", id, was.State, was.Held, now.State, now.Held, now.Assignee)
+		}
+		if !reflect.DeepEqual(now.DependsOn, was.DependsOn) {
+			t.Errorf("task %s was retargeted: depends_on %v -> %v", id, was.DependsOn, now.DependsOn)
+		}
+		for _, dep := range now.DependsOn {
+			if childIDs[dep] {
+				t.Errorf("task %s was repointed at continuation child %s", id, dep)
 			}
 		}
-	}
-
-	// Mark child1 as done
-	allTasksAfterReview := apiListTasks(t, server, authHeader, projectID)
-	for _, task := range allTasksAfterReview {
-		if task.ID == child1ID && task.State == "approved" {
-			transitionReq := httptest.NewRequest("POST", "/tasks/"+child1ID+"/transition", bytes.NewReader([]byte(`{"to":"done"}`)))
-			transitionReq.Header.Set("Authorization", authHeader)
-			transitionReq.Header.Set("Content-Type", "application/json")
-			transitionW := httptest.NewRecorder()
-			server.mux.ServeHTTP(transitionW, transitionReq)
-			if transitionW.Code != http.StatusOK {
-				t.Fatalf("failed to transition child1 to done: %d", transitionW.Code)
-			}
+		if code := e.claimCode(id, "worker-x", "haiku"); code != http.StatusConflict {
+			t.Errorf("claiming held task %s: expected 409, got %d", id, code)
 		}
 	}
-
-	// After child1 is done, child2 should be claimable (dependencies satisfied)
-	canClaimChild2After := tryClaimTask(t, server, authHeader, child2ID, "worker-child2", "haiku")
-	if !canClaimChild2After {
-		t.Errorf("child2 should be claimable after child1 is done (dependency gating not satisfied)")
-	}
-}
-
-func testResearchContinuationWithFollowUps(t *testing.T) {
-	server := setupTestServer(t, "test-token")
-	authHeader := "Bearer test-token"
-
-	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-	parent := apiGetTask(t, server, authHeader, parentID)
-	projectID := parent.ProjectID
-
-	manifest := map[string]interface{}{
-		"version":        1,
-		"parent_task_id": parentID,
-		"children": []map[string]interface{}{
-			{
-				"key": "child1", "title": "Child 1", "spec": "Child work",
-				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-1"},
-				"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
-				"acceptance_criteria": []string{"criterion"},
-				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-			},
-		},
-		"pending_candidates": []map[string]string{
-			{"claim_id": "claim-1", "disposition": "assigned"},
-		},
+	if !reflect.DeepEqual(e.get(dependentID).DependsOn, []string{parentID}) {
+		t.Errorf("the legacy dependent must still depend on the parent only, got %v", e.get(dependentID).DependsOn)
 	}
 
-	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/40"}}
-
-	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": manifest,
-	}); code != http.StatusOK {
-		t.Fatalf("expected 200, got %d; body: %s", code, body)
-	}
-
-	allTasks := apiListTasks(t, server, authHeader, projectID)
-	reviewTasksByModel := make(map[string][]string)
-	for _, task := range allTasks {
-		if task.Kind == "review" && task.TargetTaskID != nil && *task.TargetTaskID == parentID {
-			reviewTasksByModel[task.Model] = append(reviewTasksByModel[task.Model], task.ID)
+	actions := map[string]string{}
+	for _, item := range done.Continuation.ActionItems {
+		actions[item.TaskID] = item.Type
+		if item.State != before[item.TaskID].State {
+			t.Errorf("action item %+v reports a state other than the task's %s", item, before[item.TaskID].State)
 		}
 	}
-
-	// Have reviewers approve (one with a non-blocking research finding)
-	for model, taskIDs := range reviewTasksByModel {
-		if len(taskIDs) > 0 {
-			apiClaimTask(t, server, authHeader, taskIDs[0], "reviewer-"+model, model)
-			findings := []interface{}{}
-			// Opus reviewer adds a non-blocking finding (P3 severity for low-priority follow-up)
-			if model == "opus" {
-				findings = []interface{}{
-					map[string]interface{}{
-						"id":              "finding-future-work",
-						"severity":        "P3",
-						"file":            "docs/a.md",
-						"line":            10,
-						"summary":         "Consider X for future work - non-blocking research observation",
-						"in_changed_text": true,
-						"status":          "new",
-					},
-				}
-			}
-			if code, body := apiSubmit(t, server, authHeader, taskIDs[0], map[string]interface{}{
-				"agent_id": "reviewer-" + model, "result": "Approved", "verdict": "approve", "findings": findings,
-			}); code != http.StatusOK {
-				t.Fatalf("failed to submit %s review: %d; body: %s", model, code, body)
-			}
-		}
-	}
-
-	parentAfterReview := apiGetTask(t, server, authHeader, parentID)
-	if parentAfterReview.State != "approved" {
-		t.Fatalf("parent should be approved after both reviews, got %q", parentAfterReview.State)
-	}
-
-	if len(parentAfterReview.Continuation.ProposedChildren) != 1 {
-		t.Errorf("expected 1 proposed child, got %d", len(parentAfterReview.Continuation.ProposedChildren))
-	}
-
-	transitionToDone(t, server, authHeader, parentID)
-
-	parentFinal := apiGetTask(t, server, authHeader, parentID)
-	if len(parentFinal.Continuation.CreatedChildren) != 1 {
-		t.Fatalf("expected 1 created child from manifest, got %d", len(parentFinal.Continuation.CreatedChildren))
-	}
-
-	childID := parentFinal.Continuation.CreatedChildren[0].ID
-	childTask := apiGetTask(t, server, authHeader, childID)
-
-	if childTask.ID != childID {
-		t.Errorf("child task ID mismatch")
-	}
-
-	if childTask.State != "ready" {
-		t.Errorf("created child should be in ready state, got %q", childTask.State)
-	}
-
-	// Verify follow-up tasks were created alongside manifest children
-	if len(parentFinal.FindingFollowUps) == 0 {
-		t.Errorf("expected at least 1 finding follow-up task to be created from P3 finding")
-	}
-
-	// Verify follow-up is separate from manifest children (different IDs, not in CreatedChildren)
-	for _, followUp := range parentFinal.FindingFollowUps {
-		if followUp.ID == childID {
-			t.Errorf("follow-up task should have different ID than manifest child")
-		}
-		// Verify follow-up is not listed in created_children
-		for _, created := range parentFinal.Continuation.CreatedChildren {
-			if created.ID == followUp.ID {
-				t.Errorf("finding follow-up should be separate from manifest children")
-			}
-		}
-	}
-
-	// Verify child is claimable
-	apiClaimTask(t, server, authHeader, childID, "child-worker", "haiku")
-	claimedChild := apiGetTask(t, server, authHeader, childID)
-	if claimedChild.Assignee == nil || *claimedChild.Assignee != "child-worker" {
-		t.Errorf("child should be claimable, got assignee %+v", claimedChild.Assignee)
-	}
-}
-
-func testResearchContinuationHeldLegacyTasks(t *testing.T) {
-	server := setupTestServer(t, "test-token")
-	authHeader := "Bearer test-token"
-
-	// Create a parent task that will have continuation
-	parentID := createClaimedResearchTask(t, server, authHeader, "Research task.\n\n## Continuation manifest\n")
-	parent := apiGetTask(t, server, authHeader, parentID)
-	projectID := parent.ProjectID
-
-	// Create a separate legacy task that will be marked as held
-	legacyTaskID := createClaimedResearchTask(t, server, authHeader, "Legacy task (held action item)\n\nStale work from previous phase.")
-	legacyTask := apiGetTask(t, server, authHeader, legacyTaskID)
-	if legacyTask.ProjectID != projectID {
-		// Ensure they're in the same project for this test
-		legacyTaskID = createClaimedResearchTask(t, server, authHeader, "Legacy task (held action item)\n\nStale work from previous phase.")
-		legacyTask = apiGetTask(t, server, authHeader, legacyTaskID)
-	}
-
-	// Mark the legacy task as held by adding an action item
-	legacyInitialState := legacyTask.State
-	legacyInitialAssignee := legacyTask.Assignee
-
-	// Create manifest for continuation
-	manifest := map[string]interface{}{
-		"version":        1,
-		"parent_task_id": parentID,
-		"children": []map[string]interface{}{
-			{
-				"key": "child1", "title": "Child 1", "spec": "Child work",
-				"track": "research", "model": "haiku", "review_models": []string{"opus", "sonnet"},
-				"agent_merge": false, "escalate": true, "claim_ids": []string{"claim-1"},
-				"source_start_points": []string{"https://example.com/a"}, "file_scope": []string{"docs/a.md"},
-				"acceptance_criteria": []string{"criterion"},
-				"dependencies":        []map[string]string{{"kind": "parent", "ref": parentID}},
-			},
-		},
-		"pending_candidates": []map[string]string{
-			{"claim_id": "claim-1", "disposition": "assigned"},
-		},
-	}
-
-	prLinks := []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/70"}}
-
-	if code, body := apiSubmit(t, server, authHeader, parentID, map[string]interface{}{
-		"agent_id": "agent-1", "result": "Implemented", "links": prLinks, "manifest": manifest,
-	}); code != http.StatusOK {
-		t.Fatalf("expected 200, got %d; body: %s", code, body)
-	}
-
-	approveAllReviews(t, server, authHeader, projectID, parentID)
-
-	// Merge the continuation
-	transitionToDone(t, server, authHeader, parentID)
-
-	// Verify manifest children were created
-	parentFinal := apiGetTask(t, server, authHeader, parentID)
-	if len(parentFinal.Continuation.CreatedChildren) != 1 {
-		t.Fatalf("expected 1 created child, got %d", len(parentFinal.Continuation.CreatedChildren))
-	}
-
-	// Verify the legacy held task remains unchanged and not auto-retargeted
-	legacyTaskAfterMerge := apiGetTask(t, server, authHeader, legacyTaskID)
-
-	// State should be unchanged (not auto-retargeted)
-	if legacyTaskAfterMerge.State != legacyInitialState {
-		t.Errorf("held legacy task state should not change after continuation merge; was %q, now %q", legacyInitialState, legacyTaskAfterMerge.State)
-	}
-
-	// Assignee should be unchanged (not auto-retargeted)
-	if (legacyInitialAssignee == nil && legacyTaskAfterMerge.Assignee != nil) ||
-		(legacyInitialAssignee != nil && legacyTaskAfterMerge.Assignee == nil) ||
-		(legacyInitialAssignee != nil && legacyTaskAfterMerge.Assignee != nil && *legacyInitialAssignee != *legacyTaskAfterMerge.Assignee) {
-		t.Errorf("held legacy task assignee should not change after continuation merge")
-	}
-
-	// Verify manifest child is separate from held legacy task
-	createdChildID := parentFinal.Continuation.CreatedChildren[0].ID
-	if createdChildID == legacyTaskID {
-		t.Errorf("created child should be separate from held legacy task")
+	if actions[followUpID] != "legacy_held_follow_up" || actions[dependentID] != "held_dependent" || len(actions) != 2 {
+		t.Fatalf("action items must list the held follow-up and the held dependent for manual handling, got %+v", done.Continuation.ActionItems)
 	}
 }

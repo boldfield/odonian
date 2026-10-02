@@ -209,68 +209,118 @@ case does a reviewer run `gh pr merge` or transition the parent.
 
 ## Research continuation manifests (opt-in)
 
-Research-track implement tasks may carry a **continuation manifest** in their PR, proposing a set of child tasks to be created when the parent is merged. This allows controlled, reviewed task breakdown.
+A research-track parent can propose follow-on work as a **continuation manifest**. Reviewers
+examine the exact proposal together with the parent's PR, and the children exist only after the
+parent's verified human merge — nobody transcribes or promotes tickets by hand.
 
 ### Opt-in contract
 
-A research task's spec must contain a line that reads exactly `## Continuation manifest` (trimmed, case-insensitive). The line must be a standalone heading (not mid-line), not nested (no `###`), and not just prose mentioning the phrase. Only tasks with this opt-in line may submit a manifest.
+- The parent must be `track: research`, `kind: implement`, and its spec must contain a line that
+  reads exactly `## Continuation manifest` (case and surrounding whitespace ignored; a deeper
+  heading such as `### Continuation manifest`, or prose mentioning the phrase, does not count).
+- Use `agent_merge: false` on the parent. Children are created by the human `approved → done`
+  transition (or `POST /tasks/{id}/landing/complete` for a `local_commit` task) and by nothing else.
+- Parents that do not opt in behave exactly as before; a manifest sent to one is refused with
+  `400 PARENT_NOT_OPTED_IN` (`400 MANIFEST_NOT_ALLOWED` on a non-research task).
 
-### Worker submission
+### Lifecycle
 
-When submitting a research-track task, include a `manifest` field in the submission body. The manifest is a JSON object (defined in `internal/manifest/manifest.go`) with:
+1. **Submit.** The worker adds a `manifest` object to the normal submit body
+   (`odonian submit --manifest-file <path>`). The server validates it, canonicalises it, and stores
+   it with its SHA-256 digest for the review round the submission starts. A refused manifest
+   (`400`) changes nothing: the task stays `in_progress`, no review round starts, and no manifest
+   is stored. The worker fixes the manifest and submits again.
+2. **Review.** Two independent reviewers (opus and sonnet by default) examine the manifest in
+   `GET /tasks/{id}` → `submission_manifests` / `continuation.proposed_children` (each child
+   `pending`). Each reviewer must judge the proposed split — claims covered, source-only scope,
+   non-overlapping file scopes, dependencies — and **reject with a finding** if it is wrong.
+   Nothing is created while the parent is `review` or `approved`.
+3. **Approve.** When both approve, the parent moves to `approved`. Still nothing exists.
+4. **Merge.** When the human merges and transitions the parent `approved → done`, the server, in
+   the same transaction, loads the manifest of the approved round, re-validates it, checks its
+   digest, and creates one task per child. The merge fails as a whole if any step fails.
+5. **Work.** Research children start `ready`; generated build and design children start
+   `backlog` and must be promoted explicitly. A child is claimable only when it is `ready`, not
+   held, and every dependency (including a `parent` or sibling `child` dependency) is `done`; the
+   `claimable`, `dependency_status` and `blocked_by` fields of `continuation.created_children`
+   report this. The `GET /projects/{id}/tasks?claimable=true&model=<model>` list shows eligible
+   research children with no manual promotion.
 
-- **version**: Always 1 (the schema version).
-- **parent_task_id**: Must match the submitted task's ID.
-- **children**: Array of up to 3 child specifications. Each child has `key`, `title`, `spec`, `track` ("research", "build", or "design"), `model`, `review_models` (exactly 2 distinct models), `agent_merge` (boolean), `escalate` (boolean), `claim_ids` (1–6 claims), `source_start_points` (up to 4 sources), `file_scope` (non-overlapping file paths), `acceptance_criteria` (1+ criteria), and `dependencies` (other children or the parent).
-- **pending_candidates**: Optional. Maps each claim to a disposition: `assigned`, `carried_forward` (with owner), or `excluded` (with reason).
+Minimal manifest (one child; up to 3 are allowed):
 
-The server rejects the submission (`400` with an error code) if:
-- The parent spec does not opt in.
-- The manifest names a different parent task ID.
-- The manifest fails validation (unknown models, overlapping files, circular dependencies, etc.).
+```json
+{
+  "manifest": {
+    "version": 1,
+    "parent_task_id": "<the submitted task id>",
+    "children": [{
+      "key": "source-a", "title": "Analyze source A", "spec": "Source-only analysis of A",
+      "track": "research", "model": "haiku", "review_models": ["opus", "sonnet"],
+      "agent_merge": false, "escalate": true, "claim_ids": ["claim-a"],
+      "source_start_points": ["https://example.com/a"], "file_scope": ["docs/a.md"],
+      "acceptance_criteria": ["source A verified"],
+      "dependencies": [{"kind": "parent", "ref": "<the submitted task id>"}]
+    }],
+    "pending_candidates": [{"claim_id": "claim-a", "disposition": "assigned"}]
+  }
+}
+```
 
-On rejection, the task remains in `in_progress`, and no state changes occur.
+`dependencies` entries have `kind` `parent` (ref: the parent id), `child` (ref: a sibling `key`)
+or `task` (ref: an existing task id). `pending_candidates` maps every claim to `assigned`,
+`carried_forward` (with `owner`) or `excluded` (with `reason`). Each child needs exactly two
+distinct `review_models`; the full rules and error codes are in `docs/features/research-continuations.md`.
 
 ### Review duties
 
-Both reviewers examine the **exact manifest** alongside the parent's implementation. A reviewer can flag issues with the proposed children as review findings on the parent task. The manifest is shown in the `GET /tasks/{id}` response under `submission_manifests` for each review round, including the exact JSON and a SHA-256 digest.
+Both reviewers verify the **exact** manifest in the parent's current round, not a summary of it:
+that every claim is assigned, carried forward or excluded; that children are source-only and
+independent; that no two children write the same file; that dependencies are right; and that the
+digest shown for the round is the one they reviewed. A reviewer who finds a problem rejects the
+parent with a finding. The parent goes back to `ready`, and the next submission starts a new
+round with its own manifest.
 
-### Merge-time creation
+### Rejected and invalid manifests: how to recover
 
-When a human transitions an `approved` research parent to `done`:
+- **Invalid split at submit** (`400` with a validator code such as `OVERLAPPING_FILES`,
+  `TOO_MANY_CHILDREN`, `UNKNOWN_CHILD_DEPENDENCY`, `INVALID_REVIEW_MODELS`): nothing was stored.
+  Correct the manifest and submit again.
+- **Reviewer rejects the split:** the parent returns to `ready`; no children exist. Re-claim it
+  and submit a corrected manifest. That starts a new review round: `submission_manifests` then
+  lists both rounds, reviewers examine the new one, and only the approved round's manifest can
+  create children (the earlier round's children never exist).
+- **Human disagrees after approval:** `POST /tasks/{id}/transition {"to":"ready"}` from
+  `approved` bounces the parent for rework exactly as above. `blocked` and `failed` also create
+  nothing.
+- **Merge-time failure:** if the stored manifest fails re-validation or its digest does not match
+  at `approved → done` (for example because it was altered after review), the transition returns
+  `500 TRANSITION_ERROR`, is rolled back, and the parent stays `approved` with no children. The
+  API has no way to edit a stored manifest or digest, so a retry only helps if the failure was
+  transient. Otherwise bounce the parent with `{"to":"ready"}` and resubmit a corrected manifest
+  for a fresh review round.
+- **Unmerged work:** a parent that is not `approved` cannot be moved to `done` (`409 CONFLICT`),
+  and a `local_commit` parent whose reviewed commit has not landed is refused with
+  `409 LANDING_REQUIRED`. In both cases no children are created.
 
-1. The server checks if the parent's spec opted in.
-2. The server loads the manifest from the approved review round (the round the task passed review in).
-3. For each child, the server creates a new task with the manifest's fields.
-4. Research-track children start in the `ready` state and are claimable if all their dependencies (if any) are satisfied.
-5. Build and design-track children start in the `backlog` state and must be explicitly queued.
-6. Created children are linked to the parent task.
+### Retries and duplicates
 
-The `GET /tasks/{id}` response shows both proposed and created children in the `continuation` view, with status (`pending` or `created`) and manifest digest.
+Children are created once, by the transition that moves the parent to `done`. Sending
+`{"to":"done"}` a second time is refused with `409 CONFLICT` (the parent is no longer
+`approved`) and creates nothing; `GET /tasks/{id}` keeps showing the same `created_children`.
+If the first attempt failed and rolled back, the retry creates the full child set exactly once.
+Each created child records the parent, its manifest `key` and the manifest digest, so a child is
+identified by `(parent, key, digest)`; a corrected manifest from a later round has a different
+digest and therefore creates a separate set.
 
-### Recovery from invalid manifests
+### What stays separate
 
-If the stored manifest fails validation when the parent reaches `done`, the merge transition fails and rolls back. The parent remains in `approved`. Validation failures that trigger rollback include:
-
-- **Digest mismatch**: The stored manifest digest does not match the canonical digest of the persisted manifest data.
-- **Canonicalization errors**: Re-parsing and re-encoding the stored manifest produces a different canonical form.
-- **Validation rule violations**: The manifest violates any of the validation rules (e.g., overlapping files, unknown models, circular dependencies) when rechecked at merge time.
-
-To recover:
-
-1. The parent's worker or a human operator rejects the parent back to `ready` (via a manual transition or an operator action).
-2. The parent re-enters the claim queue and the worker claims it for a new review round.
-3. The worker submits a corrected manifest in the new review round.
-4. Both reviewers examine and approve the corrected manifest.
-5. Only then can a human merge the parent and create children with the new manifest.
-
-This path ensures every submitted manifest is reviewed and approved before child creation. There is no operator procedure to edit a stored digest or manifest in place.
-
-### Idempotency
-
-Child creation is idempotent within a single approved-to-done transition. When a human first transitions an `approved` parent to `done`, children are created once. If the same POST request to `/tasks/{id}/transition {"to":"done"}` is retried before the parent reaches a new state, the retry will encounter the parent already in `done` state and fail with a state-transition error. Thus, true retry-safety is enforced at the HTTP level: the first call succeeds and mutates state; retries fail because the parent is no longer `approved`.
-
-Within a single successful approved-to-done transition, each child's identity within the parent is determined by its manifest key; the parent ID and manifest digest together uniquely identify the complete child set (not individual children). Separate review rounds (after rework) produce separate manifest versions and separate child sets, each with its own digest.
+- **Review-finding follow-ups.** Non-blocking research findings still create backlog follow-up
+  tasks when a round passes. They are listed in `finding_follow_ups`, never in `created_children`,
+  and are not changed by the merge.
+- **Held legacy tasks.** A held task, or a held task that depends on the parent, is never
+  retargeted, repointed at the children, or released. `continuation.action_items`
+  (`legacy_held_follow_up`, `held_dependent`) lists them so an operator can replace or close them by
+  hand.
 
 ## Task creation
 

@@ -1107,7 +1107,9 @@ to drain the `approved` lane by merging and marking done, or to override an appr
 - `409 CONFLICT`: Transition is not allowed from the current state
 - `409 LANDING_IN_PROGRESS`: The task is `approved` and reserved by an `odonian approve` landing its work (see `POST /tasks/{id}/landing`); only that approve can move it, to `done` via `POST /tasks/{id}/landing/complete`, until it finishes or the reservation is cancelled
 - `409 LANDING_REQUIRED`: `to: done` for an `approved` task whose current review round submitted a `commit` (a `local_commit` task): its work must land on its branch first, so it reaches `done` only through `odonian approve` (`POST /tasks/{id}/landing` then `/landing/complete`)
-- `500 TRANSITION_ERROR`: Server error transitioning task
+- `500 TRANSITION_ERROR`: Server error transitioning task. For an opted-in research parent moving `approved` → `done`, this includes a stored continuation manifest that fails re-validation or whose digest no longer matches; the transition is rolled back, the parent stays `approved`, and no children are created
+
+`approved` → `done` is also the moment the server creates the children of a reviewed continuation manifest (see the `manifest` field of `POST /tasks/{id}/submit`); no other transition creates them. A repeated `done` is a `409 CONFLICT` and creates nothing.
 
 **Valid Transitions:**
 The state machine enforces these rules:
