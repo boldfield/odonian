@@ -632,7 +632,7 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 
 	if jsonOutput {
 		// Build output with review findings added to the task
-		output := map[string]interface{}{}
+		output := map[string]json.RawMessage{}
 		taskJSON, err := json.Marshal(task)
 		if err != nil {
 			return fmt.Errorf("failed to marshal task: %w", err)
@@ -641,7 +641,11 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			return fmt.Errorf("failed to unmarshal task: %w", err)
 		}
 		if len(reviewFindings) > 0 {
-			output["review_findings"] = reviewFindings
+			findingsJSON, err := json.Marshal(reviewFindings)
+			if err != nil {
+				return fmt.Errorf("failed to marshal review findings: %w", err)
+			}
+			output["review_findings"] = findingsJSON
 		}
 		finalOutput, err := json.MarshalIndent(output, "", "  ")
 		if err != nil {

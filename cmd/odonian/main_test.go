@@ -483,39 +483,55 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 	if !strings.Contains(output, "Canonical:") {
 		t.Errorf("expected 'Canonical:' header in output, got: %s", output)
 	}
-	if !strings.Contains(output, "\"parent_task_id\": \"task-1\"") {
-		t.Errorf("expected manifest body with parent_task_id in output, got: %s", output)
-	}
-	// Verify that the shown canonical bytes hash to the displayed digest
 	lines := strings.Split(output, "\n")
-	var canonicalStart int
+	canonical := ""
 	for i, line := range lines {
-		if strings.Contains(line, "Canonical:") {
-			canonicalStart = i
+		if strings.TrimSpace(line) == "Canonical:" && i+1 < len(lines) {
+			canonical = strings.TrimSpace(lines[i+1])
 			break
 		}
 	}
-	if canonicalStart > 0 {
-		// Extract canonical JSON (skip the "Canonical:" line and any empty lines)
-		var canonicalLines []string
-		for i := canonicalStart + 1; i < len(lines); i++ {
-			line := strings.TrimSpace(lines[i])
-			if line == "" || strings.HasPrefix(line, "-") || strings.HasPrefix(lines[i], "  ") && !strings.Contains(line, "{") && !strings.Contains(line, "}") && i > canonicalStart+1 {
-				break
-			}
-			if strings.Contains(line, "{") || strings.Contains(line, "}") || strings.HasPrefix(line, "\"") {
-				canonicalLines = append(canonicalLines, line)
-			}
-		}
-		if len(canonicalLines) > 0 {
-			canonicalStr := strings.Join(canonicalLines, "")
-			// Compute SHA-256 of the canonical bytes
-			digest := sha256.Sum256([]byte(canonicalStr))
-			computedHash := fmt.Sprintf("%x", digest)
-			if computedHash != realDigest {
-				t.Errorf("canonical bytes hash mismatch: expected %s, got %s; canonical: %s", realDigest, computedHash, canonicalStr)
-			}
-		}
+	if canonical != string(manifestJSON) {
+		t.Fatalf("expected canonical manifest bytes %s verbatim after 'Canonical:', got %q in output: %s", manifestJSON, canonical, output)
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	if got := fmt.Sprintf("%x", sum); got != realDigest {
+		t.Errorf("shown canonical bytes hash to %s, want displayed digest %s", got, realDigest)
+	}
+}
+
+func TestExecuteShowJSONPreservesManifestKeyOrder(t *testing.T) {
+	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+			ID:    "task-1",
+			State: "in_progress",
+			SubmissionManifests: []tuiclient.SubmissionManifest{
+				{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: "d"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	if err := executeShow(context.Background(), server.URL, "test-token", true, []string{"task-1"}, buf); err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+	var out struct {
+		Manifests []struct {
+			ManifestJSON json.RawMessage `json:"manifest_json"`
+		} `json:"submission_manifests"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil || len(out.Manifests) != 1 {
+		t.Fatalf("bad show --json output (%v): %s", err, buf.String())
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, out.Manifests[0].ManifestJSON); err != nil {
+		t.Fatal(err)
+	}
+	if compact.String() != string(manifestJSON) {
+		t.Errorf("manifest_json in --json output differs from stored bytes: got %s want %s", compact.String(), manifestJSON)
 	}
 }
 

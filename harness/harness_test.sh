@@ -345,6 +345,10 @@ echo "Test 29: research review prompt covers submission manifests and blocking r
 if grep -q 'submission_manifests' "$_rr_prompt" && \
    grep -q 'File equality check.*BLOCKING' "$_rr_prompt" && \
    grep -q 'missing committed manifest file' "$_rr_prompt" && \
+   grep -q 'Digest check' "$_rr_prompt" && \
+   grep -q 'printf .%s. .<Canonical line>. | sha256sum' "$_rr_prompt" && \
+   grep -q 'jq -S' "$_rr_prompt" && \
+   grep -q 'Oversized scope is a \*\*P1 finding' "$_rr_prompt" && \
    grep -q 'Manifest findings blocking rule' "$_rr_prompt" && \
    grep -q 'always blocks in every round' "$_rr_prompt"; then
   test_pass "research review prompt covers manifest inspection and blocking"
