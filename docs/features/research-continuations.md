@@ -136,13 +136,13 @@ The validator in `internal/manifest/manifest.go` is used by later store and API 
 
 Dependencies are typed with one of three kinds:
 
-- **parent**: A reference to the parent task. At most one per manifest. The `ref` field must match the manifest's `parent_task_id`.
+- **parent**: A reference to the parent task. Any number of children may depend on the parent, but a single child may list it at most once. The `ref` field must match the manifest's `parent_task_id`.
 - **child**: A reference to another child in the same manifest, by key. Used for intra-manifest dependencies. The `ref` field must be an existing child key.
 - **task**: A reference to an external task by ID. The `ref` field must be a valid UUID-format task ID.
 
 ### Manifest versioning
 
-The manifest contract is versioned. `CurrentVersion` is 1. Manifests with any other version are rejected. Version increments enable future schema changes.
+The manifest contract is versioned. `CurrentVersion` is 1. Manifests with any other version are rejected. The version is the schema version, not a per-manifest revision counter.
 
 ### Validation error codes
 
@@ -158,7 +158,8 @@ The validator returns specific error codes for different validation failures. Co
 - **MISSING_OWNER**: a carried_forward candidate lacks an owner
 - **MISSING_REASON**: an excluded candidate lacks a reason
 - **BLANK_CRITERION**: an acceptance criterion is blank or whitespace-only
-- **MULTIPLE_PARENT_DEPENDENCIES**: more than one parent dependency in the manifest
+- **MULTIPLE_PARENT_DEPENDENCIES**: a single child lists the parent dependency more than once
+- **INVALID_FILE_SCOPE**: a `file_scope` entry is absolute, escapes the repository via `..`, or is `.` (the whole tree)
 - **UNMATCHED_CHILD_CLAIM**: a child's claim has no assigned candidate entry
 - **UNKNOWN_DEPENDENCY_KIND**: a dependency has an unknown or invalid kind
 
@@ -175,7 +176,7 @@ The manifest contract defined here supports future work:
 
 - **Manifest persistence**: Storing manifests with parent tasks so they can be audited and traced.
 - **Child creation implementation**: Extending the store's `CreateTasks` to populate child specifications from manifests.
-- **Manifest versioning and updates**: Allowing parents to update manifests on rework (incrementing version) and tracking changes.
+- **Manifest revisions**: Allowing parents to update manifests on rework and tracking changes, via a separate revision field (the schema `version` stays fixed).
 - **Claim traceability**: Linking created children back to the claims in the manifest and the parent's sources.
 
 ## Acceptance criteria

@@ -252,6 +252,16 @@ func validateChild(child Child, allowedModels, allowedTracks map[string]bool, in
 		if strings.TrimSpace(file) == "" {
 			return ValidationError{"BLANK_FILE", fmt.Sprintf("%s: file_scope[%d] is blank", prefix, i)}
 		}
+		cleaned := filepath.Clean(file)
+		if filepath.IsAbs(cleaned) || strings.HasPrefix(file, "/") {
+			return ValidationError{"INVALID_FILE_SCOPE", fmt.Sprintf("%s: file_scope[%d] %q must be a repo-relative path", prefix, i, file)}
+		}
+		if cleaned == "." {
+			return ValidationError{"INVALID_FILE_SCOPE", fmt.Sprintf("%s: file_scope[%d] %q covers the whole tree; list specific files or directories", prefix, i, file)}
+		}
+		if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			return ValidationError{"INVALID_FILE_SCOPE", fmt.Sprintf("%s: file_scope[%d] %q escapes the repository", prefix, i, file)}
+		}
 	}
 
 	// Validate acceptance criteria
@@ -326,11 +336,9 @@ func checkDependencies(parentTaskID string, children []Child, seenKeys map[strin
 		keyToIndex[child.Key] = i
 	}
 
-	// Track parent dependencies to ensure at most one per manifest
-	parentDepCount := 0
-
 	// Validate each dependency reference
 	for _, child := range children {
+		parentDepCount := 0
 		for _, dep := range child.Dependencies {
 			if strings.TrimSpace(dep.Ref) == "" {
 				return ValidationError{"BLANK_DEPENDENCY_REF", fmt.Sprintf("child %q: dependency ref cannot be blank", child.Key)}

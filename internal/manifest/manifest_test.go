@@ -1282,55 +1282,74 @@ func TestBlankAcceptanceCriteria(t *testing.T) {
 	assertErrorCode(t, err, "BLANK_CRITERION")
 }
 
-// Regression test for multiple parent dependencies in a manifest
-func TestMultipleParentDependencies(t *testing.T) {
+// Two children may each depend on the parent.
+func TestParentDependencyPerChildAllowed(t *testing.T) {
+	c1 := createValidChild("child-1", []string{"file-1.md"})
+	c1.Dependencies = []Dependency{{Kind: DependencyParent, Ref: "parent-123"}}
+	c2 := createValidChild("child-2", []string{"file-2.md"})
+	c2.Dependencies = []Dependency{{Kind: DependencyParent, Ref: "parent-123"}}
 	manifest := &Manifest{
 		Version:      1,
 		ParentTaskID: "parent-123",
-		Children: []Child{
-			{
-				Key:                "child-1",
-				Title:              "Test 1",
-				Spec:               "Test spec 1",
-				Track:              "research",
-				Model:              "claude-opus-5-5",
-				ReviewModels:       []string{"claude-sonnet-5", "gpt-5-5"},
-				AgentMerge:         ptrBool(false),
-				Escalate:           ptrBool(true),
-				ClaimIDs:           []string{"claim-1"},
-				SourceStartPoints:  []string{"source-1"},
-				FileScope:          []string{"file-1.md"},
-				AcceptanceCriteria: []string{"criterion-1"},
-				Dependencies: []Dependency{
-					{Kind: DependencyParent, Ref: "parent-123"},
-				},
-			},
-			{
-				Key:                "child-2",
-				Title:              "Test 2",
-				Spec:               "Test spec 2",
-				Track:              "research",
-				Model:              "claude-opus-5-5",
-				ReviewModels:       []string{"claude-sonnet-5", "gpt-5-5"},
-				AgentMerge:         ptrBool(false),
-				Escalate:           ptrBool(true),
-				ClaimIDs:           []string{"claim-2"},
-				SourceStartPoints:  []string{"source-2"},
-				FileScope:          []string{"file-2.md"},
-				AcceptanceCriteria: []string{"criterion-2"},
-				Dependencies: []Dependency{
-					{Kind: DependencyParent, Ref: "parent-123"}, // Second parent dependency
-				},
-			},
-		},
+		Children:     []Child{c1, c2},
 		PendingCandidates: []PendingCandidate{
-			{ClaimID: "claim-1", Disposition: Assigned},
-			{ClaimID: "claim-2", Disposition: Assigned},
+			{ClaimID: "claim-child-1", Disposition: Assigned},
+			{ClaimID: "claim-child-2", Disposition: Assigned},
+		},
+	}
+
+	if err := manifest.Validate(validModels, validTracks); err != nil {
+		t.Fatalf("expected two children depending on the parent to pass, got %v", err)
+	}
+}
+
+// A single child may not list the parent dependency twice.
+func TestDuplicateParentDependencyWithinChild(t *testing.T) {
+	c1 := createValidChild("child-1", []string{"file-1.md"})
+	c1.Dependencies = []Dependency{
+		{Kind: DependencyParent, Ref: "parent-123"},
+		{Kind: DependencyParent, Ref: "parent-123"},
+	}
+	manifest := &Manifest{
+		Version:      1,
+		ParentTaskID: "parent-123",
+		Children:     []Child{c1},
+		PendingCandidates: []PendingCandidate{
+			{ClaimID: "claim-child-1", Disposition: Assigned},
 		},
 	}
 
 	err := manifest.Validate(validModels, validTracks)
 	assertErrorCode(t, err, "MULTIPLE_PARENT_DEPENDENCIES")
+}
+
+func TestInvalidFileScope(t *testing.T) {
+	cases := map[string]string{
+		"dot":            ".",
+		"dot-slash":      "./",
+		"absolute":       "/repo/x.md",
+		"parent-escape":  "../../etc/passwd",
+		"bare-parent":    "..",
+		"cleaned-escape": "a/../../x",
+	}
+	for name, path := range cases {
+		t.Run(name, func(t *testing.T) {
+			manifest := &Manifest{
+				Version:      1,
+				ParentTaskID: "parent-123",
+				Children: []Child{
+					createValidChild("child-1", []string{path}),
+					createValidChild("child-2", []string{"x.md"}),
+				},
+				PendingCandidates: []PendingCandidate{
+					{ClaimID: "claim-child-1", Disposition: Assigned},
+					{ClaimID: "claim-child-2", Disposition: Assigned},
+				},
+			}
+			err := manifest.Validate(validModels, validTracks)
+			assertErrorCode(t, err, "INVALID_FILE_SCOPE")
+		})
+	}
 }
 
 // Regression test for unmatched child claim (no assigned candidate entry)
@@ -1446,7 +1465,7 @@ func TestFileOverlapAttributionDeterministic(t *testing.T) {
 		}
 
 		// Check that the error message correctly attributes x/a.md to child-a and x to child-b
-		if !strings.Contains(valErr.Message, "(child \"child-a\")") || !strings.Contains(valErr.Message, "(child \"child-b\")") {
+		if !strings.Contains(valErr.Message, "\"x/a.md\" (child \"child-a\")") || !strings.Contains(valErr.Message, "\"x\" (child \"child-b\")") {
 			t.Errorf("iteration %d: error message missing expected child attributions: %s", i, valErr.Message)
 		}
 	}
