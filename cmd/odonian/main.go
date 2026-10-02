@@ -670,6 +670,19 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 				fmt.Fprintf(out, "  - %s: %s%s\n", link.Kind, link.Value, linkRoundLabel(task, link))
 			}
 		}
+		if len(task.SubmissionManifests) > 0 {
+			fmt.Fprintf(out, "Submission Manifests:\n")
+			for _, manifest := range task.SubmissionManifests {
+				fmt.Fprintf(out, "  - Round %d:\n", manifest.ReviewRound)
+				fmt.Fprintf(out, "    Parent Task ID: %s\n", manifest.ParentTaskID)
+				fmt.Fprintf(out, "    Digest: %s\n", manifest.ManifestDigest)
+				fmt.Fprintf(out, "    Submitted At: %s\n", manifest.SubmittedAt)
+				if manifest.ManifestJSON != nil {
+					manifestBytes, _ := json.MarshalIndent(manifest.ManifestJSON, "    ", "  ")
+					fmt.Fprintf(out, "    Manifest:\n%s\n", string(manifestBytes))
+				}
+			}
+		}
 		if len(reviewFindings) > 0 {
 			fmt.Fprintf(out, "Review Findings:\n")
 			for _, finding := range reviewFindings {

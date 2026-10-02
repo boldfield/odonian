@@ -432,6 +432,53 @@ func TestExecuteShowJSON(t *testing.T) {
 	}
 }
 
+func TestExecuteShowWithSubmissionManifests(t *testing.T) {
+	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:    "task-1",
+				State: "in_progress",
+				Model: "haiku",
+				Kind:  "implement",
+				Title: "Test Task",
+				Spec:  "Test spec",
+				SubmissionManifests: []tuiclient.SubmissionManifest{
+					{
+						ReviewRound:    1,
+						ParentTaskID:   "task-1",
+						ManifestJSON:   manifestJSON,
+						ManifestDigest: "abc123def456",
+						SubmittedAt:    "2026-10-02T12:00:00Z",
+					},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Submission Manifests:") {
+		t.Errorf("expected 'Submission Manifests:' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "Round 1:") {
+		t.Errorf("expected 'Round 1:' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "Parent Task ID: task-1") {
+		t.Errorf("expected 'Parent Task ID: task-1' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "Digest: abc123def456") {
+		t.Errorf("expected 'Digest: abc123def456' in output, got: %s", output)
+	}
+}
+
 func TestExecuteShowMissingID(t *testing.T) {
 	buf := &bytes.Buffer{}
 	err := executeShow(context.Background(), "http://localhost:8080", "test-token", false, []string{}, buf)
