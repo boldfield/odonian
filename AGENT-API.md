@@ -250,7 +250,11 @@ The `GET /tasks/{id}` response shows both proposed and created children in the `
 
 ### Recovery from invalid manifests
 
-If the stored manifest fails validation when the parent reaches `done` (digest mismatch, canonicalization errors, or other validation failures), the merge transition fails and rolls back. The parent remains in `approved`.
+If the stored manifest fails validation when the parent reaches `done`, the merge transition fails and rolls back. The parent remains in `approved`. Validation failures that trigger rollback include:
+
+- **Digest mismatch**: The stored manifest digest does not match the canonical digest of the persisted manifest data.
+- **Canonicalization errors**: Re-parsing and re-encoding the stored manifest produces a different canonical form.
+- **Validation rule violations**: The manifest violates any of the validation rules (e.g., overlapping files, unknown models, circular dependencies) when rechecked at merge time.
 
 To recover:
 
@@ -260,9 +264,13 @@ To recover:
 4. Both reviewers examine and approve the corrected manifest.
 5. Only then can a human merge the parent and create children with the new manifest.
 
-This path ensures every submitted manifest is reviewed and approved before child creation. There is no operator procedure to edit a stored digest in place.
+This path ensures every submitted manifest is reviewed and approved before child creation. There is no operator procedure to edit a stored digest or manifest in place.
 
-Idempotency within a single merge: calling child creation logic twice with the same approved manifest and digest from the same approved round does not create duplicate children. However, separate review rounds (after rework) may create separate manifest versions and separate child sets.
+### Idempotency
+
+Child creation is idempotent within a single approved state. If a human transitions an `approved` parent to `done` multiple times via repeated POST requests to `/tasks/{id}/transition {"to":"done"}`, the same children are created (or no duplicate children are added if they were already created in a prior transition). A child is uniquely identified by the parent ID and the manifest digest; a second transition with the same manifest digest will not create duplicates.
+
+However, separate review rounds (after rework) may produce separate manifest versions and separate child sets, each with its own digest.
 
 ## Task creation
 
