@@ -18,9 +18,10 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
 
 **Preclaimed review tasks.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, you are reviewing a preclaimed
 task that has been admitted against the research pacing policy and already claimed. Use the
-preclaimed task ID as-is; do not call `odonian next` or `odonian claim`. If the preclaimed task ID
-is invalid or already owned by another agent, step 2 will detect it; do not work a task you do not
-own.
+preclaimed task ID as-is; do not call `odonian next` or `odonian claim`. Step 2 will validate that
+the preclaimed task is claimed to your agent identity (compare the task's assignee to `$AGENT_ID`
+and verify state is `in_progress`); if validation fails, the task is invalid or already owned by
+another agent — do NOT proceed, STOP.
 
 1. **Claim a review task.** Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL"
    --kind review` — it prints the id of the first claimable `review`-kind task (`--kind review`
@@ -29,7 +30,9 @@ own.
    exit code 3 / "already claimed" → another reviewer took it, STOP. (These are auto-spawned
    `review`-kind tasks; `target_task_id` is the implement task under review.)
    **Skip this step if `ODONIAN_PRECLAIMED_TASK_ID` is set.**
-2. **Read the brief and detect your role.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, use that as your task ID; otherwise use the ID from step 1. Run `odonian show <id>` — its `spec` contains the **Implementation PR** URL and
+2. **Read the brief and detect your role.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, use that as your task ID; otherwise use the ID from step 1. Run `odonian show --json <id>` and parse the JSON to validate
+   your ownership: if the task's assignee does not match `$AGENT_ID` or the state is not `in_progress`, the
+   preclaimed ID was invalid or already released to another agent; do NOT proceed — STOP. Its `spec` contains the **Implementation PR** URL and
    the **Parent task** id (also in `target_task_id`). First, check whether this task adjudicates one disputed finding: if the spec begins with "Adjudicate one disputed research review finding", this is an **adjudication task** — skip to the adjudication path (step 3-adjudicate). Otherwise, this is a **regular review task** — continue below. If the task lookup fails (404 or permission denied), the preclaimed ID was invalid or already released to another agent; do NOT proceed — STOP.
    
    Then `odonian show <target_task_id>` (the **parent**): its `spec` is the real acceptance criteria you review against, its `pr` link is the

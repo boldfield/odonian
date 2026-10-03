@@ -25,14 +25,19 @@ first and claiming at the end is wrong.
 **Preclaimed tasks.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, you are working a preclaimed task that
 has been admitted against the research pacing policy and already claimed. Skip steps 1–2 entirely and
 go directly to step 3: use the preclaimed task ID as-is. You must not call `odonian next` or
-`odonian claim` again. If the preclaimed task ID is invalid or already owned by another agent, step 3
-will detect it; do not work a task you do not own.
+`odonian claim` again. Step 3 will validate that the preclaimed task is claimed to your agent identity
+(compare the task's assignee to `$AGENT_ID` and verify state is `in_progress`); if validation fails,
+the task is invalid or already owned by another agent — do NOT proceed, STOP.
 
 **Keep your lease alive.** A lease lapses if you go quiet too long, and a lapsed lease lets
-another worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — right after you claim,
-and again immediately **before and after** every slow step: fetching or verifying a source, running
-a named evidence tool, each `make check`, each `make test`, and any command you expect to take
-more than a minute. Pin heartbeats to those points; do not rely on sensing elapsed time.
+another worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — right after you claim
+(step 2) or validate your preclaimed task (step 3), and again immediately **before and after** every
+slow step: fetching or verifying a source, running a named evidence tool, each `make check`, each
+`make test`, and any command you expect to take more than a minute. For preclaimed tasks with research
+admission, use the attempt_id from the preclaimed claim response for heartbeat and submit operations
+(the attempt_id is sent to you separately; store it in an environment variable or file so later
+heartbeat/submit can reference the same attempt). Pin heartbeats to those points; do not rely on
+sensing elapsed time.
 
 1. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.
    It prints the id of the first claimable `implement`-kind task for your model tier — `--kind implement`
@@ -43,14 +48,16 @@ more than a minute. Pin heartbeats to those points; do not rely on sensing elaps
    claim is rejected if your model doesn't match the task's. Exit code 3 / "already claimed" → another
    worker took it; STOP. **Skip this step if `ODONIAN_PRECLAIMED_TASK_ID` is set.**
 3. Understand it. If `ODONIAN_PRECLAIMED_TASK_ID` is set, use that as your task ID; otherwise use the
-   ID from step 1. Read the task's `spec` in full (`odonian show <id>`). The spec gives the claims to
-   verify, the sources to check, pattern pointers, and acceptance criteria — and deliberately NO code.
-   **Also read the project's own task contract** (whatever the spec points you at — a CONTRIBUTING
-   doc, a research-conventions file, or rules embedded in the spec itself) for its evidence rules:
-   how a claim is marked `confirmed` vs `pending`, what a source citation must include, and whether it
-   names any evidence tools (scripts, search commands) you must run. The project's contract adds
-   domain rules on top of the rules below — follow both. If the task lookup fails (404 or permission
-   denied), the preclaimed ID was invalid or already released to another agent; do NOT proceed — STOP.
+   ID from step 1. Read the task's `spec` in full (`odonian show --json <id>`). Parse the JSON to validate
+   your ownership: if the task's assignee does not match `$AGENT_ID` or the state is not `in_progress`, the
+   preclaimed ID was invalid or already released to another agent; do NOT proceed — STOP. Otherwise, the
+   spec gives the claims to verify, the sources to check, pattern pointers, and acceptance criteria — and
+   deliberately NO code. **Also read the project's own task contract** (whatever the spec points you at —
+   a CONTRIBUTING doc, a research-conventions file, or rules embedded in the spec itself) for its evidence
+   rules: how a claim is marked `confirmed` vs `pending`, what a source citation must include, and whether
+   it names any evidence tools (scripts, search commands) you must run. The project's contract adds domain
+   rules on top of the rules below — follow both. If the task lookup fails (404 or permission denied), the
+   preclaimed ID was invalid or already released to another agent; do NOT proceed — STOP.
 4. Set up your branch. You are in your OWN worktree — NEVER run `git checkout main` (main is
    checked out in another worktree and the command will fail). Always branch from the remote, and
    always work **DETACHED** so a branch checkout can't collide with another worker's worktree.
