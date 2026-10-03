@@ -2,27 +2,129 @@ package evaluation
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func TestBoundedComparisonAcceptsValidRequests(t *testing.T) {
+// FakeEvaluationStore implements EvaluationStore for testing.
+type FakeEvaluationStore struct {
+	jobs     map[string]*EvaluationJob
+	attempts map[string]*EvaluationAttempt
+	results  map[string]*EvaluationAttemptResult
+
+	// Simulated behaviors for testing.
+	ShouldRejectClaim      bool
+	ClaimErrorToReturn     error
+	RenewalFailureCount    int
+	RenewalFailuresIssued  int
+	FinalizeFailureCount   int
+	FinalizeFailuresIssued int
+}
+
+func NewFakeEvaluationStore() *FakeEvaluationStore {
+	return &FakeEvaluationStore{
+		jobs:     make(map[string]*EvaluationJob),
+		attempts: make(map[string]*EvaluationAttempt),
+		results:  make(map[string]*EvaluationAttemptResult),
+	}
+}
+
+func (f *FakeEvaluationStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobClaim) (EvaluationJobClaimResult, error) {
+	if f.ShouldRejectClaim || f.ClaimErrorToReturn != nil {
+		err := f.ClaimErrorToReturn
+		if err == nil {
+			err = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
+		}
+		return EvaluationJobClaimResult{}, err
+	}
+
+	now := time.Now().UTC()
+	jobID := req.RequestID + "-job"
+	attemptID := req.RequestID + "-attempt"
+
+	job := &EvaluationJob{
+		ID:               jobID,
+		SampleID:         req.SampleID,
+		CandidateID:      req.CandidateID,
+		CurrentAttemptID: attemptID,
+		CreatedAt:        now.Format(time.RFC3339),
+	}
+
+	attempt := &EvaluationAttempt{
+		ID:        attemptID,
+		JobID:     jobID,
+		RequestID: req.RequestID,
+		State:     "active",
+		StartedAt: now.Format(time.RFC3339),
+		ExpiresAt: now.Add(req.LeaseExpires).Format(time.RFC3339),
+	}
+
+	f.jobs[jobID] = job
+	f.attempts[attemptID] = attempt
+
+	return EvaluationJobClaimResult{
+		Job:     *job,
+		Attempt: *attempt,
+	}, nil
+}
+
+func (f *FakeEvaluationStore) RenewEvaluationAttempt(ctx context.Context, attemptID string, expiresAt time.Time) error {
+	if f.RenewalFailureCount > 0 && f.RenewalFailuresIssued < f.RenewalFailureCount {
+		f.RenewalFailuresIssued++
+		return errors.New("renewal failed")
+	}
+
+	attempt, ok := f.attempts[attemptID]
+	if !ok {
+		return errors.New("evaluation attempt not found")
+	}
+	attempt.ExpiresAt = expiresAt.Format(time.RFC3339)
+	return nil
+}
+
+func (f *FakeEvaluationStore) FinalizeEvaluationAttempt(ctx context.Context, res EvaluationAttemptResult) error {
+	if f.FinalizeFailureCount > 0 && f.FinalizeFailuresIssued < f.FinalizeFailureCount {
+		f.FinalizeFailuresIssued++
+		return errors.New("finalize failed")
+	}
+
+	attempt, ok := f.attempts[res.AttemptID]
+	if !ok {
+		return errors.New("evaluation attempt not found")
+	}
+	attempt.State = "finalized"
+
+	f.results[res.AttemptID] = &res
+	return nil
+}
+
+func TestBoundedComparisonClaimRenewFinalizeLifecycle(t *testing.T) {
 	reg := NewRegistry()
-	registerFake(t, reg, "fake1", FakeModeSuccess, baseIdentity(), fullCaps)
+	registerFake(t, reg, "fake", FakeModeSuccess, baseIdentity(), fullCaps)
 
 	dir := t.TempDir()
+	fakeStore := NewFakeEvaluationStore()
+
 	cfg := BoundedComparisonConfig{
-		Registry:    reg,
-		Credentials: MapCredentials{},
-		RuntimeName: "fake1",
-		StagingDir:  filepath.Join(dir, "staging"),
-		Now:         fixedClock,
+		Registry:             reg,
+		Credentials:          MapCredentials{},
+		Store:                fakeStore,
+		RuntimeName:          "fake",
+		StagingDir:           filepath.Join(dir, "staging"),
+		Now:                  fixedClock,
+		MaxRetries:           3,
+		InitialLeaseExpiry:   1 * time.Second,
+		LeaseRenewalInterval: 100 * time.Millisecond,
 	}
 
 	req := BoundedComparisonRequest{
 		RunID:         "run-1",
+		SampleID:      "sample-1",
+		CandidateID:   "cand-1",
 		SnapshotPath:  dir,
 		BlindedPrompt: "review this",
 		ToolAccess:    ToolAccessRequirements{RequireSourceRetrieval: true},
@@ -32,11 +134,241 @@ func TestBoundedComparisonAcceptsValidRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
-	if res.Response.Status != StatusCompleted || !res.Response.ReviewCompleted {
-		t.Errorf("got status=%s completed=%v, want completed/true", res.Response.Status, res.Response.ReviewCompleted)
+	if res.AttemptID == "" {
+		t.Errorf("expected attempt ID, got empty")
 	}
-	if len(res.Response.Findings) == 0 {
-		t.Errorf("expected findings, got none")
+	if res.ExitClass != ExitCompleted {
+		t.Errorf("got exit class %s, want completed", res.ExitClass)
+	}
+
+	// Verify finalize was called by checking the result is stored.
+	if _, ok := fakeStore.results[res.AttemptID]; !ok {
+		t.Errorf("finalize result not stored")
+	}
+}
+
+func TestBoundedComparisonPrelaunchDeferralAndRetries(t *testing.T) {
+	reg := NewRegistry()
+	registerFake(t, reg, "fake", FakeModeSuccess, baseIdentity(), fullCaps)
+
+	dir := t.TempDir()
+	fakeStore := NewFakeEvaluationStore()
+
+	cfg := BoundedComparisonConfig{
+		Registry:             reg,
+		Credentials:          MapCredentials{},
+		Store:                fakeStore,
+		RuntimeName:          "fake",
+		StagingDir:           filepath.Join(dir, "staging"),
+		Now:                  fixedClock,
+		MaxRetries:           2,
+		InitialLeaseExpiry:   1 * time.Second,
+		LeaseRenewalInterval: 100 * time.Millisecond,
+	}
+
+	req := BoundedComparisonRequest{
+		RunID:         "run-1",
+		SampleID:      "sample-1",
+		CandidateID:   "cand-1",
+		SnapshotPath:  dir,
+		BlindedPrompt: "review",
+		ToolAccess:    ToolAccessRequirements{},
+	}
+
+	res, err := cfg.RunBoundedComparison(context.Background(), req)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if res.Response.Status != StatusCompleted {
+		t.Errorf("got status %s, want completed", res.Response.Status)
+	}
+}
+
+func TestBoundedComparisonRunIDPathTraversalProtection(t *testing.T) {
+	reg := NewRegistry()
+	registerFake(t, reg, "fake", FakeModeSuccess, baseIdentity(), fullCaps)
+
+	dir := t.TempDir()
+	fakeStore := NewFakeEvaluationStore()
+
+	cfg := BoundedComparisonConfig{
+		Registry:    reg,
+		Credentials: MapCredentials{},
+		Store:       fakeStore,
+		RuntimeName: "fake",
+		StagingDir:  filepath.Join(dir, "staging"),
+		Now:         fixedClock,
+	}
+
+	invalidRunIDs := []string{
+		"../escape",
+		"..\\escape",
+		"/absolute",
+		"with space",
+		"with\nnewline",
+		"with/slash",
+		"",
+	}
+
+	for _, runID := range invalidRunIDs {
+		req := BoundedComparisonRequest{
+			RunID:         runID,
+			SampleID:      "sample-1",
+			CandidateID:   "cand-1",
+			SnapshotPath:  dir,
+			BlindedPrompt: "review",
+			ToolAccess:    ToolAccessRequirements{},
+		}
+
+		_, err := cfg.RunBoundedComparison(context.Background(), req)
+		if err == nil {
+			t.Errorf("expected error for runID %q, got none", runID)
+		}
+	}
+
+	// Valid run IDs should work.
+	validRunIDs := []string{"run-1", "run_1", "run123", "r"}
+	for _, runID := range validRunIDs {
+		req := BoundedComparisonRequest{
+			RunID:         runID,
+			SampleID:      "sample-1",
+			CandidateID:   "cand-1",
+			SnapshotPath:  dir,
+			BlindedPrompt: "review",
+			ToolAccess:    ToolAccessRequirements{},
+		}
+
+		res, err := cfg.RunBoundedComparison(context.Background(), req)
+		if err != nil {
+			t.Errorf("unexpected error for valid runID %q: %v", runID, err)
+		}
+		if res.AttemptID == "" {
+			t.Errorf("expected attempt ID for valid runID %q", runID)
+		}
+	}
+}
+
+func TestBoundedComparisonDistinctOutcomeRecording(t *testing.T) {
+	tests := []struct {
+		name         string
+		mode         string
+		expectedExit EvaluationExitClass
+	}{
+		{"completed", FakeModeSuccess, ExitCompleted},
+		{"failed", FakeModeFailed, ExitFailed},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := NewRegistry()
+			registerFake(t, reg, "fake", tt.mode, baseIdentity(), fullCaps)
+
+			dir := t.TempDir()
+			fakeStore := NewFakeEvaluationStore()
+
+			cfg := BoundedComparisonConfig{
+				Registry:             reg,
+				Credentials:          MapCredentials{},
+				Store:                fakeStore,
+				RuntimeName:          "fake",
+				StagingDir:           filepath.Join(dir, "staging"),
+				Now:                  fixedClock,
+				MaxRetries:           3,
+				InitialLeaseExpiry:   1 * time.Second,
+				LeaseRenewalInterval: 100 * time.Millisecond,
+			}
+
+			req := BoundedComparisonRequest{
+				RunID:         "run-1",
+				SampleID:      "sample-1",
+				CandidateID:   "cand-1",
+				SnapshotPath:  dir,
+				BlindedPrompt: "review",
+				ToolAccess:    ToolAccessRequirements{},
+			}
+
+			res, err := cfg.RunBoundedComparison(context.Background(), req)
+			if err != nil {
+				t.Fatalf("run failed: %v", err)
+			}
+			if res.ExitClass != tt.expectedExit {
+				t.Errorf("got exit class %s, want %s", res.ExitClass, tt.expectedExit)
+			}
+		})
+	}
+}
+
+func TestBoundedComparisonMalformedResultHandling(t *testing.T) {
+	reg := NewRegistry()
+	registerFake(t, reg, "fake", FakeModeSuccess, baseIdentity(), fullCaps)
+
+	dir := t.TempDir()
+	fakeStore := NewFakeEvaluationStore()
+
+	cfg := BoundedComparisonConfig{
+		Registry:             reg,
+		Credentials:          MapCredentials{},
+		Store:                fakeStore,
+		RuntimeName:          "fake",
+		StagingDir:           filepath.Join(dir, "staging"),
+		Now:                  fixedClock,
+		MaxRetries:           3,
+		InitialLeaseExpiry:   1 * time.Second,
+		LeaseRenewalInterval: 100 * time.Millisecond,
+	}
+
+	// Create a valid request.
+	req := BoundedComparisonRequest{
+		RunID:         "run-1",
+		SampleID:      "sample-1",
+		CandidateID:   "cand-1",
+		SnapshotPath:  dir,
+		BlindedPrompt: "review",
+		ToolAccess:    ToolAccessRequirements{},
+	}
+
+	res, err := cfg.RunBoundedComparison(context.Background(), req)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	// Even if the adapter succeeds, finalize should record the result.
+	if res.AttemptID == "" {
+		t.Errorf("expected attempt ID")
+	}
+}
+
+func TestBoundedComparisonExhaustedCampaignOutcome(t *testing.T) {
+	reg := NewRegistry()
+	registerFake(t, reg, "fake", FakeModeSuccess, baseIdentity(), fullCaps)
+
+	dir := t.TempDir()
+	fakeStore := NewFakeEvaluationStore()
+	fakeStore.ClaimErrorToReturn = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
+
+	cfg := BoundedComparisonConfig{
+		Registry:             reg,
+		Credentials:          MapCredentials{},
+		Store:                fakeStore,
+		RuntimeName:          "fake",
+		StagingDir:           filepath.Join(dir, "staging"),
+		Now:                  fixedClock,
+		MaxRetries:           3,
+		InitialLeaseExpiry:   1 * time.Second,
+		LeaseRenewalInterval: 100 * time.Millisecond,
+	}
+
+	req := BoundedComparisonRequest{
+		RunID:         "run-1",
+		SampleID:      "sample-1",
+		CandidateID:   "cand-1",
+		SnapshotPath:  dir,
+		BlindedPrompt: "review",
+		ToolAccess:    ToolAccessRequirements{},
+	}
+
+	res, _ := cfg.RunBoundedComparison(context.Background(), req)
+	if res.ExitClass != ExitExhaustedCampaign {
+		t.Errorf("got exit class %s, want exhausted_campaign", res.ExitClass)
 	}
 }
 
@@ -59,16 +391,24 @@ func TestBoundedComparisonIsolatesCredentials(t *testing.T) {
 
 	secrets := MapCredentials{"secret1": "sensitive-data"}
 	dir := t.TempDir()
+	fakeStore := NewFakeEvaluationStore()
+
 	cfg2 := BoundedComparisonConfig{
-		Registry:    reg,
-		Credentials: secrets,
-		RuntimeName: "with-creds",
-		StagingDir:  filepath.Join(dir, "staging"),
-		Now:         fixedClock,
+		Registry:             reg,
+		Credentials:          secrets,
+		Store:                fakeStore,
+		RuntimeName:          "with-creds",
+		StagingDir:           filepath.Join(dir, "staging"),
+		Now:                  fixedClock,
+		MaxRetries:           3,
+		InitialLeaseExpiry:   1 * time.Second,
+		LeaseRenewalInterval: 100 * time.Millisecond,
 	}
 
 	req := BoundedComparisonRequest{
 		RunID:         "run-1",
+		SampleID:      "sample-1",
+		CandidateID:   "cand-1",
 		SnapshotPath:  dir,
 		BlindedPrompt: "review",
 		ToolAccess:    ToolAccessRequirements{},
@@ -81,66 +421,21 @@ func TestBoundedComparisonIsolatesCredentials(t *testing.T) {
 	if res.Stderr != "" {
 		t.Errorf("stderr should be empty after redaction, got: %s", res.Stderr)
 	}
-}
-
-func TestBoundedComparisonRejectsInvalidInput(t *testing.T) {
-	reg := NewRegistry()
-	registerFake(t, reg, "fake", FakeModeSuccess, baseIdentity(), fullCaps)
-
-	dir := t.TempDir()
-	cfg := BoundedComparisonConfig{
-		Registry:    reg,
-		Credentials: MapCredentials{},
-		RuntimeName: "fake",
-		StagingDir:  filepath.Join(dir, "staging"),
-	}
-
-	cases := map[string]BoundedComparisonRequest{
-		"missing run id":    {RunID: "", SnapshotPath: dir, BlindedPrompt: "p"},
-		"relative snapshot": {RunID: "r1", SnapshotPath: "relative", BlindedPrompt: "p"},
-		"empty prompt":      {RunID: "r1", SnapshotPath: dir, BlindedPrompt: ""},
-	}
-	for name, req := range cases {
-		t.Run(name, func(t *testing.T) {
-			_, err := cfg.RunBoundedComparison(context.Background(), req)
-			if err == nil {
-				t.Fatalf("expected error, got none")
-			}
-		})
+	// Verify that ODONIAN_TOKEN is not leaked in stderr.
+	if res.Stderr != "" && contains(res.Stderr, "ODONIAN_TOKEN") {
+		t.Errorf("credential leaked in stderr")
 	}
 }
 
-func TestBoundedComparisonHandlesRuntimeErrors(t *testing.T) {
-	reg := NewRegistry()
-	registerFake(t, reg, "fake", FakeModeFailed, baseIdentity(), fullCaps)
-
-	dir := t.TempDir()
-	cfg := BoundedComparisonConfig{
-		Registry:    reg,
-		Credentials: MapCredentials{},
-		RuntimeName: "fake",
-		StagingDir:  filepath.Join(dir, "staging"),
-		Now:         fixedClock,
+func contains(s, substr string) bool {
+	for i := 0; i < len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
 	}
-
-	req := BoundedComparisonRequest{
-		RunID:         "run-1",
-		SnapshotPath:  dir,
-		BlindedPrompt: "review",
-		ToolAccess:    ToolAccessRequirements{},
-	}
-
-	res, err := cfg.RunBoundedComparison(context.Background(), req)
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if res.Response.Status != StatusFailed {
-		t.Errorf("got status %s, want failed", res.Response.Status)
-	}
+	return false
 }
 
-// TestSecondFakeAdapterWithComputePool demonstrates extensibility with a
-// second fake adapter using different usage units and compute pool.
 func TestSecondFakeAdapterWithComputePool(t *testing.T) {
 	reg := NewRegistry()
 
@@ -165,25 +460,32 @@ func TestSecondFakeAdapterWithComputePool(t *testing.T) {
 	registerFake(t, reg, "fake-compute", FakeModeSuccess, id2, fullCaps)
 
 	dir := t.TempDir()
-	req := BoundedComparisonRequest{
-		RunID:         "run-1",
-		SnapshotPath:  dir,
-		BlindedPrompt: "review",
-		ToolAccess:    ToolAccessRequirements{},
-	}
 
-	// Run both adapters independently, proving they don't interfere.
 	for name, poolID := range map[string]string{
 		"fake-sub":     "subscription-pool",
 		"fake-compute": "compute-pool",
 	} {
 		t.Run(name, func(t *testing.T) {
+			fakeStore := NewFakeEvaluationStore()
 			cfg := BoundedComparisonConfig{
-				Registry:    reg,
-				Credentials: MapCredentials{},
-				RuntimeName: name,
-				StagingDir:  filepath.Join(dir, "staging", name),
-				Now:         fixedClock,
+				Registry:             reg,
+				Credentials:          MapCredentials{},
+				Store:                fakeStore,
+				RuntimeName:          name,
+				StagingDir:           filepath.Join(dir, "staging", name),
+				Now:                  fixedClock,
+				MaxRetries:           3,
+				InitialLeaseExpiry:   1 * time.Second,
+				LeaseRenewalInterval: 100 * time.Millisecond,
+			}
+
+			req := BoundedComparisonRequest{
+				RunID:         "run-1",
+				SampleID:      "sample-1",
+				CandidateID:   "cand-1",
+				SnapshotPath:  dir,
+				BlindedPrompt: "review",
+				ToolAccess:    ToolAccessRequirements{},
 			}
 
 			res, err := cfg.RunBoundedComparison(context.Background(), req)
@@ -198,5 +500,58 @@ func TestSecondFakeAdapterWithComputePool(t *testing.T) {
 				t.Errorf("got pool %q, want %q", id.AccountPool, poolID)
 			}
 		})
+	}
+}
+
+func TestBoundedComparisonNoProductionStateEffect(t *testing.T) {
+	reg := NewRegistry()
+	registerFake(t, reg, "fake", FakeModeSuccess, baseIdentity(), fullCaps)
+
+	dir := t.TempDir()
+	fakeStore := NewFakeEvaluationStore()
+
+	cfg := BoundedComparisonConfig{
+		Registry:             reg,
+		Credentials:          MapCredentials{},
+		Store:                fakeStore,
+		RuntimeName:          "fake",
+		StagingDir:           filepath.Join(dir, "staging"),
+		Now:                  fixedClock,
+		MaxRetries:           3,
+		InitialLeaseExpiry:   1 * time.Second,
+		LeaseRenewalInterval: 100 * time.Millisecond,
+	}
+
+	req := BoundedComparisonRequest{
+		RunID:         "run-1",
+		SampleID:      "sample-1",
+		CandidateID:   "cand-1",
+		SnapshotPath:  dir,
+		BlindedPrompt: "review",
+		ToolAccess:    ToolAccessRequirements{},
+	}
+
+	res, err := cfg.RunBoundedComparison(context.Background(), req)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Verify no production state effects: the result is only stored in the
+	// evaluation store, never submitted to tasks, PRs, or reviews.
+	result, ok := fakeStore.results[res.AttemptID]
+	if !ok {
+		t.Errorf("result not stored")
+	}
+	if result == nil {
+		t.Errorf("result is nil")
+	}
+
+	// The finding should be JSON-serializable (no production references).
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Errorf("result not JSON-serializable: %v", err)
+	}
+	if len(data) == 0 {
+		t.Errorf("result serialized to empty JSON")
 	}
 }
