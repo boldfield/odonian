@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -794,5 +795,322 @@ func TestEvaluationFindingValidation(t *testing.T) {
 	}
 	if findingID == "" {
 		t.Error("Finding ID should not be empty")
+	}
+}
+
+// TestEvaluationLeaseExpirySweep tests that expired attempts are properly swept and reclaimed.
+func TestEvaluationLeaseExpirySweep(t *testing.T) {
+	// Use injectable clock for precise lease expiry testing
+	var fakeNow time.Time = time.Unix(1000, 0)
+	s, err := Open(filepath.Join(t.TempDir(), "eval.db"), defaultTestAllowedModels(), WithClock(func() time.Time { return fakeNow }))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	st := s
+
+	ctx := context.Background()
+
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "test-campaign",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     3,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 3,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	// Claim first attempt with 100-second lease
+	req1 := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 100 * time.Second,
+	}
+	result1, _ := st.ClaimEvaluationJob(ctx, req1)
+	attemptID1 := result1.Attempt.ID
+
+	// Advance time past first lease expiry
+	fakeNow = fakeNow.Add(101 * time.Second)
+
+	// Expire overdue attempts
+	expiredCount, err := st.ExpireEvaluationAttempts(ctx, fakeNow)
+	if err != nil {
+		t.Fatalf("ExpireEvaluationAttempts failed: %v", err)
+	}
+	if expiredCount != 1 {
+		t.Errorf("Expected 1 expired attempt, got %d", expiredCount)
+	}
+
+	// Verify attempt is marked as expired
+	attempt, _ := st.GetEvaluationAttempt(ctx, attemptID1)
+	if attempt.State != EvalAttemptExpired {
+		t.Errorf("Attempt should be expired, got state: %s", attempt.State)
+	}
+	if attempt.ExitClass == nil || *attempt.ExitClass != EvalExitLeaseExpired {
+		t.Errorf("Exit class should be lease_expired, got: %v", attempt.ExitClass)
+	}
+
+	// Should now be able to claim a retry attempt (expired attempt freed capacity)
+	req2 := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req2",
+		LeaseExpires: 100 * time.Second,
+	}
+	result2, err := st.ClaimEvaluationJob(ctx, req2)
+	if err != nil {
+		t.Fatalf("Should be able to claim after expiry, got error: %v", err)
+	}
+	if result2.Attempt.SequenceNumber != 2 {
+		t.Errorf("Second attempt should have sequence number 2, got %d", result2.Attempt.SequenceNumber)
+	}
+}
+
+// TestEvaluationConcurrentClaim tests that concurrent claims on different samples are properly handled.
+func TestEvaluationConcurrentClaim(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "test-campaign",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 10,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	// Create multiple samples
+	samples := make([]EvaluationSample, 3)
+	for i := 0; i < 3; i++ {
+		sample := EvaluationSample{
+			ID:                  GenerateID(),
+			CampaignID:          campaign.ID,
+			OriginalTaskID:      fmt.Sprintf("task%d", i),
+			OriginalReviewRound: 1,
+			SubmittedSHA:        fmt.Sprintf("sha%d", i),
+			PromptVersion:       "v1",
+			ModelVersion:        "v1",
+			RuntimeVersion:      "v1",
+		}
+		sample, _ = st.CreateEvaluationSample(ctx, sample)
+		samples[i] = sample
+	}
+
+	// Launch concurrent claims with different samples
+	numClaims := 3
+	results := make([]EvaluationJobClaimResult, numClaims)
+	errsChan := make(chan error, numClaims)
+
+	for i := 0; i < numClaims; i++ {
+		go func(idx int) {
+			reqID := fmt.Sprintf("req%d", idx)
+			req := EvaluationJobClaim{
+				SampleID:     samples[idx].ID,
+				CandidateID:  candidate.ID,
+				RequestID:    reqID,
+				LeaseExpires: 5 * time.Minute,
+			}
+			result, err := st.ClaimEvaluationJob(ctx, req)
+			if err != nil {
+				errsChan <- err
+				return
+			}
+			results[idx] = result
+			errsChan <- nil
+		}(i)
+	}
+
+	// Collect results
+	for i := 0; i < numClaims; i++ {
+		if err := <-errsChan; err != nil {
+			t.Fatalf("Concurrent claim %d failed: %v", i, err)
+		}
+	}
+
+	// Verify all claims succeeded and have sequence number 1 (first attempt for each sample)
+	for i := 0; i < numClaims; i++ {
+		if results[i].Attempt.SequenceNumber != 1 {
+			t.Errorf("Attempt %d should have sequence number 1, got %d", i, results[i].Attempt.SequenceNumber)
+		}
+		if results[i].Job.SampleID != samples[i].ID {
+			t.Errorf("Result %d sample ID mismatch", i)
+		}
+	}
+}
+
+// TestEvaluationCampaignMismatch tests that samples and candidates from different campaigns cannot be paired.
+func TestEvaluationCampaignMismatch(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	// Create two campaigns
+	campaign1 := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "campaign1",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool1",
+	}
+	campaign1, _ = st.CreateEvaluationCampaign(ctx, campaign1)
+
+	campaign2 := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "campaign2",
+		ProjectID:      "proj2",
+		AllowedModelID: "model2",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool2",
+	}
+	campaign2, _ = st.CreateEvaluationCampaign(ctx, campaign2)
+
+	// Create candidate in campaign1
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign1.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 5,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	// Create sample in campaign2
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign2.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	// Try to claim with mismatched campaign
+	req := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 5 * time.Minute,
+	}
+	_, err := st.ClaimEvaluationJob(ctx, req)
+	if err == nil {
+		t.Error("Should reject claim with campaign mismatch")
+	}
+	if err != ErrEvaluationInvalidInput {
+		t.Errorf("Expected ErrEvaluationInvalidInput, got %v", err)
+	}
+}
+
+// TestEvaluationFindingRejectionOnNonCompleted tests that findings cannot be stored on non-completed attempts.
+func TestEvaluationFindingRejectionOnNonCompleted(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "test-campaign",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 5,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	req := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result, _ := st.ClaimEvaluationJob(ctx, req)
+
+	summary := "Test finding"
+
+	// Finalize with failed status
+	status := evaluation.StatusFailed
+	errorClass := evaluation.ErrClassRuntimeError
+	st.FinalizeEvaluationAttempt(ctx, result.Attempt.ID, result.Attempt.ID, "failed", &status, &errorClass, nil, nil, nil)
+
+	// Should reject findings on failed attempt
+	_, err := st.StoreEvaluationFinding(ctx, result.Attempt.ID, 0, evaluation.SeverityMaterial, "main.go", 42, &summary, nil)
+	if err == nil {
+		t.Error("Should reject findings on failed attempt")
+	}
+	if err.Error() != "findings can only be stored on completed attempts, got exit_class: failed" {
+		t.Errorf("Unexpected error: %v", err)
 	}
 }
