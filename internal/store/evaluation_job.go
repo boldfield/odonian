@@ -254,11 +254,11 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 		}
 
 		job := EvaluationJob{
-			ID:        boundJobID,
-			SampleID:  boundSampleID,
+			ID:          boundJobID,
+			SampleID:    boundSampleID,
 			CandidateID: boundCandidateID,
-			RequestID: req.RequestID,
-			CreatedAt: boundCreatedAt,
+			RequestID:   req.RequestID,
+			CreatedAt:   boundCreatedAt,
 		}
 
 		// Fetch current attempt
