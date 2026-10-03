@@ -25,6 +25,7 @@ import (
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/localcommit"
 	"github.com/boldfield/odonian/internal/notify"
+	"github.com/boldfield/odonian/internal/policy"
 	"github.com/boldfield/odonian/internal/prwatch"
 	"github.com/boldfield/odonian/internal/reconcile"
 	"github.com/boldfield/odonian/internal/store"
@@ -183,6 +184,14 @@ func runServer() {
 	if len(allowedModels) == 0 {
 		log.Fatal("ODONIAN_MODELS configuration resulted in empty allowlist")
 	}
+
+	// Validate the research pacing policy. Configuration alone launches nothing and
+	// changes no claim or dispatch behavior.
+	researchPolicy, err := policy.ParseConfig(os.Getenv("ODONIAN_RESEARCH_POLICY_MODE"), os.Getenv("ODONIAN_RESEARCH_POOLS"), allowedModels)
+	if err != nil {
+		log.Fatalf("invalid research pacing policy: %v", err)
+	}
+	log.Printf("research pacing policy mode=%s pools=%d", researchPolicy.Mode, len(researchPolicy.Pools))
 
 	// Parse escalation ladder
 	escalationLadder := parseEscalationLadder(os.Getenv("ODONIAN_ESCALATION_LADDER"), allowedModels)
