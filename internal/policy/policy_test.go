@@ -44,7 +44,7 @@ func TestAdmissionUnmappedModel(t *testing.T) {
 }
 
 func TestRateLimitingWithTokenBucket(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1000, 0)
 	pe := New(ModeEnforce, []*Pool{
 		{
 			Name:                    "main",
@@ -54,7 +54,7 @@ func TestRateLimitingWithTokenBucket(t *testing.T) {
 			BurstCapacity:           3,
 			ConcurrentDispatchLimit: 10,
 		},
-	})
+	}, now)
 	pe.SetClock(func() time.Time { return now })
 
 	// Should admit the first 3 (burst capacity)
@@ -84,7 +84,7 @@ func TestRateLimitingWithTokenBucket(t *testing.T) {
 }
 
 func TestRateLimitClockRollback(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1000, 0)
 	pe := New(ModeEnforce, []*Pool{
 		{
 			Name:                    "main",
@@ -94,7 +94,7 @@ func TestRateLimitClockRollback(t *testing.T) {
 			BurstCapacity:           1,
 			ConcurrentDispatchLimit: 10,
 		},
-	})
+	}, now)
 	pe.SetClock(func() time.Time { return now })
 
 	// Consume the burst token
@@ -367,7 +367,7 @@ func TestBurstCeiling(t *testing.T) {
 }
 
 func TestConfigurationChangesWithoutMintingCapacity(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1000, 0)
 	pe := New(ModeEnforce, []*Pool{
 		{
 			Name:                    "main",
@@ -377,7 +377,7 @@ func TestConfigurationChangesWithoutMintingCapacity(t *testing.T) {
 			BurstCapacity:           2,
 			ConcurrentDispatchLimit: 10,
 		},
-	})
+	}, now)
 	pe.SetClock(func() time.Time { return now })
 
 	// Consume burst
@@ -450,7 +450,7 @@ func TestConfigurationChangesWithoutMintingCapacity(t *testing.T) {
 }
 
 func TestFractionalRefillExactCounts(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1000, 0)
 	pe := New(ModeEnforce, []*Pool{
 		{
 			Name:                    "main",
@@ -460,7 +460,7 @@ func TestFractionalRefillExactCounts(t *testing.T) {
 			BurstCapacity:           1,
 			ConcurrentDispatchLimit: 10,
 		},
-	})
+	}, now)
 	pe.SetClock(func() time.Time { return now })
 
 	// Consume initial burst token
@@ -488,7 +488,7 @@ func TestFractionalRefillExactCounts(t *testing.T) {
 }
 
 func TestClockRollbackAndRecovery(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1000, 0)
 	pe := New(ModeEnforce, []*Pool{
 		{
 			Name:                    "main",
@@ -498,7 +498,7 @@ func TestClockRollbackAndRecovery(t *testing.T) {
 			BurstCapacity:           2,
 			ConcurrentDispatchLimit: 10,
 		},
-	})
+	}, now)
 	pe.SetClock(func() time.Time { return now })
 
 	// Consume initial burst (2 tokens)
@@ -640,7 +640,7 @@ func TestUnmappedModelEnforceReason(t *testing.T) {
 }
 
 func TestTokenBucketNoCapacityMinting(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1000, 0)
 	pe := New(ModeEnforce, []*Pool{
 		{
 			Name:                    "main",
@@ -650,7 +650,7 @@ func TestTokenBucketNoCapacityMinting(t *testing.T) {
 			BurstCapacity:           1,
 			ConcurrentDispatchLimit: 10,
 		},
-	})
+	}, now)
 	pe.SetClock(func() time.Time { return now })
 
 	// Consume burst

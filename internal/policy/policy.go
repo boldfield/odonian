@@ -94,7 +94,9 @@ type tokenBucket struct {
 }
 
 // New creates a PolicyEvaluator with the given configuration.
-func New(mode Mode, pools []*Pool) *PolicyEvaluator {
+// startTime is used to initialize token bucket high-water marks; if zero, the current time is used.
+// This is primarily for testing deterministic behavior with injected clocks.
+func New(mode Mode, pools []*Pool, startTime ...time.Time) *PolicyEvaluator {
 	pe := &PolicyEvaluator{
 		Mode:             mode,
 		Pools:            make(map[string]*Pool),
@@ -105,18 +107,24 @@ func New(mode Mode, pools []*Pool) *PolicyEvaluator {
 		clock:            time.Now,
 	}
 
+	// Determine the initial time for bucket initialization
+	var initTime time.Time
+	if len(startTime) > 0 {
+		initTime = startTime[0]
+	} else {
+		initTime = time.Now()
+	}
+
 	for _, pool := range pools {
 		pe.Pools[pool.Name] = pool
 		for model := range pool.Models {
 			pe.modelToPool[model] = pool.Name
 		}
-		now := pe.clock()
 		pe.buckets[pool.Name] = &tokenBucket{
 			tokens:         float64(pool.BurstCapacity),
 			capacity:       float64(pool.BurstCapacity),
 			refillRate:     pool.StartRate,
-			lastRefill:     now,
-			lastRefillMono: now,
+			lastRefillMono: initTime,
 		}
 	}
 
