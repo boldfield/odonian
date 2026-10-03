@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"strings"
@@ -83,14 +84,9 @@ func ParseConfig(modeStr, poolsJSON string, allowedModels []string) (Config, err
 	}
 
 	if strings.TrimSpace(poolsJSON) != "" {
-		var raw map[string]rawPool
-		dec := json.NewDecoder(bytes.NewReader([]byte(poolsJSON)))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&raw); err != nil {
+		raw, err := decodePools(poolsJSON)
+		if err != nil {
 			return Config{}, fmt.Errorf("invalid ODONIAN_RESEARCH_POOLS: %w", err)
-		}
-		if dec.More() {
-			return Config{}, fmt.Errorf("invalid ODONIAN_RESEARCH_POOLS: trailing data after JSON object")
 		}
 		names := make([]string, 0, len(raw))
 		for name := range raw {
@@ -110,6 +106,48 @@ func ParseConfig(modeStr, poolsJSON string, allowedModels []string) (Config, err
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// decodePools decodes the pools object like encoding/json would, except that a
+// repeated pool name is an error instead of silently keeping the last value.
+func decodePools(s string) (map[string]rawPool, error) {
+	dec := json.NewDecoder(bytes.NewReader([]byte(s)))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, fmt.Errorf("expected a JSON object keyed by pool name")
+	}
+	out := make(map[string]rawPool)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, _ := keyTok.(string)
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("duplicate pool name %q", name)
+		}
+		var msg json.RawMessage
+		if err := dec.Decode(&msg); err != nil {
+			return nil, err
+		}
+		pd := json.NewDecoder(bytes.NewReader(msg))
+		pd.DisallowUnknownFields()
+		var rp rawPool
+		if err := pd.Decode(&rp); err != nil {
+			return nil, fmt.Errorf("pool %q: %w", name, err)
+		}
+		out[name] = rp
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("trailing data after JSON object")
+	}
+	return out, nil
 }
 
 func (r rawPool) toPool(name string) (Pool, error) {

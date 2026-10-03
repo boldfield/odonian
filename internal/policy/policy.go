@@ -245,6 +245,8 @@ func (e *Evaluator) Evaluate(now time.Time, model string, class WorkClass) (Deci
 	if e.cfg.Mode == ModeObserve {
 		d.Verdict = admit
 	}
+	// In observe mode the work really starts, so active is counted even when
+	// the shadow verdict was a deferral/retry (which spent no token).
 	if d.Verdict.Outcome == OutcomeAdmit {
 		acct.active++
 		if class.Completion() {

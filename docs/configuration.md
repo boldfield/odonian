@@ -87,7 +87,9 @@ assumed; with the defaults the policy is `disabled`.
 
 - `account_id`: the external subscription/account. Pool state is keyed by it and shared across all
   projects and workers, so every alias on one account belongs in one pool; two pools with the same
-  account are rejected.
+  account are rejected. Renaming an `account_id` (even to fix a typo) makes it a new, never-seen
+  account that starts with a full burst and zero active dispatches, so treat it as resetting that
+  pool's allowance. Repeated pool names in the JSON object are rejected.
 - `models`: non-empty list from `ODONIAN_MODELS`. A model may appear in one pool only.
 - `start_rate`: sustained starts per second; finite and greater than zero.
 - `burst_capacity`: integer of at least 1; starts available at once when idle. Allowance never exceeds it.
