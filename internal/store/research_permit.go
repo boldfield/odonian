@@ -494,11 +494,13 @@ func (s *sqliteStore) ListResearchPoolStates(ctx context.Context, now time.Time)
 		state.Active = active
 		state.ActiveCompletion = activeCompletion
 
-		// Count deferred tasks
+		// Count deferred tasks: only non-hypothetical defers with tasks still claimable (state='ready')
 		var deferred int
 		err = tx.QueryRowContext(ctx, `
 			SELECT COUNT(*) FROM research_admission_diagnostic
-			WHERE account_id = ? AND outcome = 'defer'`, state.AccountID).Scan(&deferred)
+			WHERE account_id = ? AND outcome = 'defer' AND hypothetical = 0 AND task_id IN (
+				SELECT id FROM task WHERE state = 'ready'
+			)`, state.AccountID).Scan(&deferred)
 		if err != nil {
 			return nil, fmt.Errorf("failed to count deferred tasks: %w", err)
 		}

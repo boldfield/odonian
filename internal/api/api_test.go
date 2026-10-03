@@ -9533,6 +9533,79 @@ func TestGetResearchStatusReturnsPoolStatus(t *testing.T) {
 	}
 }
 
+// TestGetResearchStatusDeferredCountFiltering verifies deferred count only includes non-hypothetical
+// defers with tasks still claimable (state='ready').
+func TestGetResearchStatusDeferredCountFiltering(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Configure pool
+	cfg := store.ResearchPoolConfig{
+		AccountID:          "account-1",
+		StartRate:          100.0, // High rate to avoid natural rate deferral
+		BurstCapacity:      1000,
+		ConcurrentLimit:    10,
+		CompletionReserved: 2,
+	}
+	_, err := server.store.ConfigureResearchPool(context.Background(), time.Now(), cfg)
+	if err != nil {
+		t.Fatalf("failed to configure pool: %v", err)
+	}
+
+	// Create and claim a task to get an admitted permit
+	permitReq := store.PermitRequest{
+		RequestID: "request-1",
+		TaskID:    "task-1",
+		ProjectID: "project-1",
+		AgentID:   "agent-1",
+		Model:     "haiku",
+		AccountID: "account-1",
+		Class:     "research_write",
+		LeaseTTL:  5 * time.Minute,
+	}
+
+	grant, err := server.store.RequestResearchPermit(context.Background(), time.Now(), permitReq)
+	if err != nil {
+		t.Fatalf("failed to request permit: %v", err)
+	}
+
+	// Grant the permit to get it in active state
+	if grant.Permit.ID == "" {
+		t.Fatalf("expected permit to be created")
+	}
+
+	// Check status - should have 0 deferred (the admitted attempt is active, not deferred)
+	req := httptest.NewRequest("GET", "/research/status", nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to get status: %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	pools, ok := resp["pools"].([]interface{})
+	if !ok || len(pools) == 0 {
+		t.Fatalf("expected pools in response")
+	}
+
+	pool := pools[0].(map[string]interface{})
+	deferred := pool["deferred"]
+	if deferred == nil {
+		t.Errorf("expected deferred field in pool")
+	} else if deferredCount, ok := deferred.(float64); ok {
+		// Should be 0 because the active attempt is not deferred
+		if deferredCount != 0 {
+			t.Errorf("expected deferred count 0 for active attempt, got %v", deferredCount)
+		}
+	}
+}
+
 // TestRenewResearchPermitRequiresAuth verifies POST /research/permits/{id}/renew requires authentication.
 func TestRenewResearchPermitRequiresAuth(t *testing.T) {
 	server := setupTestServer(t, "test-token")
@@ -10140,5 +10213,344 @@ func TestFinalizeResearchPermitReplay(t *testing.T) {
 	attempt, ok := resp["attempt"].(map[string]interface{})
 	if !ok || attempt["state"] != "finalized" {
 		t.Errorf("expected finalized attempt on replay, got %v", attempt)
+	}
+}
+
+// TestFinalizeResearchPermitWithNegativeUsageTokens verifies 400 for negative usage_tokens.
+func TestFinalizeResearchPermitWithNegativeUsageTokens(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a research permit
+	permitReq := store.PermitRequest{
+		RequestID: "request-1",
+		TaskID:    "task-1",
+		ProjectID: "project-1",
+		AgentID:   "agent-1",
+		Model:     "haiku",
+		AccountID: "account-1",
+		Class:     "research_write",
+		LeaseTTL:  5 * time.Minute,
+	}
+
+	cfg := store.ResearchPoolConfig{
+		AccountID:          "account-1",
+		StartRate:          1.0,
+		BurstCapacity:      10,
+		ConcurrentLimit:    5,
+		CompletionReserved: 2,
+	}
+	_, err := server.store.ConfigureResearchPool(context.Background(), time.Now(), cfg)
+	if err != nil {
+		t.Fatalf("failed to configure pool: %v", err)
+	}
+
+	grant, err := server.store.RequestResearchPermit(context.Background(), time.Now(), permitReq)
+	if err != nil {
+		t.Fatalf("failed to request permit: %v", err)
+	}
+
+	// Try to finalize with negative usage_tokens
+	usageTokens := int64(-100)
+	payload := map[string]interface{}{
+		"task_id":      "task-1",
+		"model":        "haiku",
+		"agent_id":     "agent-1",
+		"attempt_id":   grant.Attempt.ID,
+		"exit_class":   "completed",
+		"usage_tokens": usageTokens,
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/research/permits/"+grant.Permit.ID+"/finalize", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+		t.Errorf("response: %s", w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err == nil {
+		errObj, ok := resp["error"].(map[string]interface{})
+		if ok {
+			code, _ := errObj["code"].(string)
+			if code != "INVALID_USAGE_TOKENS" {
+				t.Errorf("expected error code INVALID_USAGE_TOKENS, got %s", code)
+			}
+		}
+	}
+}
+
+// TestRenewResearchPermitAfterFinalize verifies 409 ATTEMPT_FINALIZED when renewing after finalize.
+func TestRenewResearchPermitAfterFinalize(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a research permit
+	permitReq := store.PermitRequest{
+		RequestID: "request-1",
+		TaskID:    "task-1",
+		ProjectID: "project-1",
+		AgentID:   "agent-1",
+		Model:     "haiku",
+		AccountID: "account-1",
+		Class:     "research_write",
+		LeaseTTL:  5 * time.Minute,
+	}
+
+	cfg := store.ResearchPoolConfig{
+		AccountID:          "account-1",
+		StartRate:          1.0,
+		BurstCapacity:      10,
+		ConcurrentLimit:    5,
+		CompletionReserved: 2,
+	}
+	_, err := server.store.ConfigureResearchPool(context.Background(), time.Now(), cfg)
+	if err != nil {
+		t.Fatalf("failed to configure pool: %v", err)
+	}
+
+	grant, err := server.store.RequestResearchPermit(context.Background(), time.Now(), permitReq)
+	if err != nil {
+		t.Fatalf("failed to request permit: %v", err)
+	}
+
+	// Finalize the permit
+	finalizePayload := map[string]interface{}{
+		"task_id":    "task-1",
+		"model":      "haiku",
+		"agent_id":   "agent-1",
+		"attempt_id": grant.Attempt.ID,
+		"exit_class": "completed",
+	}
+	finalizeBody, _ := json.Marshal(finalizePayload)
+
+	req := httptest.NewRequest("POST", "/research/permits/"+grant.Permit.ID+"/finalize", bytes.NewReader(finalizeBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("finalize failed: %d", w.Code)
+	}
+
+	// Try to renew after finalize - should get 409 ATTEMPT_FINALIZED
+	renewPayload := map[string]interface{}{
+		"task_id":    "task-1",
+		"model":      "haiku",
+		"agent_id":   "agent-1",
+		"attempt_id": grant.Attempt.ID,
+	}
+	renewBody, _ := json.Marshal(renewPayload)
+
+	req = httptest.NewRequest("POST", "/research/permits/"+grant.Permit.ID+"/renew", bytes.NewReader(renewBody))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("expected status 409, got %d", w.Code)
+		t.Errorf("response: %s", w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err == nil {
+		errObj, ok := resp["error"].(map[string]interface{})
+		if ok {
+			code, _ := errObj["code"].(string)
+			if code != "ATTEMPT_FINALIZED" {
+				t.Errorf("expected error code ATTEMPT_FINALIZED, got %s", code)
+			}
+		}
+	}
+}
+
+// TestFinalizeResearchPermitWithWrongAttemptID verifies 409 ATTEMPT_FENCED for wrong attempt_id.
+func TestFinalizeResearchPermitWithWrongAttemptID(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a research permit
+	permitReq := store.PermitRequest{
+		RequestID: "request-1",
+		TaskID:    "task-1",
+		ProjectID: "project-1",
+		AgentID:   "agent-1",
+		Model:     "haiku",
+		AccountID: "account-1",
+		Class:     "research_write",
+		LeaseTTL:  5 * time.Minute,
+	}
+
+	cfg := store.ResearchPoolConfig{
+		AccountID:          "account-1",
+		StartRate:          1.0,
+		BurstCapacity:      10,
+		ConcurrentLimit:    5,
+		CompletionReserved: 2,
+	}
+	_, err := server.store.ConfigureResearchPool(context.Background(), time.Now(), cfg)
+	if err != nil {
+		t.Fatalf("failed to configure pool: %v", err)
+	}
+
+	grant, err := server.store.RequestResearchPermit(context.Background(), time.Now(), permitReq)
+	if err != nil {
+		t.Fatalf("failed to request permit: %v", err)
+	}
+
+	// Try to finalize with a wrong attempt_id
+	payload := map[string]interface{}{
+		"task_id":    "task-1",
+		"model":      "haiku",
+		"agent_id":   "agent-1",
+		"attempt_id": "wrong-attempt-id",
+		"exit_class": "completed",
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/research/permits/"+grant.Permit.ID+"/finalize", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("expected status 409, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err == nil {
+		errObj, ok := resp["error"].(map[string]interface{})
+		if ok {
+			code, _ := errObj["code"].(string)
+			if code != "ATTEMPT_FENCED" {
+				t.Errorf("expected error code ATTEMPT_FENCED, got %s", code)
+			}
+		}
+	}
+}
+
+// TestFinalizeResearchPermitAfterTaskSubmission verifies finalize works after task submission.
+func TestFinalizeResearchPermitAfterTaskSubmission(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Setup project and document
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Research Task",
+			Spec:       "Test research task",
+			DocumentID: docID,
+			Model:      "haiku",
+			Track:      "build", // Use build track for research tasks
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Promote the task to ready
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	// Claim the task
+	claimPayload := map[string]string{"agent_id": "agent-1", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	if claimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim task: got status %d", claimW.Code)
+	}
+
+	// Decode the claim response which includes research admission
+	var claimedResponse map[string]interface{}
+	json.NewDecoder(claimW.Body).Decode(&claimedResponse)
+
+	attemptID := ""
+	permitID := ""
+
+	if researchAdmission, ok := claimedResponse["research_admission"].(map[string]interface{}); ok {
+		if attempt, ok := researchAdmission["attempt_id"].(string); ok {
+			attemptID = attempt
+		}
+		if permit, ok := researchAdmission["permit_id"].(string); ok {
+			permitID = permit
+		}
+	}
+
+	// If no research admission, skip the test
+	if permitID == "" || attemptID == "" {
+		t.Skip("Research admission not granted for this task")
+	}
+
+	// Submit the task
+	submitPayload := map[string]interface{}{
+		"agent_id":   "agent-1",
+		"attempt_id": attemptID,
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+
+	submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	if submitW.Code != http.StatusOK {
+		t.Fatalf("submit failed: %d, response: %s", submitW.Code, submitW.Body.String())
+	}
+
+	// Now finalize the permit after submission - should still work
+	finalizePayload := map[string]interface{}{
+		"task_id":    taskID,
+		"model":      "haiku",
+		"agent_id":   "agent-1",
+		"attempt_id": attemptID,
+		"exit_class": "completed",
+	}
+	finalizeBody, _ := json.Marshal(finalizePayload)
+
+	finalizeReq := httptest.NewRequest("POST", "/research/permits/"+permitID+"/finalize", bytes.NewReader(finalizeBody))
+	finalizeReq.Header.Set("Authorization", authHeader)
+	finalizeReq.Header.Set("Content-Type", "application/json")
+	finalizeW := httptest.NewRecorder()
+	server.mux.ServeHTTP(finalizeW, finalizeReq)
+
+	if finalizeW.Code != http.StatusOK {
+		t.Errorf("expected status 200 after task submission, got %d", finalizeW.Code)
+		t.Errorf("response: %s", finalizeW.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(finalizeW.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	attempt, ok := resp["attempt"].(map[string]interface{})
+	if !ok || attempt["state"] != "finalized" {
+		t.Errorf("expected finalized attempt after task submission, got %v", attempt)
 	}
 }

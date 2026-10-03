@@ -485,19 +485,19 @@ are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
 ```
 
 **Status Codes:**
-- `200 OK`: Attempt finalized
+- `200 OK`: Attempt finalized (idempotent: replaying finalize with the same parameters succeeds)
 - `400 MISSING_TASK_ID`: task_id is required
 - `400 MISSING_MODEL`: model is required
 - `400 MISSING_AGENT_ID`: agent_id is required
 - `400 MISSING_ATTEMPT_ID`: attempt_id is required
 - `400 MISSING_EXIT_CLASS`: exit_class is required
 - `400 INVALID_EXIT_CLASS`: exit_class must be one of: completed, failed, cancelled, unknown
+- `400 INVALID_USAGE_TOKENS`: usage_tokens must be non-negative
 - `401`: Missing or invalid bearer token (see [Authentication](#authentication))
 - `404 PERMIT_NOT_FOUND`: Permit does not exist
 - `409 PERMIT_IDENTITY_MISMATCH`: Provided task_id, model, or agent_id does not match the permit
 - `409 ATTEMPT_FENCED`: Attempt ID does not match the permit's current attempt
 - `409 ATTEMPT_EXPIRED`: Attempt lease has expired
-- `409 ATTEMPT_FINALIZED`: Attempt is already finalized
 - `500 FINALIZE_ERROR`: Server error finalizing attempt
 
 ---
@@ -927,7 +927,7 @@ An admitted claim adds `research_admission` to the task body: `permit_id`, `atte
 
 A denial is `429 ADMISSION_DENIED` with `error.outcome` (`defer` or `retry`), `error.reason` (`rate`, `concurrency` or `reserved_capacity`), `error.not_before` and/or `error.retry_after_seconds` (also sent as `Retry-After`). The task is left untouched — not blocked, failed or rejected — and may be claimed again later. Other research errors: `409 TASK_BUSY` (a live research attempt still holds the task), `409 REQUEST_ID_CONFLICT` (`request_id` reused for a different task, agent, model or pool).
 
-A submit ends task ownership but not the dispatch: the research attempt stays active, so it keeps holding its concurrency slot and a rework claim of that task is `409 TASK_BUSY` in `enforce` mode until the attempt lapses at its lease expiry. Renewing and finalizing a preserved attempt are store operations only (`RenewResearchAttempt`, `FinalizeResearchAttempt`); no API route exposes them yet, so they are out of scope here. In `observe` mode a live attempt on the task is recorded as a hypothetical busy refusal (`outcome: retry`, `reason: concurrency`) and superseded, and the claim is granted.
+A submit ends task ownership but not the dispatch: the research attempt stays active, so it keeps holding its concurrency slot and a rework claim of that task is `409 TASK_BUSY` in `enforce` mode until the attempt lapses at its lease expiry. After submission, renewing and finalizing a research attempt is exposed via `POST /research/permits/{permit_id}/renew` and `POST /research/permits/{permit_id}/finalize` (see the dedicated sections below). In `observe` mode a live attempt on the task is recorded as a hypothetical busy refusal (`outcome: retry`, `reason: concurrency`) and superseded, and the claim is granted.
 
 ---
 

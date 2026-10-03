@@ -1627,6 +1627,12 @@ func (s *Server) handleFinalizeResearchPermit(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Validate usage_tokens if provided
+	if payload.UsageTokens != nil && *payload.UsageTokens < 0 {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_USAGE_TOKENS", "usage_tokens must be non-negative")
+		return
+	}
+
 	now := time.Now()
 
 	// Load permit to validate identities
