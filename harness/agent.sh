@@ -369,17 +369,41 @@ clear_model_failures() {
   _fail_model_drop "$i"
 }
 
+# Tracks deferred research tasks (task_id:retry_until_epoch) within a polling pass
+# Cleared when the pass ends (nothing claimable or after sleeping).
+DEFERRED_TASKS=()
+
 # Select the highest-priority claimable task of kind $2 in project $1 whose model is not
 # currently in a failure backoff window, skipping past any head task(s) pinned to an unavailable
-# model. Echoes "id<TAB>model" of the chosen task, or nothing if the project has no claimable
-# task of this kind, or every claimable task's model is unavailable (the caller then falls back
-# to its normal "nothing claimable" nap — the agent only backs off entirely in that case).
+# model AND any deferred research tasks. Echoes "id<TAB>model" of the chosen task, or nothing if
+# the project has no claimable task of this kind, or every claimable task's model is unavailable
+# or deferred (the caller then falls back to its normal "nothing claimable" nap).
 pick_claimable_task() {
-  local project="$1" kind="$2" json id model
+  local project="$1" kind="$2" json id model now
   json=$(odonian tasks --project "$project" --claimable --kind "$kind" --json 2>/dev/null) || return 0
+  now=$(date +%s)
+  # Clear expired deferred entries before checking
+  local i cleaned_deferred=()
+  for entry in "${DEFERRED_TASKS[@]:-}"; do
+    local tid retry_until
+    tid="${entry%%:*}"
+    retry_until="${entry#*:}"
+    [ "$now" -lt "$retry_until" ] && cleaned_deferred+=("$entry")
+  done
+  DEFERRED_TASKS=("${cleaned_deferred[@]}")
+
   while IFS=$'\t' read -r id model; do
     [ -n "$id" ] || continue
     model_unavailable "$model" && continue
+    # Skip if this task is deferred until a later retry
+    local is_deferred=0
+    for entry in "${DEFERRED_TASKS[@]:-}"; do
+      if [ "${entry%%:*}" = "$id" ]; then
+        is_deferred=1
+        break
+      fi
+    done
+    [ "$is_deferred" -eq 1 ] && continue
     printf '%s\t%s\n' "$id" "$model"
     return 0
   done < <(printf '%s' "$json" | jq -r '.[]? | "\(.id)\t\(.model)"' 2>/dev/null)
@@ -387,11 +411,12 @@ pick_claimable_task() {
 }
 
 # Request research admission for a task. On success, outputs JSON with admission details
-# (permit_id, attempt_id, etc.) and returns 0. On deferral, outputs to stderr and returns 10.
+# (permit_id, attempt_id, etc.) and returns 0. On deferral (exit 10), outputs retry guidance
+# to stderr in format "retry_after_seconds=<seconds>" and returns 10.
 # On other errors, outputs and returns non-zero.
 request_research_admission() {
   local task_id="$1" model="$2"
-  local claim_output claim_rc
+  local claim_output claim_rc deferral_info
 
   # Use a stable request ID based on task ID and agent ID for idempotent retries.
   local request_id="$AGENT_ID:$task_id"
@@ -401,7 +426,10 @@ request_research_admission() {
   claim_rc=$?
 
   if [ "$claim_rc" -eq 10 ]; then
-    echo "$claim_output" >&2
+    # Extract retry_after_seconds from stderr if present (writeSchedulingHints format)
+    deferral_info=$(echo "$claim_output" | jq -r '.retry_after_seconds // 0' 2>/dev/null || echo "0")
+    [ -z "$deferral_info" ] && deferral_info="0"
+    echo "retry_after_seconds=$deferral_info" >&2
     return 10
   fi
 
@@ -473,11 +501,24 @@ dispatch() {
   local pid=$CLAUDE_PID rc task_id="${ODONIAN_TASK_ID:-}" permit_id="${ODONIAN_PRECLAIMED_PERMIT_ID:-}" attempt_id="${ODONIAN_PRECLAIMED_ATTEMPT_ID:-}"
   local last_renew=$(date +%s)
 
-  # Poll for child completion while running permit renewal. Use a polling loop instead of blocking
-  # wait so renewal can execute while the child is alive. When the child exits, wait will return
-  # its exit code.
+  # Poll for child completion while running permit renewal and task lease renewal.
+  # Use a polling loop instead of blocking wait so renewals can execute while the child is alive.
+  # When the child exits, wait will return its exit code.
+  local last_lease_renew=$(date +%s)
   while kill -0 "$pid" 2>/dev/null; do
     sleep 1
+    if [ -n "$task_id" ]; then
+      local now=$(date +%s)
+      # Renew task lease every 20s to keep ownership/in_progress alive
+      if [ $((now - last_lease_renew)) -ge 20 ]; then
+        if ! odonian heartbeat "$task_id" 2>/dev/null; then
+          echo "[$AGENT_ID] task lease renewal failed (ownership may be lost); stopping process" >&2
+          kill -TERM "-$pid" 2>/dev/null || true
+          break
+        fi
+        last_lease_renew=$now
+      fi
+    fi
     if [ -n "$permit_id" ] && [ -n "$attempt_id" ] && [ -n "$task_id" ]; then
       local now=$(date +%s)
       if [ $((now - last_renew)) -ge 30 ]; then
@@ -589,11 +630,23 @@ if [ "$MULTI" = 0 ]; then
       # Handle research admission before dispatch
       unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_PRECLAIMED_PERMIT_ID ODONIAN_TASK_ID
       if [ "$task_track" = "research" ]; then
-        admission_output=$(request_research_admission "$task_id" "$task_model")
+        admission_output=$(request_research_admission "$task_id" "$task_model" 2>/tmp/admission_stderr_$$.txt)
         admission_rc=$?
+        admission_stderr=$(cat /tmp/admission_stderr_$$.txt 2>/dev/null || echo "")
+        rm -f /tmp/admission_stderr_$$.txt
 
         if [ "$admission_rc" -eq 10 ]; then
-          echo "[$AGENT_ID] $(date '+%H:%M:%S') research task $task_id deferred (scheduling); skipping"; nap 5; continue
+          # Parse retry_after_seconds from stderr (request_research_admission outputs it there on deferral)
+          local retry_secs=5
+          if echo "$admission_stderr" | grep -q "retry_after_seconds="; then
+            retry_secs=$(echo "$admission_stderr" | grep "retry_after_seconds=" | head -1 | cut -d= -f2)
+            retry_secs=${retry_secs:-5}
+          fi
+          local retry_until=$(($(date +%s) + retry_secs))
+          echo "[$AGENT_ID] $(date '+%H:%M:%S') research task $task_id deferred (retry after ${retry_secs}s); tracking for later"
+          DEFERRED_TASKS+=("$task_id:$retry_until")
+          # Continue to other eligible work in this project
+          continue
         fi
 
         if [ "$admission_rc" -ne 0 ]; then
@@ -682,11 +735,19 @@ while true; do
     # Handle research admission before dispatch
     unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_PRECLAIMED_PERMIT_ID ODONIAN_TASK_ID
     if [ "$task_track" = "research" ]; then
-      admission_output=$(request_research_admission "$task_id" "$task_model")
+      admission_output=$(request_research_admission "$task_id" "$task_model" 2>/tmp/admission_stderr_$$.txt)
       admission_rc=$?
+      admission_stderr=$(cat /tmp/admission_stderr_$$.txt 2>/dev/null || echo "")
+      rm -f /tmp/admission_stderr_$$.txt
 
       if [ "$admission_rc" -eq 10 ]; then
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') research task $task_id deferred (scheduling); skipping to next project"
+        # Parse retry_after_seconds from stderr (request_research_admission outputs it there on deferral)
+        local retry_secs=5
+        if echo "$admission_stderr" | grep -q "retry_after_seconds="; then
+          retry_secs=$(echo "$admission_stderr" | grep "retry_after_seconds=" | head -1 | cut -d= -f2)
+          retry_secs=${retry_secs:-5}
+        fi
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') research task $task_id deferred (retry after ${retry_secs}s); moving to next project"
         continue
       fi
 
