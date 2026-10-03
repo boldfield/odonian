@@ -130,12 +130,32 @@ func goodEvents(t *testing.T) []string {
 	return []string{evLine(t, "starting"), evLine(t, blockText(validBlockJSON)), `{"type":"done"}`}
 }
 
+// signedInHome creates a private credential home holding a session-like file.
+func signedInHome(m fakeMuse) string {
+	home := filepath.Join(m.dir, "muse-home")
+	if err := os.MkdirAll(filepath.Join(home, ".config", "muse"), 0o700); err != nil {
+		panic(err)
+	}
+	for _, d := range []string{home, filepath.Join(home, ".config"), filepath.Join(home, ".config", "muse")} {
+		if err := os.Chmod(d, 0o700); err != nil {
+			panic(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(home, ".config", "muse", "session.json"), []byte(`{"session":"browser-token"}`), 0o600); err != nil {
+		panic(err)
+	}
+	return home
+}
+
+const operatorHome = "/tmp/operator-home"
+
 func museOpts(m fakeMuse) MuseOptions {
 	return MuseOptions{
 		Executable:   m.path,
 		AuthRoute:    MuseAuthRouteBrowserSession,
+		MuseHome:     signedInHome(m),
 		AccountPool:  "meta-eval-pool",
-		Environ:      []string{"PATH=" + os.Getenv("PATH"), "HOME=/tmp/muse-home", "OTHER_API_KEY=other-secret-value"},
+		Environ:      []string{"PATH=" + os.Getenv("PATH"), "HOME=" + operatorHome, "OTHER_API_KEY=other-secret-value"},
 		Timeout:      20 * time.Second,
 		ProbeTimeout: 5 * time.Second,
 	}
@@ -239,6 +259,15 @@ func TestMusePreflightExecHelpFailure(t *testing.T) {
 	}
 }
 
+func emptyHome(t *testing.T) string {
+	t.Helper()
+	d := filepath.Join(t.TempDir(), "empty-home")
+	if err := os.Mkdir(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 func TestMusePreflightAuthRouting(t *testing.T) {
 	const keyValue = "sk-super-secret-value"
 	cases := []struct {
@@ -250,7 +279,29 @@ func TestMusePreflightAuthRouting(t *testing.T) {
 		{"empty api key still overrides", func(o *MuseOptions) { o.Environ = append(o.Environ, "META_API_KEY=") }, PreflightAuthOverride},
 		{"route unattested", func(o *MuseOptions) { o.AuthRoute = "" }, PreflightAuthUnconfirmed},
 		{"wrong attestation", func(o *MuseOptions) { o.AuthRoute = "api-key" }, PreflightAuthUnconfirmed},
-		{"no home", func(o *MuseOptions) { o.Environ = []string{"PATH=" + os.Getenv("PATH")} }, PreflightAuthMissing},
+		{"no credential home", func(o *MuseOptions) { o.MuseHome = "" }, PreflightAuthUnconfirmed},
+		{"relative credential home", func(o *MuseOptions) { o.MuseHome = "muse-home" }, PreflightAuthUnconfirmed},
+		{"credential home missing", func(o *MuseOptions) { o.MuseHome = filepath.Join(o.MuseHome, "nope") }, PreflightAuthMissing},
+		{"empty credential home", func(o *MuseOptions) { o.MuseHome = emptyHome(t) }, PreflightAuthMissing},
+		{"empty operator HOME is not a session", func(o *MuseOptions) {
+			o.MuseHome = emptyHome(t)
+			o.Environ = []string{"PATH=" + os.Getenv("PATH"), "HOME="}
+		}, PreflightAuthMissing},
+		{"credential home is the adapter's HOME", func(o *MuseOptions) {
+			o.Environ = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + o.MuseHome}
+		}, PreflightAuthAmbiguous},
+		{"credential home readable by others", func(o *MuseOptions) { _ = os.Chmod(o.MuseHome, 0o750) }, PreflightAuthAmbiguous},
+		{"credential home is a symlink", func(o *MuseOptions) {
+			link := filepath.Join(t.TempDir(), "link")
+			_ = os.Symlink(o.MuseHome, link)
+			o.MuseHome = link
+		}, PreflightAuthAmbiguous},
+		{"stored key file name", func(o *MuseOptions) {
+			_ = os.WriteFile(filepath.Join(o.MuseHome, "api_key"), []byte("sk-x"), 0o600)
+		}, PreflightAuthAmbiguous},
+		{"stored key in file content", func(o *MuseOptions) {
+			_ = os.WriteFile(filepath.Join(o.MuseHome, ".config", "muse", "auth.json"), []byte(`{"apiKey":"`+keyValue+`"}`), 0o600)
+		}, PreflightAuthAmbiguous},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -343,9 +394,14 @@ func TestRunMuseChildEnvironmentIsAllowlisted(t *testing.T) {
 			t.Fatalf("child inherited %s:\n%s", banned, env)
 		}
 	}
-	for _, kept := range []string{"HOME=/tmp/muse-home", "XDG_CONFIG_HOME=/x", "LC_ALL=C"} {
+	for _, kept := range []string{"HOME=" + opts.MuseHome + "\n", "LC_ALL=C"} {
 		if !strings.Contains(env, kept) {
 			t.Fatalf("child lost %s:\n%s", kept, env)
+		}
+	}
+	for _, dropped := range []string{operatorHome, "XDG_CONFIG_HOME"} {
+		if strings.Contains(env, dropped) {
+			t.Fatalf("child inherited %s instead of the dedicated credential home:\n%s", dropped, env)
 		}
 	}
 }
@@ -539,7 +595,7 @@ func TestRunMuseInterruptionKillsDescendants(t *testing.T) {
 func TestMuseMainSIGTERMWritesInterruptedResponse(t *testing.T) {
 	m := writeFakeMuse(t, fakeMuseCfg{pre: "sleep 60 &\necho $! > \"$dir/child.pid\"\nwait"})
 	t.Setenv("PATH", os.Getenv("PATH"))
-	t.Setenv("HOME", "/tmp/muse-home")
+	t.Setenv("HOME", operatorHome)
 	t.Setenv(museAPIKeyEnv, "placeholder")
 	os.Unsetenv(museAPIKeyEnv)
 	req := museRequest(t)
@@ -555,7 +611,7 @@ func TestMuseMainSIGTERMWritesInterruptedResponse(t *testing.T) {
 
 	code := make(chan int, 1)
 	go func() {
-		code <- MuseMain([]string{"--request", reqPath, "--muse-bin", m.path, "--auth-route", MuseAuthRouteBrowserSession}, os.Stdout, os.Stderr)
+		code <- MuseMain([]string{"--request", reqPath, "--muse-bin", m.path, "--muse-home", signedInHome(m), "--auth-route", MuseAuthRouteBrowserSession}, os.Stdout, os.Stderr)
 	}()
 	pid, err := strconv.Atoi(waitForFile(t, m.file("child.pid")))
 	if err != nil {
@@ -600,10 +656,10 @@ func TestRunMuseRequiresOnlyDeclaredCapabilities(t *testing.T) {
 
 func TestMuseMainPreflightCommand(t *testing.T) {
 	m := writeFakeMuse(t, fakeMuseCfg{})
-	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=/tmp/muse-home"}
+	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + operatorHome}
 	var out, errOut strings.Builder
 
-	code := museMain(context.Background(), []string{"--preflight", "--muse-bin", m.path, "--auth-route", MuseAuthRouteBrowserSession}, env, &out, &errOut)
+	code := museMain(context.Background(), []string{"--preflight", "--muse-bin", m.path, "--muse-home", signedInHome(m), "--auth-route", MuseAuthRouteBrowserSession}, env, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("exit %d: %s %s", code, out.String(), errOut.String())
 	}
@@ -627,9 +683,9 @@ func TestMuseMainRunWritesContractValidResult(t *testing.T) {
 	if err := os.WriteFile(reqPath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=/tmp/muse-home"}
+	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + operatorHome}
 	var out, errOut strings.Builder
-	code := museMain(context.Background(), []string{"--request", reqPath, "--muse-bin", m.path, "--auth-route", MuseAuthRouteBrowserSession, "--account-pool", "p1"}, env, &out, &errOut)
+	code := museMain(context.Background(), []string{"--request", reqPath, "--muse-bin", m.path, "--muse-home", signedInHome(m), "--auth-route", MuseAuthRouteBrowserSession, "--account-pool", "p1"}, env, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
@@ -666,13 +722,13 @@ func TestMuseResponsesPassThroughHostPipeline(t *testing.T) {
 	reg := NewRegistry()
 	rt := Runtime{
 		Name: "muse", Executable: exe, Timeout: 30 * time.Second, Capabilities: []string{CapStructuredOutput}, Candidate: cfg,
-		Args:           []string{museAdapterArg, "--request", PlaceholderRequestPath, "--muse-bin", m.path, "--auth-route", MuseAuthRouteBrowserSession},
+		Args:           []string{museAdapterArg, "--request", PlaceholderRequestPath, "--muse-bin", m.path, "--muse-home", signedInHome(m), "--auth-route", MuseAuthRouteBrowserSession},
 		PassThroughEnv: []string{"HOME"},
 	}
 	if err := reg.Register(rt); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HOME", "/tmp/muse-home")
+	t.Setenv("HOME", operatorHome)
 	p := &Pipeline{Registry: reg}
 	res, err := p.Execute(context.Background(), "muse", museRequest(t))
 	if err != nil {

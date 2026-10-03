@@ -15,8 +15,10 @@ package evaluation
 // event schema, or any way to ask which credential is active. The adapter
 // therefore never assumes those: it probes `muse exec --help` for the flags it
 // needs, collects results through its own marker protocol that does not depend
-// on the event schema, and refuses to run unless the operator attests the
-// subscription route.
+// on the event schema, and refuses to run unless the billing route is
+// constrained: muse runs with a dedicated credential home (HOME is replaced,
+// XDG_* dropped) that preflight checks, so an API key stored for some other
+// purpose in the operator's own HOME can never outrank the browser session.
 
 import (
 	"bytes"
@@ -47,9 +49,9 @@ const (
 	// MusePinnedModel is the only model the adapter will run.
 	MusePinnedModel   = "muse-spark-1.3"
 	MusePromptVersion = "odonian-muse-review/v1"
-	// MuseAuthRouteBrowserSession is the operator attestation that the muse
-	// process authenticates with a stored browser session (the Power
-	// subscription) and no stored API key exists.
+	// MuseAuthRouteBrowserSession is the operator attestation that the
+	// dedicated credential home holds only a browser session (the Power
+	// subscription) and that `muse auth set` was never run against it.
 	MuseAuthRouteBrowserSession = "browser-session"
 
 	museAPIKeyEnv        = "META_API_KEY"
@@ -69,16 +71,22 @@ const (
 	museExitSignalTERM   = 143
 	museExitUsage        = 2
 	museMissingCapPrefix = "cli_flag:"
+	museHomeMaxEntries   = 5000
+	museHomeMaxScanBytes = 1 << 20
 )
+
+// museKeyHint matches file names and contents that suggest a stored API key.
+var museKeyHint = regexp.MustCompile(`(?i)api[_\-. ]?key`)
 
 // museRequiredFlags are the `muse exec` flags the adapter passes. --model is
 // not in the public documentation, so its presence is confirmed per install.
 var museRequiredFlags = []string{"--json", "--prompt-file", "--model", "--disable-approval", "--max-model-steps"}
 
 // museAllowedEnv is every variable (or prefix ending in *) the muse child
-// inherits. Everything else, API keys above all, is dropped.
+// inherits. Everything else, API keys above all, is dropped. HOME and XDG_* are
+// deliberately absent: the child's HOME is always the dedicated credential home.
 var museAllowedEnv = []string{
-	"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_*", "TERM", "TZ", "TMPDIR", "XDG_*",
+	"PATH", "USER", "LOGNAME", "LANG", "LC_*", "TERM", "TZ", "TMPDIR",
 	"SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
 	"https_proxy", "http_proxy", "no_proxy",
 }
@@ -99,7 +107,11 @@ const (
 	// PreflightAuthUnconfirmed means nothing proves the run uses the
 	// subscription session (a stored key cannot be detected from outside).
 	PreflightAuthUnconfirmed PreflightOutcome = "auth_route_unconfirmed"
-	PreflightAuthMissing     PreflightOutcome = "auth_missing"
+	// PreflightAuthMissing means the credential home holds no session at all.
+	PreflightAuthMissing PreflightOutcome = "auth_missing"
+	// PreflightAuthAmbiguous means the credential home is unsafe to trust: it
+	// is shared, is the adapter's own HOME, or shows signs of a stored API key.
+	PreflightAuthAmbiguous PreflightOutcome = "auth_ambiguous"
 )
 
 // PreflightReport is what a preflight observed. It never contains credentials.
@@ -110,6 +122,7 @@ type PreflightReport struct {
 	RuntimeVersion   string           `json:"runtime_version,omitempty"`
 	Model            string           `json:"model"`
 	AuthRoute        string           `json:"auth_route"`
+	MuseHome         string           `json:"muse_home,omitempty"`
 	ExecFlagsFound   []string         `json:"exec_flags_found,omitempty"`
 	ExecFlagsMissing []string         `json:"exec_flags_missing,omitempty"`
 }
@@ -121,6 +134,7 @@ func (r PreflightReport) Ready() bool { return r.Outcome == PreflightReady }
 type MuseOptions struct {
 	Executable    string        // path or name of the muse binary; default "muse"
 	AuthRoute     string        // operator attestation; see MuseAuthRouteBrowserSession
+	MuseHome      string        // absolute dedicated credential home; becomes the child's HOME
 	AccountPool   string        // recorded in the identity; Unknown when empty
 	MaxModelSteps int           // default 100
 	Timeout       time.Duration // whole exec run; default 30m
@@ -157,8 +171,8 @@ func envLookup(environ []string, name string) (string, bool) {
 	return "", false
 }
 
-func museChildEnv(environ []string) []string {
-	var out []string
+func museChildEnv(environ []string, home string) []string {
+	out := []string{"HOME=" + home}
 	for _, e := range environ {
 		k, _, ok := strings.Cut(e, "=")
 		if !ok {
@@ -208,7 +222,7 @@ func snippet(s string) string {
 func (o MuseOptions) probe(ctx context.Context, exe string, args ...string) (stdout, stderr string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, o.ProbeTimeout)
 	defer cancel()
-	cmd := museCommand(ctx, exe, args, museChildEnv(o.Environ))
+	cmd := museCommand(ctx, exe, args, museChildEnv(o.Environ, o.MuseHome))
 	out, errBuf := &capped{limit: museProbeCapture}, &capped{limit: museProbeCapture}
 	cmd.Stdout, cmd.Stderr = out, errBuf
 	err = cmd.Run()
@@ -222,6 +236,87 @@ func (o MuseOptions) probe(ctx context.Context, exe string, args ...string) (std
 func flagListed(help, flagName string) bool {
 	re := regexp.MustCompile(`(?:^|[\s,|\[<(])` + regexp.QuoteMeta(flagName) + `(?:$|[\s=,|\]>)])`)
 	return re.MatchString(help)
+}
+
+// checkMuseHome decides whether the dedicated credential home can be trusted
+// to route billing through the browser session. Muse documents no way to ask
+// which credential is active, so the adapter instead prevents the documented
+// bypass: the child only ever sees this directory as HOME, and the directory
+// must be private, separate from the adapter's own HOME, non-empty (so a real
+// session exists) and free of anything that looks like a stored API key.
+// File contents are inspected in memory only and never reported.
+func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
+	home := opts.MuseHome
+	if home == "" {
+		return PreflightAuthUnconfirmed, "no dedicated credential home: pass --muse-home with a directory used only by this adapter (HOME=<dir> muse, sign in with the Power browser flow)"
+	}
+	if !filepath.IsAbs(home) {
+		return PreflightAuthUnconfirmed, fmt.Sprintf("--muse-home %q must be an absolute path", home)
+	}
+	info, err := os.Lstat(home)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return PreflightAuthMissing, fmt.Sprintf("credential home %s does not exist; sign in with HOME=%s muse first", home, home)
+	case err != nil:
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home %s unreadable: %v", home, err)
+	case info.Mode()&os.ModeSymlink != 0 || !info.IsDir():
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home %s must be a real directory, not a symlink or file", home)
+	case info.Mode().Perm()&0o077 != 0:
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home %s is accessible to other users (mode %o); chmod 700", home, info.Mode().Perm())
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home %s is not owned by the adapter's user", home)
+	}
+	if own, _ := envLookup(opts.Environ, "HOME"); own != "" {
+		a, errA := filepath.EvalSymlinks(home)
+		b, errB := filepath.EvalSymlinks(own)
+		if errA == nil && errB == nil && a == b {
+			return PreflightAuthAmbiguous, "credential home is the adapter's own HOME, which may hold a stored API key that outranks the subscription session; use a dedicated directory"
+		}
+	}
+	files, hint := 0, ""
+	walkErr := filepath.WalkDir(home, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == home {
+			return nil
+		}
+		if files++; files > museHomeMaxEntries {
+			return errors.New("too many entries to inspect")
+		}
+		rel, _ := filepath.Rel(home, path)
+		if museKeyHint.MatchString(d.Name()) {
+			hint = rel
+			return filepath.SkipAll
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		buf, err := io.ReadAll(io.LimitReader(f, museHomeMaxScanBytes))
+		if err != nil {
+			return err
+		}
+		if museKeyHint.Match(buf) {
+			hint = rel
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	switch {
+	case hint != "":
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home contains what looks like a stored API key (%s); run HOME=%s muse logout and sign in again with the browser flow", hint, home)
+	case walkErr != nil:
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home could not be fully inspected: %v", walkErr)
+	case files == 0:
+		return PreflightAuthMissing, fmt.Sprintf("credential home %s is empty; sign in with HOME=%s muse (Power browser flow) first", home, home)
+	}
+	return PreflightReady, ""
 }
 
 // MusePreflight checks the installed runtime and the billing route without a
@@ -250,12 +345,13 @@ func MusePreflight(ctx context.Context, opts MuseOptions) PreflightReport {
 	}
 	if opts.AuthRoute != MuseAuthRouteBrowserSession {
 		return fail(PreflightAuthUnconfirmed,
-			"billing route is not confirmed: pass --auth-route %s after signing in with the Power browser session and running `muse logout` to remove any stored API key (a stored key outranks the session and cannot be detected from outside)",
+			"billing route is not confirmed: pass --auth-route %s only after the dedicated credential home was signed in with the Power browser session and `muse auth set` was never run against it",
 			MuseAuthRouteBrowserSession)
 	}
-	if home, _ := envLookup(opts.Environ, "HOME"); home == "" {
-		return fail(PreflightAuthMissing, "HOME is not set, so muse cannot find its stored browser session")
+	if o, msg := checkMuseHome(opts); o != PreflightReady {
+		return fail(o, "%s", msg)
 	}
+	rep.MuseHome = opts.MuseHome
 
 	stdout, stderr, err := opts.probe(ctx, exe, "--version")
 	if err != nil {
@@ -365,7 +461,7 @@ func RunMuse(ctx context.Context, req CandidateRequest, opts MuseOptions) Candid
 	cmd := museCommand(runCtx, rep.Executable, []string{
 		"exec", "--json", "--model", MusePinnedModel, "--disable-approval",
 		"--max-model-steps", strconv.Itoa(opts.MaxModelSteps), "--prompt-file", promptPath,
-	}, museChildEnv(opts.Environ))
+	}, museChildEnv(opts.Environ, opts.MuseHome))
 	cmd.Dir = req.SnapshotPath
 	events := &museEvents{kill: cancel}
 	stderr := &capped{limit: museStderrTail}
@@ -683,8 +779,8 @@ func parseMuseBlock(raw, nonce string) ([]Finding, error) {
 
 // MuseMain is the adapter entry point.
 //
-//	muse-adapter --request FILE --auth-route browser-session [--muse-bin PATH] ...
-//	muse-adapter --preflight --auth-route browser-session [--muse-bin PATH]
+//	muse-adapter --request FILE --muse-home DIR --auth-route browser-session [--muse-bin PATH] ...
+//	muse-adapter --preflight --muse-home DIR --auth-route browser-session [--muse-bin PATH]
 //
 // Run mode reads the host-staged request and writes a CandidateResponse to the
 // request's result_path; it exits 0 whenever a valid response was written and
@@ -702,6 +798,7 @@ func museMain(ctx context.Context, args, environ []string, stdout, stderr io.Wri
 	reqPath := fs.String("request", "", "request file (run mode)")
 	preflight := fs.Bool("preflight", false, "check runtime, flags and billing route without a model call")
 	museBin := fs.String("muse-bin", "muse", "muse executable (path or name)")
+	museHome := fs.String("muse-home", "", "absolute dedicated credential home; used as muse's HOME")
 	authRoute := fs.String("auth-route", "", "operator attestation of the billing route; must be "+MuseAuthRouteBrowserSession)
 	pool := fs.String("account-pool", "", "account pool name recorded in the identity")
 	steps := fs.Int("max-model-steps", museDefaultSteps, "muse exec --max-model-steps")
@@ -710,7 +807,7 @@ func museMain(ctx context.Context, args, environ []string, stdout, stderr io.Wri
 		return 2
 	}
 	opts := MuseOptions{
-		Executable: *museBin, AuthRoute: *authRoute, AccountPool: *pool,
+		Executable: *museBin, AuthRoute: *authRoute, MuseHome: *museHome, AccountPool: *pool,
 		MaxModelSteps: *steps, Timeout: *timeout, Environ: environ,
 	}
 

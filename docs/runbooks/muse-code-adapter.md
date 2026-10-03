@@ -48,31 +48,46 @@ new candidate rather than rewriting prior results.
 
 ## Billing route: how it is enforced
 
-A stored API key silently outranks a subscription session and cannot be detected from outside the CLI, so the adapter
-fails closed instead of guessing:
+Muse documents no command that reports the active credential, and a stored API key silently outranks the browser
+session. The adapter cannot ask the CLI, so it prevents the bypass instead and fails closed on anything it cannot rule
+out:
 
 1. `META_API_KEY` present in the adapter's environment (even empty) is a hard failure, `auth_override_present`. It is
    never forwarded. The key's value is never read into any output.
-2. The operator must attest the route with `--auth-route browser-session`. Without it preflight reports
-   `auth_route_unconfirmed` and muse is never started. Do this only after:
-   1. `muse logout` (removes any stored API key, which would otherwise outrank the session),
-   2. signing in with the Power account's browser flow from an interactive `muse`,
-   3. confirming no stored key was recreated (`muse auth set` was not run).
-3. `HOME` must be set so muse can find its stored browser session (`auth_missing` otherwise).
-4. The muse child runs with an allowlisted environment only (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`,
-   `TZ`, `TMPDIR`, `XDG_*`, TLS certificate variables, proxy variables). Every other variable, including any API
-   key, `ODONIAN_*`, and cloud credentials, is dropped.
+2. **Dedicated credential home (`--muse-home DIR`, required).** The muse child's `HOME` is always this directory; the
+   adapter's own `HOME` and every `XDG_*` variable are dropped. An API key someone stored in the operator's normal home
+   therefore cannot be seen by the evaluation runs. One-time setup, done by the owner (the adapter never signs in,
+   installs or writes credentials):
+   ```
+   mkdir -m 700 /home/eval/muse-home
+   HOME=/home/eval/muse-home muse logout          # clears any stored key or session in this home only
+   HOME=/home/eval/muse-home muse                 # sign in with the Power account's browser flow, then exit
+   ```
+   Never run `muse auth set` with that `HOME`.
+3. Preflight inspects the directory before muse is ever started, and reports:
 
-The attestation is a statement by the owner, not proof of entitlement. Browser sign-in alone does not prove the Power
-subscription is what is billed. Before a paid pilot, the owner validates in an interactive session and in the Meta
-Accounts Center (`/upgrade` inside `muse`) that evaluation usage lands on the subscription. This adapter performs no
-paid probe to establish that.
+   | `outcome` | Condition |
+   |---|---|
+   | `auth_route_unconfirmed` | `--muse-home` not given or not absolute |
+   | `auth_missing` | directory missing or empty, so no session exists |
+   | `auth_ambiguous` | symlink or not a directory; mode allows group/other access; owned by another user; same directory as the adapter's own `HOME`; unreadable or too large to inspect (over 5000 entries); or any file name or file content (first 1 MiB, inspected in memory, never reported) matching `api key`-style names such as `api_key`, `apiKey`, `api-key` |
+4. `--auth-route browser-session` must also be passed. It is the owner's statement that step 2 was followed and
+   `muse auth set` was never run against that home; without it, `auth_route_unconfirmed` and muse is never started.
+5. The muse child runs with an allowlisted environment only (`PATH`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`, `TZ`,
+   `TMPDIR`, TLS certificate variables, proxy variables) plus `HOME=<muse-home>`. Every other variable, including any
+   API key, `ODONIAN_*`, and cloud credentials, is dropped.
+
+Residual limits, stated plainly: the key-detection scan is a heuristic over file names and contents, because the
+storage format is undocumented, and a credential kept outside the home (for example an OS keychain, if muse used one)
+cannot be seen. A signed-in session also does not prove the Power subscription is what is billed. Before a paid pilot
+the owner validates in an interactive session using that home and in the Meta Accounts Center (`/upgrade` inside
+`muse`) that evaluation usage lands on the subscription. This adapter performs no paid probe to establish that.
 
 ## Preflight (no model call)
 
 ```
 go build -o muse-adapter ./cmd/muse-adapter
-./muse-adapter --preflight --auth-route browser-session [--muse-bin /abs/path/to/muse]
+./muse-adapter --preflight --muse-home /home/eval/muse-home --auth-route browser-session [--muse-bin /abs/path/to/muse]
 ```
 
 Preflight runs only `muse --version` and `muse exec --help`, each bounded to 20 seconds, and prints a JSON report to
@@ -80,13 +95,14 @@ stdout (exit `0` when ready, `1` otherwise). The report never contains credentia
 
 | `outcome` | Meaning | Contract response in run mode |
 |---|---|---|
-| `ready` | runtime found, version recorded, every required flag listed, route attested | runs |
+| `ready` | runtime found, version recorded, every required flag listed, credential home verified, route attested | runs |
 | `runtime_missing` | `muse` not found or not executable | `failed` / `launch_error` |
 | `runtime_error` | `--version` or `exec --help` failed, timed out or printed nothing | `failed` / `runtime_error` |
 | `capability_missing` | `exec --help` lacks one of `--json --prompt-file --model --disable-approval --max-model-steps` | `unsupported` / `capability_missing`, `missing_capabilities: ["cli_flag:--model", ...]` |
 | `auth_override_present` | `META_API_KEY` is set | `failed` / `auth_missing` |
-| `auth_route_unconfirmed` | `--auth-route browser-session` not given | `failed` / `auth_missing` |
-| `auth_missing` | `HOME` unset | `failed` / `auth_missing` |
+| `auth_route_unconfirmed` | `--auth-route browser-session` or a valid `--muse-home` not given | `failed` / `auth_missing` |
+| `auth_missing` | credential home missing or empty | `failed` / `auth_missing` |
+| `auth_ambiguous` | credential home shared, symlinked, the adapter's own `HOME`, or showing a stored key | `failed` / `auth_missing` |
 
 The response `error_message` always starts with the specific outcome name.
 
@@ -96,17 +112,18 @@ The adapter is a trusted registration (`Runtime` in `internal/evaluation/registr
 Example argv (the host substitutes `{request_path}`):
 
 ```
---request {request_path} --auth-route browser-session --muse-bin /home/eval/.local/bin/muse \
+--request {request_path} --muse-home /home/eval/muse-home --auth-route browser-session \
+  --muse-bin /home/eval/.local/bin/muse \
   --account-pool meta-eval --max-model-steps 100 --timeout 25m
 ```
 
-Pass `HOME` (and any `XDG_*` your muse install needs) through `PassThroughEnv`; register no credential references,
-because the subscription session lives in muse's own store. Declare only `structured_output`: the adapter does not
+Pass `HOME` through `PassThroughEnv` only so the adapter can refuse a credential home equal to it; register no
+credential references, because the subscription session lives in the dedicated credential home. Declare only `structured_output`: the adapter does not
 claim source retrieval, PDF access or named tools, and returns `unsupported` / `capability_missing` for a request that
 needs them. Set the host runtime timeout longer than `--timeout`: the adapter's own timeout kills muse and its process
 group cleanly, whereas a host-side kill of the adapter cannot reach muse's descendants.
 
-Flags: `--muse-bin` (default `muse` on `PATH`), `--auth-route`, `--account-pool` (recorded as `account_pool`; `unknown`
+Flags: `--muse-bin` (default `muse` on `PATH`), `--muse-home`, `--auth-route`, `--account-pool` (recorded as `account_pool`; `unknown`
 when omitted), `--max-model-steps` (default 100), `--timeout` (default 30m).
 
 ## How a run works
@@ -154,5 +171,5 @@ Responses written before a preflight succeeds carry unknown effective values.
 ## Tests
 
 `go test ./internal/evaluation` exercises the adapter against fake `muse` shell scripts (missing runtime, incompatible
-flags, auth ambiguity, malformed and missing output, exit zero without completion, non-zero exits, timeout, SIGTERM
+flags, auth ambiguity (API-key override, missing/empty/shared/symlinked credential home, own-HOME home, stored-key hints), malformed and missing output, exit zero without completion, non-zero exits, timeout, SIGTERM
 with a surviving grandchild). No test installs Muse, reads a credential or makes a paid call.
