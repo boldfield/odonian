@@ -180,6 +180,7 @@ case "${ODONIAN_PROJECT:-}" in ""|all|ALL) MULTI=1 ;; esac
 # --- graceful stop ---
 STOP=0
 CLAUDE_PID=""   # pid (== pgid, via `set -m`) of the in-flight `claude -p`, if any
+MON_PID=""      # pid (== pgid) of the in-flight research renewal monitor, if any
 request_stop() {
   [ "$STOP" -eq 1 ] && return
   STOP=1
@@ -369,10 +370,260 @@ clear_model_failures() {
   _fail_model_drop "$i"
 }
 
+# --- research admission (P5) -------------------------------------------------------------------
+# Research-track tasks are paced: the harness must be admitted for the EXACT task BEFORE any model
+# process exists. Admission is `odonian claim <id>`, which atomically checks eligibility, debits a
+# start from the pool, creates the durable permit/attempt, and claims the task. Only research-track
+# tasks take this path; build/design/merge dispatch is untouched (the agent still claims for itself).
+#
+# State of the admission currently held (set by admit_research_task, cleared by clear_preclaim):
+P_TASK="" P_ATTEMPT="" P_PERMIT="" P_REQUEST="" P_MODEL=""
+ADM_STATE=""    # granted | deferred | busy | lost | ambiguous (outcome of the last admit_research_task)
+
+clear_preclaim() { P_TASK="" P_ATTEMPT="" P_PERMIT="" P_REQUEST="" P_MODEL=""; }
+
+# Deferred tasks: a denied task is skipped by pick_claimable_task until its retry time passes, so
+# both discovery loops move on to other eligible tasks/projects/models instead of re-asking.
+# Parallel indexed arrays (bash 3.2: no associative arrays).
+DEFER_IDS=()
+DEFER_UNTIL=()
+
+defer_task() {
+  local id="$1" secs="$2" expiry i
+  expiry=$(( $(date +%s) + secs ))
+  for ((i = 0; i < ${#DEFER_IDS[@]}; i++)); do
+    if [ "${DEFER_IDS[$i]}" = "$id" ]; then DEFER_UNTIL[$i]=$expiry; return 0; fi
+  done
+  DEFER_IDS+=("$id"); DEFER_UNTIL+=("$expiry")
+}
+
+# True (rc=0) while task $1 is inside its deferral window. Read-only so it is safe in $(...).
+task_deferred() {
+  local id="$1" now i
+  now=$(date +%s)
+  for ((i = 0; i < ${#DEFER_IDS[@]}; i++)); do
+    [ "${DEFER_IDS[$i]}" = "$id" ] && [ "${DEFER_UNTIL[$i]}" -gt "$now" ] && return 0
+  done
+  return 1
+}
+
+prune_deferred() {
+  local now i ids=() untils=()
+  now=$(date +%s)
+  for ((i = 0; i < ${#DEFER_IDS[@]}; i++)); do
+    if [ "${DEFER_UNTIL[$i]}" -gt "$now" ]; then ids+=("${DEFER_IDS[$i]}"); untils+=("${DEFER_UNTIL[$i]}"); fi
+  done
+  DEFER_IDS=(); DEFER_UNTIL=()
+  for ((i = 0; i < ${#ids[@]}; i++)); do DEFER_IDS+=("${ids[$i]}"); DEFER_UNTIL+=("${untils[$i]}"); done
+}
+
+# Echo how long an idle loop should sleep: $1 (the usual nap) shortened to the earliest deferral
+# expiry (at least 1s), so a deferred task is re-asked when it is allowed, not 30s later.
+idle_nap() {
+  local now i remaining best="$1"
+  now=$(date +%s)
+  for ((i = 0; i < ${#DEFER_IDS[@]}; i++)); do
+    remaining=$(( ${DEFER_UNTIL[$i]} - now ))
+    [ "$remaining" -lt 1 ] && remaining=1
+    [ "$remaining" -lt "$best" ] && best=$remaining
+  done
+  echo "$best"
+}
+
+# Ambiguous admissions: when a claim ends without a definite answer (transport error, timeout) the
+# server may or may not have admitted us. Remember that request id per task so the next attempt
+# replays the SAME request (the server returns the original admission instead of spending another
+# start). Cleared as soon as any definite answer arrives.
+AMBIG_IDS=()
+AMBIG_REQS=()
+ambig_get() {
+  local i
+  for ((i = 0; i < ${#AMBIG_IDS[@]}; i++)); do
+    [ "${AMBIG_IDS[$i]}" = "$1" ] && { echo "${AMBIG_REQS[$i]}"; return 0; }
+  done
+  return 0
+}
+ambig_clear() {
+  local i ids=() reqs=()
+  for ((i = 0; i < ${#AMBIG_IDS[@]}; i++)); do
+    [ "${AMBIG_IDS[$i]}" = "$1" ] || { ids+=("${AMBIG_IDS[$i]}"); reqs+=("${AMBIG_REQS[$i]}"); }
+  done
+  AMBIG_IDS=(); AMBIG_REQS=()
+  for ((i = 0; i < ${#ids[@]}; i++)); do AMBIG_IDS+=("${ids[$i]}"); AMBIG_REQS+=("${reqs[$i]}"); done
+}
+ambig_set() { ambig_clear "$1"; AMBIG_IDS+=("$1"); AMBIG_REQS+=("$2"); }
+
+# RFC 3339 UTC timestamp -> epoch seconds (GNU date, then BSD date). Fails (rc=1) if unparseable.
+rfc3339_epoch() {
+  local t="$1" e
+  e=$(date -u -d "$t" +%s 2>/dev/null) && [ -n "$e" ] && { echo "$e"; return 0; }
+  t="${t%%.*}"; t="${t%Z}"
+  e=$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "$t" +%s 2>/dev/null) && [ -n "$e" ] && { echo "$e"; return 0; }
+  return 1
+}
+
+# Seconds to wait after a denial. $1 is the CLI's stderr: `retry-after: N` (an active dispatch must
+# finish first) and/or `not-before: <RFC 3339>` (time alone unblocks it). Honors the later of the
+# two, clamped to [1, 900]; 30 when the server sent no hint.
+deferral_secs() {
+  local errf="$1" retry nb secs=0 now e
+  retry=$(sed -n 's/^retry-after:[[:space:]]*//p' "$errf" | head -1 | tr -cd '0-9')
+  nb=$(sed -n 's/^not-before:[[:space:]]*//p' "$errf" | head -1 | tr -d '[:space:]')
+  [ -n "$retry" ] && secs=$retry
+  if [ -n "$nb" ] && e=$(rfc3339_epoch "$nb"); then
+    now=$(date +%s)
+    [ $((e - now + 1)) -gt "$secs" ] && secs=$((e - now + 1))
+  fi
+  [ "$secs" -eq 0 ] && secs=30
+  [ "$secs" -lt 1 ] && secs=1
+  [ "$secs" -gt 900 ] && secs=900
+  echo "$secs"
+}
+
+# Request admission for research task $1 on model $2. Sets ADM_STATE and, when granted, P_*:
+#   granted    — task is claimed by us (P_PERMIT/P_ATTEMPT are set when the server issued a permit; they
+#                are empty when the policy is disabled/not enforcing and the claim carried no permit).
+#   deferred   — pool denied (exit 10): task untouched, deferred for the server's retry hint; no model.
+#   busy       — conflict (exit 11, e.g. a live attempt still holds the task); deferred 30s.
+#   lost       — another worker claimed it first (exit 3).
+#   ambiguous  — no definite answer after retries; the request id is remembered and replayed later.
+# Nothing here ever launches a model.
+admit_research_task() {
+  local task_id="$1" model="$2" req out rc tries=0 errf secs max_tries nap_secs
+  max_tries="${ODONIAN_ADMISSION_TRIES:-3}"; nap_secs="${ODONIAN_ADMISSION_RETRY_NAP:-2}"
+  ADM_STATE=""
+  clear_preclaim
+  req="$(ambig_get "$task_id")"
+  [ -n "$req" ] || req="$AGENT_ID:$task_id:$(date +%s)-$$-$RANDOM"
+  errf="$(mktemp "${TMPDIR:-/tmp}/odonian-claim.XXXXXX")"
+  while :; do
+    out="$(odonian claim "$task_id" --agent "$AGENT_ID" --model "$model" --request-id "$req" 2>"$errf")"; rc=$?
+    case "$rc" in
+      0)
+        ambig_clear "$task_id"
+        P_TASK="$task_id"; P_MODEL="$model"
+        P_PERMIT="$(printf '%s' "$out" | jq -r '.permit_id // empty' 2>/dev/null)"
+        P_ATTEMPT="$(printf '%s' "$out" | jq -r '.attempt_id // empty' 2>/dev/null)"
+        P_REQUEST="$(printf '%s' "$out" | jq -r '.request_id // empty' 2>/dev/null)"
+        [ -n "$P_REQUEST" ] || P_REQUEST="$req"
+        if [ -z "$P_PERMIT" ] || [ -z "$P_ATTEMPT" ]; then P_PERMIT=""; P_ATTEMPT=""; fi
+        ADM_STATE=granted; rm -f "$errf"; return 0 ;;
+      10)
+        secs="$(deferral_secs "$errf")"
+        ambig_clear "$task_id"; defer_task "$task_id" "$secs"
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') research admission deferred for ${task_id:0:8} ($(tr '\n' ' ' <"$errf" | sed 's/ *$//')); retry in ${secs}s" >&2
+        ADM_STATE=deferred; rm -f "$errf"; return 1 ;;
+      3)
+        ambig_clear "$task_id"; defer_task "$task_id" 5
+        ADM_STATE=lost; rm -f "$errf"; return 1 ;;
+      11)
+        ambig_clear "$task_id"; defer_task "$task_id" 30
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') research admission conflict for ${task_id:0:8}: $(tr '\n' ' ' <"$errf" | sed 's/ *$//')" >&2
+        ADM_STATE=busy; rm -f "$errf"; return 1 ;;
+      *)
+        tries=$((tries + 1))
+        if [ "$tries" -ge "$max_tries" ] || [ "$STOP" -eq 1 ]; then
+          ambig_set "$task_id" "$req"; defer_task "$task_id" "${ODONIAN_AMBIGUOUS_RETRY_SECS:-30}"
+          echo "[$AGENT_ID] $(date '+%H:%M:%S') research admission for ${task_id:0:8} ambiguous (rc=$rc); will replay request $req" >&2
+          ADM_STATE=ambiguous; rm -f "$errf"; return 1
+        fi
+        nap "$nap_secs" ;;
+    esac
+  done
+}
+
+# Finalize the held permit with exit class $1 (completed|failed|cancelled|unknown). Idempotent: a
+# permit that is already finalized/fenced/expired answers 409 (exit 11), which is final. A transport
+# failure is retried; if it never lands the permit lapses at its lease expiry and the start stays
+# debited (uncertain outcomes are never refunded). Clears the held admission either way.
+finalize_permit() {
+  local class="$1" i rc
+  if [ -n "$P_PERMIT" ]; then
+    for i in 1 2 3; do
+      odonian permit-finalize "$P_PERMIT" --task-id "$P_TASK" --model "$P_MODEL" --agent-id "$AGENT_ID" \
+        --request-id "$P_REQUEST" --attempt-id "$P_ATTEMPT" --exit-class "$class" >/dev/null 2>&1; rc=$?
+      case "$rc" in 0|11) break ;; esac
+      [ "$i" -lt 3 ] && nap 1
+    done
+    [ "$rc" -ne 0 ] && [ "$rc" -ne 11 ] && echo "[$AGENT_ID] $(date '+%H:%M:%S') could not finalize permit $P_PERMIT (rc=$rc); it will lapse at lease expiry" >&2
+  fi
+  clear_preclaim
+  return 0
+}
+
+# Renewal + ownership monitor for one preclaimed research dispatch; runs as a background subshell
+# next to the model process and ends when that process does. Every interval it
+#   - heartbeats the task lease (fenced to the attempt) while this agent still OWNS the task
+#     (in_progress and assigned to us). Once the model submits, ownership ends: heartbeats stop but
+#     nothing else changes — the model keeps running and writing its final output;
+#   - renews the dispatch permit regardless, so dispatch capacity stays held until the process exits
+#     (finalization is the main shell's job, on process exit).
+# Ownership is LOST — and the stale process fenced (TERM its group, KILL after a grace) — only on
+# positive evidence: the attempt was fenced/expired/finalized under us (409 from heartbeat or permit
+# renewal), or the task is in_progress under a different agent. Transient errors never kill work,
+# and neither does rate exhaustion. NOTE the lease is a coordination bound, not proof the process
+# stopped: a partitioned harness cannot fence what it cannot reach, but the server still rejects
+# that process's heartbeat/submit by attempt id.
+monitor_dispatch() {
+  local pid="$1" ctl="$2" poll interval grace last now owned=1 err rc state assignee lost="" i
+  trap - EXIT INT TERM
+  poll="${ODONIAN_RENEW_POLL_SECS:-1}"; interval="${ODONIAN_RENEW_INTERVAL_SECS:-20}"; grace="${ODONIAN_FENCE_GRACE_SECS:-5}"
+  last=$(date +%s)
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$poll"
+    kill -0 "$pid" 2>/dev/null || break
+    now=$(date +%s)
+    [ $((now - last)) -lt "$interval" ] && continue
+    last=$now
+    if [ "$owned" -eq 1 ]; then
+      if err="$(odonian heartbeat "$P_TASK" --agent "$AGENT_ID" ${P_ATTEMPT:+--attempt "$P_ATTEMPT"} 2>&1 >/dev/null)"; then
+        :
+      else
+        case "$err" in
+          *ATTEMPT_FENCED*|*ATTEMPT_EXPIRED*|*ATTEMPT_FINALIZED*) lost="task attempt fenced ($err)" ;;
+          *)
+            if json="$(odonian show "$P_TASK" --json 2>/dev/null)" && [ -n "$json" ]; then
+              state="$(printf '%s' "$json" | jq -r '.state // empty' 2>/dev/null)"
+              assignee="$(printf '%s' "$json" | jq -r '.assignee // empty' 2>/dev/null)"
+              if [ "$state" = "in_progress" ] && [ -n "$assignee" ] && [ "$assignee" != "$AGENT_ID" ]; then
+                lost="task now owned by $assignee"
+              elif [ "$state" = "in_progress" ]; then
+                echo "[$AGENT_ID] heartbeat for ${P_TASK:0:8} failed transiently: $err" >&2
+              elif [ -n "$state" ]; then
+                owned=0   # submitted (or otherwise moved on): stop renewing the lease, keep the process
+                echo "[$AGENT_ID] task ${P_TASK:0:8} no longer in_progress (state=$state); lease renewal stopped, permit renewal continues" >&2
+              fi
+            else
+              echo "[$AGENT_ID] heartbeat for ${P_TASK:0:8} failed and task lookup failed: $err" >&2
+            fi ;;
+        esac
+      fi
+    fi
+    if [ -z "$lost" ] && [ -n "$P_PERMIT" ]; then
+      odonian permit-renew "$P_PERMIT" --task-id "$P_TASK" --model "$P_MODEL" --agent-id "$AGENT_ID" \
+        --request-id "$P_REQUEST" --attempt-id "$P_ATTEMPT" >/dev/null 2>"$ctl/renew.err"; rc=$?
+      if [ "$rc" -eq 11 ]; then
+        lost="permit lost ($(tr '\n' ' ' <"$ctl/renew.err"))"
+      elif [ "$rc" -ne 0 ]; then
+        echo "[$AGENT_ID] permit renewal for ${P_PERMIT:0:8} failed transiently (rc=$rc)" >&2
+      fi
+    fi
+    if [ -n "$lost" ]; then
+      echo "[$AGENT_ID] $(date '+%H:%M:%S') ownership of ${P_TASK:0:8} lost: $lost — stopping the stale process" >&2
+      : > "$ctl/fenced"
+      kill -TERM "-$pid" 2>/dev/null
+      for ((i = 0; i < grace * 10; i++)); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 0.1; done
+      kill -KILL "-$pid" 2>/dev/null
+      exit 0
+    fi
+  done
+  exit 0
+}
+
 # Select the highest-priority claimable task of kind $2 in project $1 whose model is not
 # currently in a failure backoff window, skipping past any head task(s) pinned to an unavailable
 # model. Echoes "id<TAB>model" of the chosen task, or nothing if the project has no claimable
-# task of this kind, or every claimable task's model is unavailable (the caller then falls back
+# task of this kind, or every claimable task is deferred or on an unavailable model (the caller then falls back
 # to its normal "nothing claimable" nap — the agent only backs off entirely in that case).
 pick_claimable_task() {
   local project="$1" kind="$2" json id model
@@ -380,6 +631,7 @@ pick_claimable_task() {
   while IFS=$'\t' read -r id model; do
     [ -n "$id" ] || continue
     model_unavailable "$model" && continue
+    task_deferred "$id" && continue
     printf '%s\t%s\n' "$id" "$model"
     return 0
   done < <(printf '%s' "$json" | jq -r '.[]? | "\(.id)\t\(.model)"' 2>/dev/null)
@@ -400,6 +652,15 @@ dispatch() {
 
   # Export ODONIAN_MODEL for the dispatched agent to use (pr-feedback ack marker default is ${ODONIAN_MODEL:-fleet}-worker:)
   export ODONIAN_MODEL="$AGENT_MODEL"
+
+  # Preclaimed contract (research): the harness already claimed the task, so the prompt must skip
+  # next/claim and fence its heartbeat/submit to the admitted attempt. Always reset first — these
+  # are exported and must never leak from one dispatch into the next (legacy) one.
+  unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID
+  if [ -n "$P_TASK" ]; then
+    export ODONIAN_PRECLAIMED_TASK_ID="$P_TASK"
+    [ -n "$P_ATTEMPT" ] && export ODONIAN_PRECLAIMED_ATTEMPT_ID="$P_ATTEMPT"
+  fi
 
   # Check if AGENT_MODEL is in AGENT_CODEX_MODELS (comma-separated list)
   local use_codex=0
@@ -422,12 +683,44 @@ dispatch() {
   fi
 
   CLAUDE_PID=$!   # tracked so request_stop()/cleanup() can tear down this claude's process group
-  local pid=$CLAUDE_PID rc=0
+  local pid=$CLAUDE_PID rc=0 ctl="" fenced=0
+  # Preclaimed research: a sibling monitor renews the permit/task lease for the life of the process.
+  if [ -n "$P_TASK" ]; then
+    ctl="$(mktemp -d "${TMPDIR:-/tmp}/odonian-dispatch.XXXXXX")"
+    monitor_dispatch "$pid" "$ctl" &
+    MON_PID=$!
+  fi
+  # Wait unconditionally first: the child may already be gone, and wait still yields its status. The
+  # loop re-waits when a trapped signal interrupts wait while the child is still alive.
+  wait "$pid"; rc=$?
   while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
   CLAUDE_PID=""
+  if [ -n "$MON_PID" ]; then
+    kill -TERM "-$MON_PID" 2>/dev/null || true
+    wait "$MON_PID" 2>/dev/null || true
+    MON_PID=""
+    [ -e "$ctl/fenced" ] && fenced=1
+    rm -rf "$ctl"
+  fi
+  unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID
+  # Finalize the research permit exactly once, now that the process is truly gone (never earlier:
+  # a submit ends task ownership, not the dispatch). rc 126/127 = the model binary could not be
+  # launched at all; that and any non-zero exit are `failed`, a fenced/stopped run `cancelled`.
+  if [ -n "$P_TASK" ]; then
+    local exit_class=failed
+    if [ "$fenced" -eq 1 ]; then exit_class=cancelled
+    elif [ "$rc" -eq 0 ]; then exit_class=completed
+    elif [ "$STOP" -eq 1 ]; then exit_class=cancelled
+    elif [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then echo "[$AGENT_ID] $(date '+%H:%M:%S') launch error (rc=$rc) for research task ${P_TASK:0:8}" >&2
+    fi
+    finalize_permit "$exit_class"
+    clear_preclaim
+  fi
   # If we're shutting down, the non-zero rc is our own TERM of claude — don't treat it as a credit
-  # failure and don't back off; just unwind so the loop can exit promptly.
+  # failure and don't back off; just unwind so the loop can exit promptly. Likewise a fenced
+  # (stale-ownership) stop is our own kill, not a backend failure.
   [ "$STOP" -eq 1 ] && return "$rc"
+  [ "$fenced" -eq 1 ] && return "$rc"
   if [ "$rc" -ne 0 ]; then
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatch exited rc=$rc (likely out of credits/auth) for model $AGENT_MODEL" >&2
     mark_model_unavailable "$AGENT_MODEL"
@@ -451,6 +744,10 @@ cleanup() {
   # process group so it can't outlive us as an orphan. (Cannot run if WE are SIGKILLed — that's why
   # request_stop TERMs it on the graceful path.)
   [ -n "$CLAUDE_PID" ] && kill -KILL "-$CLAUDE_PID" 2>/dev/null || true
+  [ -n "$MON_PID" ] && kill -KILL "-$MON_PID" 2>/dev/null || true
+  # Same backstop for an admitted research permit that never reached its normal finalization (an exit
+  # between admission and dispatch, or mid-dispatch): the process is gone/killed, so release the slot.
+  [ -n "$P_TASK" ] && finalize_permit cancelled
   echo "[$AGENT_ID] cleaning up worktrees for slot $SLOT"
   for wt in "$ODONIAN_HOME/wt-$SLOT" "$ODONIAN_HOME"/wt-"$SLOT"-*; do
     [ -e "$wt" ] && rm -rf "$wt"
@@ -494,20 +791,34 @@ if [ "$MULTI" = 0 ]; then
   fi
   while true; do
     [ "$STOP" -eq 1 ] && break
+    prune_deferred
     if has_claimable_work "$ODONIAN_PROJECT"; then
       # Pick the highest-priority claimable task whose model isn't in a failure backoff window
       # (skipping past any head task pinned to an unavailable model — see pick_claimable_task).
       sel=$(pick_claimable_task "$ODONIAN_PROJECT" "$KIND")
       if [ -z "$sel" ]; then
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND) with an available model; sleeping 30s"; nap 30; continue
+        _idle="$(idle_nap 30)"
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND) with an available model; sleeping ${_idle}s"; nap "$_idle"; continue
       fi
       task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
       # Read track from task, default to 'build' if absent
       task_track=$(odonian show "$task_id" --json 2>/dev/null | jq -r '.track // "build"')
+      # An unreadable task must not default to a build prompt: a research task would then reach a
+      # model without admission. Treat it as transient and look again shortly.
+      if [ -z "$task_track" ]; then echo "[$AGENT_ID] $(date '+%H:%M:%S') could not read task $task_id; retrying shortly" >&2; nap 5; continue; fi
       PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
       if [ ! -f "$PROMPT_FILE" ]; then
         odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
         echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
+      fi
+      # Research is paced: get admitted for THIS task before any model process exists. A denial
+      # leaves the task untouched, launches nothing, and defers it (honoring the server's retry hint)
+      # so the next pass picks other eligible work instead of re-asking.
+      if [ "$task_track" = "research" ]; then
+        if ! admit_research_task "$task_id" "$task_model"; then
+          [ "$STOP" -eq 1 ] && break
+          continue
+        fi
       fi
       echo "[$AGENT_ID] $(date '+%H:%M:%S') claimable $KIND; dispatching ($task_model/$task_track)…"
       export AGENT_MODEL="$task_model"
@@ -548,6 +859,8 @@ while true; do
   fi
 
   worked=0
+  deferred_this_pass=0
+  prune_deferred
   for row in "${rows[@]}"; do
     [ "$STOP" -eq 1 ] && break
     pid="${row%%$'\t'*}"; prepo="${row#*$'\t'}"
@@ -572,10 +885,20 @@ while true; do
     cd "$wt" || continue
     # Read track from task, default to 'build' if absent
     task_track=$(odonian show "$task_id" --json 2>/dev/null | jq -r '.track // "build"')
+    if [ -z "$task_track" ]; then echo "[$AGENT_ID] $(date '+%H:%M:%S') could not read task $task_id; skipping" >&2; defer_task "$task_id" 5; continue; fi
     PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
     if [ ! -f "$PROMPT_FILE" ]; then
       odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
       echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
+    fi
+    # Research is paced: get admitted for THIS task before any model process exists. A denial leaves
+    # the task untouched, launches nothing, and defers it; move on to the next project/task.
+    if [ "$task_track" = "research" ]; then
+      if ! admit_research_task "$task_id" "$task_model"; then
+        [ "$STOP" -eq 1 ] && break
+        deferred_this_pass=1
+        continue
+      fi
     fi
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatching ($task_model/$task_track/$KIND) on $(norm_repo "$prepo") [${pid:0:8}]…"
     export AGENT_MODEL="$task_model"
@@ -587,5 +910,11 @@ while true; do
   done
   [ "$STOP" -eq 1 ] && break
   # rows existed but every candidate raced away / failed setup — brief sleep, then re-poll.
-  [ "$worked" -eq 0 ] && { echo "[$AGENT_ID] $(date '+%H:%M:%S') candidate projects raced away; sleeping 10s"; nap 10; }
+  # A research deferral this pass means other candidates (same project, next task) may still be
+  # eligible: re-poll straight away, skipping the deferred task. Otherwise wait, but no longer than
+  # the earliest deferral expiry.
+  if [ "$worked" -eq 0 ]; then
+    if [ "$deferred_this_pass" -eq 1 ]; then _idle=1; else _idle="$(idle_nap 10)"; fi
+    echo "[$AGENT_ID] $(date '+%H:%M:%S') no dispatchable candidate this pass; sleeping ${_idle}s"; nap "$_idle"
+  fi
 done
