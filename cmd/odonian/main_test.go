@@ -5962,7 +5962,6 @@ func TestResearchStatusFloatTokens(t *testing.T) {
 	}
 }
 
-
 func TestPermitRenewOutput(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -5994,4 +5993,3 @@ func TestPermitRenewOutput(t *testing.T) {
 		t.Errorf("expected expires_at in response, got nil")
 	}
 }
-
