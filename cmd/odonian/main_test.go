@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -5817,5 +5818,146 @@ func TestExecuteShowJSONKeepsContinuationAndFollowUpsSeparate(t *testing.T) {
 	}
 	if _, ok := raw["finding_follow_ups"]; !ok {
 		t.Errorf("--json has no finding_follow_ups key")
+	}
+}
+
+func TestPermitRenewConflictExitCodes(t *testing.T) {
+	tests := []struct {
+		name      string
+		errorCode string
+		wantExit  int
+	}{
+		{"ATTEMPT_FENCED", "ATTEMPT_FENCED", 11},
+		{"ATTEMPT_EXPIRED", "ATTEMPT_EXPIRED", 11},
+		{"ATTEMPT_FINALIZED", "ATTEMPT_FINALIZED", 11},
+		{"PERMIT_IDENTITY_MISMATCH", "PERMIT_IDENTITY_MISMATCH", 11},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]string{
+						"code":    tt.errorCode,
+						"message": "conflict",
+					},
+				})
+			}))
+			defer server.Close()
+
+			err := executePermitRenew(context.Background(), server.URL, "testtoken",
+				[]string{"permit-1", "--task-id", "task-1", "--model", "haiku", "--agent-id", "agent-1",
+					"--request-id", "req-1", "--attempt-id", "att-1"}, io.Discard)
+
+			var conflErr *conflictError
+			if !errors.As(err, &conflErr) {
+				t.Errorf("expected conflictError, got %T: %v", err, err)
+			} else if conflErr.code != tt.wantExit {
+				t.Errorf("expected exit code %d, got %d", tt.wantExit, conflErr.code)
+			}
+		})
+	}
+}
+
+func TestPermitFinalizeConflictExitCodes(t *testing.T) {
+	tests := []struct {
+		name      string
+		errorCode string
+		wantExit  int
+	}{
+		{"ATTEMPT_FENCED", "ATTEMPT_FENCED", 11},
+		{"ATTEMPT_EXPIRED", "ATTEMPT_EXPIRED", 11},
+		{"ATTEMPT_FINALIZED", "ATTEMPT_FINALIZED", 11},
+		{"PERMIT_IDENTITY_MISMATCH", "PERMIT_IDENTITY_MISMATCH", 11},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]string{
+						"code":    tt.errorCode,
+						"message": "conflict",
+					},
+				})
+			}))
+			defer server.Close()
+
+			err := executePermitFinalize(context.Background(), server.URL, "testtoken",
+				[]string{"permit-1", "--task-id", "task-1", "--model", "haiku", "--agent-id", "agent-1",
+					"--request-id", "req-1", "--attempt-id", "att-1", "--exit-class", "completed"}, io.Discard)
+
+			var conflErr *conflictError
+			if !errors.As(err, &conflErr) {
+				t.Errorf("expected conflictError, got %T: %v", err, err)
+			} else if conflErr.code != tt.wantExit {
+				t.Errorf("expected exit code %d, got %d", tt.wantExit, conflErr.code)
+			}
+		})
+	}
+}
+
+func TestClaimSchedulingError(t *testing.T) {
+	retryAfter := int64(30)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":                  "ADMISSION_DEFERRED",
+				"message":               "admission deferred",
+				"retry_after_seconds":   retryAfter,
+			},
+		})
+	}))
+	defer server.Close()
+
+	err := executeClaim(context.Background(), server.URL, "testtoken", []string{"task-1"})
+
+	var schedErr *schedulingError
+	if !errors.As(err, &schedErr) {
+		t.Errorf("expected schedulingError, got %T: %v", err, err)
+	} else if schedErr.code != 2 {
+		t.Errorf("expected exit code 2, got %d", schedErr.code)
+	} else if schedErr.retryAfterSeconds == nil || *schedErr.retryAfterSeconds != 30 {
+		t.Errorf("expected retryAfterSeconds 30, got %v", schedErr.retryAfterSeconds)
+	}
+}
+
+func TestResearchStatusFloatTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"mode": "paced",
+			"pools": []map[string]interface{}{
+				{
+					"account_id": "acct-1",
+					"tokens":     1234.5,
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	var buf bytes.Buffer
+	err := executeResearchStatus(context.Background(), server.URL, "testtoken", true, &buf)
+	if err != nil {
+		t.Fatalf("executeResearchStatus failed: %v", err)
+	}
+
+	output := buf.String()
+	var status tuiclient.ResearchStatus
+	if err := json.Unmarshal([]byte(output), &status); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(status.Pools) != 1 {
+		t.Fatalf("expected 1 pool, got %d", len(status.Pools))
+	}
+	if status.Pools[0].Tokens != 1234.5 {
+		t.Errorf("expected tokens 1234.5, got %v", status.Pools[0].Tokens)
 	}
 }

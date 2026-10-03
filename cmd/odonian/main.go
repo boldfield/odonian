@@ -2147,7 +2147,7 @@ func executePermitRenew(ctx context.Context, baseURL, token string, args []strin
 		var apiErr *tuiclient.APIError
 		if errors.As(err, &apiErr) {
 			switch apiErr.Code {
-			case "ATTEMPT_FENCED", "EXPIRED", "FINALIZED", "PERMIT_IDENTITY_MISMATCH":
+			case "ATTEMPT_FENCED", "ATTEMPT_EXPIRED", "ATTEMPT_FINALIZED", "PERMIT_IDENTITY_MISMATCH":
 				return &conflictError{message: apiErr.Error(), code: 11}
 			}
 			if apiErr.StatusCode == 429 {
@@ -2237,7 +2237,7 @@ func executePermitFinalize(ctx context.Context, baseURL, token string, args []st
 		var apiErr *tuiclient.APIError
 		if errors.As(err, &apiErr) {
 			switch apiErr.Code {
-			case "ATTEMPT_FENCED", "EXPIRED", "FINALIZED", "PERMIT_IDENTITY_MISMATCH":
+			case "ATTEMPT_FENCED", "ATTEMPT_EXPIRED", "ATTEMPT_FINALIZED", "PERMIT_IDENTITY_MISMATCH":
 				return &conflictError{message: apiErr.Error(), code: 11}
 			}
 			if apiErr.StatusCode == 429 {
