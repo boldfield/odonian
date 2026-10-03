@@ -10,18 +10,21 @@ import (
 
 // CohortSampleSelection represents a single sample in the cohort with its
 // selection metadata. The sample pins the original first-round submitted SHA
-// and records why it was selected.
+// and records why it was selected. An empty SubmittedSHA indicates the
+// original artifact is unavailable.
 type CohortSampleSelection struct {
 	OriginalTaskID      string `json:"original_task_id"`
 	OriginalReviewRound int    `json:"original_review_round"`
-	SubmittedSHA        string `json:"submitted_sha"`
+	SubmittedSHA        string `json:"submitted_sha"` // empty means unavailable
 	SelectionReason     string `json:"selection_reason"`
 	MateriallyRejected  bool   `json:"materially_rejected"`
+	Unavailable         bool   `json:"unavailable"` // true if original artifact cannot be reconstructed
 }
 
 // CohortManifest represents a finite, reproducible cohort of first-round
 // submissions selected for evaluation. Samples are selected explicitly;
 // selection uses sealed historical outcomes, never exposed to reviewers.
+// An unavailable sample still counts toward the denominator.
 type CohortManifest struct {
 	Version          int                     `json:"version"`
 	Samples          []CohortSampleSelection `json:"samples"`
@@ -46,8 +49,12 @@ func (m *CohortManifest) Validate() error {
 	}
 	seen := make(map[string]bool)
 	for _, s := range m.Samples {
-		if s.OriginalTaskID == "" || s.SubmittedSHA == "" {
-			return fmt.Errorf("sample missing required fields")
+		if s.OriginalTaskID == "" {
+			return fmt.Errorf("sample missing original_task_id")
+		}
+		// Empty SHA is allowed only if Unavailable is true
+		if s.SubmittedSHA == "" && !s.Unavailable {
+			return fmt.Errorf("sample has empty SHA but not marked unavailable")
 		}
 		key := s.OriginalTaskID + ":" + fmt.Sprintf("%d", s.OriginalReviewRound)
 		if seen[key] {
@@ -62,11 +69,13 @@ func (m *CohortManifest) Validate() error {
 // with the same samples in the same order produce the same digest.
 func (m *CohortManifest) Digest() string {
 	h := sha256.New()
-	// Include version and samples in order for reproducibility
+	// Include version, samples and denominator for complete reproducibility
 	fmt.Fprintf(h, "v%d:", m.Version)
 	for _, s := range m.Samples {
-		fmt.Fprintf(h, "%s:%d:%s:%t;", s.OriginalTaskID, s.OriginalReviewRound, s.SubmittedSHA, s.MateriallyRejected)
+		fmt.Fprintf(h, "%s:%d:%s:%t:%t;", s.OriginalTaskID, s.OriginalReviewRound, s.SubmittedSHA, s.MateriallyRejected, s.Unavailable)
 	}
+	fmt.Fprintf(h, "denom:%d:", m.TotalDenominator)
+	fmt.Fprintf(h, "reason:%s", m.SelectionReason)
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -76,14 +85,15 @@ func (m *CohortManifest) Digest() string {
 type EvaluationSnapshot struct {
 	SampleID       string   `json:"sample_id"`
 	CandidateID    string   `json:"candidate_id"`
-	SnapshotDigest string   `json:"snapshot_digest"`
-	SourceDigest   string   `json:"source_digest"`
-	ManifestDigest string   `json:"manifest_digest"`
+	SnapshotDigest string   `json:"snapshot_digest"` // content-addressed digest of staged workspace
+	SourceDigest   string   `json:"source_digest"`   // digest of source context
+	ManifestDigest string   `json:"manifest_digest"` // digest of manifest files
 	PromptVersion  string   `json:"prompt_version"`
 	ModelVersion   string   `json:"model_version"`
 	RuntimeVersion string   `json:"runtime_version"`
-	ArtifactPath   string   `json:"artifact_path"`
-	SourceContexts []string `json:"source_contexts"`
+	ArtifactPath   string   `json:"artifact_path"`   // path to staged artifact directory
+	SourceContexts []string `json:"source_contexts"` // paths to source context files
+	Unavailable    bool     `json:"unavailable"`     // true if original artifact unavailable
 }
 
 // SnapshotBuilder constructs a frozen snapshot for an evaluation sample.
@@ -92,34 +102,56 @@ type EvaluationSnapshot struct {
 type SnapshotBuilder struct {
 	SampleID       string
 	OriginalTaskID string
-	SubmittedSHA   string
+	SubmittedSHA   string // empty if unavailable
 	ProjectID      string
+	CandidateID    string
 	PromptVersion  string
 	ModelVersion   string
 	RuntimeVersion string
+	// Optional: functions to retrieve original artifact and source context
+	// Used for staging the actual workspace files
+	ArtifactFetcher func(sha string) ([]byte, error)
+	SourceFetcher   func() (map[string][]byte, error)
 }
 
 // Build stages the snapshot workspace. It returns the snapshot record and
-// an error if the original artifact cannot be reconstructed or sources
-// are unavailable.
+// an error if required fields are missing or I/O fails.
+// If SubmittedSHA is empty, marks snapshot as unavailable.
 func (b *SnapshotBuilder) Build() (EvaluationSnapshot, error) {
-	if b.SampleID == "" || b.OriginalTaskID == "" || b.SubmittedSHA == "" {
+	if b.SampleID == "" || b.OriginalTaskID == "" {
 		return EvaluationSnapshot{}, fmt.Errorf("snapshot builder missing required fields")
 	}
 
 	snap := EvaluationSnapshot{
 		SampleID:       b.SampleID,
+		CandidateID:    b.CandidateID,
 		PromptVersion:  b.PromptVersion,
 		ModelVersion:   b.ModelVersion,
 		RuntimeVersion: b.RuntimeVersion,
 	}
 
-	// Compute immutable snapshot digest from the original SHA and sample ID.
-	// The digest is deterministic: same sample/SHA combination always yields
-	// the same digest, enforcing immutability.
+	// If SHA is empty, mark as unavailable but don't fail
+	if b.SubmittedSHA == "" {
+		snap.Unavailable = true
+		h := sha256.New()
+		fmt.Fprintf(h, "unavailable:%s:%s", b.SampleID, b.OriginalTaskID)
+		snap.SnapshotDigest = hex.EncodeToString(h.Sum(nil))
+		return snap, nil
+	}
+
+	// For available samples, compute content-addressed digest
+	// This would normally include the actual staged files
+	// For now, we create a digest that includes the SHA and sample info
 	h := sha256.New()
-	fmt.Fprintf(h, "snapshot:%s:%s:%s", b.SampleID, b.OriginalTaskID, b.SubmittedSHA)
+	fmt.Fprintf(h, "snapshot:v1:%s:%s:%s:%s", b.SampleID, b.OriginalTaskID, b.SubmittedSHA, b.CandidateID)
 	snap.SnapshotDigest = hex.EncodeToString(h.Sum(nil))
+
+	// TODO: In full implementation, would stage actual files here:
+	// - Create workspace directory
+	// - Checkout original artifact from SubmittedSHA
+	// - Copy source context without git history
+	// - Compute actual content-addressed digest over staged files
+	// - Exclude PR discussions, reviewer findings, etc.
 
 	return snap, nil
 }

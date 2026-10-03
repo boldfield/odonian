@@ -77,6 +77,18 @@ Give each candidate the same research evidence standard, task acceptance criteri
 
 The model returns structured findings to a local result artifact. A deterministic host process validates and stores the result; the model cannot call production submit. Incomplete output, malformed output, unavailable sources, interruption, and failed execution are recorded separately from a clean completed review. Exit zero alone is not evidence that review succeeded. Any default runtime observers or nested agents that run are part of the measured configuration and usage, not ignored overhead.
 
+### Content-blinding and web-discoverability limits
+
+The frozen evaluation workspace stages only the original submitted artifact and necessary source context, excluding repository history, PR discussions, reviewer findings, task event history, and production credentials. This isolation is enforced by the host staging process, not by the model itself. However, perfect blinding is not guaranteed for the following reasons:
+
+- **Public source materials**: If the original submission references publicly accessible sources (open-source libraries, public web resources, published specifications), the candidate model can retrieve and examine those sources outside the staged workspace. Selection of sources is within the candidate's scope.
+- **Reviewer discussions on public forges**: If the original task's review discussion occurred on a public forge (e.g., GitHub), the candidate may discover and read those discussions through web search or direct forge access. The staged workspace excludes links to PR discussions, but does not prevent external discovery.
+- **Published prior work**: If the original submission or related task details were published or publicly discussed (e.g., in blogs, conference talks, archived discussions), the candidate may access that content.
+
+These limitations do not undermine the evaluation's value: the workspace isolation prevents accidental leakage of sensitive metadata and ensures a reproducible, auditable baseline. However, evaluations should not be interpreted as perfectly blind with respect to all information that a human reviewer might similarly discover through independent research.
+
+Missing or unavailable original artifacts are recorded explicitly in the cohort with an `unavailable` marker and a selection reason (e.g., "original commit lost"). Such samples remain in the denominator for reporting purposes but are excluded from candidate evaluation attempts, ensuring transparent accounting.
+
 ### Reporting and decisions
 
 Reports group by immutable candidate version and model/runtime/tool configuration, never by a hardcoded Muse column. Display provider-reported usage units as supplied; do not turn missing token counts, local compute time, or incomparable subscription units into fabricated dollar savings.

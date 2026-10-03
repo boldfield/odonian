@@ -52,10 +52,21 @@ func TestCohortManifestValidation(t *testing.T) {
 			cohort: &CohortManifest{
 				Version: 1,
 				Samples: []CohortSampleSelection{
-					{OriginalTaskID: "t1"}, // missing SubmittedSHA
+					{OriginalTaskID: "t1"}, // missing SubmittedSHA and not marked unavailable
 				},
 			},
 			wantErr: true,
+		},
+		{
+			name: "unavailable sample with empty SHA",
+			cohort: &CohortManifest{
+				Version: 1,
+				Samples: []CohortSampleSelection{
+					{OriginalTaskID: "t1", SubmittedSHA: "", Unavailable: true}, // Empty SHA is OK when unavailable
+				},
+				TotalDenominator: 10,
+			},
+			wantErr: false,
 		},
 		{
 			name: "duplicate sample",
@@ -246,8 +257,9 @@ func TestSnapshotBuilderBasic(t *testing.T) {
 
 func TestSnapshotBuilderMissingFields(t *testing.T) {
 	tests := []struct {
-		name    string
-		builder SnapshotBuilder
+		name      string
+		builder   SnapshotBuilder
+		wantError bool
 	}{
 		{
 			name: "missing sample ID",
@@ -255,6 +267,7 @@ func TestSnapshotBuilderMissingFields(t *testing.T) {
 				OriginalTaskID: "t1",
 				SubmittedSHA:   "sha1",
 			},
+			wantError: true,
 		},
 		{
 			name: "missing task ID",
@@ -262,6 +275,7 @@ func TestSnapshotBuilderMissingFields(t *testing.T) {
 				SampleID:     "s1",
 				SubmittedSHA: "sha1",
 			},
+			wantError: true,
 		},
 		{
 			name: "missing submitted SHA",
@@ -269,14 +283,22 @@ func TestSnapshotBuilderMissingFields(t *testing.T) {
 				SampleID:       "s1",
 				OriginalTaskID: "t1",
 			},
+			wantError: false, // Empty SHA is allowed, marks snapshot as unavailable
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := tt.builder.Build()
-			if err == nil {
+			snap, err := tt.builder.Build()
+			if tt.wantError && err == nil {
 				t.Errorf("expected error for %s", tt.name)
+			}
+			if !tt.wantError && err != nil {
+				t.Errorf("unexpected error for %s: %v", tt.name, err)
+			}
+			// If it's the missing SHA test, verify it's marked unavailable
+			if tt.name == "missing submitted SHA" && !snap.Unavailable {
+				t.Errorf("snapshot with empty SHA should be marked unavailable")
 			}
 		})
 	}
