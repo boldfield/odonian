@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/boldfield/odonian/internal/evaluation"
@@ -34,6 +35,7 @@ var (
 	ErrEvaluationCampaignPaused        = errors.New("evaluation campaign is paused")
 	ErrEvaluationCampaignAlreadyPaused = errors.New("evaluation campaign is already paused")
 	ErrEvaluationInvalidInput          = errors.New("invalid evaluation input")
+	ErrEvaluationAlreadyExists         = errors.New("evaluation record already exists")
 )
 
 // EvaluationExitClass is the distinct terminal outcome of one attempt.
@@ -207,6 +209,9 @@ func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign Eva
 		campaign.ID, campaign.Name, campaign.Description,
 		campaign.CohortManifest, campaign.AttemptCap, now, now,
 	)
+	if isUniqueViolation(err) {
+		return EvaluationCampaign{}, ErrEvaluationAlreadyExists
+	}
 	if err != nil {
 		return EvaluationCampaign{}, fmt.Errorf("create evaluation campaign: %w", err)
 	}
@@ -307,6 +312,9 @@ func (s *sqliteStore) CreateEvaluationCandidate(ctx context.Context, candidate E
 		candidate.ID, candidate.CampaignID, string(identityJSON), candidate.Config.Digest(),
 		identity.AccountPool, candidate.PerCandidateCap, candidate.CreatedAt,
 	)
+	if isUniqueViolation(err) {
+		return EvaluationCandidate{}, ErrEvaluationAlreadyExists
+	}
 	if err != nil {
 		return EvaluationCandidate{}, fmt.Errorf("create evaluation candidate: %w", err)
 	}
@@ -595,6 +603,20 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 		}
 	}
 
+	// A paused campaign admits nothing; this outranks the capacity checks so a
+	// waiting runner sees the pause rather than a misleading exhaustion.
+	var pausedAt, resumedAt *string
+	err = tx.QueryRowContext(ctx,
+		`SELECT paused_at, resumed_at FROM evaluation_campaign WHERE id = ?`,
+		campaignID,
+	).Scan(&pausedAt, &resumedAt)
+	if err != nil {
+		return EvaluationJobClaimResult{}, fmt.Errorf("check campaign pause state: %w", err)
+	}
+	if pausedAt != nil && resumedAt == nil {
+		return EvaluationJobClaimResult{}, ErrEvaluationCampaignPaused
+	}
+
 	// Check candidate capacity: per-candidate attempts (count all, including expired)
 	var candidateAttempts int
 	err = tx.QueryRowContext(ctx,
@@ -643,19 +665,6 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 
 	if err == nil && campaignAttempts >= attemptCap {
 		return EvaluationJobClaimResult{}, ErrEvaluationCapacityExhausted
-	}
-
-	// Check if campaign is paused
-	var pausedAt *string
-	err = tx.QueryRowContext(ctx,
-		`SELECT paused_at FROM evaluation_campaign WHERE id = ?`,
-		campaignID,
-	).Scan(&pausedAt)
-	if err != nil && err != sql.ErrNoRows {
-		return EvaluationJobClaimResult{}, fmt.Errorf("check campaign pause state: %w", err)
-	}
-	if pausedAt != nil {
-		return EvaluationJobClaimResult{}, ErrEvaluationCampaignPaused
 	}
 
 	// Debit the candidate's independent pool. A missing pool is an error and a
@@ -952,6 +961,10 @@ func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, res Evaluat
 	return nil
 }
 
+func isUniqueViolation(err error) bool {
+	return err != nil && (strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY"))
+}
+
 func nullableString(v string) any {
 	if v == "" {
 		return nil
@@ -1089,21 +1102,29 @@ func (s *sqliteStore) GetEvaluationSample(ctx context.Context, sampleID string) 
 // GetEvaluationCandidate fetches a candidate by ID, rebuilding its M1 config
 // from the stored canonical identity and verifying it against the stored digest.
 func (s *sqliteStore) GetEvaluationCandidate(ctx context.Context, candidateID string) (EvaluationCandidate, error) {
-	candidate := EvaluationCandidate{}
-	var identityJSON, digest, pool string
-
-	err := s.conn.QueryRowContext(ctx,
+	row := s.conn.QueryRowContext(ctx,
 		`SELECT id, campaign_id, identity_json, candidate_config_digest, account_pool_id, per_candidate_cap, created_at
 		 FROM evaluation_candidate WHERE id = ?`,
 		candidateID,
-	).Scan(&candidate.ID, &candidate.CampaignID, &identityJSON, &digest, &pool, &candidate.PerCandidateCap, &candidate.CreatedAt)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return EvaluationCandidate{}, ErrEvaluationCandidateNotFound
-		}
-		return EvaluationCandidate{}, fmt.Errorf("get candidate: %w", err)
+	)
+	candidate, err := scanEvaluationCandidate(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return EvaluationCandidate{}, ErrEvaluationCandidateNotFound
 	}
+	return candidate, err
+}
 
+// scanEvaluationCandidate reads one candidate row and verifies the stored
+// identity against its recorded digest and pool.
+func scanEvaluationCandidate(row interface{ Scan(...any) error }) (EvaluationCandidate, error) {
+	candidate := EvaluationCandidate{}
+	var identityJSON, digest, pool string
+	if err := row.Scan(&candidate.ID, &candidate.CampaignID, &identityJSON, &digest, &pool, &candidate.PerCandidateCap, &candidate.CreatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return EvaluationCandidate{}, err
+		}
+		return EvaluationCandidate{}, fmt.Errorf("scan candidate: %w", err)
+	}
 	var identity evaluation.CandidateIdentity
 	if err := json.Unmarshal([]byte(identityJSON), &identity); err != nil {
 		return EvaluationCandidate{}, fmt.Errorf("%w: %v", ErrEvaluationCandidateCorrupt, err)
@@ -1173,11 +1194,15 @@ func (s *sqliteStore) GetEvaluationCampaign(ctx context.Context, campaignID stri
 	return campaign, nil
 }
 
-// ListEvaluationCandidates fetches all candidates for a campaign.
+// ListEvaluationCandidates fetches all candidates for a campaign in creation
+// order, each verified against its recorded digest.
 func (s *sqliteStore) ListEvaluationCandidates(ctx context.Context, campaignID string) ([]EvaluationCandidate, error) {
+	if _, err := s.GetEvaluationCampaign(ctx, campaignID); err != nil {
+		return nil, err
+	}
 	rows, err := s.conn.QueryContext(ctx,
 		`SELECT id, campaign_id, identity_json, candidate_config_digest, account_pool_id, per_candidate_cap, created_at
-		 FROM evaluation_candidate WHERE campaign_id = ? ORDER BY created_at`,
+		 FROM evaluation_candidate WHERE campaign_id = ? ORDER BY created_at, id`,
 		campaignID)
 	if err != nil {
 		return nil, fmt.Errorf("query candidates: %w", err)
@@ -1186,35 +1211,65 @@ func (s *sqliteStore) ListEvaluationCandidates(ctx context.Context, campaignID s
 
 	var candidates []EvaluationCandidate
 	for rows.Next() {
-		var c EvaluationCandidate
-		var identityJSON, digest, poolID string
-		if err := rows.Scan(&c.ID, &c.CampaignID, &identityJSON, &digest, &poolID,
-			&c.PerCandidateCap, &c.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scan candidate: %w", err)
+		c, err := scanEvaluationCandidate(rows)
+		if err != nil {
+			return nil, err
 		}
-
-		if err := json.Unmarshal([]byte(identityJSON), &c.Config); err != nil {
-			return nil, fmt.Errorf("unmarshal candidate identity: %w", err)
-		}
-
 		candidates = append(candidates, c)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return candidates, nil
+	return candidates, rows.Err()
 }
 
-// CountEvaluationAttempts returns the number of attempts for a candidate.
-func (s *sqliteStore) CountEvaluationAttempts(ctx context.Context, candidateID string) (int, error) {
-	var count int
-	err := s.conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM evaluation_attempt ea
-		 JOIN evaluation_job ej ON ea.job_id = ej.id
-		 WHERE ej.candidate_id = ?`,
-		candidateID).Scan(&count)
+// EvaluationCandidateStatus is one candidate's cap usage. Every started attempt
+// counts against the caps, including expired ones; Active counts only attempts
+// whose lease is still live.
+type EvaluationCandidateStatus struct {
+	Candidate    EvaluationCandidate
+	AttemptsUsed int
+	Active       int
+	// Pool is nil when the candidate's pool has not been configured, which
+	// blocks admission rather than meaning unlimited capacity.
+	Pool *EvaluationPoolState
+}
+
+// EvaluationCampaignStatus is the campaign with per-candidate usage.
+type EvaluationCampaignStatus struct {
+	Campaign          EvaluationCampaign
+	TotalAttemptsUsed int
+	Candidates        []EvaluationCandidateStatus
+}
+
+// GetEvaluationCampaignStatus reads the campaign, its candidates and their
+// attempt and pool usage without changing anything.
+func (s *sqliteStore) GetEvaluationCampaignStatus(ctx context.Context, campaignID string) (EvaluationCampaignStatus, error) {
+	campaign, err := s.GetEvaluationCampaign(ctx, campaignID)
 	if err != nil {
-		return 0, fmt.Errorf("count attempts: %w", err)
+		return EvaluationCampaignStatus{}, err
 	}
-	return count, nil
+	candidates, err := s.ListEvaluationCandidates(ctx, campaignID)
+	if err != nil {
+		return EvaluationCampaignStatus{}, err
+	}
+	now := formatTS(s.Now())
+	status := EvaluationCampaignStatus{Campaign: campaign, Candidates: make([]EvaluationCandidateStatus, 0, len(candidates))}
+	for _, c := range candidates {
+		cs := EvaluationCandidateStatus{Candidate: c}
+		err := s.conn.QueryRowContext(ctx,
+			`SELECT COUNT(*), COALESCE(SUM(CASE WHEN ea.state = 'active' AND ea.expires_at > ? THEN 1 ELSE 0 END), 0)
+			 FROM evaluation_attempt ea JOIN evaluation_job ej ON ea.job_id = ej.id
+			 WHERE ej.candidate_id = ?`, now, c.ID).Scan(&cs.AttemptsUsed, &cs.Active)
+		if err != nil {
+			return EvaluationCampaignStatus{}, fmt.Errorf("count attempts: %w", err)
+		}
+		pool, err := s.GetEvaluationPool(ctx, c.AccountPoolID())
+		switch {
+		case err == nil:
+			cs.Pool = &pool
+		case !errors.Is(err, ErrEvaluationPoolNotConfigured):
+			return EvaluationCampaignStatus{}, err
+		}
+		status.TotalAttemptsUsed += cs.AttemptsUsed
+		status.Candidates = append(status.Candidates, cs)
+	}
+	return status, nil
 }
