@@ -80,6 +80,13 @@ type Store interface {
 	UnarchiveProject(ctx context.Context, projectID string) (Project, error)
 	GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error)
 	TombstoneLink(ctx context.Context, taskID, linkID string) error
+	RequestPermit(ctx context.Context, requestID, taskID, projectID, agentID, model, accountPool string) (ResearchPermit, error)
+	GetPermit(ctx context.Context, permitID string) (ResearchPermit, error)
+	RenewPermit(ctx context.Context, permitID, attemptID string) (ResearchPermit, error)
+	FinalizePermit(ctx context.Context, permitID, attemptID string, exitClass *string, usageTokens *string) (ResearchPermit, error)
+	ListActivePermits(ctx context.Context, state string) ([]ResearchPermit, error)
+	ListPermitsByProject(ctx context.Context, projectID string) ([]ResearchPermit, error)
+	ListPermitsByPool(ctx context.Context, accountPool string) ([]ResearchPermit, error)
 }
 
 // sqliteStore wraps a SQLite database connection and provides migration functionality.
@@ -1082,6 +1089,40 @@ func (e *ValidationError) Error() string {
 		return e.Message
 	}
 	return e.Code
+}
+
+// ResearchPermit represents a research admission permit binding task/project/agent/model/pool
+// and a caller request ID. Stable retries recover the same permit; new attempts debit new starts.
+// Renewal and finalize are idempotent and fenced by attempt identity.
+type ResearchPermit struct {
+	ID                 string  `db:"id" json:"id"`
+	TaskID             string  `db:"task_id" json:"task_id"`
+	ProjectID          string  `db:"project_id" json:"project_id"`
+	AgentID            string  `db:"agent_id" json:"agent_id"`
+	Model              string  `db:"model" json:"model"`
+	AccountPool        string  `db:"account_pool" json:"account_pool"`
+	RequestID          string  `db:"request_id" json:"request_id"`
+	AttemptID          string  `db:"attempt_id" json:"attempt_id"`
+	State              string  `db:"state" json:"state"` // active, expired, finalized
+	AttemptStartedAt   string  `db:"attempt_started_at" json:"attempt_started_at"`
+	AttemptFinalizedAt *string `db:"attempt_finalized_at" json:"attempt_finalized_at"` // nullable
+	CreatedAt          string  `db:"created_at" json:"created_at"`
+	UpdatedAt          string  `db:"updated_at" json:"updated_at"`
+}
+
+// ResearchAttempt represents an individual attempt within a permit lifecycle.
+// Each attempt tracks start/finalization times, exit class, and optional usage.
+// Unknown usage is distinct from zero and represented as null.
+type ResearchAttempt struct {
+	ID             string  `db:"id" json:"id"`
+	PermitID       string  `db:"permit_id" json:"permit_id"`
+	SequenceNumber int     `db:"sequence_number" json:"sequence_number"`
+	StartedAt      string  `db:"started_at" json:"started_at"`
+	FinalizedAt    *string `db:"finalized_at" json:"finalized_at"` // nullable
+	ExitClass      *string `db:"exit_class" json:"exit_class"`     // nullable: completed, error, timeout, etc.
+	UsageTokens    *string `db:"usage_tokens" json:"usage_tokens"` // nullable: unknown distinct from zero
+	CreatedAt      string  `db:"created_at" json:"created_at"`
+	UpdatedAt      string  `db:"updated_at" json:"updated_at"`
 }
 
 func invalid(code, message string) error {
@@ -6081,4 +6122,215 @@ func (s *sqliteStore) canonicalizeManifest(raw json.RawMessage, taskID string) (
 	canonical := strings.TrimSuffix(buf.String(), "\n")
 	sum := sha256.Sum256([]byte(canonical))
 	return &canonicalManifest{parentTaskID: m.ParentTaskID, json: canonical, digest: hex.EncodeToString(sum[:])}, nil
+}
+
+// RequestPermit requests or retrieves an existing permit by request ID.
+// If the requestID already exists, returns the existing permit (stable retry).
+// Otherwise creates a new permit with a fresh attempt ID.
+func (s *sqliteStore) RequestPermit(ctx context.Context, requestID, taskID, projectID, agentID, model, accountPool string) (ResearchPermit, error) {
+	// First, try to find an existing permit with this request ID
+	var existing ResearchPermit
+	err := s.conn.QueryRowContext(ctx,
+		`SELECT id, task_id, project_id, agent_id, model, account_pool, request_id, attempt_id, state, attempt_started_at, attempt_finalized_at, created_at, updated_at FROM research_permit WHERE request_id = ?`,
+		requestID,
+	).Scan(&existing.ID, &existing.TaskID, &existing.ProjectID, &existing.AgentID, &existing.Model, &existing.AccountPool, &existing.RequestID, &existing.AttemptID, &existing.State, &existing.AttemptStartedAt, &existing.AttemptFinalizedAt, &existing.CreatedAt, &existing.UpdatedAt)
+
+	if err == nil {
+		return existing, nil
+	}
+	if err != sql.ErrNoRows {
+		return ResearchPermit{}, fmt.Errorf("query existing permit failed: %w", err)
+	}
+
+	// Create a new permit with a fresh attempt ID
+	permitID := GenerateID()
+	attemptID := GenerateID()
+	now := nowTimestamp()
+
+	_, err = s.conn.ExecContext(ctx,
+		`INSERT INTO research_permit (id, task_id, project_id, agent_id, model, account_pool, request_id, attempt_id, state, attempt_started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		permitID, taskID, projectID, agentID, model, accountPool, requestID, attemptID, "active", now, now, now,
+	)
+	if err != nil {
+		return ResearchPermit{}, fmt.Errorf("insert permit failed: %w", err)
+	}
+
+	// Create the corresponding attempt record
+	attemptRowID := GenerateID()
+	_, err = s.conn.ExecContext(ctx,
+		`INSERT INTO research_attempt (id, permit_id, sequence_number, started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		attemptRowID, permitID, 1, now, now, now,
+	)
+	if err != nil {
+		return ResearchPermit{}, fmt.Errorf("insert attempt failed: %w", err)
+	}
+
+	return ResearchPermit{
+		ID:               permitID,
+		TaskID:           taskID,
+		ProjectID:        projectID,
+		AgentID:          agentID,
+		Model:            model,
+		AccountPool:      accountPool,
+		RequestID:        requestID,
+		AttemptID:        attemptID,
+		State:            "active",
+		AttemptStartedAt: now,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}, nil
+}
+
+// GetPermit retrieves a permit by ID.
+func (s *sqliteStore) GetPermit(ctx context.Context, permitID string) (ResearchPermit, error) {
+	var p ResearchPermit
+	err := s.conn.QueryRowContext(ctx,
+		`SELECT id, task_id, project_id, agent_id, model, account_pool, request_id, attempt_id, state, attempt_started_at, attempt_finalized_at, created_at, updated_at FROM research_permit WHERE id = ?`,
+		permitID,
+	).Scan(&p.ID, &p.TaskID, &p.ProjectID, &p.AgentID, &p.Model, &p.AccountPool, &p.RequestID, &p.AttemptID, &p.State, &p.AttemptStartedAt, &p.AttemptFinalizedAt, &p.CreatedAt, &p.UpdatedAt)
+
+	if err == sql.ErrNoRows {
+		return ResearchPermit{}, fmt.Errorf("permit not found")
+	}
+	if err != nil {
+		return ResearchPermit{}, fmt.Errorf("query permit failed: %w", err)
+	}
+	return p, nil
+}
+
+// RenewPermit refreshes a permit's timestamps.
+// Idempotent: only updates if the attempt ID matches (fenced by attempt identity).
+func (s *sqliteStore) RenewPermit(ctx context.Context, permitID, attemptID string) (ResearchPermit, error) {
+	now := nowTimestamp()
+
+	// Update only if attempt_id matches (fence against stale operations)
+	res, err := s.conn.ExecContext(ctx,
+		`UPDATE research_permit SET updated_at = ?, attempt_started_at = ? WHERE id = ? AND attempt_id = ?`,
+		now, now, permitID, attemptID,
+	)
+	if err != nil {
+		return ResearchPermit{}, fmt.Errorf("update permit failed: %w", err)
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return ResearchPermit{}, fmt.Errorf("rows affected failed: %w", err)
+	}
+	if affected == 0 {
+		return ResearchPermit{}, fmt.Errorf("permit not found or attempt ID mismatch")
+	}
+
+	return s.GetPermit(ctx, permitID)
+}
+
+// FinalizePermit marks a permit as finalized with optional exit class and usage.
+// Idempotent: only updates if the attempt ID matches (fenced by attempt identity).
+func (s *sqliteStore) FinalizePermit(ctx context.Context, permitID, attemptID string, exitClass *string, usageTokens *string) (ResearchPermit, error) {
+	now := nowTimestamp()
+
+	// Update only if attempt_id matches (fence against stale operations)
+	res, err := s.conn.ExecContext(ctx,
+		`UPDATE research_permit SET state = 'finalized', attempt_finalized_at = ?, updated_at = ? WHERE id = ? AND attempt_id = ?`,
+		now, now, permitID, attemptID,
+	)
+	if err != nil {
+		return ResearchPermit{}, fmt.Errorf("update permit failed: %w", err)
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return ResearchPermit{}, fmt.Errorf("rows affected failed: %w", err)
+	}
+	if affected == 0 {
+		return ResearchPermit{}, fmt.Errorf("permit not found or attempt ID mismatch")
+	}
+
+	// Update the corresponding attempt record with exit class and usage
+	_, err = s.conn.ExecContext(ctx,
+		`UPDATE research_attempt SET finalized_at = ?, exit_class = ?, usage_tokens = ?, updated_at = ? WHERE permit_id = ?`,
+		now, exitClass, usageTokens, now, permitID,
+	)
+	if err != nil {
+		return ResearchPermit{}, fmt.Errorf("update attempt failed: %w", err)
+	}
+
+	return s.GetPermit(ctx, permitID)
+}
+
+// ListActivePermits lists permits by state (active, expired, finalized).
+func (s *sqliteStore) ListActivePermits(ctx context.Context, state string) ([]ResearchPermit, error) {
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT id, task_id, project_id, agent_id, model, account_pool, request_id, attempt_id, state, attempt_started_at, attempt_finalized_at, created_at, updated_at FROM research_permit WHERE state = ? ORDER BY created_at DESC`,
+		state,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query permits failed: %w", err)
+	}
+	defer rows.Close()
+
+	var permits []ResearchPermit
+	for rows.Next() {
+		var p ResearchPermit
+		err := rows.Scan(&p.ID, &p.TaskID, &p.ProjectID, &p.AgentID, &p.Model, &p.AccountPool, &p.RequestID, &p.AttemptID, &p.State, &p.AttemptStartedAt, &p.AttemptFinalizedAt, &p.CreatedAt, &p.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("scan permit failed: %w", err)
+		}
+		permits = append(permits, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration failed: %w", err)
+	}
+	return permits, nil
+}
+
+// ListPermitsByProject lists permits for a specific project.
+func (s *sqliteStore) ListPermitsByProject(ctx context.Context, projectID string) ([]ResearchPermit, error) {
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT id, task_id, project_id, agent_id, model, account_pool, request_id, attempt_id, state, attempt_started_at, attempt_finalized_at, created_at, updated_at FROM research_permit WHERE project_id = ? ORDER BY created_at DESC`,
+		projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query permits failed: %w", err)
+	}
+	defer rows.Close()
+
+	var permits []ResearchPermit
+	for rows.Next() {
+		var p ResearchPermit
+		err := rows.Scan(&p.ID, &p.TaskID, &p.ProjectID, &p.AgentID, &p.Model, &p.AccountPool, &p.RequestID, &p.AttemptID, &p.State, &p.AttemptStartedAt, &p.AttemptFinalizedAt, &p.CreatedAt, &p.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("scan permit failed: %w", err)
+		}
+		permits = append(permits, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration failed: %w", err)
+	}
+	return permits, nil
+}
+
+// ListPermitsByPool lists permits for a specific account pool.
+func (s *sqliteStore) ListPermitsByPool(ctx context.Context, accountPool string) ([]ResearchPermit, error) {
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT id, task_id, project_id, agent_id, model, account_pool, request_id, attempt_id, state, attempt_started_at, attempt_finalized_at, created_at, updated_at FROM research_permit WHERE account_pool = ? ORDER BY created_at DESC`,
+		accountPool,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query permits failed: %w", err)
+	}
+	defer rows.Close()
+
+	var permits []ResearchPermit
+	for rows.Next() {
+		var p ResearchPermit
+		err := rows.Scan(&p.ID, &p.TaskID, &p.ProjectID, &p.AgentID, &p.Model, &p.AccountPool, &p.RequestID, &p.AttemptID, &p.State, &p.AttemptStartedAt, &p.AttemptFinalizedAt, &p.CreatedAt, &p.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("scan permit failed: %w", err)
+		}
+		permits = append(permits, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration failed: %w", err)
+	}
+	return permits, nil
 }
