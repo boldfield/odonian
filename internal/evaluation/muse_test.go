@@ -10,7 +10,26 @@ import (
 )
 
 func TestMuseIdentity(t *testing.T) {
-	id := buildMuseIdentity()
+	// Save original env and PATH.
+	oldPath := os.Getenv("PATH")
+	defer func() {
+		if oldPath != "" {
+			os.Setenv("PATH", oldPath)
+		}
+	}()
+
+	// Set up a temp directory with a fake muse executable.
+	dir := t.TempDir()
+	musePath := filepath.Join(dir, "muse")
+	if err := os.WriteFile(musePath, []byte("#!/bin/sh\necho 'muse-spark-1.3'"), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+	os.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	id, err := buildMuseIdentity()
+	if err != nil {
+		t.Fatalf("buildMuseIdentity failed: %v", err)
+	}
 
 	// Verify all required fields are set and not Unknown.
 	if id.AdapterName != "muse" {
@@ -22,14 +41,23 @@ func TestMuseIdentity(t *testing.T) {
 	if id.ModelID != "muse-code" {
 		t.Errorf("model_id = %q, want muse-code", id.ModelID)
 	}
-	if !strings.Contains(id.ModelRevision, "spark") {
-		t.Errorf("model_revision = %q, want to contain spark", id.ModelRevision)
+	if id.ModelRevision != MuseVersion {
+		t.Errorf("model_revision = %q, want %q", id.ModelRevision, MuseVersion)
 	}
 	if id.RuntimeName == "" || id.RuntimeName == Unknown {
 		t.Errorf("runtime_name = %q, want non-empty", id.RuntimeName)
 	}
-	if !strings.Contains(id.RuntimeVersion, "spark") {
-		t.Errorf("runtime_version = %q, want to contain spark", id.RuntimeVersion)
+	if id.RuntimeVersion == "" || id.RuntimeVersion == Unknown {
+		t.Errorf("runtime_version = %q, want non-empty", id.RuntimeVersion)
+	}
+	if id.PromptVersion != Unknown {
+		t.Errorf("prompt_version = %q, want unknown", id.PromptVersion)
+	}
+	if id.Tools.Known {
+		t.Errorf("tools should be unknown, got known=%v", id.Tools.Known)
+	}
+	if id.Observers.Known {
+		t.Errorf("observers should be unknown, got known=%v", id.Observers.Known)
 	}
 	if id.AccountPool != "meta-power" {
 		t.Errorf("account_pool = %q, want meta-power", id.AccountPool)
@@ -42,23 +70,26 @@ func TestMuseIdentity(t *testing.T) {
 }
 
 func TestMusePreflightMissingMuse(t *testing.T) {
-	id := buildMuseIdentity()
-	stderr := &bytes.Buffer{}
-
-	missing, err := musePreflight(stderr, &id)
-
-	// If muse is not installed, we expect an error mentioning "not installed" or "executable file not found".
-	// If muse is installed, we expect no error and no missing capabilities.
-	if err != nil {
-		if !strings.Contains(err.Error(), "not installed") && !strings.Contains(err.Error(), "executable file not found") {
-			t.Errorf("unexpected error: %v", err)
+	// Save original PATH.
+	oldPath := os.Getenv("PATH")
+	defer func() {
+		if oldPath != "" {
+			os.Setenv("PATH", oldPath)
 		}
-		// Expected behavior in test environments where muse is not installed.
-		return
-	}
+	}()
 
-	if missing != nil && len(missing) > 0 {
-		t.Errorf("expected no missing capabilities, got %v", missing)
+	// Set PATH to exclude muse.
+	os.Setenv("PATH", "/dev/null")
+
+	stderr := &bytes.Buffer{}
+	_, err := musePreflight(stderr)
+
+	// muse should not be found.
+	if err == nil {
+		t.Error("expected error for missing muse, got none")
+	}
+	if !strings.Contains(err.Error(), "not installed") && !strings.Contains(err.Error(), "executable file not found") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
@@ -76,11 +107,10 @@ func TestMusePreflightAPIKeyDetection(t *testing.T) {
 	// Test with API key set (simulating pay-as-you-go override).
 	os.Setenv("META_API_KEY", "fake-key-12345")
 
-	id := buildMuseIdentity()
 	stderr := &bytes.Buffer{}
-	missing, err := musePreflight(stderr, &id)
+	missing, err := musePreflight(stderr)
 
-	// The preflight should ALWAYS reject an explicit META_API_KEY, even if muse is available.
+	// The preflight should ALWAYS reject an explicit META_API_KEY.
 	if err == nil {
 		t.Error("expected error for META_API_KEY override, got none")
 	}
@@ -93,14 +123,43 @@ func TestMusePreflightAPIKeyDetection(t *testing.T) {
 }
 
 func TestMuseMainPreflightMode(t *testing.T) {
+	// Save original PATH and MUSE_AUTH.
+	oldPath := os.Getenv("PATH")
+	oldAuth := os.Getenv("MUSE_AUTH")
+	defer func() {
+		if oldPath != "" {
+			os.Setenv("PATH", oldPath)
+		}
+		if oldAuth != "" {
+			os.Setenv("MUSE_AUTH", oldAuth)
+		} else {
+			os.Unsetenv("MUSE_AUTH")
+		}
+	}()
+
+	// Set up a temp directory with a fake muse executable and auth file.
 	dir := t.TempDir()
-	reqPath := filepath.Join(dir, "request.json")
-	resultPath := filepath.Join(dir, "result.json")
+	musePath := filepath.Join(dir, "muse")
+	if err := os.WriteFile(musePath, []byte("#!/bin/sh\nif [ \"$1\" = '--help' ]; then echo 'muse help'; fi\necho 'muse-spark-1.3'"), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+
+	// Create a fake auth file.
+	authPath := filepath.Join(dir, "auth")
+	if err := os.WriteFile(authPath, []byte("fake-auth-token"), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	os.Setenv("MUSE_AUTH", authPath)
+	os.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	tmpDir := t.TempDir()
+	reqPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
 
 	req := CandidateRequest{
 		Version:       ProtocolVersion,
 		RunID:         "run-muse-1",
-		SnapshotPath:  dir,
+		SnapshotPath:  tmpDir,
 		BlindedPrompt: "review this code",
 		ToolAccess:    ToolAccessRequirements{RequireSourceRetrieval: true},
 		ResultPath:    resultPath,
@@ -117,42 +176,14 @@ func TestMuseMainPreflightMode(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	code := MuseMain([]string{"--request", reqPath, "--preflight"}, stderr)
 
-	// Always read and validate the response.
-	result, err := os.ReadFile(resultPath)
-	if err != nil {
-		t.Fatalf("read result: %v", err)
-	}
-	var resp CandidateResponse
-	if err := json.Unmarshal(result, &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if err := resp.Validate(); err != nil {
-		t.Fatalf("response validation failed: %v", err)
-	}
-	if resp.RunID != req.RunID {
-		t.Errorf("response run_id = %q, want %q", resp.RunID, req.RunID)
+	// Preflight-only mode with successful checks should exit 0 and not write a response.
+	if code != 0 {
+		t.Errorf("MuseMain returned %d, want 0 (preflight success)", code)
 	}
 
-	if code == 0 {
-		// muse is installed; check for success.
-		if resp.Status != StatusCompleted {
-			t.Errorf("response status = %q, want completed", resp.Status)
-		}
-		if !resp.ReviewCompleted {
-			t.Errorf("response review_completed = %v, want true", resp.ReviewCompleted)
-		}
-	} else if code == 1 {
-		// muse not installed is OK; check for failed status.
-		if resp.Status != StatusFailed {
-			t.Errorf("response status = %q, want failed", resp.Status)
-		}
-		if strings.Contains(resp.ErrorMessage, "not installed") || strings.Contains(resp.ErrorMessage, "executable file not found") {
-			// Expected error message.
-		} else {
-			t.Errorf("expected 'not installed' in error message, got: %s", resp.ErrorMessage)
-		}
-	} else {
-		t.Fatalf("unexpected exit code %d", code)
+	// Result file should not exist for successful preflight.
+	if _, err := os.Stat(resultPath); err == nil {
+		t.Errorf("expected no result file for successful preflight, but file exists")
 	}
 }
 
@@ -189,15 +220,31 @@ func TestMuseMainInvalidRequest(t *testing.T) {
 }
 
 func TestMuseMainMissingResultDir(t *testing.T) {
+	// Save original PATH.
+	oldPath := os.Getenv("PATH")
+	defer func() {
+		if oldPath != "" {
+			os.Setenv("PATH", oldPath)
+		}
+	}()
+
+	// Set up a temp directory with a fake muse executable.
 	dir := t.TempDir()
-	reqPath := filepath.Join(dir, "request.json")
+	musePath := filepath.Join(dir, "muse")
+	if err := os.WriteFile(musePath, []byte("#!/bin/sh\necho 'muse-spark-1.3'"), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+	os.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	tmpDir := t.TempDir()
+	reqPath := filepath.Join(tmpDir, "request.json")
 	// Result path in a non-existent directory that can't be created.
-	resultPath := filepath.Join(dir, "subdir", "result.json")
+	resultPath := filepath.Join(tmpDir, "subdir", "result.json")
 
 	req := CandidateRequest{
 		Version:       ProtocolVersion,
 		RunID:         "run-1",
-		SnapshotPath:  dir,
+		SnapshotPath:  tmpDir,
 		BlindedPrompt: "test",
 		ToolAccess:    ToolAccessRequirements{},
 		ResultPath:    resultPath,
@@ -222,12 +269,191 @@ func TestMuseMainMissingResultDir(t *testing.T) {
 	}
 }
 
+func TestMuseMainMalformedOutput(t *testing.T) {
+	// Save original PATH and MUSE_AUTH.
+	oldPath := os.Getenv("PATH")
+	oldAuth := os.Getenv("MUSE_AUTH")
+	defer func() {
+		if oldPath != "" {
+			os.Setenv("PATH", oldPath)
+		}
+		if oldAuth != "" {
+			os.Setenv("MUSE_AUTH", oldAuth)
+		} else {
+			os.Unsetenv("MUSE_AUTH")
+		}
+	}()
+
+	// Set up a temp directory with a fake muse executable that outputs malformed JSON.
+	dir := t.TempDir()
+	musePath := filepath.Join(dir, "muse")
+	// Fake muse that outputs invalid JSON when called with exec
+	museSh := `#!/bin/sh
+if [ "$1" = "--help" ]; then
+  echo "muse help"
+elif [ "$1" = "exec" ]; then
+  echo '{"invalid json'
+else
+  echo "muse-spark-1.3"
+fi`
+	if err := os.WriteFile(musePath, []byte(museSh), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+
+	// Create a fake auth file.
+	authPath := filepath.Join(dir, "auth")
+	if err := os.WriteFile(authPath, []byte("fake-auth-token"), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	os.Setenv("MUSE_AUTH", authPath)
+	os.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	tmpDir := t.TempDir()
+	reqPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:       ProtocolVersion,
+		RunID:         "run-malformed",
+		SnapshotPath:  tmpDir,
+		BlindedPrompt: "review this",
+		ToolAccess:    ToolAccessRequirements{},
+		ResultPath:    resultPath,
+	}
+
+	data, _ := json.Marshal(req)
+	os.WriteFile(reqPath, data, 0o600)
+
+	stderr := &bytes.Buffer{}
+	code := MuseMain([]string{"--request", reqPath}, stderr)
+
+	if code != 1 {
+		t.Errorf("MuseMain returned %d, want 1 (malformed output)", code)
+	}
+
+	// Check that a response was written with error status.
+	result, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	var resp CandidateResponse
+	if err := json.Unmarshal(result, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != StatusFailed {
+		t.Errorf("response status = %q, want failed", resp.Status)
+	}
+	if resp.ErrorClass != ErrClassOutputMalformed {
+		t.Errorf("error_class = %q, want output_malformed", resp.ErrorClass)
+	}
+}
+
+func TestMuseMainAuthFailure(t *testing.T) {
+	// Save original env.
+	oldAuth := os.Getenv("MUSE_AUTH")
+	oldConfig := os.Getenv("MUSE_CONFIG")
+	oldPath := os.Getenv("PATH")
+	oldHome := os.Getenv("HOME")
+
+	defer func() {
+		if oldAuth != "" {
+			os.Setenv("MUSE_AUTH", oldAuth)
+		} else {
+			os.Unsetenv("MUSE_AUTH")
+		}
+		if oldConfig != "" {
+			os.Setenv("MUSE_CONFIG", oldConfig)
+		} else {
+			os.Unsetenv("MUSE_CONFIG")
+		}
+		if oldPath != "" {
+			os.Setenv("PATH", oldPath)
+		}
+		if oldHome != "" {
+			os.Setenv("HOME", oldHome)
+		}
+	}()
+
+	// Set up a temp directory with a fake muse executable.
+	dir := t.TempDir()
+	musePath := filepath.Join(dir, "muse")
+	if err := os.WriteFile(musePath, []byte("#!/bin/sh\necho 'muse-spark-1.3'"), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+	os.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	// Clear auth env vars and set HOME to a directory without .muse/auth.
+	os.Unsetenv("MUSE_AUTH")
+	os.Unsetenv("MUSE_CONFIG")
+	os.Setenv("HOME", dir) // dir has no .muse/auth subdirectory
+
+	tmpDir := t.TempDir()
+	reqPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:       ProtocolVersion,
+		RunID:         "run-auth",
+		SnapshotPath:  tmpDir,
+		BlindedPrompt: "review this",
+		ToolAccess:    ToolAccessRequirements{},
+		ResultPath:    resultPath,
+	}
+
+	data, _ := json.Marshal(req)
+	os.WriteFile(reqPath, data, 0o600)
+
+	stderr := &bytes.Buffer{}
+	code := MuseMain([]string{"--request", reqPath}, stderr)
+
+	if code != 1 {
+		t.Errorf("MuseMain returned %d, want 1 (auth failure)", code)
+	}
+
+	// Check that a response was written with auth error.
+	result, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	var resp CandidateResponse
+	if err := json.Unmarshal(result, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != StatusFailed {
+		t.Errorf("response status = %q, want failed", resp.Status)
+	}
+	if resp.ErrorClass != ErrClassAuthMissing {
+		t.Errorf("error_class = %q, want auth_missing", resp.ErrorClass)
+	}
+}
+
 func TestMuseIdentityDigest(t *testing.T) {
-	id := buildMuseIdentity()
+	// Save original PATH.
+	oldPath := os.Getenv("PATH")
+	defer func() {
+		if oldPath != "" {
+			os.Setenv("PATH", oldPath)
+		}
+	}()
+
+	// Set up a temp directory with a fake muse executable.
+	dir := t.TempDir()
+	musePath := filepath.Join(dir, "muse")
+	if err := os.WriteFile(musePath, []byte("#!/bin/sh\necho 'muse-spark-1.3'"), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+	os.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	id, err := buildMuseIdentity()
+	if err != nil {
+		t.Fatalf("buildMuseIdentity failed: %v", err)
+	}
+
 	digest1 := id.Digest()
 
 	// Same identity should have same digest.
-	digest2 := id.Digest()
+	id2, _ := buildMuseIdentity()
+	digest2 := id2.Digest()
 	if digest1 != digest2 {
 		t.Errorf("digest mismatch for same identity: %s vs %s", digest1, digest2)
 	}
@@ -242,7 +468,27 @@ func TestMuseIdentityDigest(t *testing.T) {
 }
 
 func TestMuseResponseValidation(t *testing.T) {
-	id := buildMuseIdentity()
+	// Save original PATH.
+	oldPath := os.Getenv("PATH")
+	defer func() {
+		if oldPath != "" {
+			os.Setenv("PATH", oldPath)
+		}
+	}()
+
+	// Set up a temp directory with a fake muse executable.
+	dir := t.TempDir()
+	musePath := filepath.Join(dir, "muse")
+	if err := os.WriteFile(musePath, []byte("#!/bin/sh\necho 'muse-spark-1.3'"), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+	os.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	id, err := buildMuseIdentity()
+	if err != nil {
+		t.Fatalf("buildMuseIdentity failed: %v", err)
+	}
+
 	base := CandidateResponse{
 		Version:         ProtocolVersion,
 		RunID:           "run-1",
