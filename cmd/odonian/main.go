@@ -59,8 +59,40 @@ func (e *handledError) Error() string {
 	return "handled"
 }
 
+type schedulingError struct {
+	message           string
+	retryAfterSeconds *int64
+	code              int
+}
+
+func (e *schedulingError) Error() string {
+	return e.message
+}
+
+type conflictError struct {
+	message string
+	code    int
+}
+
+func (e *conflictError) Error() string {
+	return e.message
+}
+
 func main() {
 	if err := run(os.Args); err != nil {
+		var schedErr *schedulingError
+		if errors.As(err, &schedErr) {
+			fmt.Fprintf(os.Stderr, "scheduling: %v\n", schedErr.Error())
+			if schedErr.retryAfterSeconds != nil {
+				fmt.Fprintf(os.Stderr, "retry-after: %d\n", *schedErr.retryAfterSeconds)
+			}
+			os.Exit(schedErr.code)
+		}
+		var conflErr *conflictError
+		if errors.As(err, &conflErr) {
+			fmt.Fprintf(os.Stderr, "conflict: %v\n", conflErr.Error())
+			os.Exit(conflErr.code)
+		}
 		var claimErr *claimError
 		if errors.As(err, &claimErr) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", claimErr.Error())
@@ -861,13 +893,35 @@ func executeClaim(ctx context.Context, baseURL, token string, args []string) err
 
 	// Create client and claim task
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	if err := client.ClaimTask(ctx, taskID, agentID, model); err != nil {
+	admission, err := client.ClaimTask(ctx, taskID, agentID, model)
+	if err != nil {
 		if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 			return &claimError{message: "already claimed", code: 3}
+		}
+		var apiErr *tuiclient.APIError
+		if errors.As(err, &apiErr) {
+			if apiErr.StatusCode == 429 {
+				return &schedulingError{
+					message:           apiErr.Error(),
+					retryAfterSeconds: apiErr.RetryAfterSeconds,
+					code:              2,
+				}
+			}
+			if apiErr.StatusCode == 409 {
+				return &conflictError{message: apiErr.Error(), code: 11}
+			}
 		}
 		return err
 	}
 	saveAttempt(client, taskID)
+
+	if admission != nil {
+		output, err := json.MarshalIndent(admission, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %w", err)
+		}
+		fmt.Fprintln(os.Stdout, string(output))
+	}
 
 	return nil
 }
@@ -1420,7 +1474,7 @@ func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			return err
 		}
 
-		if err := client.ClaimTask(ctx, task.ID, agentID, model); err != nil {
+		if _, err := client.ClaimTask(ctx, task.ID, agentID, model); err != nil {
 			if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 				return &claimError{message: "raced, none claimed", code: 2}
 			}
@@ -2037,7 +2091,7 @@ func executeResearchStatus(ctx context.Context, baseURL, token string, jsonOutpu
 				fmt.Fprintf(out, "    Active: %d\n", pool.Active)
 				fmt.Fprintf(out, "    Active Completion: %d\n", pool.ActiveCompletion)
 				fmt.Fprintf(out, "    Deferred: %d\n", pool.Deferred)
-				fmt.Fprintf(out, "    Tokens: %s\n", pool.Tokens)
+				fmt.Fprintf(out, "    Tokens: %g\n", pool.Tokens)
 				fmt.Fprintf(out, "    Settled At: %s\n", pool.SettledAt)
 			}
 		}
@@ -2090,6 +2144,20 @@ func executePermitRenew(ctx context.Context, baseURL, token string, args []strin
 	client := tuiclient.NewHTTPClient(baseURL, token)
 	attempt, err := client.RenewResearchPermit(ctx, permitID, *taskIDFlag, *modelFlag, *agentIDFlag, *requestIDFlag, *attemptIDFlag)
 	if err != nil {
+		var apiErr *tuiclient.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.Code {
+			case "ATTEMPT_FENCED", "EXPIRED", "FINALIZED", "PERMIT_IDENTITY_MISMATCH":
+				return &conflictError{message: apiErr.Error(), code: 11}
+			}
+			if apiErr.StatusCode == 429 {
+				return &schedulingError{
+					message:           apiErr.Error(),
+					retryAfterSeconds: apiErr.RetryAfterSeconds,
+					code:              2,
+				}
+			}
+		}
 		return fmt.Errorf("failed to renew research permit: %w", err)
 	}
 
@@ -2149,13 +2217,37 @@ func executePermitFinalize(ctx context.Context, baseURL, token string, args []st
 	}
 
 	var usageTokens *int64
-	if *usageTokensFlag > 0 {
+	usageTokensSet := false
+	for i, arg := range args {
+		if arg == "--usage-tokens" && i+1 < len(args) {
+			usageTokensSet = true
+			break
+		} else if strings.HasPrefix(arg, "--usage-tokens=") {
+			usageTokensSet = true
+			break
+		}
+	}
+	if usageTokensSet {
 		usageTokens = usageTokensFlag
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
 	attempt, err := client.FinalizeResearchPermit(ctx, permitID, *taskIDFlag, *modelFlag, *agentIDFlag, *requestIDFlag, *attemptIDFlag, *exitClassFlag, usageTokens)
 	if err != nil {
+		var apiErr *tuiclient.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.Code {
+			case "ATTEMPT_FENCED", "EXPIRED", "FINALIZED", "PERMIT_IDENTITY_MISMATCH":
+				return &conflictError{message: apiErr.Error(), code: 11}
+			}
+			if apiErr.StatusCode == 429 {
+				return &schedulingError{
+					message:           apiErr.Error(),
+					retryAfterSeconds: apiErr.RetryAfterSeconds,
+					code:              2,
+				}
+			}
+		}
 		return fmt.Errorf("failed to finalize research permit: %w", err)
 	}
 

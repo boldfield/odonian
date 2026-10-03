@@ -37,7 +37,7 @@ func TestAttemptCarriedFromClaimToHeartbeatAndSubmit(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	claimer := tuiclient.NewHTTPClient(ts.URL, "tok")
-	if err := claimer.ClaimTask(t.Context(), "task-1", "agent", "opus"); err != nil {
+	if _, err := claimer.ClaimTask(t.Context(), "task-1", "agent", "opus"); err != nil {
 		t.Fatal(err)
 	}
 	saveAttempt(claimer, "task-1")

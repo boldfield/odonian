@@ -13,7 +13,7 @@ type MockClient struct {
 	ListEventsFunc                    func(ctx context.Context, taskID string) ([]Event, error)
 	ListDocumentsFunc                 func(ctx context.Context, projectID string) ([]Document, error)
 	PromoteTaskFunc                   func(ctx context.Context, id string) error
-	ClaimTaskFunc                     func(ctx context.Context, id, agentID, model string) error
+	ClaimTaskFunc                     func(ctx context.Context, id, agentID, model string) (*ResearchAdmission, error)
 	ReviewTaskFunc                    func(ctx context.Context, id, actor, verdict string, note *string) error
 	TransitionTaskFunc                func(ctx context.Context, id, to string, note *string) error
 	HeartbeatTaskFunc                 func(ctx context.Context, id, agentID string) error
@@ -79,11 +79,11 @@ func (m *MockClient) PromoteTask(ctx context.Context, id string) error {
 	return m.PromoteTaskFunc(ctx, id)
 }
 
-func (m *MockClient) ClaimTask(ctx context.Context, id, agentID, model string) error {
+func (m *MockClient) ClaimTask(ctx context.Context, id, agentID, model string) (*ResearchAdmission, error) {
 	if m.ClaimTaskFunc != nil {
 		return m.ClaimTaskFunc(ctx, id, agentID, model)
 	}
-	return nil
+	return nil, nil
 }
 
 func (m *MockClient) ReviewTask(ctx context.Context, id, actor, verdict string, note *string) error {

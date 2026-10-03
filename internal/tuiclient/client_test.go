@@ -1006,7 +1006,7 @@ func TestClaimTask(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
 	if err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
@@ -1026,7 +1026,7 @@ func TestClaimTaskAlreadyClaimed(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
 	if err == nil {
 		t.Fatal("Expected error from 409 response, got nil")
 	}
@@ -1050,7 +1050,7 @@ func TestClaimTaskServerError(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
 	if err == nil {
 		t.Fatal("Expected error from 500 response, got nil")
 	}
