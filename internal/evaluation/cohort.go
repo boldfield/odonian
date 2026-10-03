@@ -5,6 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"sort"
 )
 
@@ -139,21 +143,128 @@ func (b *SnapshotBuilder) Build() (EvaluationSnapshot, error) {
 		return snap, nil
 	}
 
-	// For available samples, compute content-addressed digest
-	// This would normally include the actual staged files
-	// For now, we create a digest that includes the SHA and sample info
-	h := sha256.New()
-	fmt.Fprintf(h, "snapshot:v1:%s:%s:%s:%s", b.SampleID, b.OriginalTaskID, b.SubmittedSHA, b.CandidateID)
-	snap.SnapshotDigest = hex.EncodeToString(h.Sum(nil))
+	// Create a fresh workspace directory for staging
+	workspaceDir, err := ioutil.TempDir("", "snapshot-"+b.SampleID+"-*")
+	if err != nil {
+		return EvaluationSnapshot{}, fmt.Errorf("create workspace directory: %w", err)
+	}
 
-	// TODO: In full implementation, would stage actual files here:
-	// - Create workspace directory
-	// - Checkout original artifact from SubmittedSHA
-	// - Copy source context without git history
-	// - Compute actual content-addressed digest over staged files
-	// - Exclude PR discussions, reviewer findings, etc.
+	// Stage artifact and source context using provided fetchers
+	contentDigest := sha256.New()
+
+	// If artifact fetcher is provided, stage it
+	if b.ArtifactFetcher != nil {
+		artifactData, err := b.ArtifactFetcher(b.SubmittedSHA)
+		if err != nil {
+			os.RemoveAll(workspaceDir)
+			return EvaluationSnapshot{}, fmt.Errorf("fetch artifact: %w", err)
+		}
+		if len(artifactData) > 0 {
+			artifactPath := filepath.Join(workspaceDir, "artifact")
+			if err := ioutil.WriteFile(artifactPath, artifactData, 0644); err != nil {
+				os.RemoveAll(workspaceDir)
+				return EvaluationSnapshot{}, fmt.Errorf("write artifact: %w", err)
+			}
+			snap.ArtifactPath = artifactPath
+			// Include artifact in digest
+			fmt.Fprintf(contentDigest, "artifact:%x:", sha256.Sum256(artifactData))
+		}
+	}
+
+	// If source fetcher is provided, stage source context
+	sourcePaths := []string{}
+	if b.SourceFetcher != nil {
+		sources, err := b.SourceFetcher()
+		if err != nil {
+			os.RemoveAll(workspaceDir)
+			return EvaluationSnapshot{}, fmt.Errorf("fetch source context: %w", err)
+		}
+		for name, data := range sources {
+			srcPath := filepath.Join(workspaceDir, "source", name)
+			srcDir := filepath.Dir(srcPath)
+			if err := os.MkdirAll(srcDir, 0755); err != nil {
+				os.RemoveAll(workspaceDir)
+				return EvaluationSnapshot{}, fmt.Errorf("create source directory: %w", err)
+			}
+			if err := ioutil.WriteFile(srcPath, data, 0644); err != nil {
+				os.RemoveAll(workspaceDir)
+				return EvaluationSnapshot{}, fmt.Errorf("write source file %s: %w", name, err)
+			}
+			sourcePaths = append(sourcePaths, srcPath)
+			// Include source in digest
+			fmt.Fprintf(contentDigest, "source:%s:%x:", name, sha256.Sum256(data))
+		}
+	}
+	snap.SourceContexts = sourcePaths
+
+	// Compute content-addressed digest over all staged files in workspace
+	if err := b.computeWorkspaceDigest(workspaceDir, contentDigest); err != nil {
+		os.RemoveAll(workspaceDir)
+		return EvaluationSnapshot{}, err
+	}
+
+	// Include sample/candidate/SHA in final digest to ensure per-candidate uniqueness
+	fmt.Fprintf(contentDigest, "sample:%s:task:%s:sha:%s:candidate:%s",
+		b.SampleID, b.OriginalTaskID, b.SubmittedSHA, b.CandidateID)
+	snap.SnapshotDigest = hex.EncodeToString(contentDigest.Sum(nil))
 
 	return snap, nil
+}
+
+// computeWorkspaceDigest walks the workspace directory and includes all files in digest.
+// This ensures the digest can detect tampering or leaked files.
+func (b *SnapshotBuilder) computeWorkspaceDigest(dir string, h io.Writer) error {
+	entries, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read workspace: %w", err)
+	}
+
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if entry.IsDir() {
+			if err := b.walkDir(path, h); err != nil {
+				return err
+			}
+		} else {
+			if err := b.hashFile(path, h); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// walkDir recursively includes all files in a directory in the digest.
+func (b *SnapshotBuilder) walkDir(dir string, h io.Writer) error {
+	entries, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read directory %s: %w", dir, err)
+	}
+
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if entry.IsDir() {
+			if err := b.walkDir(path, h); err != nil {
+				return err
+			}
+		} else {
+			if err := b.hashFile(path, h); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// hashFile reads a file and includes it in the digest.
+func (b *SnapshotBuilder) hashFile(path string, h io.Writer) error {
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read file %s: %w", path, err)
+	}
+	dataHash := sha256.Sum256(data)
+	fmt.Fprintf(h, "file:%s:%x:", filepath.Base(path), dataHash)
+	return nil
 }
 
 // DeterministicCohortBuilder helps construct a reproducible cohort.

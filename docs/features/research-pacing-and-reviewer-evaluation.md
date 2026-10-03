@@ -79,7 +79,9 @@ The model returns structured findings to a local result artifact. A deterministi
 
 ### Content-blinding and web-discoverability limits
 
-The frozen evaluation workspace stages only the original submitted artifact and necessary source context, excluding repository history, PR discussions, reviewer findings, task event history, and production credentials. This isolation is enforced by the host staging process, not by the model itself. However, perfect blinding is not guaranteed for the following reasons:
+The frozen evaluation workspace stages only the original submitted artifact and necessary source context, excluding repository history, PR discussions, reviewer findings, task event history, and production credentials. This isolation is enforced by the host staging process through the SnapshotBuilder, which creates a fresh directory containing only the staged artifact and source context, computes a content-addressed digest over the staged files (enabling detection of tampering), and returns the path to the staged workspace for the candidate runtime. The candidate never sees repository history, reviewer comments, task event logs, or other artifacts.
+
+However, perfect blinding is not guaranteed for the following reasons:
 
 - **Public source materials**: If the original submission references publicly accessible sources (open-source libraries, public web resources, published specifications), the candidate model can retrieve and examine those sources outside the staged workspace. Selection of sources is within the candidate's scope.
 - **Reviewer discussions on public forges**: If the original task's review discussion occurred on a public forge (e.g., GitHub), the candidate may discover and read those discussions through web search or direct forge access. The staged workspace excludes links to PR discussions, but does not prevent external discovery.

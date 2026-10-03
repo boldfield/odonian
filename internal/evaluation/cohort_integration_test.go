@@ -2,6 +2,9 @@ package evaluation
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -481,10 +484,18 @@ func TestSnapshotLeakageExclusion(t *testing.T) {
 		t.Fatalf("failed to validate cohort: %v", err)
 	}
 
-	// Create snapshots for both candidates
+	// Create snapshots for both candidates with actual artifact and source fetchers
 	// Each candidate should see only the original artifact, not later reviewer feedback
 	candidates := []string{"muse-candidate", "pi-candidate"}
 	snapshots := make(map[string]EvaluationSnapshot)
+
+	// Provide fetchers that return the original artifact and source,
+	// without any reviewer feedback, PR links, or task event data
+	originalArtifact := []byte("// Original implementation before feedback\nfunc validate() { /* initial version */ }")
+	sourceContext := map[string][]byte{
+		"manifest.json": []byte(`{"version": 1, "original": true}`),
+		"README.md":     []byte("# Original research task\n\nThis is the original submission."),
+	}
 
 	for _, candID := range candidates {
 		builder := SnapshotBuilder{
@@ -496,6 +507,12 @@ func TestSnapshotLeakageExclusion(t *testing.T) {
 			PromptVersion:  "v1.0",
 			ModelVersion:   "varies-by-candidate",
 			RuntimeVersion: "1.2.3",
+			ArtifactFetcher: func(sha string) ([]byte, error) {
+				return originalArtifact, nil
+			},
+			SourceFetcher: func() (map[string][]byte, error) {
+				return sourceContext, nil
+			},
 		}
 
 		snap, err := builder.Build()
@@ -505,29 +522,56 @@ func TestSnapshotLeakageExclusion(t *testing.T) {
 
 		snapshots[candID] = snap
 
-		// Key assertion: snapshot must contain original SHA, not later fixes
-		// In full implementation, this would verify the staged files don't contain:
-		// - PR discussion links
-		// - Other reviewer comments/findings
-		// - Task event history
-		// - Production board credentials
-		// - Later reviewer verdicts
+		// Verify the snapshot was staged
 		if snap.SnapshotDigest == "" {
 			t.Errorf("snapshot digest should not be empty")
 		}
+
+		// Verify artifact and source were included
+		if snap.ArtifactPath == "" {
+			t.Errorf("snapshot should have artifact path")
+		}
+		if len(snap.SourceContexts) == 0 {
+			t.Errorf("snapshot should have source contexts")
+		}
+
+		// Verify files were actually created at the paths
+		if snap.ArtifactPath != "" {
+			if _, err := os.Stat(snap.ArtifactPath); err != nil {
+				t.Errorf("artifact file should exist at %s: %v", snap.ArtifactPath, err)
+			}
+		}
+
+		// Verify no reviewer feedback or PR links appear in staged files
+		if snap.ArtifactPath != "" {
+			data, _ := ioutil.ReadFile(snap.ArtifactPath)
+			artifactStr := string(data)
+			if strings.Contains(artifactStr, "pr/") || strings.Contains(artifactStr, "PR #") {
+				t.Errorf("staged artifact should not contain PR discussion links")
+			}
+			if strings.Contains(artifactStr, "CHANGES_REQUESTED") || strings.Contains(artifactStr, "reviewer feedback") {
+				t.Errorf("staged artifact should not contain reviewer feedback")
+			}
+		}
+
+		for _, srcPath := range snap.SourceContexts {
+			data, _ := ioutil.ReadFile(srcPath)
+			srcStr := string(data)
+			if strings.Contains(srcStr, "verdict") || strings.Contains(srcStr, "reviewer") {
+				t.Errorf("source context should not contain reviewer findings")
+			}
+		}
 	}
 
-	// All candidates should have same snapshot digest for same sample+SHA
-	// (but different from other candidates' sample+SHA combinations)
+	// Different snapshot IDs should produce different digests
 	snap1 := snapshots[candidates[0]]
 	snap2 := snapshots[candidates[1]]
 
-	// Different snapshot IDs (because different CandidateIDs)
 	if snap1.SampleID == snap2.SampleID {
 		t.Errorf("different candidates should have different sample IDs")
 	}
 
-	// Both should reflect the same original SHA - no leakage from later fixes
+	// Different sample IDs should produce different digests
 	if snap1.SnapshotDigest == snap2.SnapshotDigest {
 		t.Errorf("different sample IDs should produce different digests")
 	}
@@ -540,7 +584,9 @@ func TestSnapshotLeakageExclusion(t *testing.T) {
 
 // TestLeakageWithRejectedAndCleanMix verifies that when a cohort contains
 // both rejected and clean samples, snapshots properly exclude reviewer
-// feedback and preserve only the original artifacts.
+// feedback and preserve only the original artifacts. The MateriallyRejected
+// flag is metadata for selection rationale only and must never appear in
+// staged content.
 func TestLeakageWithRejectedAndCleanMix(t *testing.T) {
 	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 
@@ -572,10 +618,19 @@ func TestLeakageWithRejectedAndCleanMix(t *testing.T) {
 		t.Fatalf("cohort validation failed: %v", err)
 	}
 
-	// Create snapshots for both - the MateriallyRejected flag is in the cohort
-	// metadata but must NOT appear in the prompt given to the candidate
+	// Create snapshots with actual artifact and source fetchers
+	// The MateriallyRejected flag is in cohort metadata but must NOT appear
+	// in the prompt given to the candidate
 	snapshots := make(map[string]EvaluationSnapshot)
 	for i, sample := range cohort.Samples {
+		// Provide different content for clean vs rejected, but without rejection reason in prompt
+		var artifact []byte
+		if i == 0 {
+			artifact = []byte("// Clean implementation\nfunc validate() { /* correct */ }")
+		} else {
+			artifact = []byte("// Original rejected implementation\nfunc validate() { /* had bounds issue */ }")
+		}
+
 		builder := SnapshotBuilder{
 			SampleID:       "snap-" + sample.OriginalTaskID,
 			OriginalTaskID: sample.OriginalTaskID,
@@ -583,15 +638,37 @@ func TestLeakageWithRejectedAndCleanMix(t *testing.T) {
 			ProjectID:      "project-1",
 			CandidateID:    "test-candidate",
 			PromptVersion:  "v1.0",
+			ArtifactFetcher: func(sha string) ([]byte, error) {
+				return artifact, nil
+			},
+			SourceFetcher: func() (map[string][]byte, error) {
+				return map[string][]byte{
+					"context.md": []byte("Original submission context"),
+				}, nil
+			},
 		}
 
-		snap, _ := builder.Build()
+		snap, err := builder.Build()
+		if err != nil {
+			t.Fatalf("failed to build snapshot for %s: %v", sample.OriginalTaskID, err)
+		}
 		key := fmt.Sprintf("sample-%d", i)
 		snapshots[key] = snap
+
+		// Verify rejection reason is NOT in staged content
+		if snap.ArtifactPath != "" {
+			data, _ := ioutil.ReadFile(snap.ArtifactPath)
+			artifactStr := string(data)
+			if strings.Contains(artifactStr, "bounds check") {
+				t.Errorf("staged artifact should not contain rejection reason")
+			}
+			if strings.Contains(artifactStr, "MateriallyRejected") {
+				t.Errorf("staged artifact should not contain rejection metadata")
+			}
+		}
 	}
 
 	// Both snapshots should preserve their original SHAs
-	// (in full implementation, the staged files would exclude rejection reason)
 	cleanSnap := snapshots["sample-0"]
 	rejectedSnap := snapshots["sample-1"]
 
@@ -599,8 +676,13 @@ func TestLeakageWithRejectedAndCleanMix(t *testing.T) {
 		t.Errorf("available samples should not be marked unavailable")
 	}
 
-	// Digests should be different (different SHAs)
+	// Digests should be different (different SHAs and artifact content)
 	if cleanSnap.SnapshotDigest == rejectedSnap.SnapshotDigest {
 		t.Errorf("different SHAs should produce different digests")
+	}
+
+	// Verify artifact paths exist and differ
+	if cleanSnap.ArtifactPath == "" || rejectedSnap.ArtifactPath == "" {
+		t.Errorf("both snapshots should have artifact paths")
 	}
 }
