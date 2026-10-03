@@ -18,10 +18,19 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
 
 **Preclaimed review tasks.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, you are reviewing a preclaimed
 task that has been admitted against the research pacing policy and already claimed. Use the
-preclaimed task ID as-is; do not call `odonian next` or `odonian claim`. Step 2 will validate that
-the preclaimed task is claimed to your agent identity (compare the task's assignee to `$AGENT_ID`
-and verify state is `in_progress`); if validation fails, the task is invalid or already owned by
-another agent — do NOT proceed, STOP.
+preclaimed task ID as-is; do not call `odonian next` or `odonian claim`, and never review any task
+other than `ODONIAN_PRECLAIMED_TASK_ID` (this applies equally to regular reviews and adjudication
+tasks). The permit attempt identity is supplied as `ODONIAN_PRECLAIMED_ATTEMPT_ID`; pass it as
+`--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on every `odonian heartbeat` and `odonian submit`. Step 2
+will validate that the preclaimed task is claimed to your agent identity (compare the task's assignee
+to `$AGENT_ID` and verify state is `in_progress`); if validation fails, the task is invalid or already
+owned by another agent — do NOT proceed, STOP.
+
+**Ordinary (legacy) mode.** If `ODONIAN_PRECLAIMED_TASK_ID` is NOT set, follow step 1 as written
+(`odonian next`, then `odonian claim`). This legacy flow is valid only while the research admission
+policy is not `enforce` (see `odonian research-policy --json`). Under `enforce` the server denies
+unadmitted claims: if `odonian next` or `odonian claim` exits 2 (scheduling denial), report the
+printed reason and retry hint and STOP — do not retry in a loop and do not review any task.
 
 1. **Claim a review task.** Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL"
    --kind review` — it prints the id of the first claimable `review`-kind task (`--kind review`

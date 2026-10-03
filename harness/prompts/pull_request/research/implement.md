@@ -25,18 +25,28 @@ first and claiming at the end is wrong.
 **Preclaimed tasks.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, you are working a preclaimed task that
 has been admitted against the research pacing policy and already claimed. Skip steps 1–2 entirely and
 go directly to step 3: use the preclaimed task ID as-is. You must not call `odonian next` or
-`odonian claim` again. Step 3 will validate that the preclaimed task is claimed to your agent identity
-(compare the task's assignee to `$AGENT_ID` and verify state is `in_progress`); if validation fails,
-the task is invalid or already owned by another agent — do NOT proceed, STOP.
+`odonian claim` again, and never work any task other than `ODONIAN_PRECLAIMED_TASK_ID`. The permit
+attempt identity is supplied as `ODONIAN_PRECLAIMED_ATTEMPT_ID`; pass it as
+`--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on every `odonian heartbeat` and `odonian submit`.
+Step 3 will validate that the preclaimed task is claimed to your agent identity (compare the task's assignee to `$AGENT_ID`
+and verify state is `in_progress`); if validation fails, the task is invalid or already owned by another
+agent — do NOT proceed, STOP.
+
+**Ordinary (legacy) mode.** If `ODONIAN_PRECLAIMED_TASK_ID` is NOT set, follow steps 1–2 below as
+written (`odonian next`, then `odonian claim`). This legacy flow is valid only while the research
+admission policy is not `enforce` (see `odonian research-policy --json`). Under `enforce` the server
+denies unadmitted claims: if `odonian next` or `odonian claim` exits 2 (scheduling denial), report the
+printed reason and retry hint and STOP — do not retry in a loop and do not work any task.
 
 **Keep your lease alive.** A lease lapses if you go quiet too long, and a lapsed lease lets
 another worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — right after you claim
-(step 2) or validate your preclaimed task (step 3), and again immediately **before and after** every
+(step 2), or, for a preclaimed task, `odonian heartbeat <id> --attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"`
+right after you validate it (step 3) — and again immediately **before and after** every
 slow step: fetching or verifying a source, running a named evidence tool, each `make check`, each
 `make test`, and any command you expect to take more than a minute. For preclaimed tasks with research
 admission, the attempt_id is provided via the `ODONIAN_PRECLAIMED_ATTEMPT_ID` environment variable.
-Use this with the `--attempt` flag on `odonian heartbeat` and `odonian submit` calls for proper
-fencing of the work to the specific permit. Pin heartbeats to those points; do not rely on
+Pass it as `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on every `odonian heartbeat` and
+`odonian submit` call (not just the first) for proper fencing of the work to the specific permit. Pin heartbeats to those points; do not rely on
 sensing elapsed time.
 
 1. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.

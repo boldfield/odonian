@@ -404,9 +404,20 @@ Research prompts (`harness/prompts/pull_request/research/implement.md` and
 
 - The worker or reviewer skips the `odonian next` and `odonian claim` steps.
 - The worker or reviewer uses the supplied task ID directly and validates ownership by reading
-  the task (`odonian show <id>`).
+  the task (`odonian show --json <id>`): its `assignee` must equal `$AGENT_ID` and its `state` must
+  be `in_progress`.
 - The task must exist and be owned by the current agent; if not, the worker or reviewer stops
-  without proceeding.
+  without proceeding. Only `ODONIAN_PRECLAIMED_TASK_ID` may be worked; the prompts never select
+  another task. This applies to regular research reviews and to adjudication tasks alike.
+- `ODONIAN_PRECLAIMED_ATTEMPT_ID` carries the admitted permit attempt identity (the `attempt_id`
+  from the claim's `research_admission` output). The harness must export it alongside the task ID;
+  the prompts pass it as `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on every `odonian heartbeat`
+  and `odonian submit` so the work is fenced to that attempt (no claim ran in the worker process,
+  so no attempt file was saved for it).
+- When `ODONIAN_PRECLAIMED_TASK_ID` is not set, the prompts run the ordinary `odonian next` +
+  `odonian claim` flow. That legacy flow is valid only while the research admission policy mode is
+  not `enforce`; under `enforce`, an exit code 2 (scheduling denial) from `next`/`claim` means the
+  worker reports the reason and retry hint and stops.
 - Preserve all source checks, findings, adjudication, manifestation and submission requirements
   from the regular prompt flow.
 
