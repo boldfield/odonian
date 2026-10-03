@@ -3836,7 +3836,7 @@ func TestBoardModel_ArchiveTaskFlow_ConfirmY(t *testing.T) {
 
 	// Select the ready task
 	model.selectedTaskID = "ready-task-1"
-	model.selectedColumn = 1 // ready column
+	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Press 'z' to start archive
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
@@ -3924,7 +3924,7 @@ func TestBoardModel_ArchiveTaskFlow_ConfirmN(t *testing.T) {
 	model = m.(*BoardModel)
 
 	model.selectedTaskID = "ready-task-1"
-	model.selectedColumn = 1
+	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Press 'z' to start archive
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
@@ -3986,7 +3986,7 @@ func TestBoardModel_ArchiveTaskNoBareKeypress(t *testing.T) {
 	model = m.(*BoardModel)
 
 	model.selectedTaskID = "ready-task-1"
-	model.selectedColumn = 1
+	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Pressing any key other than 'z' should not trigger archive
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
@@ -4197,7 +4197,7 @@ func TestBoardModel_HoldTaskFlow_ConfirmY(t *testing.T) {
 
 	// Select the ready task
 	model.selectedTaskID = "ready-task-1"
-	model.selectedColumn = 1 // ready column
+	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Press 't' to start hold
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
@@ -4238,6 +4238,12 @@ func TestBoardModel_HoldTaskFlow_ConfirmY(t *testing.T) {
 	// Verify hold was called with correct task ID
 	if capturedHoldID != "ready-task-1" {
 		t.Errorf("HoldTask: expected task ID ready-task-1, got %q", capturedHoldID)
+	}
+
+	// Verify [HELD] marker appears in the board view after hold and refetch
+	boardOutput := model.View()
+	if !strings.Contains(boardOutput, "[HELD]") {
+		t.Errorf("Expected [HELD] marker to appear after hold and refetch.\nOutput:\n%s", boardOutput)
 	}
 }
 
@@ -4288,7 +4294,13 @@ func TestBoardModel_ReleaseTaskFlow_ConfirmY(t *testing.T) {
 
 	// Select the held task
 	model.selectedTaskID = "ready-task-1"
-	model.selectedColumn = 1 // ready column
+	model.selectedColumn = findColumnIndex(stateReady)
+
+	// Verify [HELD] marker is visible before release
+	boardOutputBefore := model.View()
+	if !strings.Contains(boardOutputBefore, "[HELD]") {
+		t.Errorf("Expected [HELD] marker before release.\nOutput:\n%s", boardOutputBefore)
+	}
 
 	// Press 't' to start release (since task is held)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
@@ -4329,6 +4341,12 @@ func TestBoardModel_ReleaseTaskFlow_ConfirmY(t *testing.T) {
 	// Verify release was called with correct task ID
 	if capturedReleaseID != "ready-task-1" {
 		t.Errorf("ReleaseTask: expected task ID ready-task-1, got %q", capturedReleaseID)
+	}
+
+	// Verify [HELD] marker disappears in the board view after release and refetch
+	boardOutputAfter := model.View()
+	if strings.Contains(boardOutputAfter, "[HELD]") {
+		t.Errorf("Expected [HELD] marker to disappear after release and refetch.\nOutput:\n%s", boardOutputAfter)
 	}
 }
 
@@ -4373,7 +4391,7 @@ func TestBoardModel_HoldTaskFlow_ConfirmN(t *testing.T) {
 	model = m.(*BoardModel)
 
 	model.selectedTaskID = "ready-task-1"
-	model.selectedColumn = 1
+	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Press 't' to start hold
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
@@ -4776,5 +4794,167 @@ func TestBoardModel_ApproveRefusedInLocalCommitMode(t *testing.T) {
 	}
 	if !strings.Contains(msg.err, "odonian approve review-task-1") {
 		t.Errorf("expected the message to point at odonian approve, got %q", msg.err)
+	}
+}
+
+// TestBoardModel_HeldMarkerRendering verifies that [HELD] marker is rendered on board rows.
+// findColumnIndex returns the column index for a given state name in stateOrder.
+func findColumnIndex(state string) int {
+	for i, s := range stateOrder {
+		if s == state {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestBoardModel_HeldMarkerRendering verifies that held tasks display [HELD] marker with proper formatting.
+func TestBoardModel_HeldMarkerRendering(t *testing.T) {
+	mockClient := &tuiclient.MockClient{}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	bucketed := make(map[string][]tuiclient.Task)
+	bucketed["backlog"] = []tuiclient.Task{}
+	bucketed["ready"] = []tuiclient.Task{
+		{ID: "ready-ta", Title: "Held Task", State: "ready", Model: "haiku", Held: true},
+		{ID: "ready-tb", Title: "Normal Task", State: "ready", Model: "haiku", Held: false},
+	}
+	bucketed["in_progress"] = []tuiclient.Task{}
+	bucketed["review"] = []tuiclient.Task{}
+	bucketed["approved"] = []tuiclient.Task{}
+	bucketed["done"] = []tuiclient.Task{}
+	bucketed["blocked"] = []tuiclient.Task{}
+
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+	model.selectedColumn = findColumnIndex(stateReady)
+	model.selectedTaskID = "ready-ta"
+
+	output := model.View()
+
+	// Assert selected held row format: "▸ ready-ta [haiku] [HELD]  Held Task"
+	if !strings.Contains(output, "▸ ready-ta [haiku] [HELD]  Held Task") {
+		t.Errorf("Expected selected held row format '▸ ready-ta [haiku] [HELD]  Held Task' not found.\nOutput:\n%s", output)
+	}
+
+	// Assert unselected normal row format: "  ready-tb [haiku]  Normal Task" (no [HELD])
+	if !strings.Contains(output, "  ready-tb [haiku]  Normal Task") {
+		t.Errorf("Expected unselected normal row format '  ready-tb [haiku]  Normal Task' not found.\nOutput:\n%s", output)
+	}
+
+	// Verify exactly one [HELD] marker
+	if count := strings.Count(output, "[HELD]"); count != 1 {
+		t.Errorf("Expected exactly one [HELD] marker, got %d.\nOutput:\n%s", count, output)
+	}
+}
+
+// TestBoardModel_HeldMarkerLongTitle verifies [HELD] marker remains visible with long titles at typical terminal widths.
+func TestBoardModel_HeldMarkerLongTitle(t *testing.T) {
+	mockClient := &tuiclient.MockClient{}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	model = m.(*BoardModel)
+
+	bucketed := make(map[string][]tuiclient.Task)
+	bucketed["backlog"] = []tuiclient.Task{}
+	bucketed["ready"] = []tuiclient.Task{
+		{ID: "ready-lg", Title: "This is a very long task title that should not push the held marker off the visible area even at standard widths", State: "ready", Model: "haiku", Held: true},
+	}
+	bucketed["in_progress"] = []tuiclient.Task{}
+	bucketed["review"] = []tuiclient.Task{}
+	bucketed["approved"] = []tuiclient.Task{}
+	bucketed["done"] = []tuiclient.Task{}
+	bucketed["blocked"] = []tuiclient.Task{}
+
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+	model.selectedColumn = findColumnIndex(stateReady)
+
+	output := model.View()
+
+	// Verify [HELD] marker appears (it comes before the long title, so it won't be pushed off)
+	if !strings.Contains(output, "[HELD]") {
+		t.Errorf("Expected [HELD] marker with long title.\nOutput:\n%s", output)
+	}
+}
+
+// TestBoardModel_HeldMarkerNonReadyState verifies [HELD] marker renders correctly in non-ready states.
+func TestBoardModel_HeldMarkerNonReadyState(t *testing.T) {
+	mockClient := &tuiclient.MockClient{}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	expiresAt := time.Now().Add(2 * time.Hour).Format(time.RFC3339Nano)
+	assignee := "worker-xyz"
+
+	bucketed := make(map[string][]tuiclient.Task)
+	bucketed["backlog"] = []tuiclient.Task{}
+	bucketed["ready"] = []tuiclient.Task{}
+	bucketed["in_progress"] = []tuiclient.Task{
+		{
+			ID:             "in-prog-1",
+			Title:          "Held in progress task",
+			State:          stateInProgress,
+			Model:          "opus",
+			Held:           true,
+			Assignee:       &assignee,
+			LeaseExpiresAt: &expiresAt,
+			UpdatedAt:      time.Now().Format(time.RFC3339Nano),
+		},
+	}
+	bucketed["review"] = []tuiclient.Task{}
+	bucketed["approved"] = []tuiclient.Task{}
+	bucketed["done"] = []tuiclient.Task{}
+	bucketed["blocked"] = []tuiclient.Task{}
+
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+	model.selectedColumn = findColumnIndex(stateInProgress)
+
+	output := model.View()
+
+	// Verify [HELD] marker appears in in_progress state
+	if !strings.Contains(output, "[HELD]") {
+		t.Errorf("Expected [HELD] marker in in_progress state.\nOutput:\n%s", output)
+	}
+
+	// Verify assignee/lease line is present and unchanged
+	if !strings.Contains(output, "@worker-xyz · lease") {
+		t.Errorf("Expected assignee and lease info preserved for in_progress held task.\nOutput:\n%s", output)
+	}
+
+	// Verify task ID is present and in correct column (truncated to 8 chars in display)
+	if !strings.Contains(output, "in-prog-") {
+		t.Errorf("Expected task ID 'in-prog-' (truncated from in-prog-1) in output.\nOutput:\n%s", output)
 	}
 }
