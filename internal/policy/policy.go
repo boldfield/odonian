@@ -20,6 +20,7 @@ const (
 	ReasonRateLimit     DeferralReason = "rate_limit"
 	ReasonConcurrency   DeferralReason = "concurrency"
 	ReasonCompletionCap DeferralReason = "completion_cap"
+	ReasonUnmappedModel DeferralReason = "unmapped_model"
 )
 
 // AdmissionResult describes the outcome of an admission check.
@@ -73,10 +74,11 @@ type PolicyEvaluator struct {
 
 // tokenBucket tracks a rate-limit bucket with refill logic.
 type tokenBucket struct {
-	tokens     float64
-	capacity   float64
-	refillRate float64
-	lastRefill time.Time
+	tokens         float64
+	capacity       float64
+	refillRate     float64
+	lastRefill     time.Time
+	lastRefillMono time.Time // monotonic high-water mark for clock rollback safety
 }
 
 // New creates a PolicyEvaluator with the given configuration.
@@ -96,11 +98,13 @@ func New(mode Mode, pools []*Pool) *PolicyEvaluator {
 		for model := range pool.Models {
 			pe.modelToPool[model] = pool.Name
 		}
+		now := pe.clock()
 		pe.buckets[pool.Name] = &tokenBucket{
-			tokens:     float64(pool.BurstCapacity),
-			capacity:   float64(pool.BurstCapacity),
-			refillRate: pool.StartRate,
-			lastRefill: pe.clock(),
+			tokens:         float64(pool.BurstCapacity),
+			capacity:       float64(pool.BurstCapacity),
+			refillRate:     pool.StartRate,
+			lastRefill:     now,
+			lastRefillMono: now,
 		}
 	}
 
@@ -125,7 +129,7 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, isCompletion bool) Admis
 	if !ok {
 		// Unmapped model - only reject if enforcing
 		if pe.Mode == ModeEnforce {
-			return AdmissionResult{Admitted: false, Reason: ReasonRateLimit}
+			return AdmissionResult{Admitted: false, Reason: ReasonUnmappedModel}
 		}
 		return AdmissionResult{Admitted: true}
 	}
@@ -133,24 +137,27 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, isCompletion bool) Admis
 	pool := pe.Pools[poolName]
 
 	// Check concurrency limit
-	if pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
-		return AdmissionResult{
-			Admitted:     false,
-			Reason:       ReasonConcurrency,
-			RetryAfterMs: 1000, // Suggest 1 second retry
-		}
-	}
-
-	// Check completion capacity if applicable
+	// For first-pass work: limited to (total - reserved) slots
+	// For completion work: limited to total slots
 	if isCompletion {
-		reserved := pool.CompletionReserved
-		activeCompletion := pe.completionActive[poolName]
-		availableCompletion := reserved - activeCompletion
-
-		if availableCompletion <= 0 {
+		// Completion work: check against total concurrent limit
+		if pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
 			return AdmissionResult{
 				Admitted:     false,
-				Reason:       ReasonCompletionCap,
+				Reason:       ReasonConcurrency,
+				RetryAfterMs: 1000,
+			}
+		}
+	} else {
+		// First-pass work: limited to (total - reserved) slots
+		reserved := pool.CompletionReserved
+		firstPassLimit := pool.ConcurrentDispatchLimit - reserved
+		activeFirstPass := pe.concurrency[poolName] - pe.completionActive[poolName]
+
+		if activeFirstPass >= firstPassLimit {
+			return AdmissionResult{
+				Admitted:     false,
+				Reason:       ReasonConcurrency,
 				RetryAfterMs: 1000,
 			}
 		}
@@ -163,14 +170,14 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, isCompletion bool) Admis
 
 	if bucket.tokens >= 1.0 {
 		bucket.tokens -= 1.0
-		bucket.lastRefill = now
+		bucket.lastRefillMono = now
 		return AdmissionResult{Admitted: true}
 	}
 
 	// Rate limit exceeded - calculate when next token will be available
-	timeSinceRefill := now.Sub(bucket.lastRefill).Seconds()
-	tokensEarned := timeSinceRefill * bucket.refillRate
-	timeToNextToken := (1.0 - bucket.tokens - tokensEarned) / bucket.refillRate
+	// The bucket already has the refilled tokens, so we just need to know
+	// when the current tokens + future refill will reach 1.0
+	timeToNextToken := (1.0 - bucket.tokens) / bucket.refillRate
 	if timeToNextToken < 0 {
 		timeToNextToken = 0
 	}
@@ -209,12 +216,21 @@ func (pe *PolicyEvaluator) ReleaseAdmission(model string, isCompletion bool) {
 }
 
 // refill updates the token bucket based on elapsed time.
-// Time moving backward (clock rollback) does not refill.
+// Uses a monotonic high-water mark to handle clock rollback safely.
 func (b *tokenBucket) refill(now time.Time) {
-	elapsed := now.Sub(b.lastRefill)
+	// Use monotonic high-water mark to handle clock rollback
+	// If now is earlier than lastRefillMono, don't refill (clock rolled back)
+	// If now is later, calculate elapsed from the last actual monotonic time
+	if now.Before(b.lastRefillMono) {
+		// Clock rolled back - don't refill, don't update lastRefill
+		return
+	}
+
+	elapsed := now.Sub(b.lastRefillMono)
 	if elapsed > 0 {
 		tokensToAdd := elapsed.Seconds() * b.refillRate
 		b.tokens = min(b.capacity, b.tokens+tokensToAdd)
+		b.lastRefillMono = now
 	}
 }
 

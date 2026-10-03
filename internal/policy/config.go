@@ -54,7 +54,6 @@ func ParseConfig(allowedModels map[string]bool) (*Config, error) {
 	pools := make([]*Pool, 0, len(poolsData))
 	seenAccounts := make(map[string]bool)    // track duplicates
 	allPoolModels := make(map[string]string) // model -> pool name, for duplicate detection
-	unmappedModels := make(map[string]bool)
 
 	for poolName, poolConfig := range poolsData {
 		pool, err := parsePoolConfig(poolName, poolConfig, allowedModels)
@@ -72,18 +71,6 @@ func ParseConfig(allowedModels map[string]bool) (*Config, error) {
 			allPoolModels[model] = poolName
 		}
 
-		// Track which models have pools
-		for model := range allowedModels {
-			if _, inPool := pool.Models[model]; !inPool {
-				unmappedModels[model] = true
-			}
-		}
-
-		// Remove mapped models from unmapped set
-		for model := range pool.Models {
-			delete(unmappedModels, model)
-		}
-
 		if seenAccounts[pool.AccountID] {
 			return nil, fmt.Errorf("pool %s: duplicate account %s", poolName, pool.AccountID)
 		}
@@ -93,12 +80,21 @@ func ParseConfig(allowedModels map[string]bool) (*Config, error) {
 	}
 
 	// If enforce mode and there are unmapped models, error
-	if mode == ModeEnforce && len(unmappedModels) > 0 {
-		var unmapped []string
-		for model := range unmappedModels {
-			unmapped = append(unmapped, model)
+	// Compute unmapped models once, after all pools have been processed
+	if mode == ModeEnforce {
+		unmappedModels := make(map[string]bool)
+		for model := range allowedModels {
+			if _, ok := allPoolModels[model]; !ok {
+				unmappedModels[model] = true
+			}
 		}
-		return nil, fmt.Errorf("enforce mode requires all allowed models to be in a pool; unmapped: %v", unmapped)
+		if len(unmappedModels) > 0 {
+			var unmapped []string
+			for model := range unmappedModels {
+				unmapped = append(unmapped, model)
+			}
+			return nil, fmt.Errorf("enforce mode requires all allowed models to be in a pool; unmapped: %v", unmapped)
+		}
 	}
 
 	return &Config{
