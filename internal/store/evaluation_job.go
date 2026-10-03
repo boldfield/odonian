@@ -80,6 +80,8 @@ type EvaluationCampaign struct {
 	AttemptCap        int
 	CreatedAt         string
 	UpdatedAt         string
+	PausedAt          *string
+	ResumedAt         *string
 }
 
 // EvaluationCandidate is an immutable candidate version. Its identity is the
@@ -222,6 +224,27 @@ func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign Eva
 		return EvaluationCampaign{}, fmt.Errorf("commit transaction: %w", err)
 	}
 	return campaign, nil
+}
+
+func (s *sqliteStore) PauseEvaluationCampaign(ctx context.Context, campaignID string) error {
+	now := s.Now().UTC().Format(timestampLayout)
+
+	result, err := s.conn.ExecContext(ctx,
+		`UPDATE evaluation_campaign SET paused_at = ? WHERE id = ? AND paused_at IS NULL AND resumed_at IS NULL`,
+		now, campaignID)
+	if err != nil {
+		return fmt.Errorf("pause campaign: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check pause result: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrEvaluationCampaignNotFound
+	}
+
+	return nil
 }
 
 // CreateEvaluationCandidate persists a new immutable candidate version. The
@@ -1070,12 +1093,12 @@ func (s *sqliteStore) GetEvaluationCampaign(ctx context.Context, campaignID stri
 	campaign := EvaluationCampaign{}
 
 	err := s.conn.QueryRowContext(ctx,
-		`SELECT id, name, description, cohort_manifest, attempt_cap, created_at, updated_at
+		`SELECT id, name, description, cohort_manifest, attempt_cap, created_at, updated_at, paused_at, resumed_at
 		 FROM evaluation_campaign WHERE id = ?`,
 		campaignID,
 	).Scan(&campaign.ID, &campaign.Name, &campaign.Description,
 		&campaign.CohortManifest, &campaign.AttemptCap,
-		&campaign.CreatedAt, &campaign.UpdatedAt)
+		&campaign.CreatedAt, &campaign.UpdatedAt, &campaign.PausedAt, &campaign.ResumedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return EvaluationCampaign{}, ErrEvaluationCampaignNotFound

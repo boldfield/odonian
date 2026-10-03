@@ -109,6 +109,7 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	// Evaluation endpoints (protected)
 	mux.HandleFunc("POST /evaluation/campaigns", wrapProtected("POST /evaluation/campaigns", server.handleCreateEvaluationCampaign))
 	mux.HandleFunc("GET /evaluation/campaigns/{id}", wrapProtected("GET /evaluation/campaigns/{id}", server.handleGetEvaluationCampaign))
+	mux.HandleFunc("GET /evaluation/campaigns/{id}/status", wrapProtected("GET /evaluation/campaigns/{id}/status", server.handleGetEvaluationCampaignStatus))
 	mux.HandleFunc("GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}", wrapProtected("GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}", server.handleGetEvaluationSample))
 	mux.HandleFunc("POST /evaluation/jobs/claim", wrapProtected("POST /evaluation/jobs/claim", server.handleClaimEvaluationJob))
 	mux.HandleFunc("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew", wrapProtected("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew", server.handleRenewEvaluationAttempt))
@@ -1910,16 +1911,37 @@ func (s *Server) handleRenewEvaluationAttempt(w http.ResponseWriter, r *http.Req
 	}
 
 	var payload struct {
-		ExpiresAtMs int64 `json:"expires_at_ms"`
+		LeaseTTLMs int64 `json:"lease_ttl_ms"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
 		return
 	}
 
-	expiresAt := time.UnixMilli(payload.ExpiresAtMs).UTC()
+	if payload.LeaseTTLMs <= 0 || payload.LeaseTTLMs > 3600000 {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "lease_ttl_ms must be between 1 and 3600000 (1 hour)")
+		return
+	}
 
-	err := s.store.RenewEvaluationAttempt(r.Context(), attemptID, expiresAt)
+	attempt, err := s.store.GetEvaluationAttempt(r.Context(), attemptID)
+	if errors.Is(err, store.ErrEvaluationAttemptNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Evaluation attempt not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FETCH_ERROR", "Failed to fetch evaluation attempt")
+		return
+	}
+
+	if attempt.JobID != jobID {
+		s.errorResponse(w, http.StatusBadRequest, "JOB_MISMATCH", "Attempt does not belong to the specified job")
+		return
+	}
+
+	now := time.Now().UTC()
+	expiresAt := now.Add(time.Duration(payload.LeaseTTLMs) * time.Millisecond)
+
+	err = s.store.RenewEvaluationAttempt(r.Context(), attemptID, expiresAt)
 	if errors.Is(err, store.ErrEvaluationAttemptNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Evaluation attempt not found")
 		return
@@ -1942,7 +1964,8 @@ func (s *Server) handleRenewEvaluationAttempt(w http.ResponseWriter, r *http.Req
 	}
 
 	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
-		"message": "Attempt lease renewed",
+		"message":    "Attempt lease renewed",
+		"expires_at": expiresAt.UnixMilli(),
 	})
 }
 
@@ -1970,23 +1993,63 @@ func (s *Server) handleFinalizeEvaluationAttempt(w http.ResponseWriter, r *http.
 		return
 	}
 
+	attempt, err := s.store.GetEvaluationAttempt(r.Context(), attemptID)
+	if errors.Is(err, store.ErrEvaluationAttemptNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Evaluation attempt not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FETCH_ERROR", "Failed to fetch evaluation attempt")
+		return
+	}
+
+	if attempt.JobID != jobID {
+		s.errorResponse(w, http.StatusBadRequest, "JOB_MISMATCH", "Attempt does not belong to the specified job")
+		return
+	}
+
 	findings := make([]evaluation.Finding, 0, len(payload.Findings))
 	for _, f := range payload.Findings {
+		if f == nil {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "Finding cannot be nil")
+			return
+		}
 		var finding evaluation.Finding
 		if id, ok := f["id"].(string); ok {
 			finding.ID = id
+		} else if _, exists := f["id"]; exists {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "Finding id must be a string")
+			return
 		}
 		if sev, ok := f["severity"].(string); ok {
 			finding.Severity = evaluation.Severity(sev)
+		} else if _, exists := f["severity"]; exists {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "Finding severity must be a string")
+			return
 		}
 		if claim, ok := f["claim"].(string); ok {
 			finding.Claim = claim
+		} else if _, exists := f["claim"]; exists {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "Finding claim must be a string")
+			return
 		}
 		if summary, ok := f["summary"].(string); ok {
 			finding.Summary = summary
+		} else if _, exists := f["summary"]; exists {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "Finding summary must be a string")
+			return
 		}
 		if evidence, ok := f["evidence"].(string); ok {
 			finding.Evidence = evidence
+		} else if _, exists := f["evidence"]; exists {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "Finding evidence must be a string")
+			return
+		}
+		for key := range f {
+			if key != "id" && key != "severity" && key != "claim" && key != "summary" && key != "evidence" {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "Unknown finding field: "+key)
+				return
+			}
 		}
 		findings = append(findings, finding)
 	}
@@ -2003,7 +2066,7 @@ func (s *Server) handleFinalizeEvaluationAttempt(w http.ResponseWriter, r *http.
 		Findings:       findings,
 	}
 
-	err := s.store.FinalizeEvaluationAttempt(r.Context(), result)
+	err = s.store.FinalizeEvaluationAttempt(r.Context(), result)
 	if errors.Is(err, store.ErrEvaluationAttemptNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Evaluation attempt not found")
 		return
@@ -2042,10 +2105,61 @@ func (s *Server) handlePauseEvaluationCampaign(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// For now, we just acknowledge the pause request. The actual pause logic would be
-	// implemented in a future update to track paused state in the campaign.
+	err := s.store.PauseEvaluationCampaign(r.Context(), campaignID)
+	if errors.Is(err, store.ErrEvaluationCampaignNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Campaign not found or already paused")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "PAUSE_ERROR", "Failed to pause campaign")
+		return
+	}
+
+	campaign, err := s.store.GetEvaluationCampaign(r.Context(), campaignID)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FETCH_ERROR", "Failed to fetch campaign after pause")
+		return
+	}
+
 	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
-		"message":     "Campaign pause requested",
 		"campaign_id": campaignID,
+		"paused_at":   campaign.PausedAt,
 	})
+}
+
+// handleGetEvaluationCampaignStatus handles GET /evaluation/campaigns/{id}/status to return campaign status with candidates.
+func (s *Server) handleGetEvaluationCampaignStatus(w http.ResponseWriter, r *http.Request) {
+	campaignID := r.PathValue("id")
+	if campaignID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_ID", "Campaign ID is required")
+		return
+	}
+
+	campaign, err := s.store.GetEvaluationCampaign(r.Context(), campaignID)
+	if errors.Is(err, store.ErrEvaluationCampaignNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Campaign not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FETCH_ERROR", "Failed to fetch campaign")
+		return
+	}
+
+	isPaused := campaign.PausedAt != nil && campaign.ResumedAt == nil
+
+	campaignStatus := map[string]interface{}{
+		"id":                  campaign.ID,
+		"name":                campaign.Name,
+		"description":         campaign.Description,
+		"allowed_project_ids": campaign.AllowedProjectIDs,
+		"allowed_model_ids":   campaign.AllowedModelIDs,
+		"attempt_cap":         campaign.AttemptCap,
+		"is_paused":           isPaused,
+		"paused_at":           campaign.PausedAt,
+		"resumed_at":          campaign.ResumedAt,
+		"created_at":          campaign.CreatedAt,
+		"updated_at":          campaign.UpdatedAt,
+	}
+
+	s.encodeJSON(w, http.StatusOK, campaignStatus)
 }
