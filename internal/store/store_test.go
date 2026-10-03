@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/boldfield/odonian/internal/forge"
+	"github.com/boldfield/odonian/internal/policy"
 )
 
 // defaultTestAllowedModels returns the default allowed models for tests (matching main.go default).
@@ -18662,4 +18663,135 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 			t.Errorf("expected approved state (not auto-merged), got %s", parent.State)
 		}
 	})
+}
+
+// TestClaimTaskWithPermitRetryReplay verifies idempotent retry doesn't double-debit.
+func TestClaimTaskWithPermitRetryReplay(t *testing.T) {
+	s := newPermitStore(t)
+	ctx := context.Background()
+	now := rt0
+
+	// Set up research pool
+	s.ConfigureResearchPool(ctx, now, ResearchPoolConfig{
+		AccountID: "acct", StartRate: 0.001, BurstCapacity: 2, ConcurrentLimit: 5, CompletionReserved: 0,
+	})
+
+	// Create project and document
+	proj, _ := s.CreateProject(ctx, "test-proj", "https://github.com/test/repo")
+	doc, _ := s.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+
+	// Create a research task (with ReviewModels to get research track)
+	tasks, _ := s.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}},
+	})
+	taskID := tasks[0].ID
+
+	// Verify task is research track
+	task, _ := s.GetTask(ctx, taskID)
+	if task.Track != "research" {
+		t.Skipf("created task is track %q, not research", task.Track)
+	}
+
+	// Promote to ready
+	s.PromoteTask(ctx, taskID)
+
+	// First claim succeeds
+	permit1 := &PermitRequest{
+		RequestID: "req-1", TaskID: taskID, ProjectID: proj.ID, AgentID: "agent1", Model: "opus",
+		AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: 10 * time.Second,
+	}
+	task1, err := s.ClaimTaskWithPermit(ctx, taskID, "agent1", "opus", 10*time.Second, permit1, now)
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if task1.State != "in_progress" {
+		t.Errorf("first claim state = %q, want in_progress", task1.State)
+	}
+
+	// Get pool state
+	pool1, _ := s.GetResearchPool(ctx, now, "acct")
+	tokens1 := pool1.Tokens
+
+	// Retry same request - should not debit again (idempotent)
+	task2, err := s.ClaimTaskWithPermit(ctx, taskID, "agent1", "opus", 10*time.Second, permit1, now)
+	if err != nil {
+		// On retry of an already-claimed task, we expect ErrConflict since task is no longer claimable
+		// This is acceptable behavior - the key point is we don't debit again
+		t.Logf("retry claim returned: %v (expected for already-claimed task)", err)
+	} else if task2.ID != task1.ID {
+		t.Errorf("retry returned different task")
+	}
+
+	// Verify pool tokens didn't change (no double-debit)
+	pool2, _ := s.GetResearchPool(ctx, now, "acct")
+	if pool2.Tokens != tokens1 {
+		t.Errorf("retry may have debited again: tokens before %v, after %v (diff=%v)", tokens1, pool2.Tokens, tokens1-pool2.Tokens)
+	}
+}
+
+// TestClaimTaskWithPermitInputValidation tests that invalid inputs are rejected early.
+func TestClaimTaskWithPermitInputValidation(t *testing.T) {
+	s := newPermitStore(t)
+	ctx := context.Background()
+	now := rt0
+
+	proj, _ := s.CreateProject(ctx, "test-proj", "https://github.com/test/repo")
+	doc, _ := s.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	tasks, _ := s.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}},
+	})
+	taskID := tasks[0].ID
+
+	s.PromoteTask(ctx, taskID)
+
+	tests := []struct {
+		name      string
+		permit    *PermitRequest
+		wantError bool
+	}{
+		{
+			name: "valid permit",
+			permit: &PermitRequest{
+				RequestID: "req", TaskID: taskID, ProjectID: proj.ID, AgentID: "agent", Model: "opus",
+				AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: 10 * time.Second,
+			},
+			wantError: false,
+		},
+		{
+			name: "missing request_id",
+			permit: &PermitRequest{
+				RequestID: "", TaskID: taskID, ProjectID: proj.ID, AgentID: "agent", Model: "opus",
+				AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: 10 * time.Second,
+			},
+			wantError: true,
+		},
+		{
+			name: "negative lease TTL",
+			permit: &PermitRequest{
+				RequestID: "req", TaskID: taskID, ProjectID: proj.ID, AgentID: "agent", Model: "opus",
+				AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: -1,
+			},
+			wantError: true,
+		},
+		{
+			name: "non-paced work class",
+			permit: &PermitRequest{
+				RequestID: "req", TaskID: taskID, ProjectID: proj.ID, AgentID: "agent", Model: "opus",
+				AccountID: "acct", Class: policy.BuildWork, LeaseTTL: 10 * time.Second,
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := s.ClaimTaskWithPermit(ctx, taskID, "agent", "opus", 10*time.Second, tt.permit, now)
+			if tt.wantError && err == nil {
+				t.Errorf("expected error, got none")
+			}
+			if !tt.wantError && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
 }
