@@ -30,6 +30,7 @@ var (
 	ErrEvaluationCapacityExhausted = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
 	ErrEvaluationCandidateCorrupt  = errors.New("stored evaluation candidate does not match its recorded digest")
 	ErrEvaluationProjectNotAllowed = errors.New("project is not allowed for this evaluation campaign")
+	ErrEvaluationModelNotAllowed   = errors.New("model is not allowed for this evaluation campaign")
 	ErrEvaluationInvalidInput      = errors.New("invalid evaluation input")
 )
 
@@ -67,13 +68,14 @@ const (
 )
 
 // EvaluationCampaign represents a finite evaluation experiment. Samples may
-// only come from AllowedProjectIDs. Account pools belong to candidates.
+// only come from AllowedProjectIDs and candidates may only use a model in
+// AllowedModelIDs. Account pools belong to candidates.
 type EvaluationCampaign struct {
 	ID                string
 	Name              string
 	Description       *string
 	AllowedProjectIDs []string
-	AllowedModelID    string
+	AllowedModelIDs   []string
 	CohortManifest    string
 	AttemptCap        int
 	CreatedAt         string
@@ -163,7 +165,7 @@ type EvaluationJobClaimResult struct {
 // CreateEvaluationCampaign persists a new campaign and its allowed projects.
 func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign EvaluationCampaign) (EvaluationCampaign, error) {
 	if campaign.ID == "" || campaign.Name == "" || len(campaign.AllowedProjectIDs) == 0 ||
-		campaign.AllowedModelID == "" || campaign.CohortManifest == "" || campaign.AttemptCap < 1 {
+		len(campaign.AllowedModelIDs) == 0 || campaign.CohortManifest == "" || campaign.AttemptCap < 1 {
 		return EvaluationCampaign{}, ErrEvaluationInvalidInput
 	}
 	seen := map[string]bool{}
@@ -174,10 +176,19 @@ func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign Eva
 		seen[p] = true
 	}
 
+	seenModels := map[string]bool{}
+	for _, m := range campaign.AllowedModelIDs {
+		if m == "" || seenModels[m] {
+			return EvaluationCampaign{}, ErrEvaluationInvalidInput
+		}
+		seenModels[m] = true
+	}
+
 	now := s.Now().UTC().Format(timestampLayout)
 	campaign.CreatedAt = now
 	campaign.UpdatedAt = now
 	campaign.AllowedProjectIDs = append([]string(nil), campaign.AllowedProjectIDs...)
+	campaign.AllowedModelIDs = append([]string(nil), campaign.AllowedModelIDs...)
 
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -187,10 +198,10 @@ func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign Eva
 
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO evaluation_campaign
-		 (id, name, description, allowed_model_id, cohort_manifest, attempt_cap, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (id, name, description, cohort_manifest, attempt_cap, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		campaign.ID, campaign.Name, campaign.Description,
-		campaign.AllowedModelID, campaign.CohortManifest, campaign.AttemptCap, now, now,
+		campaign.CohortManifest, campaign.AttemptCap, now, now,
 	)
 	if err != nil {
 		return EvaluationCampaign{}, fmt.Errorf("create evaluation campaign: %w", err)
@@ -199,6 +210,12 @@ func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign Eva
 		if _, err = tx.ExecContext(ctx,
 			`INSERT INTO evaluation_campaign_project (campaign_id, project_id) VALUES (?, ?)`, campaign.ID, p); err != nil {
 			return EvaluationCampaign{}, fmt.Errorf("create evaluation campaign project: %w", err)
+		}
+	}
+	for _, m := range campaign.AllowedModelIDs {
+		if _, err = tx.ExecContext(ctx,
+			`INSERT INTO evaluation_campaign_model (campaign_id, model_id) VALUES (?, ?)`, campaign.ID, m); err != nil {
+			return EvaluationCampaign{}, fmt.Errorf("create evaluation campaign model: %w", err)
 		}
 	}
 	if err = tx.Commit(); err != nil {
@@ -225,12 +242,20 @@ func (s *sqliteStore) CreateEvaluationCandidate(ctx context.Context, candidate E
 		return EvaluationCandidate{}, fmt.Errorf("marshal candidate identity: %w", err)
 	}
 
-	var campaignExists int
+	var campaignExists, modelAllowed int
 	if err := s.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM evaluation_campaign WHERE id = ?`, candidate.CampaignID).Scan(&campaignExists); err != nil {
 		return EvaluationCandidate{}, fmt.Errorf("check campaign: %w", err)
 	}
 	if campaignExists == 0 {
 		return EvaluationCandidate{}, ErrEvaluationCampaignNotFound
+	}
+	if err := s.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM evaluation_campaign_model WHERE campaign_id = ? AND model_id = ?`,
+		candidate.CampaignID, identity.ModelID).Scan(&modelAllowed); err != nil {
+		return EvaluationCandidate{}, fmt.Errorf("check allowed model: %w", err)
+	}
+	if modelAllowed == 0 {
+		return EvaluationCandidate{}, fmt.Errorf("%w: %q", ErrEvaluationModelNotAllowed, identity.ModelID)
 	}
 
 	candidate.CreatedAt = s.Now().UTC().Format(timestampLayout)
@@ -381,7 +406,7 @@ func (s *sqliteStore) ExpireEvaluationAttempts(ctx context.Context, now time.Tim
 // For a given request_id, it's idempotent: re-requesting the same request_id returns the same attempt.
 // For a fresh request_id on the same sample/candidate, it creates a new attempt if capacity allows.
 func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobClaim) (EvaluationJobClaimResult, error) {
-	if req.SampleID == "" || req.CandidateID == "" || req.RequestID == "" {
+	if req.SampleID == "" || req.CandidateID == "" || req.RequestID == "" || req.LeaseExpires <= 0 {
 		return EvaluationJobClaimResult{}, ErrEvaluationInvalidInput
 	}
 
@@ -686,6 +711,11 @@ func (s *sqliteStore) RenewEvaluationAttempt(ctx context.Context, attemptID stri
 		return ErrEvaluationAttemptExpired
 	}
 
+	// A renewal must move the lease forward, past now.
+	if !expiresAt.After(now) || !expiresAt.After(currentExpires) {
+		return ErrEvaluationInvalidInput
+	}
+
 	expiresAtStr := expiresAt.UTC().Format(timestampLayout)
 	result, err := s.conn.ExecContext(ctx,
 		`UPDATE evaluation_attempt SET expires_at = ? WHERE id = ? AND state = ?`,
@@ -738,6 +768,10 @@ func (r EvaluationAttemptResult) validate() error {
 		default:
 			return fmt.Errorf("%w: status %q", ErrEvaluationInvalidInput, *r.Status)
 		}
+	}
+	if r.Status != nil && (r.ExitClass == EvalExitCompleted) != (*r.Status == evaluation.StatusCompleted) &&
+		(r.ExitClass == EvalExitCompleted || *r.Status == evaluation.StatusCompleted) {
+		return fmt.Errorf("%w: exit_class %q contradicts status %q", ErrEvaluationInvalidInput, r.ExitClass, *r.Status)
 	}
 	if r.ErrorClass != nil {
 		switch *r.ErrorClass {
@@ -1036,11 +1070,11 @@ func (s *sqliteStore) GetEvaluationCampaign(ctx context.Context, campaignID stri
 	campaign := EvaluationCampaign{}
 
 	err := s.conn.QueryRowContext(ctx,
-		`SELECT id, name, description, allowed_model_id, cohort_manifest, attempt_cap, created_at, updated_at
+		`SELECT id, name, description, cohort_manifest, attempt_cap, created_at, updated_at
 		 FROM evaluation_campaign WHERE id = ?`,
 		campaignID,
 	).Scan(&campaign.ID, &campaign.Name, &campaign.Description,
-		&campaign.AllowedModelID, &campaign.CohortManifest, &campaign.AttemptCap,
+		&campaign.CohortManifest, &campaign.AttemptCap,
 		&campaign.CreatedAt, &campaign.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1063,6 +1097,23 @@ func (s *sqliteStore) GetEvaluationCampaign(ctx context.Context, campaignID stri
 		campaign.AllowedProjectIDs = append(campaign.AllowedProjectIDs, p)
 	}
 	if err := rows.Err(); err != nil {
+		return EvaluationCampaign{}, err
+	}
+
+	modelRows, err := s.conn.QueryContext(ctx,
+		`SELECT model_id FROM evaluation_campaign_model WHERE campaign_id = ? ORDER BY model_id`, campaignID)
+	if err != nil {
+		return EvaluationCampaign{}, fmt.Errorf("get campaign models: %w", err)
+	}
+	defer modelRows.Close()
+	for modelRows.Next() {
+		var m string
+		if err := modelRows.Scan(&m); err != nil {
+			return EvaluationCampaign{}, fmt.Errorf("scan campaign model: %w", err)
+		}
+		campaign.AllowedModelIDs = append(campaign.AllowedModelIDs, m)
+	}
+	if err := modelRows.Err(); err != nil {
 		return EvaluationCampaign{}, err
 	}
 	return campaign, nil

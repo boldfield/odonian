@@ -248,7 +248,7 @@ func TestEvaluationSamplesRespectAllowedProjectsAndStayFrozen(t *testing.T) {
 	if !reflect.DeepEqual(got.AllowedProjectIDs, []string{"projA", "projB"}) {
 		t.Fatalf("allowed projects = %v", got.AllowedProjectIDs)
 	}
-	if _, err := st.CreateEvaluationCampaign(ctx, EvaluationCampaign{ID: GenerateID(), Name: "n", AllowedModelID: "m", CohortManifest: "{}", AttemptCap: 1}); !errors.Is(err, ErrEvaluationInvalidInput) {
+	if _, err := st.CreateEvaluationCampaign(ctx, EvaluationCampaign{ID: GenerateID(), Name: "n", AllowedModelIDs: []string{"m"}, CohortManifest: "{}", AttemptCap: 1}); !errors.Is(err, ErrEvaluationInvalidInput) {
 		t.Errorf("campaign without projects: err = %v", err)
 	}
 
@@ -516,5 +516,118 @@ func TestEvaluationStateSurvivesRestart(t *testing.T) {
 	}
 	if _, err := st.GetEvaluationPool(ctx, "pool1"); err != nil {
 		t.Errorf("pool after restart: %v", err)
+	}
+}
+
+func TestEvaluationClaimRejectsNonPositiveLeaseBeforeSpendingCapacity(t *testing.T) {
+	st, _, f := newEvalClockFixture(t, 1, 1)
+	for _, lease := range []time.Duration{0, -time.Hour} {
+		if _, err := claimEval(st, f.sample, f.cand, lease); !errors.Is(err, ErrEvaluationInvalidInput) {
+			t.Fatalf("lease %v: err = %v, want ErrEvaluationInvalidInput", lease, err)
+		}
+	}
+	if n := evalCount(t, st, "evaluation_attempt"); n != 0 {
+		t.Fatalf("rejected claims created %d attempts", n)
+	}
+	if _, err := claimEval(st, f.sample, f.cand, time.Minute); err != nil {
+		t.Fatalf("capacity was spent by rejected claims: %v", err)
+	}
+}
+
+func TestEvaluationRenewMustMoveLeaseForward(t *testing.T) {
+	ctx := context.Background()
+	st, clock, f := newEvalClockFixture(t, 5, 10)
+	r, err := claimEval(st, f.sample, f.cand, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Minute)
+	for name, at := range map[string]time.Time{
+		"at now":           clock.Now(),
+		"before now":       clock.Now().Add(-time.Minute),
+		"before current":   clock.Now().Add(30 * time.Minute),
+		"equal to current": evalT0.Add(time.Hour),
+		"zero time":        {},
+	} {
+		if err := st.RenewEvaluationAttempt(ctx, r.Attempt.ID, at); !errors.Is(err, ErrEvaluationInvalidInput) {
+			t.Errorf("renew %s: err = %v, want ErrEvaluationInvalidInput", name, err)
+		}
+	}
+	got, err := st.GetEvaluationAttempt(ctx, r.Attempt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExpiresAt != r.Attempt.ExpiresAt {
+		t.Errorf("rejected renewals changed the lease: %s -> %s", r.Attempt.ExpiresAt, got.ExpiresAt)
+	}
+	if err := st.RenewEvaluationAttempt(ctx, r.Attempt.ID, clock.Now().Add(2*time.Hour)); err != nil {
+		t.Errorf("forward renewal: %v", err)
+	}
+}
+
+func TestEvaluationCampaignEnforcesAllowedModels(t *testing.T) {
+	ctx := context.Background()
+	st := newEvaluationStore(t)
+	for name, models := range map[string][]string{"none": nil, "empty": {""}, "duplicate": {"a", "a"}} {
+		_, err := st.CreateEvaluationCampaign(ctx, EvaluationCampaign{
+			ID: GenerateID(), Name: "n", AllowedProjectIDs: []string{"p"}, AllowedModelIDs: models,
+			CohortManifest: "{}", AttemptCap: 1,
+		})
+		if !errors.Is(err, ErrEvaluationInvalidInput) {
+			t.Errorf("%s models: err = %v, want ErrEvaluationInvalidInput", name, err)
+		}
+	}
+
+	c, err := st.CreateEvaluationCampaign(ctx, EvaluationCampaign{
+		ID: GenerateID(), Name: "n", AllowedProjectIDs: []string{"p"}, AllowedModelIDs: []string{"fakeB-model", "fakeA-model"},
+		CohortManifest: "{}", AttemptCap: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetEvaluationCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.AllowedModelIDs, []string{"fakeA-model", "fakeB-model"}) {
+		t.Fatalf("allowed models = %v", got.AllowedModelIDs)
+	}
+
+	// Candidates whose M1 model is in the set are accepted, several per campaign.
+	for _, adapter := range []string{"fakeA", "fakeB"} {
+		if _, err := st.CreateEvaluationCandidate(ctx, newPoolTestCandidate(c.ID, adapter, "v1", "pool1", 1)); err != nil {
+			t.Errorf("candidate %s: %v", adapter, err)
+		}
+	}
+	// A model outside the set is rejected and nothing is stored.
+	before := evalCount(t, st, "evaluation_candidate")
+	if _, err := st.CreateEvaluationCandidate(ctx, newPoolTestCandidate(c.ID, "provider-a", "v1", "pool1", 1)); !errors.Is(err, ErrEvaluationModelNotAllowed) {
+		t.Fatalf("disallowed model: err = %v, want ErrEvaluationModelNotAllowed", err)
+	}
+	if after := evalCount(t, st, "evaluation_candidate"); after != before {
+		t.Errorf("rejected candidate was stored (%d -> %d)", before, after)
+	}
+}
+
+func TestEvaluationFinalizeRejectsContradictoryExitAndStatus(t *testing.T) {
+	st, _, f := newEvalClockFixture(t, 5, 10)
+	r, err := claimEval(st, f.sample, f.cand, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, done := evaluation.StatusFailed, evaluation.StatusCompleted
+	for name, res := range map[string]EvaluationAttemptResult{
+		"completed exit, failed status": {ExitClass: EvalExitCompleted, Status: &failed},
+		"failed exit, completed status": {ExitClass: EvalExitFailed, Status: &done},
+	} {
+		res.AttemptID, res.FenceAttemptID = r.Attempt.ID, r.Attempt.ID
+		if err := st.FinalizeEvaluationAttempt(context.Background(), res); !errors.Is(err, ErrEvaluationInvalidInput) {
+			t.Errorf("%s: err = %v, want ErrEvaluationInvalidInput", name, err)
+		}
+	}
+	if err := st.FinalizeEvaluationAttempt(context.Background(), EvaluationAttemptResult{
+		AttemptID: r.Attempt.ID, FenceAttemptID: r.Attempt.ID, ExitClass: EvalExitFailed, Status: &failed,
+	}); err != nil {
+		t.Errorf("consistent result rejected: %v", err)
 	}
 }

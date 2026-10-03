@@ -11,7 +11,6 @@ CREATE TABLE evaluation_campaign (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT,
-  allowed_model_id TEXT NOT NULL,
   cohort_manifest TEXT NOT NULL,
   attempt_cap INTEGER NOT NULL CHECK (attempt_cap >= 1),
   created_at TEXT NOT NULL,
@@ -23,6 +22,14 @@ CREATE TABLE evaluation_campaign_project (
   campaign_id TEXT NOT NULL,
   project_id TEXT NOT NULL,
   PRIMARY KEY (campaign_id, project_id),
+  FOREIGN KEY (campaign_id) REFERENCES evaluation_campaign(id)
+);
+
+-- Models a campaign's candidates may use (a candidate's M1 ModelID must be in this set).
+CREATE TABLE evaluation_campaign_model (
+  campaign_id TEXT NOT NULL,
+  model_id TEXT NOT NULL CHECK (length(model_id) > 0),
+  PRIMARY KEY (campaign_id, model_id),
   FOREIGN KEY (campaign_id) REFERENCES evaluation_campaign(id)
 );
 

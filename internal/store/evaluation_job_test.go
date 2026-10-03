@@ -62,7 +62,7 @@ func TestEvaluationJobClaim(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "test-campaign",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        10,
 	}
@@ -132,7 +132,7 @@ func TestEvaluationJobClaimIdempotent(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "test-campaign",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        10,
 	}
@@ -191,7 +191,7 @@ func TestEvaluationJobCapacityEnforcement(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "test-campaign",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        1,
 	}
@@ -263,7 +263,7 @@ func TestEvaluationAttemptRenewAndFinalize(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "test",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{}`,
 		AttemptCap:        10,
 	}
@@ -338,7 +338,7 @@ func TestEvaluationRetryAttemptLifecycle(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "retry-test",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        10,
 	}
@@ -420,7 +420,7 @@ func TestEvaluationCapacityEnforcement(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "cap-test",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        2,
 	}
@@ -504,7 +504,7 @@ func TestEvaluationFencingLateStaleFence(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "fence-test",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        10,
 	}
@@ -564,7 +564,7 @@ func TestEvaluationFencingWrongAttemptID(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "fence-wrong-test",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        10,
 	}
@@ -639,7 +639,7 @@ func TestEvaluationLeaseExpirySweep(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "test-campaign",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        3,
 	}
@@ -717,7 +717,7 @@ func TestEvaluationConcurrentClaim(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "test-campaign",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        1,
 	}
@@ -796,7 +796,7 @@ func TestEvaluationConfigVersionIsolation(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "test-campaign",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model-a", "model-b"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        20,
 	}
@@ -907,7 +907,7 @@ func TestEvaluationCampaignMismatch(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "campaign1",
 		AllowedProjectIDs: []string{"proj1"},
-		AllowedModelID:    "model1",
+		AllowedModelIDs:   []string{"model1"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        10,
 	}
@@ -917,7 +917,7 @@ func TestEvaluationCampaignMismatch(t *testing.T) {
 		ID:                GenerateID(),
 		Name:              "campaign2",
 		AllowedProjectIDs: []string{"proj2"},
-		AllowedModelID:    "model2",
+		AllowedModelIDs:   []string{"model2"},
 		CohortManifest:    `{"samples": []}`,
 		AttemptCap:        10,
 	}

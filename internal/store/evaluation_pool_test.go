@@ -74,7 +74,7 @@ func newPoolTestCampaign(t *testing.T, st Store, attemptCap int, projects ...str
 		projects = []string{"proj1"}
 	}
 	c, err := st.CreateEvaluationCampaign(context.Background(), EvaluationCampaign{
-		ID: GenerateID(), Name: "pool-campaign", AllowedProjectIDs: projects, AllowedModelID: "m",
+		ID: GenerateID(), Name: "pool-campaign", AllowedProjectIDs: projects, AllowedModelIDs: []string{"fakeA-model", "fakeB-model", "local-llm-model", "provider-a-model", "provider-b-model"},
 		CohortManifest: `{"samples": []}`, AttemptCap: attemptCap,
 	})
 	if err != nil {
