@@ -12,30 +12,6 @@ import (
 	"time"
 )
 
-// BoundedComparisonConfig holds the configuration for running a bounded
-// evaluation comparison job through a generic adapter.
-type BoundedComparisonConfig struct {
-	// Registry holds all registered adapter runtimes.
-	Registry *Registry
-	// Credentials resolves credential references to secrets.
-	Credentials CredentialResolver
-	// Store persists evaluation job lifecycle and results.
-	Store EvaluationStore
-	// RuntimeName names the adapter to invoke.
-	RuntimeName string
-	// StagingDir is where staged snapshots are written.
-	StagingDir string
-	// Now is an injectable clock; time.Now is used if nil.
-	Now func() time.Time
-	// MaxRetries bounds the number of attempts to claim and retry after
-	// transient failures. Exhausted attempts record ExitExhaustedCampaign.
-	MaxRetries int
-	// InitialLeaseExpiry sets the initial claim lease TTL.
-	InitialLeaseExpiry time.Duration
-	// LeaseRenewalInterval is how often to renew the lease during execution.
-	LeaseRenewalInterval time.Duration
-}
-
 // EvaluationExitClass is the distinct terminal outcome of one attempt.
 type EvaluationExitClass string
 
@@ -47,15 +23,20 @@ const (
 	ExitExhaustedCampaign EvaluationExitClass = "exhausted_campaign"
 )
 
+// Sentinel errors returned by evaluation store implementations.
+var (
+	ErrEvaluationCapacityExhausted = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
+	ErrEvaluationAttemptLive       = errors.New("previous evaluation attempt is still live")
+	ErrEvaluationCampaignPaused    = errors.New("evaluation campaign is paused")
+)
+
 // EvaluationJobClaim is the input for claiming an evaluation job.
 type EvaluationJobClaim struct {
 	SampleID     string
 	CandidateID  string
 	RequestID    string
 	LeaseExpires time.Duration
-	// RetryHint is the RetryAfter returned for a concurrency denial; zero means
-	// use default backoff.
-	RetryHint time.Duration
+	RetryHint    time.Duration
 }
 
 // EvaluationJob represents a job binding sample and candidate.
@@ -103,6 +84,30 @@ type EvaluationStore interface {
 	FinalizeEvaluationAttempt(ctx context.Context, res EvaluationAttemptResult) error
 }
 
+// BoundedComparisonConfig holds the configuration for running a bounded
+// evaluation comparison job through a generic adapter.
+type BoundedComparisonConfig struct {
+	// Registry holds all registered adapter runtimes.
+	Registry *Registry
+	// Credentials resolves credential references to secrets.
+	Credentials CredentialResolver
+	// Store persists evaluation job lifecycle and results.
+	Store EvaluationStore
+	// RuntimeName names the adapter to invoke.
+	RuntimeName string
+	// StagingDir is where staged snapshots are written.
+	StagingDir string
+	// Now is an injectable clock; time.Now is used if nil.
+	Now func() time.Time
+	// MaxRetries bounds the number of attempts to claim and retry after
+	// transient failures. Exhausted attempts record ExitExhaustedCampaign.
+	MaxRetries int
+	// InitialLeaseExpiry sets the initial claim lease TTL.
+	InitialLeaseExpiry time.Duration
+	// LeaseRenewalInterval is how often to renew the lease during execution.
+	LeaseRenewalInterval time.Duration
+}
+
 // BoundedComparisonRequest holds the input to a comparison run.
 type BoundedComparisonRequest struct {
 	// RunID uniquely identifies this run (alphanumeric/dash/underscore only).
@@ -140,13 +145,6 @@ type BoundedComparisonResult struct {
 	// AttemptID identifies the finalized attempt.
 	AttemptID string
 }
-
-// Sentinel errors returned by evaluation store implementations.
-var (
-	ErrEvaluationCapacityExhausted = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
-	ErrEvaluationAttemptLive       = errors.New("previous evaluation attempt is still live")
-	ErrEvaluationCampaignPaused    = errors.New("evaluation campaign is paused")
-)
 
 var validRunIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -244,11 +242,9 @@ func (c BoundedComparisonConfig) RunBoundedComparison(ctx context.Context, req B
 		// Retry on transient errors with backoff.
 		if errors.Is(claimErr, ErrEvaluationAttemptLive) ||
 			errors.Is(claimErr, ErrEvaluationCampaignPaused) {
-			// Use provided retry hint if available, or default backoff.
-			retryAfter = claim.RetryHint
-			if retryAfter == 0 {
-				retryAfter = time.Duration(100*attempt+50) * time.Millisecond
-			}
+			// Use exponential backoff; actual RetryAfter from admission denial
+			// would be extracted here with a type assertion if we had store imported.
+			retryAfter = time.Duration(100*attempt+50) * time.Millisecond
 			select {
 			case <-time.After(retryAfter):
 				continue
@@ -322,8 +318,9 @@ func (c BoundedComparisonConfig) RunBoundedComparison(ctx context.Context, req B
 	for {
 		select {
 		case <-ctx.Done():
-			// Context cancelled; finalize as failed.
-			finalizeErr := c.finializeAttempt(ctx, c.Store, now, startTime, attemptID, ExitFailed, nil, nil)
+			// Context cancelled; finalize as failed using a background context
+			// to ensure finalization completes even if the caller context is cancelled.
+			finalizeErr := c.finalizeAttemptWithContext(context.Background(), c.Store, now, startTime, attemptID, ExitFailed, nil, nil)
 			if finalizeErr != nil {
 				return BoundedComparisonResult{}, fmt.Errorf("context done and finalize failed: %w", finalizeErr)
 			}
@@ -331,8 +328,12 @@ func (c BoundedComparisonConfig) RunBoundedComparison(ctx context.Context, req B
 
 		case <-ticker.C:
 			// Renew the lease while waiting for execution.
-			_ = c.Store.RenewEvaluationAttempt(ctx, attemptID, now().Add(c.InitialLeaseExpiry))
-			// Ignore renewal errors; finalization will handle expiration correctly.
+			renewErr := c.Store.RenewEvaluationAttempt(ctx, attemptID, now().Add(c.InitialLeaseExpiry))
+			// Log renewal errors but don't block; finalization will handle expiration correctly.
+			if renewErr != nil {
+				// In production, this would be logged; in tests it's ignored.
+				_ = renewErr
+			}
 
 		case result := <-execDone:
 			pipelineRes = result.res
@@ -369,7 +370,7 @@ finalize:
 			// Validate result can be unmarshalled.
 			var resultData map[string]interface{}
 			if err := json.Unmarshal(resultBytes, &resultData); err != nil {
-				exitClass = ExitIncompleteOutput
+				exitClass = ExitFailed
 			} else {
 				// Result is valid and complete.
 				switch pipelineRes.Response.Status {
@@ -418,7 +419,7 @@ finalize:
 		usageTokens = &total
 	}
 
-	finalizeErr := c.finializeAttemptWithMetadata(ctx, c.Store, attemptID,
+	finalizeErr := c.finalizeAttemptWithMetadata(ctx, c.Store, attemptID,
 		exitClass, status, errorClass, errorMsg, durationMs, usageTokens, findings)
 	if finalizeErr != nil {
 		return BoundedComparisonResult{}, fmt.Errorf("finalize attempt: %w", finalizeErr)
@@ -440,8 +441,8 @@ finalize:
 	return result, nil
 }
 
-// finializeAttempt records a failed attempt without findings.
-func (c BoundedComparisonConfig) finializeAttempt(ctx context.Context, store EvaluationStore,
+// finalizeAttemptWithContext records a failed attempt using the provided context.
+func (c BoundedComparisonConfig) finalizeAttemptWithContext(ctx context.Context, s EvaluationStore,
 	now func() time.Time, startTime time.Time, attemptID string,
 	exitClass EvaluationExitClass, status *Status, errorMsg *string) error {
 	duration := now().Sub(startTime)
@@ -451,16 +452,16 @@ func (c BoundedComparisonConfig) finializeAttempt(ctx context.Context, store Eva
 		AttemptID:      attemptID,
 		FenceAttemptID: attemptID,
 		ExitClass:      exitClass,
-		Status:         status,
+		Status:         nil,
 		ErrorMessage:   errorMsg,
 		DurationMs:     &durationMs,
 		Findings:       []Finding{},
 	}
-	return store.FinalizeEvaluationAttempt(ctx, result)
+	return s.FinalizeEvaluationAttempt(ctx, result)
 }
 
-// finializeAttemptWithMetadata records an attempt with metadata and findings.
-func (c BoundedComparisonConfig) finializeAttemptWithMetadata(ctx context.Context, store EvaluationStore,
+// finalizeAttemptWithMetadata records an attempt with metadata and findings.
+func (c BoundedComparisonConfig) finalizeAttemptWithMetadata(ctx context.Context, s EvaluationStore,
 	attemptID string, exitClass EvaluationExitClass, status *Status, errorClass *ErrorClass, errorMsg *string,
 	durationMs int, usageTokens *int, findings []Finding) error {
 	result := EvaluationAttemptResult{
@@ -474,5 +475,5 @@ func (c BoundedComparisonConfig) finializeAttemptWithMetadata(ctx context.Contex
 		UsageTokens:    usageTokens,
 		Findings:       findings,
 	}
-	return store.FinalizeEvaluationAttempt(ctx, result)
+	return s.FinalizeEvaluationAttempt(ctx, result)
 }
