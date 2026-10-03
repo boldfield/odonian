@@ -24,6 +24,8 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_PPROF` | unset | Enable Go runtime profiling on `/debug/pprof/` when set to exactly `true`. All pprof endpoints require the same bearer-token auth as every other protected route. When unset or any other value, `/debug/pprof/` returns 404. See [Runtime profiling with pprof](#runtime-profiling-with-pprof). |
 | `ODONIAN_SLOW_REQUEST_MS` | `500` | Per-request latency logging threshold in milliseconds. Requests at or above this threshold log at INFO level; below it log at DEBUG. `/healthz` is never logged. A non-integer or negative value logs one warning at startup and falls back to the default. |
 | `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by PR-watch, supersession PR cleanup, and `odonian merge`. See [Forge tokens](#forge-tokens). |
+| `ODONIAN_RESEARCH_POLICY_MODE` | `disabled` | Research admission policy mode: `disabled` (no rate limiting), `observe` (log hypothetical denials without enforcing), or `enforce` (enforce rate limits). Applies only to research track tasks. Requires `ODONIAN_RESEARCH_POOLS` to be configured when set to `enforce`. |
+| `ODONIAN_RESEARCH_POOLS` | unset | JSON object defining account/quota pools for research work. Each pool maps a set of models to rate-limiting configuration. See [Research pacing pools](#research-pacing-pools). |
 
 ### Research tasks and escalation
 
@@ -51,6 +53,84 @@ Research tasks use a dedicated escalation ladder and thresholds, separate from t
   `ODONIAN_RESEARCH_ADJUDICATOR` names a configured model that differs from both reviewers. The server
   spawns an adjudication task scoped to that finding alone; the adjudicator's ruling binds only that
   finding and never votes on the round. See the `ODONIAN_RESEARCH_ADJUDICATOR` variable above.
+
+### Research pacing pools
+
+The `ODONIAN_RESEARCH_POOLS` environment variable configures rate-limiting pools for research work when
+`ODONIAN_RESEARCH_POLICY_MODE` is set to `observe` or `enforce`. The variable contains a JSON object
+where each key is a pool name and each value defines the pool's configuration.
+
+**Pool configuration schema** (JSON object):
+
+```json
+{
+  "pool_name": {
+    "account_id": "string (required, unique per pool)",
+    "models": ["model1", "model2"],
+    "start_rate": 1.5,
+    "burst_capacity": 10,
+    "concurrent_dispatch_limit": 5,
+    "completion_reserved": 2
+  }
+}
+```
+
+**Pool fields:**
+
+- `account_id` (string, required): Unique identifier for the external subscription/account. Aliases
+  sharing the same account pool share one rate limit across all projects.
+- `models` (array of strings, required): List of model names from `ODONIAN_MODELS` that use this pool.
+  Each model can be in only one pool. In `enforce` mode, all models in `ODONIAN_MODELS` must be assigned
+  to a pool.
+- `start_rate` (number, required): Sustained rate in starts per second. Must be positive and finite.
+  This is a proxy for subscription rate, not exact billing; actual usage depends on task complexity and
+  concurrent workers.
+- `burst_capacity` (positive integer, required): Maximum burst capacity (tokens in the bucket). Allows
+  short bursts above the sustained rate, up to this capacity.
+- `concurrent_dispatch_limit` (positive integer, required): Maximum concurrent active dispatches from
+  this pool. Completion work (reviews, rework, adjudication) shares this limit with fresh starts.
+- `completion_reserved` (non-negative integer, required): Capacity reserved for completion work (must
+  be ≤ `concurrent_dispatch_limit`). New first-pass writers cannot consume reserved slots. Completion
+  work still obeys the total ceiling; reserved capacity is not borrowed.
+
+**Example:**
+
+```bash
+export ODONIAN_RESEARCH_POLICY_MODE=enforce
+export ODONIAN_RESEARCH_POOLS='
+{
+  "muse": {
+    "account_id": "meta-power-acct",
+    "models": ["haiku"],
+    "start_rate": 0.5,
+    "burst_capacity": 5,
+    "concurrent_dispatch_limit": 3,
+    "completion_reserved": 1
+  },
+  "opus": {
+    "account_id": "anthropic-prod",
+    "models": ["opus", "sonnet"],
+    "start_rate": 2.0,
+    "burst_capacity": 20,
+    "concurrent_dispatch_limit": 10,
+    "completion_reserved": 5
+  }
+}
+'
+```
+
+**Admission outcomes:**
+
+When a new research task is claimed, the policy checks token availability, concurrency, and reserved
+capacity. Admission results in one of:
+
+- **Admit**: The task is launched; one token is consumed.
+- **Timed deferral**: The task's claim is deferred until a specific time (rate limit). The response
+  includes `not_before` timestamp.
+- **Concurrency dependent retry**: Too many concurrent dispatches are active. The response suggests a
+  bounded retry interval.
+
+See `docs/features/research-pacing-and-reviewer-evaluation.md` for detailed design and behavior.
 
 ### Runtime profiling with pprof
 
