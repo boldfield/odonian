@@ -27,6 +27,7 @@ import (
 
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/manifest"
+	"github.com/boldfield/odonian/internal/policy"
 )
 
 //go:embed migrations
@@ -61,6 +62,9 @@ type Store interface {
 	ListDependents(ctx context.Context, taskID string) ([]string, error)
 	UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string) (Task, error)
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
+	ClaimResearchTask(ctx context.Context, req ResearchClaim) (ResearchClaimResult, error)
+	SetResearchPolicy(ctx context.Context, now time.Time, cfg policy.Config) error
+	GetResearchAdmissionDiagnostic(ctx context.Context, taskID string) (ResearchAdmissionDiagnostic, error)
 	HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error)
 	PromoteTask(ctx context.Context, taskID string) (Task, error)
 	SubmitTask(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings ...json.RawMessage) (TaskWithDepsAndLinks, error)
@@ -94,6 +98,12 @@ type sqliteStore struct {
 	researchEscalationLadder []string
 	researchAdjudicator      string
 
+	// clock is the server time source for claim, heartbeat and research
+	// admission; nil means time.Now. Tests inject a fake clock.
+	clock func() time.Time
+	// research holds the research admission policy (see SetResearchPolicy).
+	research researchPolicyState
+
 	// supersedeCloseHook, when set, is invoked after each background
 	// closeSupersededPR attempt finishes. It exists solely so tests can
 	// deterministically wait for the async close instead of racing it; it is
@@ -103,6 +113,14 @@ type sqliteStore struct {
 
 // StoreOption is a functional option for configuring a Store.
 type StoreOption func(*sqliteStore)
+
+// WithClock sets the server time source used by task claim and heartbeat and by
+// research admission. The default is time.Now.
+func WithClock(now func() time.Time) StoreOption {
+	return func(s *sqliteStore) {
+		s.clock = now
+	}
+}
 
 // WithEscalationLadder sets the escalation ladder for the store.
 // The ladder defines the order of models for escalation.
@@ -1841,22 +1859,29 @@ func (s *sqliteStore) ListDependents(ctx context.Context, taskID string) ([]stri
 // Returns ErrNotFound if the task doesn't exist.
 // Returns MODEL_MISMATCH ConflictError if the task's model doesn't match.
 // Returns ErrConflict if the task is not claimable (already claimed, not ready, unfinished deps, etc).
+//
+// ClaimTask is the legacy/direct claim path and obeys the research admission
+// policy like every other claim: a research task under an enabled policy is
+// admitted (or denied with *AdmissionDeniedError) by ClaimResearchTask with a
+// server-generated request ID. Non-research tasks and a disabled policy keep
+// the plain behavior above.
 func (s *sqliteStore) ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error) {
-	tx, err := s.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
+	res, err := s.ClaimResearchTask(ctx, ResearchClaim{TaskID: taskID, AgentID: agentID, Model: model, LeaseTTL: leaseTTL})
+	return res.Task, err
+}
 
-	now := nowTimestamp()
-	leaseExpiry := leaseExpiryTimestamp(leaseTTL)
+// claimTaskTx performs the plain claim inside tx at the given server time:
+// one conditional UPDATE reusing claimableSQL with the model check, a claim
+// event, and a read of the claimed task. When nothing was claimed the error says why.
+func (s *sqliteStore) claimTaskTx(ctx context.Context, tx *sql.Tx, now time.Time, taskID, agentID, model string, leaseTTL time.Duration) (Task, error) {
+	nowTS := formatTS(now)
+	leaseExpiry := formatTS(now.Add(leaseTTL))
 
-	// Single conditional UPDATE reusing claimableSQL with additional model check
 	result, err := tx.ExecContext(ctx, `
 		UPDATE task
 		SET state='in_progress', assignee=?, lease_expires_at=?, updated_at=?
 		WHERE id=? AND model=? AND `+claimableSQL,
-		agentID, leaseExpiry, now, taskID, model, now)
+		agentID, leaseExpiry, nowTS, taskID, model, nowTS)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to claim task: %w", err)
 	}
@@ -1865,67 +1890,67 @@ func (s *sqliteStore) ClaimTask(ctx context.Context, taskID, agentID, model stri
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
 	}
-
-	if rowsAffected == 1 {
-		// Claim succeeded. Append event in the same transaction.
-		_, err := s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil)
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to append claim event: %w", err)
-		}
-
-		// SELECT the claimed task within the same transaction
-		var t Task
-		var reviewModelsJSON *string
-		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
-			FROM task WHERE id = ?
-		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to fetch claimed task: %w", err)
-		}
-
-		// Unmarshal review_models from JSON
-		t.ReviewModels = []string{}
-		if reviewModelsJSON != nil {
-			if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
-				return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
-		}
-
-		return t, nil
+	if rowsAffected != 1 {
+		return Task{}, classifyClaimFailure(ctx, tx, nowTS, taskID, model)
 	}
 
-	// rowsAffected == 0: task was not claimed. Determine the cause for the right error.
+	if _, err := s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil); err != nil {
+		return Task{}, fmt.Errorf("failed to append claim event: %w", err)
+	}
+
+	var t Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch claimed task: %w", err)
+	}
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+	return t, nil
+}
+
+// classifyClaimFailure explains why a task is not claimable. It never returns nil.
+func classifyClaimFailure(ctx context.Context, tx *sql.Tx, nowTS, taskID, model string) error {
 	var taskExists bool
 	var taskModel string
 	var isOtherwiseClaimable bool
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) > 0, COALESCE(model, ''), EXISTS(SELECT 1 FROM task WHERE id = ? AND `+claimableSQL+`)
 		FROM task WHERE id = ?
-	`, taskID, now, taskID).Scan(&taskExists, &taskModel, &isOtherwiseClaimable)
+	`, taskID, nowTS, taskID).Scan(&taskExists, &taskModel, &isOtherwiseClaimable)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return Task{}, fmt.Errorf("failed to check task: %w", err)
+		return fmt.Errorf("failed to check task: %w", err)
 	}
-
 	if !taskExists {
-		// Task does not exist -> ErrNotFound
-		tx.Rollback()
-		return Task{}, ErrNotFound
+		return ErrNotFound
 	}
-
-	// Task exists. Check if the model doesn't match and the task is otherwise claimable.
 	if taskModel != model && isOtherwiseClaimable {
-		tx.Rollback()
-		return Task{}, conflict("MODEL_MISMATCH", fmt.Sprintf("Task model '%s' does not match declared model '%s'", taskModel, model))
+		return conflict("MODEL_MISMATCH", fmt.Sprintf("Task model '%s' does not match declared model '%s'", taskModel, model))
 	}
+	// Not ready, unfinished deps, held, live lease, or model mismatch on an unclaimable task.
+	return ErrConflict
+}
 
-	// Task exists but is not claimable for some reason (not ready, unfinished deps, live lease, or model mismatch) -> ErrConflict
-	tx.Rollback()
-	return Task{}, ErrConflict
+// claimPreflight reports nil when a claim by a task of this model would succeed
+// right now, else the error the claim would return. It writes nothing.
+func claimPreflight(ctx context.Context, tx *sql.Tx, now time.Time, taskID, model string) error {
+	nowTS := formatTS(now)
+	var ok bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM task WHERE id = ? AND model = ? AND `+claimableSQL+`)`, taskID, model, nowTS).Scan(&ok)
+	if err != nil {
+		return fmt.Errorf("failed to check task claimability: %w", err)
+	}
+	if ok {
+		return nil
+	}
+	return classifyClaimFailure(ctx, tx, nowTS, taskID, model)
 }
 
 // HeartbeatTask atomically extends the lease on an in_progress task.
@@ -1934,6 +1959,10 @@ func (s *sqliteStore) ClaimTask(ctx context.Context, taskID, agentID, model stri
 // Returns the updated Task on success (rowsAffected == 1).
 // Returns ErrNotFound if the task doesn't exist.
 // Returns ErrConflict if the task is not in_progress or not assigned to the given agentID.
+// A research attempt ID in ctx (WithResearchAttempt) must be the task's current
+// attempt for that agent, else the heartbeat fails with an ATTEMPT_FENCED or
+// ATTEMPT_EXPIRED ConflictError. A live attempt is renewed alongside the task
+// lease (never shortened); a heartbeat never spends a start.
 func (s *sqliteStore) HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -1941,8 +1970,9 @@ func (s *sqliteStore) HeartbeatTask(ctx context.Context, taskID, agentID string,
 	}
 	defer tx.Rollback()
 
-	now := nowTimestamp()
-	leaseExpiry := leaseExpiryTimestamp(leaseTTL)
+	nowT := s.nowTime()
+	now := formatTS(nowT)
+	leaseExpiry := formatTS(nowT.Add(leaseTTL))
 
 	// Single conditional UPDATE: only update if state is 'in_progress' AND assignee matches
 	result, err := tx.ExecContext(ctx, `
@@ -1960,6 +1990,11 @@ func (s *sqliteStore) HeartbeatTask(ctx context.Context, taskID, agentID string,
 	}
 
 	if rowsAffected == 1 {
+		// A research attempt bound to this task is fenced and renewed with the
+		// lease; a stale attempt fails here and the UPDATE above rolls back.
+		if err := fenceResearchAttempt(ctx, tx, nowT, taskID, agentID, researchAttemptFromContext(ctx), leaseTTL); err != nil {
+			return Task{}, err
+		}
 		// SELECT the updated task within the same transaction
 		var t Task
 		var reviewModelsJSON *string
@@ -2203,6 +2238,15 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 			return TaskWithDepsAndLinks{}, ErrConflict
 		}
 		return TaskWithDepsAndLinks{}, fmt.Errorf("failed to determine task kind: %w", err)
+	}
+
+	// Reject a submission from a research attempt that a replacement superseded.
+	// The attempt itself is left active: submitting ends task ownership, not the
+	// dispatch. Only the store-level RenewResearchAttempt and FinalizeResearchAttempt
+	// drive that lifecycle; no API route exposes them yet, so until a harness
+	// integration calls them the preserved attempt lapses at its lease expiry.
+	if err := fenceResearchAttempt(ctx, tx, s.nowTime(), taskID, agentID, researchAttemptFromContext(ctx), 0); err != nil {
+		return TaskWithDepsAndLinks{}, err
 	}
 
 	// Validate verdict based on task kind

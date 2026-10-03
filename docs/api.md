@@ -731,6 +731,17 @@ A task is claimable only if:
 
 The claim is atomic — implemented as a conditional UPDATE statement. If the claim succeeds, `rowsAffected == 1` and the task is guaranteed to be in `in_progress` with a fresh lease. If `rowsAffected == 0`, the client lost the race (another agent claimed it first) or the model didn't match, and should retry with a different task.
 
+**Research admission (research-track tasks only):**
+Research claims are admitted against the research pacing policy in the same transaction as the claim, so a start is debited only when the claim succeeds. Legacy clients that send only `agent_id` and `model` are paced identically. Non-research claims and `disabled` mode return the bare task above.
+
+Optional request fields: `request_id` (stable key; retrying the same request recovers the original admission, `replayed: true`), `account_id` and `work_class` (assertions only — the server derives both; a mismatch is `400 INVALID_RESEARCH_CLAIM`, an unknown class is `400 INVALID_WORK_CLASS`).
+
+An admitted claim adds `research_admission` to the task body: `permit_id`, `attempt_id`, `request_id`, `account_id`, `expires_at`, `replayed`, and in `observe` mode `observed_denial` (the hypothetical outcome; the work is still granted). Pass `attempt_id` on heartbeat and submit; a superseded attempt gets `409 ATTEMPT_FENCED` (or `409 ATTEMPT_EXPIRED`) and cannot change its replacement. Heartbeats never spend a start. The `odonian` CLI does this automatically: `claim` saves the attempt ID in a file keyed by task and worker session (`$ODONIAN_SESSION_ID`, else `$CLAUDE_CODE_SESSION_ID`, else `$CODEX_SESSION_ID`) under `$ODONIAN_STATE_DIR` (default the user cache dir), so a replacement session never overwrites the ID a stale session reads; with no session variable set the file is per-task and cannot distinguish sessions. `heartbeat`/`submit` send it back (override with `--attempt`). A heartbeat or submit with no `attempt_id` is a legacy call that cannot be told apart from a replacement of the same agent. Rework, adjudication, reclaim and retry each count as a start.
+
+A denial is `429 ADMISSION_DENIED` with `error.outcome` (`defer` or `retry`), `error.reason` (`rate`, `concurrency` or `reserved_capacity`), `error.not_before` and/or `error.retry_after_seconds` (also sent as `Retry-After`). The task is left untouched — not blocked, failed or rejected — and may be claimed again later. Other research errors: `409 TASK_BUSY` (a live research attempt still holds the task), `409 REQUEST_ID_CONFLICT` (`request_id` reused for a different task, agent, model or pool).
+
+A submit ends task ownership but not the dispatch: the research attempt stays active, so it keeps holding its concurrency slot and a rework claim of that task is `409 TASK_BUSY` in `enforce` mode until the attempt lapses at its lease expiry. Renewing and finalizing a preserved attempt are store operations only (`RenewResearchAttempt`, `FinalizeResearchAttempt`); no API route exposes them yet, so they are out of scope here. In `observe` mode a live attempt on the task is recorded as a hypothetical busy refusal (`outcome: retry`, `reason: concurrency`) and superseded, and the claim is granted.
+
 ---
 
 #### `POST /tasks/{id}/heartbeat`

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 )
 
@@ -261,6 +262,35 @@ type HTTPClient struct {
 	baseURL string
 	token   string
 	http    *http.Client
+
+	// attempts maps task ID to the research attempt ID returned by its claim, so
+	// heartbeat and submit from the same client fence against that attempt.
+	attemptsMu sync.Mutex
+	attempts   map[string]string
+}
+
+// AttemptID returns the research attempt this client holds for a task: the one
+// returned by its claim, or one set with SetAttemptID. Empty for a task with no
+// research attempt.
+func (c *HTTPClient) AttemptID(taskID string) string {
+	c.attemptsMu.Lock()
+	defer c.attemptsMu.Unlock()
+	return c.attempts[taskID]
+}
+
+// SetAttemptID makes heartbeat and submit for taskID send attemptID, for callers
+// that claimed in another process. An empty ID clears it.
+func (c *HTTPClient) SetAttemptID(taskID, attemptID string) {
+	c.attemptsMu.Lock()
+	defer c.attemptsMu.Unlock()
+	if attemptID == "" {
+		delete(c.attempts, taskID)
+		return
+	}
+	if c.attempts == nil {
+		c.attempts = make(map[string]string)
+	}
+	c.attempts[taskID] = attemptID
 }
 
 // NewHTTPClient creates a new HTTP client for the Odonian API.
@@ -624,6 +654,18 @@ func (c *HTTPClient) ClaimTask(ctx context.Context, id, agentID, model string) e
 	}
 	defer resp.Body.Close()
 
+	// A research claim returns research_admission.attempt_id; keep it so later
+	// heartbeats and the submit are fenced to this attempt. Anything else (a bare
+	// task, an unreadable body) means there is no attempt to fence.
+	var claimed struct {
+		ResearchAdmission *struct {
+			AttemptID string `json:"attempt_id"`
+		} `json:"research_admission"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&claimed) == nil && claimed.ResearchAdmission != nil {
+		c.SetAttemptID(id, claimed.ResearchAdmission.AttemptID)
+	}
+
 	return nil
 }
 
@@ -675,13 +717,15 @@ func (c *HTTPClient) TransitionTask(ctx context.Context, id, to string, note *st
 
 // heartbeatTaskRequest is the request body for HeartbeatTask.
 type heartbeatTaskRequest struct {
-	AgentID string `json:"agent_id"`
+	AgentID   string `json:"agent_id"`
+	AttemptID string `json:"attempt_id,omitempty"`
 }
 
 // HeartbeatTask extends a task's lease.
 func (c *HTTPClient) HeartbeatTask(ctx context.Context, id, agentID string) error {
 	body := heartbeatTaskRequest{
-		AgentID: agentID,
+		AgentID:   agentID,
+		AttemptID: c.AttemptID(id),
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/heartbeat", id), body)
@@ -695,13 +739,14 @@ func (c *HTTPClient) HeartbeatTask(ctx context.Context, id, agentID string) erro
 
 // submitTaskRequest is the request body for SubmitTask.
 type submitTaskRequest struct {
-	AgentID  string          `json:"agent_id"`
-	Result   string          `json:"result"`
-	Verdict  *string         `json:"verdict,omitempty"`
-	Links    []LinkInput     `json:"links"`
-	Findings json.RawMessage `json:"findings,omitempty"`
-	Disputes json.RawMessage `json:"disputes,omitempty"`
-	Manifest json.RawMessage `json:"manifest,omitempty"`
+	AgentID   string          `json:"agent_id"`
+	AttemptID string          `json:"attempt_id,omitempty"`
+	Result    string          `json:"result"`
+	Verdict   *string         `json:"verdict,omitempty"`
+	Links     []LinkInput     `json:"links"`
+	Findings  json.RawMessage `json:"findings,omitempty"`
+	Disputes  json.RawMessage `json:"disputes,omitempty"`
+	Manifest  json.RawMessage `json:"manifest,omitempty"`
 }
 
 // SubmitTask submits a task result with optional verdict and links.
@@ -725,13 +770,14 @@ func (c *HTTPClient) SubmitTaskWithDisputesAndFindings(ctx context.Context, id, 
 // continuation manifest (research-track implement, per docs/features/research-continuations.md).
 func (c *HTTPClient) SubmitTaskWithManifest(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) error {
 	body := submitTaskRequest{
-		AgentID:  agentID,
-		Result:   result,
-		Verdict:  verdict,
-		Links:    links,
-		Findings: findings,
-		Disputes: disputes,
-		Manifest: manifest,
+		AgentID:   agentID,
+		AttemptID: c.AttemptID(id),
+		Result:    result,
+		Verdict:   verdict,
+		Links:     links,
+		Findings:  findings,
+		Disputes:  disputes,
+		Manifest:  manifest,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/submit", id), body)

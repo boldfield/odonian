@@ -185,8 +185,8 @@ func runServer() {
 		log.Fatal("ODONIAN_MODELS configuration resulted in empty allowlist")
 	}
 
-	// Validate the research pacing policy. Configuration alone launches nothing and
-	// changes no claim or dispatch behavior.
+	// Validate the research pacing policy. It is installed in the store below and
+	// governs every research claim; the default mode is disabled, which changes nothing.
 	researchPolicy, err := policy.ParseConfig(os.Getenv("ODONIAN_RESEARCH_POLICY_MODE"), os.Getenv("ODONIAN_RESEARCH_POOLS"), allowedModels)
 	if err != nil {
 		log.Fatalf("invalid research pacing policy: %v", err)
@@ -286,6 +286,9 @@ func runServer() {
 
 	// Prune old events on startup
 	ctx := context.Background()
+	if err := s.SetResearchPolicy(ctx, time.Now(), researchPolicy); err != nil {
+		log.Fatalf("failed to apply research pacing policy: %v", err)
+	}
 	deletedCount, err := s.PruneEvents(ctx, eventTerminalRetentionDays)
 	if err != nil {
 		log.Fatalf("failed to prune events: %v", err)
@@ -852,6 +855,7 @@ func executeClaim(ctx context.Context, baseURL, token string, args []string) err
 		}
 		return err
 	}
+	saveAttempt(client, taskID)
 
 	return nil
 }
@@ -873,6 +877,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	noOpFlag := fs.Bool("no-op", false, "mark as already-satisfied (no-op)")
 	messageFlag := fs.String("message", "", "commit message override (local_commit mode)")
 	agentFlag := fs.String("agent", "", "agent ID")
+	attemptFlag := fs.String("attempt", "", "research attempt ID (default: the one saved by claim)")
 	findingsFileFlag := fs.String("findings-file", "", "path to JSON file with structured findings")
 	disputesFileFlag := fs.String("disputes-file", "", "path to JSON file with finding disputes (research-track rework only)")
 	manifestFileFlag := fs.String("manifest-file", "", "path to JSON file with a research continuation manifest (research implement only; the task spec must opt in)")
@@ -1067,9 +1072,11 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 		verdict = verdictFlag
 	}
 
+	loadAttempt(client, taskID, *attemptFlag)
 	if err := client.SubmitTaskWithManifest(ctx, taskID, agentID, *resultFlag, verdict, links, findings, disputes, manifestBody); err != nil {
 		return fmt.Errorf("failed to submit task: %w", err)
 	}
+	clearAttempt(taskID)
 
 	return nil
 }
@@ -1085,6 +1092,7 @@ func executeHeartbeat(ctx context.Context, baseURL, token string, args []string)
 	fs := flag.NewFlagSet("heartbeat", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	agentFlag := fs.String("agent", "", "agent ID")
+	attemptFlag := fs.String("attempt", "", "research attempt ID (default: the one saved by claim)")
 	positionals, err := parseFlagsWithPositionals(fs, args)
 	if err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
@@ -1105,6 +1113,7 @@ func executeHeartbeat(ctx context.Context, baseURL, token string, args []string)
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
+	loadAttempt(client, taskID, *attemptFlag)
 	if err := client.HeartbeatTask(ctx, taskID, agentID); err != nil {
 		return fmt.Errorf("failed to heartbeat task: %w", err)
 	}
@@ -1405,6 +1414,7 @@ func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			}
 			return err
 		}
+		saveAttempt(client, task.ID)
 
 		if jsonOutput {
 			task, err := client.GetTask(ctx, task.ID)
