@@ -1866,3 +1866,291 @@ When a task is claimed, a lease expiration time is set (`lease_expires_at`). If 
 
 **No Sweeper:**
 The MVP does not run a background sweeper. Lease expiry is checked lazily inside the atomic claim query. For target concurrency of 2–5 agents, this is sufficient and keeps the system simple.
+
+## Evaluation Campaign & Job Endpoints
+
+These endpoints manage model-agnostic reviewer evaluation campaigns, which are separate from production research review tasks. Evaluation jobs have durable claim/lease/attempt lifecycle, but cannot vote, reject, advance production task states, create follow-ups, or affect production review scorecards.
+
+### Create Evaluation Campaign
+
+#### `POST /evaluation/campaigns`
+
+Create a new evaluation campaign with attempt cap and allowed projects/models.
+
+**Request:**
+```json
+{
+  "name": "Muse Spark 1.3 comparison",
+  "description": "Initial evaluation of Muse Spark 1.3",
+  "cohort_manifest": "{...}",
+  "attempt_cap": 100,
+  "allowed_project_ids": ["proj-1", "proj-2"],
+  "allowed_model_ids": ["muse-spark-1.3"]
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": "camp-abc123",
+  "name": "Muse Spark 1.3 comparison",
+  "description": "Initial evaluation of Muse Spark 1.3",
+  "allowed_project_ids": ["proj-1", "proj-2"],
+  "allowed_model_ids": ["muse-spark-1.3"],
+  "attempt_cap": 100,
+  "created_at": "2026-10-03T12:00:00Z",
+  "updated_at": "2026-10-03T12:00:00Z"
+}
+```
+
+**Errors:**
+- `400 INVALID_INPUT`: Missing or invalid required fields
+- `409 ALREADY_EXISTS`: Campaign with this ID already exists
+
+### Get Evaluation Campaign
+
+#### `GET /evaluation/campaigns/{id}`
+
+Retrieve campaign details.
+
+**Request:**
+```bash
+curl -H "Authorization: Bearer token" https://api.example.com/evaluation/campaigns/camp-abc123
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": "camp-abc123",
+  "name": "Muse Spark 1.3 comparison",
+  "description": "Initial evaluation of Muse Spark 1.3",
+  "allowed_project_ids": ["proj-1", "proj-2"],
+  "allowed_model_ids": ["muse-spark-1.3"],
+  "attempt_cap": 100,
+  "created_at": "2026-10-03T12:00:00Z",
+  "updated_at": "2026-10-03T12:00:00Z",
+  "paused_at": null,
+  "resumed_at": null
+}
+```
+
+**Errors:**
+- `404 NOT_FOUND`: Campaign not found
+
+### Get Evaluation Campaign Status
+
+#### `GET /evaluation/campaigns/{id}/status`
+
+Retrieve comprehensive campaign status including pause state.
+
+**Request:**
+```bash
+curl -H "Authorization: Bearer token" https://api.example.com/evaluation/campaigns/camp-abc123/status
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": "camp-abc123",
+  "name": "Muse Spark 1.3 comparison",
+  "description": "Initial evaluation of Muse Spark 1.3",
+  "allowed_project_ids": ["proj-1", "proj-2"],
+  "allowed_model_ids": ["muse-spark-1.3"],
+  "attempt_cap": 100,
+  "is_paused": false,
+  "paused_at": null,
+  "resumed_at": null,
+  "created_at": "2026-10-03T12:00:00Z",
+  "updated_at": "2026-10-03T12:00:00Z"
+}
+```
+
+**Errors:**
+- `404 NOT_FOUND`: Campaign not found
+
+### Pause Evaluation Campaign
+
+#### `POST /evaluation/campaigns/{id}/pause`
+
+Pause a campaign to block new job admission.
+
+**Request:**
+```bash
+curl -X POST -H "Authorization: Bearer token" https://api.example.com/evaluation/campaigns/camp-abc123/pause
+```
+
+**Response (200 OK):**
+```json
+{
+  "campaign_id": "camp-abc123",
+  "paused_at": "2026-10-03T13:00:00Z"
+}
+```
+
+**Errors:**
+- `404 NOT_FOUND`: Campaign not found or already paused
+- `500 PAUSE_ERROR`: Failed to pause campaign
+
+### Claim Evaluation Job
+
+#### `POST /evaluation/jobs/claim`
+
+Claim a job for a sample/candidate pair.
+
+**Request:**
+```json
+{
+  "sample_id": "sample-123",
+  "candidate_id": "cand-456",
+  "request_id": "req-789",
+  "lease_ttl_ms": 300000
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "job": {
+    "id": "job-123",
+    "sample_id": "sample-123",
+    "candidate_id": "cand-456",
+    "current_attempt_id": "att-001",
+    "created_at": "2026-10-03T12:00:00Z"
+  },
+  "attempt": {
+    "id": "att-001",
+    "job_id": "job-123",
+    "request_id": "req-789",
+    "previous_attempt_id": null,
+    "sequence_number": 1,
+    "state": "active",
+    "started_at": "2026-10-03T12:00:00Z",
+    "expires_at": "2026-10-03T12:05:00Z"
+  }
+}
+```
+
+**Errors:**
+- `400 INVALID_INPUT`: Missing or invalid required fields, lease_ttl_ms must be > 0
+- `404 SAMPLE_NOT_FOUND`: Sample not found
+- `404 CANDIDATE_NOT_FOUND`: Candidate not found
+- `409 CAPACITY_EXHAUSTED`: Campaign or candidate capacity exhausted
+- `409 ATTEMPT_LIVE`: Previous evaluation attempt is still active
+
+### Renew Evaluation Attempt
+
+#### `POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew`
+
+Extend the lease for an active attempt. Uses relative TTL validation.
+
+**Request:**
+```json
+{
+  "lease_ttl_ms": 300000
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "message": "Attempt lease renewed",
+  "expires_at": 1727961900000
+}
+```
+
+**Validation:**
+- `lease_ttl_ms` must be between 1 and 3600000 (1 hour)
+- Attempt identity must match the job's current attempt
+- Attempt must not have expired or been finalized
+
+**Errors:**
+- `400 INVALID_ID`: Job ID or Attempt ID is missing
+- `400 INVALID_INPUT`: lease_ttl_ms outside valid range
+- `400 JOB_MISMATCH`: Attempt does not belong to the specified job
+- `404 NOT_FOUND`: Attempt not found
+- `409 ATTEMPT_EXPIRED`: Attempt lease has expired
+- `409 ATTEMPT_FINALIZED`: Attempt is already finalized
+
+### Finalize Evaluation Attempt
+
+#### `POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize`
+
+Record results and finalize an attempt. Findings are strictly validated.
+
+**Request:**
+```json
+{
+  "fence_attempt_id": "att-001",
+  "exit_class": "completed",
+  "status": "completed",
+  "error_class": null,
+  "error_message": null,
+  "duration_ms": 45000,
+  "usage_tokens": 5000,
+  "findings": [
+    {
+      "id": "f-001",
+      "severity": "material",
+      "claim": "Variable not initialized",
+      "summary": "Missing initialization",
+      "evidence": "Line 42: x used before assignment"
+    }
+  ]
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "message": "Attempt finalized"
+}
+```
+
+**Validation:**
+- Attempt identity must match the job's current attempt
+- All finding fields (id, severity, claim, summary, evidence) must be strings if present
+- Unknown finding fields are rejected
+- Attempt must not have expired or been finalized
+
+**Errors:**
+- `400 INVALID_ID`: Job ID or Attempt ID is missing
+- `400 INVALID_INPUT`: Invalid findings structure
+- `400 JOB_MISMATCH`: Attempt does not belong to the specified job
+- `404 NOT_FOUND`: Attempt not found
+- `409 FENCE_MISMATCH`: Attempt ID does not match the job's current attempt
+- `409 ATTEMPT_EXPIRED`: Attempt lease has expired
+- `409 ATTEMPT_FINALIZED`: Attempt is already finalized
+
+### Get Evaluation Sample
+
+#### `GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}`
+
+Retrieve evaluation sample details.
+
+**Request:**
+```bash
+curl -H "Authorization: Bearer token" https://api.example.com/evaluation/campaigns/camp-abc123/samples/sample-123
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": "sample-123",
+  "campaign_id": "camp-abc123",
+  "project_id": "proj-1",
+  "original_task_id": "task-abc",
+  "original_review_round": 1,
+  "submitted_sha": "abc123def456",
+  "snapshot_digest": "snap-123",
+  "source_digest": "src-123",
+  "manifest_digest": "mani-123",
+  "prompt_version": "v1",
+  "model_version": "1.0",
+  "runtime_version": "2.0",
+  "created_at": "2026-10-03T12:00:00Z"
+}
+```
+
+**Errors:**
+- `404 NOT_FOUND`: Sample not found
+
