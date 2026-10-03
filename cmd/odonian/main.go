@@ -88,7 +88,7 @@ func run(args []string) error {
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
-	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback":
+	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize":
 		return runClient(args[1], args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command %q\n\n", args[1])
@@ -125,6 +125,10 @@ Commands:
   merge                  Merge a pull request and transition tasks
   wt-ensure              Ensure worktree for task (local_commit mode)
   pr-feedback            Manage PR feedback (list, ack)
+  research-policy        Get research pacing policy configuration
+  research-status        Get current research pool status
+  permit-renew           Renew a research permit
+  permit-finalize        Finalize a research permit
   help, -h, --help       Show this help message
 `, version)
 }
@@ -431,6 +435,14 @@ func runClient(verb string, args []string) error {
 		return executeWtEnsure(ctx, baseURL, token, args)
 	case "pr-feedback":
 		return executePRFeedback(ctx, args, os.Stdout)
+	case "research-policy":
+		return executeResearchPolicy(ctx, baseURL, token, jsonOutput, os.Stdout)
+	case "research-status":
+		return executeResearchStatus(ctx, baseURL, token, jsonOutput, os.Stdout)
+	case "permit-renew":
+		return executePermitRenew(ctx, baseURL, token, args, os.Stdout)
+	case "permit-finalize":
+		return executePermitFinalize(ctx, baseURL, token, args, os.Stdout)
 	default:
 		return fmt.Errorf("unknown command %q", verb)
 	}
@@ -1957,4 +1969,201 @@ func printContinuation(out io.Writer, task tuiclient.TaskDetail) {
 			fmt.Fprintf(out, "  - %s: %s (%s%s)\n", f.ID, f.Title, f.State, held)
 		}
 	}
+}
+
+func executeResearchPolicy(ctx context.Context, baseURL, token string, jsonOutput bool, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	policy, err := client.GetResearchPolicy(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get research policy: %w", err)
+	}
+
+	if jsonOutput {
+		output, err := json.MarshalIndent(policy, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %w", err)
+		}
+		fmt.Fprintln(out, string(output))
+	} else {
+		fmt.Fprintf(out, "Mode: %s\n", policy.Mode)
+		if len(policy.Pools) > 0 {
+			fmt.Fprintf(out, "Pools:\n")
+			for _, pool := range policy.Pools {
+				fmt.Fprintf(out, "  Account: %s\n", pool.AccountID)
+				fmt.Fprintf(out, "    Start Rate: %.2f\n", pool.StartRate)
+				fmt.Fprintf(out, "    Burst Capacity: %d\n", pool.BurstCapacity)
+				fmt.Fprintf(out, "    Concurrent Limit: %d\n", pool.ConcurrentLimit)
+				fmt.Fprintf(out, "    Completion Reserved: %d\n", pool.CompletionReserved)
+			}
+		}
+	}
+
+	return nil
+}
+
+func executeResearchStatus(ctx context.Context, baseURL, token string, jsonOutput bool, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	status, err := client.GetResearchStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get research status: %w", err)
+	}
+
+	if jsonOutput {
+		output, err := json.MarshalIndent(status, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %w", err)
+		}
+		fmt.Fprintln(out, string(output))
+	} else {
+		fmt.Fprintf(out, "Mode: %s\n", status.Mode)
+		if len(status.Pools) > 0 {
+			fmt.Fprintf(out, "Pool Status:\n")
+			for _, pool := range status.Pools {
+				fmt.Fprintf(out, "  Account: %s\n", pool.AccountID)
+				fmt.Fprintf(out, "    Active: %d\n", pool.Active)
+				fmt.Fprintf(out, "    Active Completion: %d\n", pool.ActiveCompletion)
+				fmt.Fprintf(out, "    Deferred: %d\n", pool.Deferred)
+				fmt.Fprintf(out, "    Tokens: %s\n", pool.Tokens)
+				fmt.Fprintf(out, "    Settled At: %s\n", pool.SettledAt)
+			}
+		}
+	}
+
+	return nil
+}
+
+func executePermitRenew(ctx context.Context, baseURL, token string, args []string, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	fs := flag.NewFlagSet("permit-renew", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	taskIDFlag := fs.String("task-id", "", "task ID")
+	modelFlag := fs.String("model", "", "model")
+	agentIDFlag := fs.String("agent-id", "", "agent ID")
+	requestIDFlag := fs.String("request-id", "", "request ID")
+	attemptIDFlag := fs.String("attempt-id", "", "attempt ID")
+	positionals, err := parseFlagsWithPositionals(fs, args)
+	if err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	if len(positionals) < 1 {
+		return fmt.Errorf("permit ID is required")
+	}
+	permitID := positionals[0]
+
+	if *taskIDFlag == "" {
+		return fmt.Errorf("--task-id flag is required")
+	}
+	if *modelFlag == "" {
+		return fmt.Errorf("--model flag is required")
+	}
+	if *agentIDFlag == "" {
+		return fmt.Errorf("--agent-id flag is required")
+	}
+	if *requestIDFlag == "" {
+		return fmt.Errorf("--request-id flag is required")
+	}
+	if *attemptIDFlag == "" {
+		return fmt.Errorf("--attempt-id flag is required")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	attempt, err := client.RenewResearchPermit(ctx, permitID, *taskIDFlag, *modelFlag, *agentIDFlag, *requestIDFlag, *attemptIDFlag)
+	if err != nil {
+		return fmt.Errorf("failed to renew research permit: %w", err)
+	}
+
+	output, err := json.MarshalIndent(attempt, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+	fmt.Fprintln(out, string(output))
+
+	return nil
+}
+
+func executePermitFinalize(ctx context.Context, baseURL, token string, args []string, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	fs := flag.NewFlagSet("permit-finalize", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	taskIDFlag := fs.String("task-id", "", "task ID")
+	modelFlag := fs.String("model", "", "model")
+	agentIDFlag := fs.String("agent-id", "", "agent ID")
+	requestIDFlag := fs.String("request-id", "", "request ID")
+	attemptIDFlag := fs.String("attempt-id", "", "attempt ID")
+	exitClassFlag := fs.String("exit-class", "", "exit class (completed, failed, cancelled, unknown)")
+	usageTokensFlag := fs.Int64("usage-tokens", 0, "usage tokens (optional)")
+	positionals, err := parseFlagsWithPositionals(fs, args)
+	if err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	if len(positionals) < 1 {
+		return fmt.Errorf("permit ID is required")
+	}
+	permitID := positionals[0]
+
+	if *taskIDFlag == "" {
+		return fmt.Errorf("--task-id flag is required")
+	}
+	if *modelFlag == "" {
+		return fmt.Errorf("--model flag is required")
+	}
+	if *agentIDFlag == "" {
+		return fmt.Errorf("--agent-id flag is required")
+	}
+	if *requestIDFlag == "" {
+		return fmt.Errorf("--request-id flag is required")
+	}
+	if *attemptIDFlag == "" {
+		return fmt.Errorf("--attempt-id flag is required")
+	}
+	if *exitClassFlag == "" {
+		return fmt.Errorf("--exit-class flag is required")
+	}
+
+	var usageTokens *int64
+	if *usageTokensFlag > 0 {
+		usageTokens = usageTokensFlag
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	attempt, err := client.FinalizeResearchPermit(ctx, permitID, *taskIDFlag, *modelFlag, *agentIDFlag, *requestIDFlag, *attemptIDFlag, *exitClassFlag, usageTokens)
+	if err != nil {
+		return fmt.Errorf("failed to finalize research permit: %w", err)
+	}
+
+	output, err := json.MarshalIndent(attempt, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+	fmt.Fprintln(out, string(output))
+
+	return nil
 }

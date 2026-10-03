@@ -26,6 +26,10 @@ type MockClient struct {
 	ArchiveTaskFunc                   func(ctx context.Context, id string) error
 	ArchiveProjectFunc                func(ctx context.Context, id string) error
 	GetResearchReviewerScorecardsFunc func(ctx context.Context, projectID string) (ReviewerScorecards, error)
+	GetResearchPolicyFunc             func(ctx context.Context) (ResearchPolicy, error)
+	GetResearchStatusFunc             func(ctx context.Context) (ResearchStatus, error)
+	RenewResearchPermitFunc           func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (ResearchAttempt, error)
+	FinalizeResearchPermitFunc        func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (ResearchAttempt, error)
 	Tasks                             []Task // for simple test data
 }
 
@@ -158,4 +162,32 @@ func (m *MockClient) GetResearchReviewerScorecards(ctx context.Context, projectI
 		return m.GetResearchReviewerScorecardsFunc(ctx, projectID)
 	}
 	return ReviewerScorecards{}, nil
+}
+
+func (m *MockClient) GetResearchPolicy(ctx context.Context) (ResearchPolicy, error) {
+	if m.GetResearchPolicyFunc != nil {
+		return m.GetResearchPolicyFunc(ctx)
+	}
+	return ResearchPolicy{}, nil
+}
+
+func (m *MockClient) GetResearchStatus(ctx context.Context) (ResearchStatus, error) {
+	if m.GetResearchStatusFunc != nil {
+		return m.GetResearchStatusFunc(ctx)
+	}
+	return ResearchStatus{}, nil
+}
+
+func (m *MockClient) RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (ResearchAttempt, error) {
+	if m.RenewResearchPermitFunc != nil {
+		return m.RenewResearchPermitFunc(ctx, permitID, taskID, model, agentID, requestID, attemptID)
+	}
+	return ResearchAttempt{}, nil
+}
+
+func (m *MockClient) FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (ResearchAttempt, error) {
+	if m.FinalizeResearchPermitFunc != nil {
+		return m.FinalizeResearchPermitFunc(ctx, permitID, taskID, model, agentID, requestID, attemptID, exitClass, usageTokens)
+	}
+	return ResearchAttempt{}, nil
 }

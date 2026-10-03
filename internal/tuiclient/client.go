@@ -37,6 +37,10 @@ type Client interface {
 	ArchiveTask(ctx context.Context, id string) error
 	ArchiveProject(ctx context.Context, id string) error
 	GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error)
+	GetResearchPolicy(ctx context.Context) (ResearchPolicy, error)
+	GetResearchStatus(ctx context.Context) (ResearchStatus, error)
+	RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (ResearchAttempt, error)
+	FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (ResearchAttempt, error)
 }
 
 // Response structs for the TUI client (distinct from internal/store)
@@ -255,6 +259,41 @@ type ReviewerScorecard struct {
 
 type ReviewerScorecards struct {
 	Scorecards []ReviewerScorecard `json:"reviewer_scorecards"`
+}
+
+type ResearchPoolConfig struct {
+	AccountID          string  `json:"account_id"`
+	StartRate          float64 `json:"start_rate"`
+	BurstCapacity      int     `json:"burst_capacity"`
+	ConcurrentLimit    int     `json:"concurrent_limit"`
+	CompletionReserved int     `json:"completion_reserved"`
+}
+
+type ResearchPolicy struct {
+	Mode  string               `json:"mode"`
+	Pools []ResearchPoolConfig `json:"pools"`
+}
+
+type ResearchPoolState struct {
+	AccountID        string `json:"account_id"`
+	Active           int    `json:"active"`
+	ActiveCompletion int    `json:"active_completion"`
+	Deferred         int    `json:"deferred"`
+	Tokens           string `json:"tokens"`
+	SettledAt        string `json:"settled_at"`
+}
+
+type ResearchStatus struct {
+	Mode  string              `json:"mode"`
+	Pools []ResearchPoolState `json:"pools"`
+}
+
+type ResearchAttempt struct {
+	ID        string `json:"id"`
+	PermitID  string `json:"permit_id"`
+	TaskID    string `json:"task_id"`
+	State     string `json:"state"`
+	ExitClass string `json:"exit_class,omitempty"`
 }
 
 // HTTPClient implements the Client interface.
@@ -885,4 +924,116 @@ func (c *HTTPClient) GetResearchReviewerScorecards(ctx context.Context, projectI
 	}
 
 	return scorecards, nil
+}
+
+// GetResearchPolicy fetches the research pacing policy configuration.
+func (c *HTTPClient) GetResearchPolicy(ctx context.Context) (ResearchPolicy, error) {
+	resp, err := c.do(ctx, "GET", "/research/policy", nil)
+	if err != nil {
+		return ResearchPolicy{}, err
+	}
+	defer resp.Body.Close()
+
+	var policy ResearchPolicy
+	if err := json.NewDecoder(resp.Body).Decode(&policy); err != nil {
+		return ResearchPolicy{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return policy, nil
+}
+
+// GetResearchStatus fetches the current research pool status.
+func (c *HTTPClient) GetResearchStatus(ctx context.Context) (ResearchStatus, error) {
+	resp, err := c.do(ctx, "GET", "/research/status", nil)
+	if err != nil {
+		return ResearchStatus{}, err
+	}
+	defer resp.Body.Close()
+
+	var status ResearchStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return ResearchStatus{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return status, nil
+}
+
+// RenewResearchPermit extends the lease on an active research attempt.
+func (c *HTTPClient) RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (ResearchAttempt, error) {
+	body := map[string]string{
+		"task_id":    taskID,
+		"model":      model,
+		"agent_id":   agentID,
+		"request_id": requestID,
+		"attempt_id": attemptID,
+	}
+
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/research/permits/%s/renew", url.QueryEscape(permitID)), body)
+	if err != nil {
+		return ResearchAttempt{}, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ResearchAttempt{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	attemptData, ok := result["attempt"].(map[string]interface{})
+	if !ok {
+		return ResearchAttempt{}, fmt.Errorf("invalid response structure")
+	}
+
+	attempt := ResearchAttempt{
+		ID:       attemptData["id"].(string),
+		PermitID: attemptData["permit_id"].(string),
+		TaskID:   attemptData["task_id"].(string),
+		State:    attemptData["state"].(string),
+	}
+	if exitClass, ok := attemptData["exit_class"].(string); ok {
+		attempt.ExitClass = exitClass
+	}
+
+	return attempt, nil
+}
+
+// FinalizeResearchPermit ends an active research attempt and records the outcome.
+func (c *HTTPClient) FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (ResearchAttempt, error) {
+	body := map[string]interface{}{
+		"task_id":    taskID,
+		"model":      model,
+		"agent_id":   agentID,
+		"request_id": requestID,
+		"attempt_id": attemptID,
+		"exit_class": exitClass,
+	}
+	if usageTokens != nil {
+		body["usage_tokens"] = usageTokens
+	}
+
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/research/permits/%s/finalize", url.QueryEscape(permitID)), body)
+	if err != nil {
+		return ResearchAttempt{}, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ResearchAttempt{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	attemptData, ok := result["attempt"].(map[string]interface{})
+	if !ok {
+		return ResearchAttempt{}, fmt.Errorf("invalid response structure")
+	}
+
+	attempt := ResearchAttempt{
+		ID:        attemptData["id"].(string),
+		PermitID:  attemptData["permit_id"].(string),
+		TaskID:    attemptData["task_id"].(string),
+		State:     attemptData["state"].(string),
+		ExitClass: attemptData["exit_class"].(string),
+	}
+
+	return attempt, nil
 }

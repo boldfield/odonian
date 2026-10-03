@@ -322,6 +322,79 @@ digest and therefore creates a separate set.
   (`legacy_held_follow_up`, `held_dependent`) lists them so an operator can replace or close them by
   hand.
 
+## Research admission CLI commands
+
+Research tasks are admitted against a research pacing policy that manages consumption automatically.
+The following CLI commands expose research admission operations and status.
+
+### Get research pacing policy configuration
+
+```bash
+odonian research-policy [--json]
+```
+
+Returns the configured research pacing policy: mode (`enforce`, `observe`, or `disabled`), and
+configured account/quota pools without credentials. With `--json`, output is JSON; otherwise it's
+formatted as text.
+
+### Get current research pool status
+
+```bash
+odonian research-status [--json]
+```
+
+Returns the current effective state of each research pool: active attempts, deferred tasks, tokens,
+and time of last settlement. With `--json`, output is JSON; otherwise formatted as text.
+
+### Renew a research permit
+
+```bash
+odonian permit-renew <permit_id> \
+  --task-id <task-id> \
+  --model <model> \
+  --agent-id <agent-id> \
+  --request-id <request-id> \
+  --attempt-id <attempt-id>
+```
+
+Extends the lease on an active research attempt. All parameters are required and must match the
+permit's identity. Returns the renewed attempt with its updated lease expiry time as JSON.
+
+### Finalize a research permit
+
+```bash
+odonian permit-finalize <permit_id> \
+  --task-id <task-id> \
+  --model <model> \
+  --agent-id <agent-id> \
+  --request-id <request-id> \
+  --attempt-id <attempt-id> \
+  --exit-class <exit-class> \
+  [--usage-tokens <tokens>]
+```
+
+Ends an active research attempt and records the outcome. `exit_class` must be one of: `completed`,
+`failed`, `cancelled`, `unknown`. `usage_tokens` is optional and specifies the token usage if
+reported by the runtime. Returns the finalized attempt with its exit status as JSON.
+
+### Preclaimed task support
+
+Research prompts (`harness/prompts/pull_request/research/implement.md` and
+`harness/prompts/pull_request/research/review.md`) support operating on a preclaimed task ID when
+`ODONIAN_PRECLAIMED_TASK_ID` is set in the environment. When this variable is set:
+
+- The worker or reviewer skips the `odonian next` and `odonian claim` steps.
+- The worker or reviewer uses the supplied task ID directly and validates ownership by reading
+  the task (`odonian show <id>`).
+- The task must exist and be owned by the current agent; if not, the worker or reviewer stops
+  without proceeding.
+- Preserve all source checks, findings, adjudication, manifestation and submission requirements
+  from the regular prompt flow.
+
+This support allows the harness to pre-admit research tasks against the pacing policy (atomically
+claiming and debiting a start in one call), then supply the admitted task ID to the worker/reviewer
+process so no additional claims or discovery calls are needed.
+
 ## Task creation
 
 ```json
