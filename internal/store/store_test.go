@@ -18680,9 +18680,9 @@ func TestClaimTaskWithPermitRetryReplay(t *testing.T) {
 	proj, _ := s.CreateProject(ctx, "test-proj", "https://github.com/test/repo")
 	doc, _ := s.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
 
-	// Create a research task (with ReviewModels to get research track)
+	// Create a research task (explicitly set track to "research")
 	tasks, _ := s.CreateTasks(ctx, proj.ID, []TaskInput{
-		{Title: "Test", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}},
+		{Title: "Test", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}, Track: "research"},
 	})
 	taskID := tasks[0].ID
 
@@ -18712,20 +18712,29 @@ func TestClaimTaskWithPermitRetryReplay(t *testing.T) {
 	pool1, _ := s.GetResearchPool(ctx, now, "acct")
 	tokens1 := pool1.Tokens
 
-	// Retry same request - should not debit again (idempotent)
+	// Retry same request - should return original claim without re-debiting (idempotent)
 	task2, err := s.ClaimTaskWithPermit(ctx, taskID, "agent1", "opus", 10*time.Second, permit1, now)
 	if err != nil {
-		// On retry of an already-claimed task, we expect ErrConflict since task is no longer claimable
-		// This is acceptable behavior - the key point is we don't debit again
-		t.Logf("retry claim returned: %v (expected for already-claimed task)", err)
-	} else if task2.ID != task1.ID {
-		t.Errorf("retry returned different task")
+		t.Fatalf("retry claim should succeed: %v", err)
+	}
+	if task2.ID != task1.ID {
+		t.Errorf("retry returned different task: %q vs %q", task2.ID, task1.ID)
+	}
+	if task2.State != "in_progress" {
+		t.Errorf("retry returned task in wrong state: %q (want in_progress)", task2.State)
+	}
+	if task2.Assignee == nil || *task2.Assignee != "agent1" {
+		assignee := ""
+		if task2.Assignee != nil {
+			assignee = *task2.Assignee
+		}
+		t.Errorf("retry returned task with wrong assignee: %q (want agent1)", assignee)
 	}
 
 	// Verify pool tokens didn't change (no double-debit)
 	pool2, _ := s.GetResearchPool(ctx, now, "acct")
 	if pool2.Tokens != tokens1 {
-		t.Errorf("retry may have debited again: tokens before %v, after %v (diff=%v)", tokens1, pool2.Tokens, tokens1-pool2.Tokens)
+		t.Errorf("retry debited again: tokens before %v, after %v (diff=%v)", tokens1, pool2.Tokens, tokens1-pool2.Tokens)
 	}
 }
 
@@ -18735,10 +18744,15 @@ func TestClaimTaskWithPermitInputValidation(t *testing.T) {
 	ctx := context.Background()
 	now := rt0
 
+	// Set up research pool for validation test
+	s.ConfigureResearchPool(ctx, now, ResearchPoolConfig{
+		AccountID: "acct", StartRate: 0.001, BurstCapacity: 2, ConcurrentLimit: 5, CompletionReserved: 0,
+	})
+
 	proj, _ := s.CreateProject(ctx, "test-proj", "https://github.com/test/repo")
 	doc, _ := s.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
 	tasks, _ := s.CreateTasks(ctx, proj.ID, []TaskInput{
-		{Title: "Test", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}},
+		{Title: "Test", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}, Track: "research"},
 	})
 	taskID := tasks[0].ID
 
@@ -18769,7 +18783,7 @@ func TestClaimTaskWithPermitInputValidation(t *testing.T) {
 			name: "negative lease TTL",
 			permit: &PermitRequest{
 				RequestID: "req", TaskID: taskID, ProjectID: proj.ID, AgentID: "agent", Model: "opus",
-				AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: -1,
+				AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: 10 * time.Second,
 			},
 			wantError: true,
 		},
@@ -18785,7 +18799,12 @@ func TestClaimTaskWithPermitInputValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := s.ClaimTaskWithPermit(ctx, taskID, "agent", "opus", 10*time.Second, tt.permit, now)
+			leaseTTL := 10 * time.Second
+			// For negative lease TTL test, pass -1 as the function parameter
+			if tt.name == "negative lease TTL" {
+				leaseTTL = -1 * time.Second
+			}
+			_, err := s.ClaimTaskWithPermit(ctx, taskID, "agent", "opus", leaseTTL, tt.permit, now)
 			if tt.wantError && err == nil {
 				t.Errorf("expected error, got none")
 			}
@@ -18793,5 +18812,105 @@ func TestClaimTaskWithPermitInputValidation(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+// TestConcurrentClaimsRaceAllowance verifies that concurrent racing claims admit at most the allowance.
+func TestConcurrentClaimsRaceAllowance(t *testing.T) {
+	s := newPermitStore(t)
+	ctx := context.Background()
+	now := rt0
+
+	// Set up research pool with limited allowance (1 token) to test racing
+	s.ConfigureResearchPool(ctx, now, ResearchPoolConfig{
+		AccountID: "acct", StartRate: 0.001, BurstCapacity: 1, ConcurrentLimit: 5, CompletionReserved: 0,
+	})
+
+	proj, _ := s.CreateProject(ctx, "test-proj", "https://github.com/test/repo")
+	doc, _ := s.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+
+	// Create independent research tasks (no dependencies)
+	tasks, _ := s.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Task1", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}, Track: "research"},
+		{Title: "Task2", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}, Track: "research"},
+		{Title: "Task3", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}, Track: "research"},
+	})
+
+	for _, task := range tasks {
+		s.PromoteTask(ctx, task.ID)
+	}
+
+	// First claim succeeds
+	permit1 := &PermitRequest{
+		RequestID: "req-1", TaskID: tasks[0].ID, ProjectID: proj.ID, AgentID: "agent1", Model: "opus",
+		AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: 10 * time.Second,
+	}
+	task1, err := s.ClaimTaskWithPermit(ctx, tasks[0].ID, "agent1", "opus", 10*time.Second, permit1, now)
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if task1.State != "in_progress" {
+		t.Errorf("first claim state = %q, want in_progress", task1.State)
+	}
+
+	// Second claim should be denied (allowance exhausted)
+	permit2 := &PermitRequest{
+		RequestID: "req-2", TaskID: tasks[1].ID, ProjectID: proj.ID, AgentID: "agent2", Model: "opus",
+		AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: 10 * time.Second,
+	}
+	_, err = s.ClaimTaskWithPermit(ctx, tasks[1].ID, "agent2", "opus", 10*time.Second, permit2, now)
+	var admissionErr *AdmissionDeniedError
+	if !errors.As(err, &admissionErr) {
+		t.Errorf("second claim should be denied: got %v", err)
+	}
+
+	// Verify pool reflects only one debit
+	pool, _ := s.GetResearchPool(ctx, now, "acct")
+	startAllowance := float64(1)
+	expectedTokens := startAllowance - 1 // One debit for the successful claim
+	if pool.Tokens != expectedTokens {
+		t.Errorf("pool tokens = %v, want %v (one debit only)", pool.Tokens, expectedTokens)
+	}
+}
+
+// TestFailedClaimNotDebited verifies that failed claims don't debit the pool.
+func TestFailedClaimNotDebited(t *testing.T) {
+	s := newPermitStore(t)
+	ctx := context.Background()
+	now := rt0
+
+	// Set up research pool
+	s.ConfigureResearchPool(ctx, now, ResearchPoolConfig{
+		AccountID: "acct", StartRate: 0.001, BurstCapacity: 2, ConcurrentLimit: 5, CompletionReserved: 0,
+	})
+
+	proj, _ := s.CreateProject(ctx, "test-proj", "https://github.com/test/repo")
+	doc, _ := s.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+
+	// Create a task with unmet dependencies (not promoted to ready)
+	tasks, _ := s.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test", Spec: "test", DocumentID: doc.ID, Model: "opus", ReviewModels: []string{"sonnet"}, Track: "research"},
+	})
+	taskID := tasks[0].ID
+	// Deliberately do NOT promote the task, so it's not claimable
+
+	// Get initial pool state
+	pool1, _ := s.GetResearchPool(ctx, now, "acct")
+	tokens1 := pool1.Tokens
+
+	// Try to claim unclaimable task
+	permit := &PermitRequest{
+		RequestID: "req-1", TaskID: taskID, ProjectID: proj.ID, AgentID: "agent1", Model: "opus",
+		AccountID: "acct", Class: policy.ResearchWrite, LeaseTTL: 10 * time.Second,
+	}
+	_, err := s.ClaimTaskWithPermit(ctx, taskID, "agent1", "opus", 10*time.Second, permit, now)
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("should fail on unclaimable task: got %v", err)
+	}
+
+	// Verify pool tokens unchanged (no debit on failed claim)
+	pool2, _ := s.GetResearchPool(ctx, now, "acct")
+	if pool2.Tokens != tokens1 {
+		t.Errorf("pool tokens changed after failed claim: before %v, after %v", tokens1, pool2.Tokens)
 	}
 }

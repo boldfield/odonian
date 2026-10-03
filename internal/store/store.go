@@ -1981,29 +1981,15 @@ func (s *sqliteStore) ClaimTaskWithPermit(ctx context.Context, taskID, agentID, 
 
 	taskTrack = t.Track
 
-	// Step 2: Check claimability BEFORE admission/debit (spec order requirement)
-	// Verify dependencies, holds, state, and model match
-	var isClaimable bool
-	err = tx.QueryRowContext(ctx, `
-		SELECT EXISTS(SELECT 1 FROM task WHERE id = ? AND `+claimableSQL+`)`,
-		taskID, now_ts).Scan(&isClaimable)
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to check claimability: %w", err)
-	}
-
-	if !isClaimable {
-		// Task exists but is not claimable (wrong state, unfinished deps, live lease, held, etc.)
-		if t.Model != model {
-			return Task{}, conflict("MODEL_MISMATCH", fmt.Sprintf("Task model '%s' does not match declared model '%s'", t.Model, model))
-		}
-		return Task{}, ErrConflict
-	}
-
-	// Step 3: Request admission for research tasks (after claimability verified)
+	// Step 2: For research tasks, look up existing request_id BEFORE claimability check
+	// This enables idempotent retry: same request_id returns the original claim
+	var existingPermit *ResearchPermit
+	var denialForRecord *AdmissionDeniedError
 	if taskTrack == "research" && permitReq != nil {
 		// Look up existing request_id for idempotent replay (no double-debit on retry)
 		existing, err := getPermit(ctx, tx, "request_id", permitReq.RequestID)
 		if err == nil {
+			existingPermit = &existing
 			// Permit already exists - verify binding matches
 			if existing.TaskID != permitReq.TaskID || existing.ProjectID != permitReq.ProjectID ||
 				existing.AgentID != permitReq.AgentID || existing.Model != permitReq.Model ||
@@ -2022,9 +2008,35 @@ func (s *sqliteStore) ClaimTaskWithPermit(ctx context.Context, taskID, agentID, 
 				// Return the original denial or final state
 				return Task{}, ErrConflict
 			}
+			// Attempt is active - we can replay the original claim
+			// Fall through to fetch the task and return it
 		} else if !errors.Is(err, ErrPermitNotFound) {
 			return Task{}, err
-		} else {
+		}
+	}
+
+	// Step 3: Check claimability BEFORE admission/debit (spec order requirement)
+	// Verify dependencies, holds, state, and model match
+	// Skip this if we have an existing active permit (replay case)
+	if existingPermit == nil {
+		var isClaimable bool
+		err = tx.QueryRowContext(ctx, `
+			SELECT EXISTS(SELECT 1 FROM task WHERE id = ? AND `+claimableSQL+`)`,
+			taskID, now_ts).Scan(&isClaimable)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to check claimability: %w", err)
+		}
+
+		if !isClaimable {
+			// Task exists but is not claimable (wrong state, unfinished deps, live lease, held, etc.)
+			if t.Model != model {
+				return Task{}, conflict("MODEL_MISMATCH", fmt.Sprintf("Task model '%s' does not match declared model '%s'", t.Model, model))
+			}
+			return Task{}, ErrConflict
+		}
+
+		// Step 4: Request admission for research tasks (after claimability verified)
+		if taskTrack == "research" && permitReq != nil {
 			// New permit: request admission within transaction
 			permit := ResearchPermit{
 				ID:         GenerateID(),
@@ -2042,48 +2054,52 @@ func (s *sqliteStore) ClaimTaskWithPermit(ctx context.Context, taskID, agentID, 
 				return Task{}, err
 			}
 			if denied != nil {
-				// Admission denied - preserve bounded diagnostics, don't claim task
-				// Denial error already contains retry information
-				return Task{}, denied
-			}
-			// Admission granted - insert permit in transaction
-			permit.CurrentAttemptID = a.ID
-			_, err = tx.ExecContext(ctx, `
-				INSERT INTO research_permit (id, request_id, task_id, project_id, agent_id, model, account_id, completion, current_attempt_id, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				permit.ID, permit.RequestID, permit.TaskID, permit.ProjectID, permit.AgentID, permit.Model, permit.AccountID, permit.Completion, permit.CurrentAttemptID, permit.CreatedAt)
-			if err != nil {
-				return Task{}, fmt.Errorf("failed to insert research permit: %w", err)
+				// Admission denied - preserve bounded diagnostics, commit to keep them
+				denialForRecord = denied
+				// Continue to commit transaction to preserve diagnostics, then return denial
+			} else {
+				// Admission granted - insert permit in transaction
+				permit.CurrentAttemptID = a.ID
+				_, err = tx.ExecContext(ctx, `
+					INSERT INTO research_permit (id, request_id, task_id, project_id, agent_id, model, account_id, completion, current_attempt_id, created_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					permit.ID, permit.RequestID, permit.TaskID, permit.ProjectID, permit.AgentID, permit.Model, permit.AccountID, permit.Completion, permit.CurrentAttemptID, permit.CreatedAt)
+				if err != nil {
+					return Task{}, fmt.Errorf("failed to insert research permit: %w", err)
+				}
 			}
 		}
 	}
 
-	// Step 4: Claim the task (now that claimability and admission are verified)
-	leaseExpiry := leaseExpiryTimestamp(leaseTTL)
-	result, err := tx.ExecContext(ctx, `
-		UPDATE task
-		SET state='in_progress', assignee=?, lease_expires_at=?, updated_at=?
-		WHERE id=? AND model=? AND `+claimableSQL,
-		agentID, leaseExpiry, now_ts, taskID, model, now_ts)
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to claim task: %w", err)
-	}
+	// Step 5: Claim the task (now that claimability and admission are verified)
+	// Skip claiming if we have an existing permit (replay case) - it's already claimed
+	if existingPermit == nil {
+		leaseExpiry := leaseExpiryTimestamp(leaseTTL)
+		result, err := tx.ExecContext(ctx, `
+			UPDATE task
+			SET state='in_progress', assignee=?, lease_expires_at=?, updated_at=?
+			WHERE id=? AND model=? AND `+claimableSQL,
+			agentID, leaseExpiry, now_ts, taskID, model, now_ts)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to claim task: %w", err)
+		}
 
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
-	}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
+		}
 
-	if rowsAffected != 1 {
-		// Task not claimed (state changed between steps 2 and 4, or lease expired)
-		// This is a race condition - return conflict
-		return Task{}, ErrConflict
-	}
+		if rowsAffected != 1 {
+			// Task not claimed (state changed between steps 3 and 5, or lease expired)
+			// This is a race condition - return conflict
+			return Task{}, ErrConflict
+		}
 
-	// Claim succeeded - append event
-	_, err = s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil)
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to append claim event: %w", err)
+		// Claim succeeded - append event
+		_, err = s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to append claim event: %w", err)
+		}
 	}
 
 	// Fetch updated task
@@ -2102,8 +2118,15 @@ func (s *sqliteStore) ClaimTaskWithPermit(ctx context.Context, taskID, agentID, 
 		}
 	}
 
+	// Commit transaction to preserve bounded admission diagnostics even on denial
 	if err := tx.Commit(); err != nil {
 		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// If admission was denied, return the denial error after committing
+	// This preserves bounded diagnostics while returning the error to the caller
+	if denialForRecord != nil {
+		return Task{}, denialForRecord
 	}
 
 	return t, nil

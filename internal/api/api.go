@@ -714,79 +714,86 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Enforce or Observe modes: require research context and validate
+		// Enforce or Observe modes: handle research context
 		var permitReq *store.PermitRequest
-		if payload.RequestID == "" || payload.AccountID == "" || payload.WorkClass == "" {
-			// Policy is enabled but client didn't provide research context - require all fields
+
+		// Check if client provided research context
+		hasResearchContext := payload.RequestID != "" && payload.AccountID != "" && payload.WorkClass != ""
+
+		// In enforce mode, research context is required; in observe mode, it's optional
+		if !hasResearchContext && s.researchPolicy.Mode == policy.ModeEnforce {
 			s.errorResponse(w, http.StatusBadRequest, "MISSING_RESEARCH_CONTEXT", "request_id, account_id, and work_class are required for research claims when policy is enabled")
 			return
 		}
 
-		// Validate work class (only paced classes are valid)
-		workClass := policy.WorkClass(payload.WorkClass)
-		if !workClass.Paced() {
-			s.errorResponse(w, http.StatusBadRequest, "NOT_PACED", fmt.Sprintf("Work class %q is not valid research work", payload.WorkClass))
-			return
-		}
+		// If client provided research context, validate and build permitReq
+		if hasResearchContext {
+			// Validate work class (only paced classes are valid)
+			workClass := policy.WorkClass(payload.WorkClass)
+			if !workClass.Paced() {
+				s.errorResponse(w, http.StatusBadRequest, "NOT_PACED", fmt.Sprintf("Work class %q is not valid research work", payload.WorkClass))
+				return
+			}
 
-		permitReq = &store.PermitRequest{
-			RequestID: payload.RequestID,
-			TaskID:    taskID,
-			ProjectID: t.ProjectID,
-			AgentID:   payload.AgentID,
-			Model:     payload.Model,
-			AccountID: payload.AccountID,
-			Class:     workClass,
-			LeaseTTL:  s.leaseTTL,
-		}
+			permitReq = &store.PermitRequest{
+				RequestID: payload.RequestID,
+				TaskID:    taskID,
+				ProjectID: t.ProjectID,
+				AgentID:   payload.AgentID,
+				Model:     payload.Model,
+				AccountID: payload.AccountID,
+				Class:     workClass,
+				LeaseTTL:  s.leaseTTL,
+			}
 
-		// Call ClaimTaskWithPermit
-		task, err := s.store.ClaimTaskWithPermit(r.Context(), taskID, payload.AgentID, payload.Model, s.leaseTTL, permitReq, time.Now())
-		if errors.Is(err, store.ErrNotFound) {
-			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
-			return
-		}
+			// Call ClaimTaskWithPermit
+			task, err := s.store.ClaimTaskWithPermit(r.Context(), taskID, payload.AgentID, payload.Model, s.leaseTTL, permitReq, time.Now())
+			if errors.Is(err, store.ErrNotFound) {
+				s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+				return
+			}
 
-		// Handle admission denial
-		var admissionErr *store.AdmissionDeniedError
-		if errors.As(err, &admissionErr) {
-			// In observe mode, ignore denial and claim anyway
-			if s.researchPolicy.Mode == policy.ModeObserve {
-				// TODO: Log the hypothetical denial decision, then fall through to regular claim
-				// For now, just honor the denial like enforce mode
+			// Handle admission denial
+			var admissionErr *store.AdmissionDeniedError
+			if errors.As(err, &admissionErr) {
+				// In observe mode, ignore denial and claim anyway
+				if s.researchPolicy.Mode == policy.ModeObserve {
+					// TODO: Log the hypothetical denial decision, then fall through to regular claim
+					// For now, just honor the denial like enforce mode
+					s.errorResponse(w, http.StatusConflict, "ADMISSION_DENIED", admissionErr.Error())
+					return
+				}
+				// Enforce mode: honor the denial
 				s.errorResponse(w, http.StatusConflict, "ADMISSION_DENIED", admissionErr.Error())
 				return
 			}
-			// Enforce mode: honor the denial
-			s.errorResponse(w, http.StatusConflict, "ADMISSION_DENIED", admissionErr.Error())
+
+			// Handle other errors
+			var conflictErr *store.ConflictError
+			if errors.As(err, &conflictErr) {
+				s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+				return
+			}
+
+			if errors.Is(err, store.ErrConflict) {
+				s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not claimable")
+				return
+			}
+
+			// Handle input validation errors from ClaimTaskWithPermit
+			if errors.Is(err, store.ErrInvalidResearchInput) {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_RESEARCH_REQUEST", err.Error())
+				return
+			}
+
+			if err != nil {
+				s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim task")
+				return
+			}
+
+			s.encodeJSON(w, http.StatusOK, task)
 			return
 		}
-
-		// Handle other errors
-		var conflictErr *store.ConflictError
-		if errors.As(err, &conflictErr) {
-			s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
-			return
-		}
-
-		if errors.Is(err, store.ErrConflict) {
-			s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not claimable")
-			return
-		}
-
-		// Handle input validation errors from ClaimTaskWithPermit
-		if errors.Is(err, store.ErrInvalidResearchInput) {
-			s.errorResponse(w, http.StatusBadRequest, "INVALID_RESEARCH_REQUEST", err.Error())
-			return
-		}
-
-		if err != nil {
-			s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim task")
-			return
-		}
-
-		s.encodeJSON(w, http.StatusOK, task)
-		return
 	}
 
 	// Non-research task: use regular claim path (no permit)
