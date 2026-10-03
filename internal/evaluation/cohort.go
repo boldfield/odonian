@@ -6,10 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // CohortSampleSelection represents a single sample in the cohort with its
@@ -95,6 +95,7 @@ type EvaluationSnapshot struct {
 	PromptVersion  string   `json:"prompt_version"`
 	ModelVersion   string   `json:"model_version"`
 	RuntimeVersion string   `json:"runtime_version"`
+	WorkspacePath  string   `json:"workspace_path"`  // root of staged workspace directory
 	ArtifactPath   string   `json:"artifact_path"`   // path to staged artifact directory
 	SourceContexts []string `json:"source_contexts"` // paths to source context files
 	Unavailable    bool     `json:"unavailable"`     // true if original artifact unavailable
@@ -134,19 +135,20 @@ func (b *SnapshotBuilder) Build() (EvaluationSnapshot, error) {
 		RuntimeVersion: b.RuntimeVersion,
 	}
 
-	// If SHA is empty, mark as unavailable but don't fail
+	// Create a fresh workspace directory for staging
+	workspaceDir, err := os.MkdirTemp("", "snapshot-"+b.SampleID+"-*")
+	if err != nil {
+		return EvaluationSnapshot{}, fmt.Errorf("create workspace directory: %w", err)
+	}
+
+	// If SHA is empty, mark as unavailable but still set workspace
 	if b.SubmittedSHA == "" {
 		snap.Unavailable = true
+		snap.WorkspacePath = workspaceDir
 		h := sha256.New()
 		fmt.Fprintf(h, "unavailable:%s:%s", b.SampleID, b.OriginalTaskID)
 		snap.SnapshotDigest = hex.EncodeToString(h.Sum(nil))
 		return snap, nil
-	}
-
-	// Create a fresh workspace directory for staging
-	workspaceDir, err := ioutil.TempDir("", "snapshot-"+b.SampleID+"-*")
-	if err != nil {
-		return EvaluationSnapshot{}, fmt.Errorf("create workspace directory: %w", err)
 	}
 
 	// Stage artifact and source context using provided fetchers
@@ -161,7 +163,7 @@ func (b *SnapshotBuilder) Build() (EvaluationSnapshot, error) {
 		}
 		if len(artifactData) > 0 {
 			artifactPath := filepath.Join(workspaceDir, "artifact")
-			if err := ioutil.WriteFile(artifactPath, artifactData, 0644); err != nil {
+			if err := os.WriteFile(artifactPath, artifactData, 0644); err != nil {
 				os.RemoveAll(workspaceDir)
 				return EvaluationSnapshot{}, fmt.Errorf("write artifact: %w", err)
 			}
@@ -179,19 +181,44 @@ func (b *SnapshotBuilder) Build() (EvaluationSnapshot, error) {
 			os.RemoveAll(workspaceDir)
 			return EvaluationSnapshot{}, fmt.Errorf("fetch source context: %w", err)
 		}
-		for name, data := range sources {
+		// Sort source names deterministically to ensure reproducible digests
+		sortedNames := make([]string, 0, len(sources))
+		for name := range sources {
+			sortedNames = append(sortedNames, name)
+		}
+		sort.Strings(sortedNames)
+
+		for _, name := range sortedNames {
+			data := sources[name]
+			// Validate source name to prevent path traversal
+			if filepath.IsAbs(name) || strings.Contains(name, "..") {
+				os.RemoveAll(workspaceDir)
+				return EvaluationSnapshot{}, fmt.Errorf("invalid source name %q: must be relative path without ..", name)
+			}
 			srcPath := filepath.Join(workspaceDir, "source", name)
+			// Verify the resolved path stays within workspace
+			absPath, err := filepath.Abs(srcPath)
+			if err != nil {
+				os.RemoveAll(workspaceDir)
+				return EvaluationSnapshot{}, fmt.Errorf("resolve path %s: %w", srcPath, err)
+			}
+			absWorkspace, _ := filepath.Abs(workspaceDir)
+			if !strings.HasPrefix(absPath, absWorkspace) {
+				os.RemoveAll(workspaceDir)
+				return EvaluationSnapshot{}, fmt.Errorf("source path %q escapes workspace", name)
+			}
+
 			srcDir := filepath.Dir(srcPath)
 			if err := os.MkdirAll(srcDir, 0755); err != nil {
 				os.RemoveAll(workspaceDir)
 				return EvaluationSnapshot{}, fmt.Errorf("create source directory: %w", err)
 			}
-			if err := ioutil.WriteFile(srcPath, data, 0644); err != nil {
+			if err := os.WriteFile(srcPath, data, 0644); err != nil {
 				os.RemoveAll(workspaceDir)
 				return EvaluationSnapshot{}, fmt.Errorf("write source file %s: %w", name, err)
 			}
 			sourcePaths = append(sourcePaths, srcPath)
-			// Include source in digest
+			// Include source in digest: hash both filename and content deterministically
 			fmt.Fprintf(contentDigest, "source:%s:%x:", name, sha256.Sum256(data))
 		}
 	}
@@ -207,48 +234,38 @@ func (b *SnapshotBuilder) Build() (EvaluationSnapshot, error) {
 	fmt.Fprintf(contentDigest, "sample:%s:task:%s:sha:%s:candidate:%s",
 		b.SampleID, b.OriginalTaskID, b.SubmittedSHA, b.CandidateID)
 	snap.SnapshotDigest = hex.EncodeToString(contentDigest.Sum(nil))
+	snap.WorkspacePath = workspaceDir
 
 	return snap, nil
 }
 
 // computeWorkspaceDigest walks the workspace directory and includes all files in digest.
 // This ensures the digest can detect tampering or leaked files.
+// Files are processed in sorted order for deterministic output.
 func (b *SnapshotBuilder) computeWorkspaceDigest(dir string, h io.Writer) error {
-	entries, err := ioutil.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("read workspace: %w", err)
-	}
-
-	for _, entry := range entries {
-		path := filepath.Join(dir, entry.Name())
-		if entry.IsDir() {
-			if err := b.walkDir(path, h); err != nil {
-				return err
-			}
-		} else {
-			if err := b.hashFile(path, h); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return b.walkDirSorted(dir, dir, h)
 }
 
-// walkDir recursively includes all files in a directory in the digest.
-func (b *SnapshotBuilder) walkDir(dir string, h io.Writer) error {
-	entries, err := ioutil.ReadDir(dir)
+// walkDirSorted recursively includes all files in a directory in the digest, sorted by name.
+func (b *SnapshotBuilder) walkDirSorted(dir, workspaceRoot string, h io.Writer) error {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read directory %s: %w", dir, err)
 	}
 
+	// Sort entries for deterministic ordering
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
 	for _, entry := range entries {
 		path := filepath.Join(dir, entry.Name())
 		if entry.IsDir() {
-			if err := b.walkDir(path, h); err != nil {
+			if err := b.walkDirSorted(path, workspaceRoot, h); err != nil {
 				return err
 			}
 		} else {
-			if err := b.hashFile(path, h); err != nil {
+			if err := b.hashFile(path, workspaceRoot, h); err != nil {
 				return err
 			}
 		}
@@ -256,14 +273,19 @@ func (b *SnapshotBuilder) walkDir(dir string, h io.Writer) error {
 	return nil
 }
 
-// hashFile reads a file and includes it in the digest.
-func (b *SnapshotBuilder) hashFile(path string, h io.Writer) error {
-	data, err := ioutil.ReadFile(path)
+// hashFile reads a file and includes it in the digest, using relative path for reproducibility.
+func (b *SnapshotBuilder) hashFile(path, workspaceRoot string, h io.Writer) error {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read file %s: %w", path, err)
 	}
+	// Hash relative path to preserve directory structure
+	relPath, err := filepath.Rel(workspaceRoot, path)
+	if err != nil {
+		relPath = path
+	}
 	dataHash := sha256.Sum256(data)
-	fmt.Fprintf(h, "file:%s:%x:", filepath.Base(path), dataHash)
+	fmt.Fprintf(h, "file:%s:%x:", relPath, dataHash)
 	return nil
 }
 
