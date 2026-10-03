@@ -129,8 +129,12 @@ func (a *attemptRun) finalization(runCtx context.Context, out evaluation.Result,
 		msg = "response does not carry a validated, completed review"
 	}
 	if out.Launched {
-		id := resp.Identity
-		detail.EffectiveIdentity, detail.EffectiveDigest = &id, id.Digest()
+		// A host-made response (malformed, missing, timeout, crash) carries the
+		// all-unknown identity: the runtime never reported itself, so there is
+		// no effective identity to record or compare to the configured one.
+		if id := resp.Identity; id.Digest() != evaluation.UnknownIdentity().Digest() {
+			detail.EffectiveIdentity, detail.EffectiveDigest = &id, id.Digest()
+		}
 		detail.Usage = resp.Usage
 	}
 	d := int(resp.Timing.FinishedAt.Sub(resp.Timing.StartedAt) / time.Millisecond)

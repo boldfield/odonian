@@ -92,7 +92,7 @@ type Config struct {
 	CallTimeout     time.Duration // bound on each renew and finalize call; default 30s
 	MaxAttempts     int           // attempts per run, retries included; default 3
 	RetryBackoff    time.Duration // first retry delay, doubling each retry; default 5s
-	MaxDeferrals    int           // refused claims tolerated per attempt; default 3
+	MaxDeferrals    int           // refusals per run after which it is deferred (so N-1 waits); default 3
 	MaxDeferWait    time.Duration // longest single wait for a hint; default 15m
 	FinalizeRetries int           // extra finalize tries on a transient error; default 3
 

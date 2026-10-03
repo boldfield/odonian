@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -782,5 +783,86 @@ func TestNewValidatesItsBounds(t *testing.T) {
 	r, err := New(base)
 	if err != nil || r.cfg.MaxAttempts != 3 || r.cfg.RenewEvery != r.cfg.LeaseTTL/3 || !r.cfg.ToolAccess.RequireSourceRetrieval {
 		t.Fatalf("defaults = %+v, %v", r, err)
+	}
+}
+
+func TestIncompleteWorkIsRecordedApartFromSourceFailure(t *testing.T) {
+	h := newHarness(t, 1)
+	h.openPool("pool-a")
+	cand := h.addCandidate("alpha", evaluation.FakeModeSuccess, ident("alpha", "model-a", "pool-a"), 10)
+	id := cand.Config.Identity()
+	truncated := funcExec(func(_ context.Context, _ string, req evaluation.CandidateRequest) (evaluation.Result, error) {
+		start := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+		return evaluation.Result{
+			Runtime: "alpha", CandidateDigest: cand.Digest(), Launched: true,
+			Response: evaluation.CandidateResponse{
+				Version: evaluation.ProtocolVersion, RunID: req.RunID, Status: evaluation.StatusIncomplete,
+				ErrorClass: evaluation.ErrClassOutputTruncated, ErrorMessage: "ran out of output",
+				Findings: []evaluation.Finding{{ID: "f1", Severity: evaluation.SeverityMinor, Summary: "cut off"}},
+				Identity: id, Timing: evaluation.Timing{StartedAt: start, FinishedAt: start.Add(time.Second)},
+			},
+		}, nil
+	})
+	r, _, _ := h.runner(func(c *Config) { c.Executor = truncated })
+
+	rep := r.Run(context.Background(), h.job(0, cand))
+
+	if rep.Kind != Kind(store.EvalExitIncompleteOutput) || len(rep.Attempts) != 3 || !rep.RetriesExhausted {
+		t.Fatalf("report = %+v", rep)
+	}
+	for _, rec := range rep.Attempts {
+		att := h.attempt(rec.AttemptID)
+		if *att.ExitClass != store.EvalExitIncompleteOutput || *att.ExitClass == store.EvalExitUnavailableSource ||
+			att.ErrorClass == nil || *att.ErrorClass != string(evaluation.ErrClassOutputTruncated) {
+			t.Fatalf("attempt = %+v", att)
+		}
+		if f, _ := h.st.ListEvaluationFindings(context.Background(), rec.AttemptID); len(f) != 0 {
+			t.Fatalf("an incomplete attempt recorded findings: %v", f)
+		}
+	}
+}
+
+func TestHostMadeResponsesAreNotTheRuntimesEffectiveIdentity(t *testing.T) {
+	h := newHarness(t, 1)
+	h.openPool("pool-a")
+	cand := h.addCandidate("alpha", evaluation.FakeModeSuccess, ident("alpha", "model-a", "pool-a"), 10)
+	id := cand.Config.Identity()
+	var mu sync.Mutex
+	calls := 0
+	mixed := funcExec(func(_ context.Context, _ string, req evaluation.CandidateRequest) (evaluation.Result, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		start := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+		resp := evaluation.CandidateResponse{
+			Version: evaluation.ProtocolVersion, RunID: req.RunID, Status: evaluation.StatusFailed,
+			ErrorClass: evaluation.ErrClassOutputMalformed, ErrorMessage: "unreadable result",
+			Identity: evaluation.UnknownIdentity(),
+			Timing:   evaluation.Timing{StartedAt: start, FinishedAt: start.Add(time.Second)},
+		}
+		if n > 1 {
+			resp.Status, resp.ErrorClass, resp.ErrorMessage = evaluation.StatusCompleted, "", ""
+			resp.ReviewCompleted, resp.Identity = true, id
+		}
+		return evaluation.Result{Runtime: "alpha", CandidateDigest: cand.Digest(), Launched: true, Response: resp}, nil
+	})
+	r, _, _ := h.runner(func(c *Config) { c.Executor = mixed })
+
+	rep := r.Run(context.Background(), h.job(0, cand))
+
+	if len(rep.Attempts) != 2 || rep.Kind != Kind(store.EvalExitCompleted) {
+		t.Fatalf("report = %+v", rep)
+	}
+	failed, done := h.detail(rep.Attempts[0].AttemptID), h.detail(rep.Attempts[1].AttemptID)
+	if failed.EffectiveIdentity != nil || failed.EffectiveDigest != "" || !failed.Launched {
+		t.Errorf("a host-made response recorded an effective identity: %+v", failed)
+	}
+	if done.EffectiveIdentity == nil || done.EffectiveDigest != cand.Digest() {
+		t.Errorf("the runtime's own identity was not recorded: %+v", done)
+	}
+	sums := GroupByCandidate([]Report{rep})
+	if len(sums) != 1 || len(sums[0].EffectiveDigests) != 1 || sums[0].EffectiveDigests[0] != cand.Digest() {
+		t.Fatalf("summaries = %+v, want exactly the candidate's own digest", sums)
 	}
 }
