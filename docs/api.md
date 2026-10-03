@@ -1820,6 +1820,7 @@ finalize.
 | `error_class` | string, optional | `capability_missing`, `output_truncated`, `source_unavailable`, `budget_exhausted`, `interrupted`, `timeout`, `runtime_error`, `output_malformed`, `output_missing`, `auth_missing`, `launch_error` |
 | `error_message` | string, optional | at most 1024 bytes |
 | `duration_ms`, `usage_tokens` | int, optional | non-negative; omitted means unknown, not zero |
+| `detail` | object, optional | host-recorded run detail, stored with the result and immutable: `candidate_digest` (required, must be the attempt's candidate), `effective_identity` with `effective_digest` (what the runtime reported about itself; both or neither), `prompt_digest`, `standard_digest`, `launched`, `exit_code`, and `usage` (provider-native unit name to non-negative number, at most 64 units, never summed or converted). A run that never launched carries no exit code, identity or usage |
 | `findings` | object[], optional | only with `exit_class` `completed`; each `{"id", "severity", "summary", "claim"?, "evidence"?}`, `severity` in `material`, `minor`, `note`, unique non-empty `id`, non-empty `summary`, at most 500 findings; unknown finding keys are rejected |
 
 There is no verdict, task ID or review field: an evaluation result cannot vote.

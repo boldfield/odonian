@@ -777,3 +777,41 @@ func toStr(v interface{}) string {
 		return string(b)
 	}
 }
+
+func TestEvaluationAPIFinalizeRecordsAttemptDetail(t *testing.T) {
+	e := newEvalAPI(t)
+	e.basicSetup(5, 5, 5)
+	c := e.claim("s1", "cand-a", "r1")
+	cand, err := e.store.GetEvaluationCandidate(t.Context(), "cand-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := cand.Config.Identity()
+	detail := func(d map[string]interface{}) map[string]interface{} {
+		res := completedResult(c.attemptID)
+		res["detail"] = d
+		return res
+	}
+	e.expect("POST", c.path("finalize"), detail(map[string]interface{}{
+		"candidate_digest": "someone-else", "launched": true,
+	}), 400, "INVALID_INPUT")
+	e.expect("POST", c.path("finalize"), detail(map[string]interface{}{
+		"candidate_digest": cand.Digest(), "launched": true, "usage": map[string]float64{"gpu_seconds": -2},
+	}), 400, "INVALID_INPUT")
+	e.expect("POST", c.path("finalize"), detail(map[string]interface{}{
+		"candidate_digest": cand.Digest(), "launched": true, "verdict": "approve",
+	}), 400, "INVALID_INPUT")
+	if got, _ := e.store.GetEvaluationAttemptDetail(t.Context(), c.attemptID); got != nil {
+		t.Fatalf("a rejected result recorded detail: %+v", got)
+	}
+
+	e.expect("POST", c.path("finalize"), detail(map[string]interface{}{
+		"candidate_digest": cand.Digest(), "effective_identity": identity, "effective_digest": identity.Digest(),
+		"prompt_digest": "p", "standard_digest": "s", "launched": true, "exit_code": 0,
+		"usage": map[string]float64{"gpu_seconds": 4.5, "critic_calls": 2},
+	}), 200, "")
+	got, err := e.store.GetEvaluationAttemptDetail(t.Context(), c.attemptID)
+	if err != nil || got == nil || got.EffectiveDigest != identity.Digest() || got.Usage["gpu_seconds"] != 4.5 || got.Usage["critic_calls"] != 2 {
+		t.Fatalf("recorded detail = %+v, %v", got, err)
+	}
+}
