@@ -71,13 +71,12 @@ The adapter requires Meta Power subscription authentication, configured via one 
 
 Run the preflight check without starting a full review:
 ```bash
-./odonian evaluation adapter \
-  --mode muse \
+./muse-adapter \
   --request <path-to-request.json> \
   --preflight
 ```
 
-Exit code 0 indicates preflight passed; non-zero indicates a configuration issue.
+Exit code 0 indicates preflight passed; non-zero indicates a configuration issue. The preflight writes a response to the `result_path` specified in the request, recording the effective runtime version and configuration.
 
 ## Usage
 
@@ -86,7 +85,7 @@ The Muse adapter is invoked automatically by the Odonian evaluation runner when 
 ### Direct Invocation (for debugging)
 
 ```bash
-./evaluation-muse \
+./muse-adapter \
   --request /path/to/request.json
 ```
 
@@ -136,7 +135,7 @@ The adapter records the following for each review:
 - **Model Revision**: `muse-spark-1.3` (the pinned model version)
 - **Runtime Name**: `muse-code-cli` (the execution environment)
 - **Runtime Version**: Automatically read from `muse --version` output
-- **Account Pool**: `meta-power` (subscription type)
+- **Account Pool**: Unknown (subscription routing is configured but not exposed by the CLI)
 - **Prompt Version**: Unknown (Muse's internal prompt engineering is not exposed)
 - **Tools**: Unknown (Muse's available tools are not exposed via CLI)
 

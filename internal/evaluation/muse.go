@@ -9,7 +9,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -85,6 +87,8 @@ func MuseMain(args []string, stderr io.Writer) int {
 		return exitOnSuccess
 	}
 
+	startTime := time.Now()
+
 	base := CandidateResponse{
 		Version:  ProtocolVersion,
 		RunID:    req.RunID,
@@ -104,11 +108,12 @@ func MuseMain(args []string, stderr io.Writer) int {
 	}
 
 	// Perform preflight checks.
-	if missing, err := musePreflight(stderr); err != nil {
-		// Auth or config error.
+	missing, errClass, errMsg := musePreflight(stderr)
+	if errClass != "" {
+		// Runtime error, auth error, or ambiguous configuration.
 		base.Status = StatusFailed
-		base.ErrorClass = ErrClassAuthMissing
-		base.ErrorMessage = err.Error()
+		base.ErrorClass = errClass
+		base.ErrorMessage = errMsg
 		code := writeResp(base, 0)
 		if code != 0 {
 			return code
@@ -129,8 +134,16 @@ func MuseMain(args []string, stderr io.Writer) int {
 
 	if *preflight {
 		// Preflight-only mode: preflight checks passed.
-		// Don't write a response since preflight didn't run a review.
-		return 0
+		// Write the response with effective identity (but no review/findings).
+		base.Status = StatusCompleted
+		base.ReviewCompleted = false
+		base.Findings = []Finding{}
+		base.Timing = Timing{
+			StartedAt:  startTime,
+			FinishedAt: time.Now(),
+		}
+		base.Usage = map[string]float64{}
+		return writeResp(base, 0)
 	}
 
 	// Invoke muse exec.
@@ -183,19 +196,18 @@ func readMuseVersion() (string, error) {
 }
 
 // musePreflight performs configuration and auth validation without a paid call.
-// It returns missing capabilities (if any) and an error (if unrecoverable).
-func musePreflight(stderr io.Writer) ([]string, error) {
-	// Check for API-key overrides FIRST, before any runtime invocation.
-	// This prevents pay-as-you-go fallback from being invoked.
+// It returns missing capabilities, error class (if any), and error message (if unrecoverable).
+func musePreflight(stderr io.Writer) ([]string, ErrorClass, string) {
+	// Check for pay-as-you-go API-key overrides FIRST, before any runtime invocation.
 	if apiKey := os.Getenv("META_API_KEY"); apiKey != "" {
-		return nil, fmt.Errorf("META_API_KEY is set in environment; must use configured subscription auth, not pay-as-you-go")
+		return nil, ErrClassAuthMissing, "META_API_KEY is set in environment; must use configured subscription auth, not pay-as-you-go"
 	}
 
 	// Check that muse is installed and accessible.
 	cmd := exec.Command("muse", "--help")
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("muse cli not installed or not accessible: %w", err)
+		return nil, ErrClassRuntimeError, fmt.Sprintf("muse cli not installed or not accessible: %v", err)
 	}
 
 	// Check subscription auth configuration and catch ambiguous routing.
@@ -204,12 +216,12 @@ func musePreflight(stderr io.Writer) ([]string, error) {
 	museCfg := os.Getenv("MUSE_CONFIG")
 
 	// Count configured auth sources.
-	authSourceCount := 0
+	var authSources []string
 	if authEnv != "" {
-		authSourceCount++
+		authSources = append(authSources, "MUSE_AUTH")
 	}
 	if museCfg != "" {
-		authSourceCount++
+		authSources = append(authSources, "MUSE_CONFIG")
 	}
 
 	// Check for ~/.muse/auth as a fallback.
@@ -218,35 +230,63 @@ func musePreflight(stderr io.Writer) ([]string, error) {
 	if err == nil {
 		defaultAuthPath := home + "/.muse/auth"
 		defaultAuthExists = fileExists(defaultAuthPath)
-		if defaultAuthExists && authSourceCount == 0 {
-			authSourceCount++
+		if defaultAuthExists {
+			authSources = append(authSources, "~/.muse/auth")
 		}
 	}
 
 	// Fail if multiple auth sources are configured (ambiguous routing).
-	if authSourceCount > 1 {
-		return nil, fmt.Errorf("ambiguous auth configuration: multiple auth sources set (MUSE_AUTH, MUSE_CONFIG, ~/.muse/auth); configure exactly one")
+	if len(authSources) > 1 {
+		return nil, ErrClassAuthMissing, fmt.Sprintf("ambiguous auth configuration: multiple auth sources set (%s); configure exactly one", strings.Join(authSources, ", "))
 	}
 
 	// Fail if no auth sources are configured.
-	if authSourceCount == 0 {
+	if len(authSources) == 0 {
 		if err != nil {
-			return nil, fmt.Errorf("no subscription auth configured: cannot determine home directory, and MUSE_AUTH/MUSE_CONFIG not set")
+			return nil, ErrClassAuthMissing, fmt.Sprintf("no subscription auth configured: cannot determine home directory, and MUSE_AUTH/MUSE_CONFIG not set")
 		}
-		return nil, fmt.Errorf("no subscription auth configured: set MUSE_AUTH, MUSE_CONFIG, or configure ~/.muse/auth for subscription entitlement")
+		return nil, ErrClassAuthMissing, "no subscription auth configured: set MUSE_AUTH, MUSE_CONFIG, or configure ~/.muse/auth for subscription entitlement"
 	}
 
 	// Validate that specified files exist.
 	if museCfg != "" && !fileExists(museCfg) {
-		return nil, fmt.Errorf("MUSE_CONFIG points to non-existent file: %s", museCfg)
+		return nil, ErrClassAuthMissing, fmt.Sprintf("MUSE_CONFIG points to non-existent file: %s", museCfg)
 	}
 	if authEnv != "" && !fileExists(authEnv) {
-		return nil, fmt.Errorf("MUSE_AUTH points to non-existent file: %s", authEnv)
+		return nil, ErrClassAuthMissing, fmt.Sprintf("MUSE_AUTH points to non-existent file: %s", authEnv)
 	}
 
-	// All required capabilities are available by default in muse-spark-1.3.
-	// We report no missing capabilities here.
-	return nil, nil
+	// Probe muse exec --help to verify required capabilities are supported.
+	missing := checkMuseExecCapabilities(stderr)
+	if len(missing) > 0 {
+		return missing, "", ""
+	}
+
+	return nil, "", ""
+}
+
+// checkMuseExecCapabilities probes muse exec --help to verify that required flags are supported.
+func checkMuseExecCapabilities(stderr io.Writer) []string {
+	cmd := exec.Command("muse", "exec", "--help")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		// If we can't read the help, assume capabilities are missing.
+		return []string{"muse exec --help", "--model", "--output-format", "--workspace", "--input"}
+	}
+
+	helpText := stdout.String()
+	var missing []string
+
+	requiredFlags := []string{"--model", "--output-format", "--workspace", "--input"}
+	for _, flag := range requiredFlags {
+		if !strings.Contains(helpText, flag) {
+			missing = append(missing, flag)
+		}
+	}
+
+	return missing
 }
 
 // invokeMuseExec runs the muse exec command with the given request.
@@ -281,6 +321,17 @@ func invokeMuseExec(stderr io.Writer, req *CandidateRequest, base *CandidateResp
 		return writeResp(*base, 1)
 	}
 
+	// Set up signal handling to interrupt the process gracefully.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigChan)
+
+	go func() {
+		<-sigChan
+		// Kill the muse process on signal.
+		cmd.Process.Kill()
+	}()
+
 	// Parse JSONL output and look for explicit completion signal.
 	var findings []Finding
 	var completionFound bool
@@ -294,8 +345,8 @@ func invokeMuseExec(stderr io.Writer, req *CandidateRequest, base *CandidateResp
 
 		var jsonlEntry map[string]interface{}
 		if err := json.Unmarshal(line, &jsonlEntry); err != nil {
-			// Drain stdout to avoid deadlock, then kill the process.
-			io.Copy(io.Discard, stdout)
+			// Kill the process on malformed output.
+			cmd.Process.Kill()
 			cmd.Wait()
 			base.Status = StatusFailed
 			base.ErrorClass = ErrClassOutputMalformed
@@ -310,24 +361,48 @@ func invokeMuseExec(stderr io.Writer, req *CandidateRequest, base *CandidateResp
 		}
 
 		// Try to extract a finding from the JSONL entry.
-		// Findings should have id, severity, and summary fields.
+		// Findings must have id and summary fields.
 		if id := extractStringField(jsonlEntry, jsonlFieldID, ""); id != "" {
+			summary := extractStringField(jsonlEntry, jsonlFieldSummary, "")
+			if summary == "" {
+				// Malformed finding: missing required summary field.
+				cmd.Process.Kill()
+				cmd.Wait()
+				base.Status = StatusFailed
+				base.ErrorClass = ErrClassOutputMalformed
+				base.ErrorMessage = fmt.Sprintf("finding missing required 'summary' field (id=%s)", id)
+				return writeResp(*base, 1)
+			}
+
+			severityStr := extractStringField(jsonlEntry, jsonlFieldSeverity, string(SeverityNote))
+			// Validate severity is a known value.
+			switch Severity(severityStr) {
+			case SeverityNote, SeverityMinor, SeverityMaterial:
+				// Valid severity.
+			default:
+				// Unknown severity value.
+				cmd.Process.Kill()
+				cmd.Wait()
+				base.Status = StatusFailed
+				base.ErrorClass = ErrClassOutputMalformed
+				base.ErrorMessage = fmt.Sprintf("finding has unknown severity value: %q (id=%s)", severityStr, id)
+				return writeResp(*base, 1)
+			}
+
 			finding := Finding{
 				ID:       id,
-				Severity: Severity(extractStringField(jsonlEntry, jsonlFieldSeverity, string(SeverityNote))),
-				Summary:  extractStringField(jsonlEntry, jsonlFieldSummary, ""),
+				Severity: Severity(severityStr),
+				Summary:  summary,
 				Claim:    extractStringField(jsonlEntry, jsonlFieldClaim, ""),
 				Evidence: extractStringField(jsonlEntry, jsonlFieldEvidence, ""),
 			}
-			if finding.Summary != "" {
-				findings = append(findings, finding)
-			}
+			findings = append(findings, finding)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		// Drain stdout to avoid deadlock, then kill the process.
-		io.Copy(io.Discard, stdout)
+		// Kill the process on scan error.
+		cmd.Process.Kill()
 		cmd.Wait()
 		base.Status = StatusFailed
 		base.ErrorClass = ErrClassOutputMalformed

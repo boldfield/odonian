@@ -66,14 +66,14 @@ func TestMusePreflightMissingMuse(t *testing.T) {
 	t.Setenv("PATH", "/dev/null")
 
 	stderr := &bytes.Buffer{}
-	_, err := musePreflight(stderr)
+	_, errClass, errMsg := musePreflight(stderr)
 
-	// muse should not be found.
-	if err == nil {
-		t.Error("expected error for missing muse, got none")
+	// muse should not be found, should report runtime error.
+	if errClass != ErrClassRuntimeError {
+		t.Errorf("expected runtime error for missing muse, got error_class=%q", errClass)
 	}
-	if !strings.Contains(err.Error(), "not installed") && !strings.Contains(err.Error(), "executable file not found") {
-		t.Errorf("unexpected error: %v", err)
+	if !strings.Contains(errMsg, "not installed") && !strings.Contains(errMsg, "executable file not found") {
+		t.Errorf("unexpected error message: %v", errMsg)
 	}
 }
 
@@ -82,17 +82,17 @@ func TestMusePreflightAPIKeyDetection(t *testing.T) {
 	t.Setenv("META_API_KEY", "fake-key-12345")
 
 	stderr := &bytes.Buffer{}
-	missing, err := musePreflight(stderr)
+	missing, errClass, errMsg := musePreflight(stderr)
 
 	// The preflight should ALWAYS reject an explicit META_API_KEY.
-	if err == nil {
-		t.Error("expected error for META_API_KEY override, got none")
+	if errClass != ErrClassAuthMissing {
+		t.Errorf("expected auth_missing error for META_API_KEY override, got error_class=%q", errClass)
 	}
-	if !strings.Contains(err.Error(), "META_API_KEY") {
-		t.Errorf("expected error to mention META_API_KEY, got: %v", err)
+	if !strings.Contains(errMsg, "META_API_KEY") {
+		t.Errorf("expected error to mention META_API_KEY, got: %v", errMsg)
 	}
 	if missing != nil {
-		t.Errorf("expected no capabilities returned on auth error, got %v", missing)
+		t.Errorf("expected no missing capabilities on auth error, got %v", missing)
 	}
 }
 
@@ -100,7 +100,20 @@ func TestMuseMainPreflightMode(t *testing.T) {
 	// Set up a temp directory with a fake muse executable and auth file.
 	dir := t.TempDir()
 	musePath := filepath.Join(dir, "muse")
-	if err := os.WriteFile(musePath, []byte("#!/bin/sh\nif [ \"$1\" = '--help' ]; then echo 'muse help'; fi\necho 'muse-spark-1.3'"), 0o755); err != nil {
+	museSh := `#!/bin/sh
+if [ "$1" = "--help" ]; then
+  echo "muse help"
+elif [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "usage: muse exec [options]"
+  echo "Options:"
+  echo "  --model <model>"
+  echo "  --output-format <format>"
+  echo "  --workspace <path>"
+  echo "  --input <prompt>"
+else
+  echo "muse-spark-1.3"
+fi`
+	if err := os.WriteFile(musePath, []byte(museSh), 0o755); err != nil {
 		t.Fatalf("write fake muse: %v", err)
 	}
 
@@ -136,14 +149,28 @@ func TestMuseMainPreflightMode(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	code := MuseMain([]string{"--request", reqPath, "--preflight"}, stderr)
 
-	// Preflight-only mode with successful checks should exit 0 and not write a response.
+	// Preflight-only mode with successful checks should exit 0 and write a response.
 	if code != 0 {
 		t.Errorf("MuseMain returned %d, want 0 (preflight success)", code)
 	}
 
-	// Result file should not exist for successful preflight.
-	if _, err := os.Stat(resultPath); err == nil {
-		t.Errorf("expected no result file for successful preflight, but file exists")
+	// Result file should exist and contain the effective identity.
+	result, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("expected result file for successful preflight, but got error: %v", err)
+	}
+	var resp CandidateResponse
+	if err := json.Unmarshal(result, &resp); err != nil {
+		t.Fatalf("decode preflight response: %v", err)
+	}
+	if resp.Status != StatusCompleted {
+		t.Errorf("preflight response status = %q, want completed", resp.Status)
+	}
+	if resp.ReviewCompleted {
+		t.Errorf("preflight response review_completed = %v, want false", resp.ReviewCompleted)
+	}
+	if resp.Identity.RuntimeVersion == "" || resp.Identity.RuntimeVersion == Unknown {
+		t.Errorf("preflight should record runtime version, got %q", resp.Identity.RuntimeVersion)
 	}
 }
 
@@ -229,6 +256,9 @@ func TestMuseMainMalformedOutput(t *testing.T) {
 	museSh := `#!/bin/sh
 if [ "$1" = "--help" ]; then
   echo "muse help"
+elif [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "usage: muse exec [options]"
+  echo "Options: --model, --output-format, --workspace, --input"
 elif [ "$1" = "exec" ]; then
   echo '{"invalid json'
 else
@@ -411,6 +441,9 @@ func TestMuseMainExitZeroNoCompletion(t *testing.T) {
 	museSh := `#!/bin/sh
 if [ "$1" = "--help" ]; then
   echo "muse help"
+elif [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "usage: muse exec [options]"
+  echo "Options: --model, --output-format, --workspace, --input"
 elif [ "$1" = "exec" ]; then
   echo '{"id":"f1","severity":"material","summary":"test finding"}'
   exit 0
@@ -536,6 +569,9 @@ func TestMuseMainCompletionEvent(t *testing.T) {
 	museSh := `#!/bin/sh
 if [ "$1" = "--help" ]; then
   echo "muse help"
+elif [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "usage: muse exec [options]"
+  echo "Options: --model, --output-format, --workspace, --input"
 elif [ "$1" = "exec" ]; then
   echo '{"id":"f1","severity":"material","summary":"test finding"}'
   echo '{"type":"completion"}'
@@ -595,5 +631,213 @@ fi`
 		t.Errorf("findings count = %d, want 1", len(resp.Findings))
 	} else if resp.Findings[0].ID != "f1" {
 		t.Errorf("finding id = %q, want f1", resp.Findings[0].ID)
+	}
+}
+
+func TestMuseMainMissingSummary(t *testing.T) {
+	// Test that findings without a summary field are rejected.
+	dir := t.TempDir()
+	musePath := filepath.Join(dir, "muse")
+	museSh := `#!/bin/sh
+if [ "$1" = "--help" ]; then
+  echo "muse help"
+elif [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "usage: muse exec [options]"
+  echo "Options: --model, --output-format, --workspace, --input"
+elif [ "$1" = "exec" ]; then
+  echo '{"id":"f1","severity":"material"}'
+  echo '{"type":"completion"}'
+  exit 0
+else
+  echo "muse-spark-1.3"
+fi`
+	if err := os.WriteFile(musePath, []byte(museSh), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+
+	authPath := filepath.Join(dir, "auth")
+	if err := os.WriteFile(authPath, []byte("fake-auth-token"), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	t.Setenv("MUSE_AUTH", authPath)
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	tmpDir := t.TempDir()
+	reqPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:       ProtocolVersion,
+		RunID:         "run-no-summary",
+		SnapshotPath:  tmpDir,
+		BlindedPrompt: "review this",
+		ToolAccess:    ToolAccessRequirements{},
+		ResultPath:    resultPath,
+	}
+
+	data, _ := json.Marshal(req)
+	os.WriteFile(reqPath, data, 0o600)
+
+	stderr := &bytes.Buffer{}
+	code := MuseMain([]string{"--request", reqPath}, stderr)
+
+	if code != 1 {
+		t.Errorf("MuseMain returned %d, want 1 (missing summary)", code)
+	}
+
+	result, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	var resp CandidateResponse
+	if err := json.Unmarshal(result, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != StatusFailed {
+		t.Errorf("response status = %q, want failed", resp.Status)
+	}
+	if resp.ErrorClass != ErrClassOutputMalformed {
+		t.Errorf("error_class = %q, want output_malformed", resp.ErrorClass)
+	}
+	if !strings.Contains(resp.ErrorMessage, "summary") {
+		t.Errorf("error message should mention summary, got: %s", resp.ErrorMessage)
+	}
+}
+
+func TestMuseMainInvalidSeverity(t *testing.T) {
+	// Test that findings with invalid severity values are rejected.
+	dir := t.TempDir()
+	musePath := filepath.Join(dir, "muse")
+	museSh := `#!/bin/sh
+if [ "$1" = "--help" ]; then
+  echo "muse help"
+elif [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "usage: muse exec [options]"
+  echo "Options: --model, --output-format, --workspace, --input"
+elif [ "$1" = "exec" ]; then
+  echo '{"id":"f1","severity":"unknown-severity","summary":"test"}'
+  echo '{"type":"completion"}'
+  exit 0
+else
+  echo "muse-spark-1.3"
+fi`
+	if err := os.WriteFile(musePath, []byte(museSh), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+
+	authPath := filepath.Join(dir, "auth")
+	if err := os.WriteFile(authPath, []byte("fake-auth-token"), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	t.Setenv("MUSE_AUTH", authPath)
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	tmpDir := t.TempDir()
+	reqPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:       ProtocolVersion,
+		RunID:         "run-invalid-severity",
+		SnapshotPath:  tmpDir,
+		BlindedPrompt: "review this",
+		ToolAccess:    ToolAccessRequirements{},
+		ResultPath:    resultPath,
+	}
+
+	data, _ := json.Marshal(req)
+	os.WriteFile(reqPath, data, 0o600)
+
+	stderr := &bytes.Buffer{}
+	code := MuseMain([]string{"--request", reqPath}, stderr)
+
+	if code != 1 {
+		t.Errorf("MuseMain returned %d, want 1 (invalid severity)", code)
+	}
+
+	result, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	var resp CandidateResponse
+	if err := json.Unmarshal(result, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != StatusFailed {
+		t.Errorf("response status = %q, want failed", resp.Status)
+	}
+	if resp.ErrorClass != ErrClassOutputMalformed {
+		t.Errorf("error_class = %q, want output_malformed", resp.ErrorClass)
+	}
+	if !strings.Contains(resp.ErrorMessage, "severity") {
+		t.Errorf("error message should mention severity, got: %s", resp.ErrorMessage)
+	}
+}
+
+func TestMuseMainIncompatibleFlags(t *testing.T) {
+	// Test that preflight fails when muse exec doesn't support required flags.
+	dir := t.TempDir()
+	musePath := filepath.Join(dir, "muse")
+	// Fake muse whose exec --help doesn't mention --model, --output-format, etc.
+	museSh := `#!/bin/sh
+if [ "$1" = "--help" ]; then
+  echo "usage: muse [command]"
+  echo "Commands: run"
+elif [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "usage: muse exec [options]"
+  echo "Options: --timeout <seconds>"
+else
+  echo "muse-spark-1.3"
+fi`
+	if err := os.WriteFile(musePath, []byte(museSh), 0o755); err != nil {
+		t.Fatalf("write fake muse: %v", err)
+	}
+
+	authPath := filepath.Join(dir, "auth")
+	if err := os.WriteFile(authPath, []byte("fake-auth-token"), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	t.Setenv("MUSE_AUTH", authPath)
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	tmpDir := t.TempDir()
+	reqPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:       ProtocolVersion,
+		RunID:         "run-incompatible",
+		SnapshotPath:  tmpDir,
+		BlindedPrompt: "test",
+		ToolAccess:    ToolAccessRequirements{},
+		ResultPath:    resultPath,
+	}
+
+	data, _ := json.Marshal(req)
+	os.WriteFile(reqPath, data, 0o600)
+
+	stderr := &bytes.Buffer{}
+	code := MuseMain([]string{"--request", reqPath}, stderr)
+
+	if code != 1 {
+		t.Errorf("MuseMain returned %d, want 1 (incompatible flags)", code)
+	}
+
+	result, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	var resp CandidateResponse
+	if err := json.Unmarshal(result, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != StatusUnsupported {
+		t.Errorf("response status = %q, want unsupported", resp.Status)
+	}
+	if resp.ErrorClass != ErrClassCapabilityMissing {
+		t.Errorf("error_class = %q, want capability_missing", resp.ErrorClass)
+	}
+	if len(resp.MissingCapabilities) == 0 {
+		t.Errorf("expected missing capabilities to be listed")
 	}
 }
