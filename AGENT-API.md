@@ -433,6 +433,85 @@ This support allows the harness to pre-admit research tasks against the pacing p
 claiming and debiting a start in one call), then supply the admitted task ID to the worker/reviewer
 process so no additional claims or discovery calls are needed.
 
+## Evaluation campaign CLI commands
+
+Evaluation campaigns compare candidate reviewer versions on frozen samples. They are isolated from
+the board: these commands never read or write a task, review, verdict or PR link, and a finalized
+evaluation attempt **cannot vote on a research task**. Nothing is created automatically, every cap is
+a finite integer you pass, and there is no unlimited default. See `docs/api.md` ("Evaluation
+Campaigns") for the HTTP interface each command wraps.
+
+Every command needs `ODONIAN_URL` and `ODONIAN_TOKEN`, takes only the flags below (unknown flags and
+extra arguments are errors) and prints the server's JSON response as **one compact line** on stdout.
+Flags marked * are required. Candidates are always referenced by candidate-version ID; nothing names
+a provider.
+
+```bash
+# Pools (a candidate's identity.account_pool must name a configured pool)
+odonian evaluation-pool-set --id local --concurrency-only --concurrent-limit 2
+odonian evaluation-pool-set --id acct --start-rate 0.5 --burst 3 --concurrent-limit 2
+odonian evaluation-pool-get --id local
+
+# Campaign
+odonian evaluation-create-campaign --id c1 --name "Reviewer comparison" \
+  --projects proj1,proj2 --models model-a,model-b --cohort "$(cat cohort.json)" --cap 100 \
+  [--description "..."]
+odonian evaluation-get-campaign --id c1
+odonian evaluation-get-campaign-status --id c1
+odonian evaluation-pause-campaign --id c1
+
+# Candidate versions (identity JSON inline or from a file)
+odonian evaluation-create-candidate --campaign c1 --id v1 --cap 50 --identity-file identity.json
+odonian evaluation-list-candidates --campaign c1
+odonian evaluation-get-sample --campaign c1 --sample s1
+
+# Attempts
+odonian evaluation-claim-job --sample s1 --candidate v1 --request-id run-1 --ttl-ms 600000
+odonian evaluation-renew-attempt --job <job_id> --attempt <attempt_id> --ttl-ms 600000
+odonian evaluation-finalize-attempt --job <job_id> --attempt <attempt_id> --exit-class completed \
+  --result '{"status":"completed","duration_ms":4200,"findings":[{"id":"f1","severity":"minor","summary":"..."}]}'
+```
+
+| Command | Flags | HTTP |
+|---|---|---|
+| `evaluation-pool-set` | `--id`*, `--concurrent-limit`*, then either `--concurrency-only` or `--start-rate` and `--burst` | `PUT /evaluation/pools/{id}` |
+| `evaluation-pool-get` | `--id`* | `GET /evaluation/pools/{id}` |
+| `evaluation-create-campaign` | `--id`*, `--name`*, `--projects`* and `--models`* (comma-separated), `--cohort`*, `--cap`* (>= 1), `--description` | `POST /evaluation/campaigns` |
+| `evaluation-get-campaign` | `--id`* | `GET /evaluation/campaigns/{id}` |
+| `evaluation-get-campaign-status` | `--id`* | `GET /evaluation/campaigns/{id}/status` |
+| `evaluation-pause-campaign` | `--id`* | `POST /evaluation/campaigns/{id}/pause` |
+| `evaluation-create-candidate` | `--campaign`*, `--id`*, `--cap`* (>= 1), `--identity` or `--identity-file` (one of them)* | `POST /evaluation/campaigns/{id}/candidates` |
+| `evaluation-list-candidates` | `--campaign`* | `GET /evaluation/campaigns/{id}/candidates` |
+| `evaluation-get-sample` | `--campaign`*, `--sample`* | `GET /evaluation/campaigns/{campaign}/samples/{sample}` |
+| `evaluation-claim-job` | `--sample`*, `--candidate`*, `--request-id`*, `--ttl-ms`* (1-3600000) | `POST /evaluation/jobs/claim` |
+| `evaluation-renew-attempt` | `--job`*, `--attempt`*, `--ttl-ms`* (1-3600000) | `POST /evaluation/jobs/{job}/attempts/{attempt}/renew` |
+| `evaluation-finalize-attempt` | `--job`*, `--attempt`*, `--exit-class`*, `--result` or `--result-file` | `POST /evaluation/jobs/{job}/attempts/{attempt}/finalize` |
+
+**Finalize payload.** `--result` (or `--result-file`) is a JSON object limited to `status`,
+`error_class`, `error_message`, `duration_ms`, `usage_tokens` and `findings`; any other key (including
+`fence_attempt_id`, `exit_class`, `task_id` or `verdict`) is rejected before anything is sent. The
+fence is always the `--attempt` flag and the exit class always the `--exit-class` flag, so a result
+file cannot override either.
+
+**Status.** `evaluation-get-campaign-status` is the poll command. Read `state` (`active`, `paused` or
+`exhausted`), `attempts_remaining`, and each candidate's `attempts_remaining`, `exhausted`,
+`active_attempts` and `pool`.
+
+**Exit codes.** Validation of flags exits 1 without contacting the server. A server refusal maps like
+the research admission commands: `429 ADMISSION_DENIED` exits **10** (prints `scheduling:` and the
+retry hints; wait and retry the claim), and every `409` exits **11** with `conflict: server error
+(<CODE>): ...` on stderr, where `<CODE>` is one of `PAUSED_WAITING` (stop claiming; the campaign is
+paused), `CAPACITY_EXHAUSTED` (this candidate or campaign is out of attempts), `ATTEMPT_LIVE`,
+`FENCE_MISMATCH` (a newer attempt superseded yours), `ATTEMPT_EXPIRED` (your lease ran out before the
+result arrived), `ATTEMPT_FINALIZED` (a repeat of an already recorded result; nothing changed),
+`POOL_NOT_CONFIGURED` or `ALREADY_PAUSED`. None of these should be retried blindly. Other errors
+(`400`, `404`, `5xx`) exit 1.
+
+**Replay.** Re-running `evaluation-claim-job` with the same `--request-id` returns the original
+attempt without spending cap, so a worker may safely retry after a lost response. Re-running
+`evaluation-finalize-attempt` after it succeeded exits 11 `ATTEMPT_FINALIZED` and records nothing
+twice.
+
 ## Exit codes
 
 Research admission commands (`claim`, `next --claim`, `permit-renew`, `permit-finalize`) use

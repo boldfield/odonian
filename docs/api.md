@@ -1607,6 +1607,253 @@ curl -X POST -H "Authorization: Bearer token" \
 
 ---
 
+## Evaluation Campaigns
+
+Evaluation campaigns compare candidate reviewer versions on frozen samples of past review work. They
+are a separate surface from tasks and reviews: every `/evaluation/...` route reads and writes only
+the evaluation tables. None of them reads or writes a task, review task, verdict, PR link or
+scorecard, so an experimental result **cannot vote on, reject, advance or otherwise change a
+research task**. Nothing is created automatically: a campaign, its candidate versions and its pools
+exist only because a caller created them, every cap is a finite integer the caller chose, and there
+is no "unlimited" value. Every route requires the bearer token. There are no provider-specific
+routes; a candidate is described by the generic candidate identity (adapter, model, runtime,
+settings, tools, account pool) and referenced everywhere by its candidate-version ID.
+
+All request bodies are a single JSON object. Unknown fields, trailing data, bodies over 4 MiB and
+invalid JSON are `400 INVALID_INPUT`. Errors use the standard envelope
+`{"error": {"code": "...", "message": "..."}}`.
+
+Not exposed over HTTP: sample creation (samples are frozen by the cohort tooling), campaign
+activation of a cohort, replacing a candidate's model, and resuming a paused campaign.
+
+### Pools
+
+An evaluation pool bounds how fast and how many attempts start against one account or compute
+resource. Pools are separate from the research pools and can never spend or occupy research
+allowance. A candidate names its pool in `identity.account_pool`; claiming against a pool that was
+never configured is `409 POOL_NOT_CONFIGURED`, never unlimited capacity.
+
+#### `PUT /evaluation/pools/{id}`
+
+Create a pool, or update the limits of an existing one without resetting its allowance or its
+active attempts. A pool's mode cannot change after creation.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `concurrency_only` | bool | `true` for a local compute pool bounded by `concurrent_limit` alone |
+| `concurrent_limit` | int, required, >= 1 | maximum attempts live at once |
+| `start_rate` | number | rate pools only: sustained starts per second, finite and > 0 |
+| `burst_capacity` | int | rate pools only: starts allowed in a burst, >= 1 |
+
+A concurrency-only pool must not set `start_rate` or `burst_capacity`; a rate pool must set both.
+
+**Response (200):**
+```json
+{"pool": {"id": "local", "mode": "concurrency_only", "concurrent_limit": 2, "active": 0}}
+```
+A rate pool also reports `start_rate`, `burst_capacity` and the settled `tokens`. Errors:
+`400 INVALID_INPUT`.
+
+#### `GET /evaluation/pools/{id}`
+
+Read a pool (settled allowance and live occupancy; nothing is changed). Same response shape as
+`PUT`. `409 POOL_NOT_CONFIGURED` if the pool was never configured.
+
+### Campaigns
+
+#### `POST /evaluation/campaigns`
+
+Create a bounded campaign.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string, required | caller-chosen campaign ID |
+| `name` | string, required | |
+| `description` | string, optional | |
+| `allowed_project_ids` | string[], required, non-empty, no duplicates | projects whose samples may be evaluated |
+| `allowed_model_ids` | string[], required, non-empty, no duplicates | models candidates may use |
+| `cohort_manifest` | string, required | frozen description of the cohort |
+| `attempt_cap` | int, required, 1..100000 | total attempts the campaign may start |
+
+**Response (201):**
+```json
+{"campaign": {"id": "c1", "name": "n", "description": null, "allowed_project_ids": ["p"],
+  "allowed_model_ids": ["m"], "cohort_manifest": "{}", "attempt_cap": 3,
+  "paused_at": null, "created_at": "2026-03-01T00:00:00.000Z"}}
+```
+Errors: `400 INVALID_INPUT` (missing field, cap outside 1..100000, duplicates, unknown field),
+`409 ALREADY_EXISTS`.
+
+#### `GET /evaluation/campaigns/{id}`
+
+Same `campaign` object (`paused_at` is set while a pause is in force). `404 CAMPAIGN_NOT_FOUND`.
+
+#### `GET /evaluation/campaigns/{id}/status`
+
+Compact machine-readable status, safe to poll. It carries counts only: no findings, prompts or
+sample content.
+
+```json
+{
+  "campaign_id": "c1", "name": "n", "state": "active", "paused_at": null,
+  "attempt_cap": 4, "attempts_used": 1, "attempts_remaining": 3,
+  "candidates": [{
+    "candidate_id": "v1", "config_digest": "8aec...", "adapter_name": "fake",
+    "model_id": "m1", "model_revision": "unknown", "account_pool_id": "pool1",
+    "per_candidate_cap": 3, "attempts_used": 1, "attempts_remaining": 2,
+    "active_attempts": 1, "exhausted": false,
+    "pool": {"id": "pool1", "mode": "concurrency_only", "concurrent_limit": 2, "active": 1}
+  }]
+}
+```
+
+`state` is `paused` while an explicit pause is in force; otherwise `exhausted` when the campaign cap
+is spent or every candidate's cap is spent; otherwise `active`. Every started attempt, including an
+expired or failed one, counts against the caps; `active_attempts` counts only attempts whose lease is
+still live. `pool` is `null` when the candidate's pool was never configured (admission is then
+blocked). `404 CAMPAIGN_NOT_FOUND`.
+
+#### `POST /evaluation/campaigns/{id}/pause`
+
+Explicitly pause a campaign. No body. From then on `POST /evaluation/jobs/claim` for the campaign
+returns `409 PAUSED_WAITING` (checked before the caps and pools); attempts already live may still
+renew and finalize. A pause is one-way over this API; there is no resume route.
+
+**Response (200):** `{"campaign_id": "c1", "state": "paused", "paused_at": "..."}`.
+Errors: `404 CAMPAIGN_NOT_FOUND`, `409 ALREADY_PAUSED`.
+
+### Candidate versions
+
+A candidate is an immutable version of a reviewer configuration. The server validates the identity,
+computes its `config_digest` itself (a client-supplied digest is an unknown field and is rejected),
+and re-verifies the digest on every read.
+
+#### `POST /evaluation/campaigns/{id}/candidates`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string, required | caller-chosen candidate-version ID |
+| `per_candidate_cap` | int, required, 1..100000 | attempts this candidate may start |
+| `identity` | object, required | the candidate identity (below) |
+
+`identity` fields, each required and either a real value or the literal `"unknown"`:
+`adapter_name`, `adapter_version`, `model_id`, `model_revision`, `runtime_name`, `runtime_version`,
+`prompt_version`, `account_pool`; plus `reasoning_settings` and `generation_settings`
+(`{"known": bool, "values": {...}}`) and `tools` and `observers` (`{"known": bool, "names": [...]}`).
+`identity.model_id` must be in the campaign's `allowed_model_ids`.
+
+A campaign may have any number of candidates, each with its own cap and pool.
+
+**Response (201):**
+```json
+{"candidate": {"id": "v1", "campaign_id": "c1", "config_digest": "8aec...",
+  "account_pool_id": "pool1", "per_candidate_cap": 3, "identity": {"adapter_name": "fake", "...": "..."},
+  "created_at": "..."}}
+```
+Errors: `400 INVALID_INPUT` (bad identity or cap), `400 MODEL_NOT_ALLOWED`, `404 CAMPAIGN_NOT_FOUND`,
+`409 ALREADY_EXISTS`.
+
+#### `GET /evaluation/campaigns/{id}/candidates`
+
+`{"candidates": [<candidate>, ...]}`. `404 CAMPAIGN_NOT_FOUND`.
+
+### Samples
+
+#### `GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}`
+
+Read one frozen sample: `id`, `campaign_id`, `project_id`, `original_task_id`,
+`original_review_round`, `submitted_sha`, `snapshot_digest`, `source_digest`, `manifest_digest`,
+`prompt_version`, `model_version`, `runtime_version`, `created_at`, under `{"sample": {...}}`.
+`404 SAMPLE_NOT_FOUND`, including when the sample belongs to a different campaign.
+
+### Job admission and attempts
+
+#### `POST /evaluation/jobs/claim`
+
+Admit one attempt of one candidate on one sample.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `sample_id` | string, required | |
+| `candidate_id` | string, required | candidate-version ID |
+| `request_id` | string, required | stable key; a repeat returns the original attempt |
+| `lease_ttl_ms` | int, required, 1..3600000 | lease length from the server clock |
+
+**Response (200):**
+```json
+{"job": {"id": "...", "sample_id": "s1", "candidate_id": "v1", "current_attempt_id": "...", "created_at": "..."},
+ "attempt": {"id": "...", "job_id": "...", "request_id": "r1", "sequence_number": 1,
+   "previous_attempt_id": null, "state": "active", "started_at": "...", "expires_at": "...",
+   "ended_at": null, "exit_class": null, "status": null}}
+```
+
+**Replay safety.** Repeating a claim with the same `request_id`, sample and candidate returns the
+same job and attempt and spends no cap or pool allowance. A new `request_id` for a sample whose
+previous attempt is still live is `409 ATTEMPT_LIVE`; once that attempt has expired or finalized, a
+new `request_id` starts attempt `sequence_number + 1` on the same job.
+
+Errors: `400 INVALID_INPUT`; `404 SAMPLE_NOT_FOUND` / `CANDIDATE_NOT_FOUND`;
+`409 PAUSED_WAITING` (campaign paused); `409 CAPACITY_EXHAUSTED` (campaign or candidate cap spent);
+`409 POOL_NOT_CONFIGURED`; `409 ATTEMPT_LIVE`; `429 ADMISSION_DENIED` (pool rate or concurrency
+limit, with `outcome`, `reason`, `not_before`, `retry_after_seconds` and a `Retry-After` header as
+for research admission). A refused claim spends no cap.
+
+#### `POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew`
+
+Extend a live attempt's lease. Body: `{"lease_ttl_ms": 1..3600000}`; the new expiry is
+`lease_ttl_ms` from the server clock and must be later than the current expiry.
+
+**Response (200):** `{"attempt": {...}}`. Errors: `400 INVALID_INPUT` (bad ttl, or it would not
+extend the lease), `404 ATTEMPT_NOT_FOUND` (unknown attempt, or the attempt does not belong to
+`job_id`), `409 ATTEMPT_EXPIRED`, `409 ATTEMPT_FINALIZED`, `409 FENCE_MISMATCH`.
+
+#### `POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize`
+
+Record the attempt's outcome and findings atomically. Only the job's current, live attempt can
+finalize.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `fence_attempt_id` | string, required | must equal `{attempt_id}` |
+| `exit_class` | string, required | `completed`, `failed`, `cancelled`, `unknown`, `timeout`, `unavailable_snapshot`, `unavailable_source`, `invalid_output`, `incomplete_output` (`lease_expired` is recorded by the server only) |
+| `status` | string, optional | `completed`, `incomplete`, `unsupported`, `interrupted`, `failed`; `completed` if and only if `exit_class` is `completed` |
+| `error_class` | string, optional | `capability_missing`, `output_truncated`, `source_unavailable`, `budget_exhausted`, `interrupted`, `timeout`, `runtime_error`, `output_malformed`, `output_missing`, `auth_missing`, `launch_error` |
+| `error_message` | string, optional | at most 1024 bytes |
+| `duration_ms`, `usage_tokens` | int, optional | non-negative; omitted means unknown, not zero |
+| `findings` | object[], optional | only with `exit_class` `completed`; each `{"id", "severity", "summary", "claim"?, "evidence"?}`, `severity` in `material`, `minor`, `note`, unique non-empty `id`, non-empty `summary`, at most 500 findings; unknown finding keys are rejected |
+
+There is no verdict, task ID or review field: an evaluation result cannot vote.
+
+**Response (200):** `{"attempt": {... "state": "finalized", "exit_class": "completed" ...}, "finding_count": 2}`.
+
+**Stale and replayed results.** A result is rejected, and records nothing, when:
+- `fence_attempt_id` differs from the path attempt, or the attempt is not the job's current attempt
+  (superseded by a retry): `409 FENCE_MISMATCH`;
+- the lease has been reached: `409 ATTEMPT_EXPIRED`; the attempt is recorded once as `expired` with
+  exit class `lease_expired` and its findings are discarded;
+- the attempt is already finalized (a replay of the same result): `409 ATTEMPT_FINALIZED`, with the
+  original findings left untouched and not duplicated;
+- `attempt_id` does not belong to `job_id`: `404 ATTEMPT_NOT_FOUND`.
+
+Invalid payloads are `400 INVALID_INPUT` and leave the attempt live.
+
+### Evaluation error codes
+
+| Status | Code | Meaning |
+|---|---|---|
+| 400 | `INVALID_INPUT` | malformed or invalid body, cap or ttl out of range |
+| 400 | `MODEL_NOT_ALLOWED` | candidate model not allowed by the campaign |
+| 404 | `CAMPAIGN_NOT_FOUND`, `CANDIDATE_NOT_FOUND`, `SAMPLE_NOT_FOUND`, `ATTEMPT_NOT_FOUND` | unknown ID |
+| 409 | `ALREADY_EXISTS` | campaign or candidate ID already used |
+| 409 | `ALREADY_PAUSED`, `PAUSED_WAITING` | pause requested twice; admission refused while paused |
+| 409 | `CAPACITY_EXHAUSTED` | campaign or candidate cap spent |
+| 409 | `POOL_NOT_CONFIGURED` | candidate's pool does not exist |
+| 409 | `ATTEMPT_LIVE`, `FENCE_MISMATCH`, `ATTEMPT_EXPIRED`, `ATTEMPT_FINALIZED` | lifecycle conflicts above |
+| 429 | `ADMISSION_DENIED` | pool rate or concurrency limit; retry after the hint |
+| 500 | `CANDIDATE_CORRUPT` | stored candidate failed digest verification |
+
+---
+
 ## Full Lifecycle Walkthrough
 
 This exercises the API against a running server with the default `haiku`, `sonnet`, `opus` model allowlist.

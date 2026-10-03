@@ -173,6 +173,9 @@ func run(args []string) error {
 	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize":
 		return runClient(args[1], args[2:])
 	default:
+		if evaluationVerbs[args[1]] {
+			return runClient(args[1], args[2:])
+		}
 		fmt.Fprintf(os.Stderr, "error: unknown command %q\n\n", args[1])
 		printUsageWriter(os.Stderr)
 		return &handledError{code: 1}
@@ -211,6 +214,7 @@ Commands:
   research-status        Get current research pool status
   permit-renew           Renew a research permit
   permit-finalize        Finalize a research permit
+  evaluation-*           Isolated reviewer-comparison campaigns (see AGENT-API.md)
   help, -h, --help       Show this help message
 `, version)
 }
@@ -526,6 +530,9 @@ func runClient(verb string, args []string) error {
 	case "permit-finalize":
 		return executePermitFinalize(ctx, baseURL, token, args, os.Stdout)
 	default:
+		if evaluationVerbs[verb] {
+			return executeEvaluation(ctx, verb, baseURL, token, args, os.Stdout)
+		}
 		return fmt.Errorf("unknown command %q", verb)
 	}
 }

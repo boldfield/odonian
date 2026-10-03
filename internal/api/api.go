@@ -105,6 +105,20 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("POST /research/permits/{permit_id}/renew", wrapProtected("POST /research/permits/{permit_id}/renew", server.handleRenewResearchPermit))
 	mux.HandleFunc("POST /research/permits/{permit_id}/finalize", wrapProtected("POST /research/permits/{permit_id}/finalize", server.handleFinalizeResearchPermit))
 
+	// Evaluation endpoints (protected): isolated reviewer-comparison lifecycle.
+	mux.HandleFunc("PUT /evaluation/pools/{id}", wrapProtected("PUT /evaluation/pools/{id}", server.handleConfigureEvaluationPool))
+	mux.HandleFunc("GET /evaluation/pools/{id}", wrapProtected("GET /evaluation/pools/{id}", server.handleGetEvaluationPool))
+	mux.HandleFunc("POST /evaluation/campaigns", wrapProtected("POST /evaluation/campaigns", server.handleCreateEvaluationCampaign))
+	mux.HandleFunc("GET /evaluation/campaigns/{id}", wrapProtected("GET /evaluation/campaigns/{id}", server.handleGetEvaluationCampaign))
+	mux.HandleFunc("GET /evaluation/campaigns/{id}/status", wrapProtected("GET /evaluation/campaigns/{id}/status", server.handleGetEvaluationCampaignStatus))
+	mux.HandleFunc("POST /evaluation/campaigns/{id}/pause", wrapProtected("POST /evaluation/campaigns/{id}/pause", server.handlePauseEvaluationCampaign))
+	mux.HandleFunc("POST /evaluation/campaigns/{id}/candidates", wrapProtected("POST /evaluation/campaigns/{id}/candidates", server.handleCreateEvaluationCandidate))
+	mux.HandleFunc("GET /evaluation/campaigns/{id}/candidates", wrapProtected("GET /evaluation/campaigns/{id}/candidates", server.handleListEvaluationCandidates))
+	mux.HandleFunc("GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}", wrapProtected("GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}", server.handleGetEvaluationSample))
+	mux.HandleFunc("POST /evaluation/jobs/claim", wrapProtected("POST /evaluation/jobs/claim", server.handleClaimEvaluationJob))
+	mux.HandleFunc("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew", wrapProtected("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew", server.handleRenewEvaluationAttempt))
+	mux.HandleFunc("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize", wrapProtected("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize", server.handleFinalizeEvaluationAttempt))
+
 	// Task endpoints (protected)
 	mux.HandleFunc("POST /projects/{id}/tasks", wrapProtected("POST /projects/{id}/tasks", server.handleCreateTasks))
 	mux.HandleFunc("GET /projects/{id}/tasks", wrapProtected("GET /projects/{id}/tasks", server.handleListTasks))
