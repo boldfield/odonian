@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -24,7 +25,7 @@ type Client interface {
 	ListEvents(ctx context.Context, taskID string) ([]Event, error)
 	ListDocuments(ctx context.Context, projectID string) ([]Document, error)
 	PromoteTask(ctx context.Context, id string) error
-	ClaimTask(ctx context.Context, id, agentID, model string) error
+	ClaimTask(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error)
 	ReviewTask(ctx context.Context, id, actor, verdict string, note *string) error
 	TransitionTask(ctx context.Context, id, to string, note *string) error
 	HeartbeatTask(ctx context.Context, id, agentID string) error
@@ -37,6 +38,10 @@ type Client interface {
 	ArchiveTask(ctx context.Context, id string) error
 	ArchiveProject(ctx context.Context, id string) error
 	GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error)
+	GetResearchPolicy(ctx context.Context) (ResearchPolicy, error)
+	GetResearchStatus(ctx context.Context) (ResearchStatus, error)
+	RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error)
+	FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error)
 }
 
 // Response structs for the TUI client (distinct from internal/store)
@@ -257,6 +262,53 @@ type ReviewerScorecards struct {
 	Scorecards []ReviewerScorecard `json:"reviewer_scorecards"`
 }
 
+type ResearchPoolConfig struct {
+	AccountID          string  `json:"account_id"`
+	StartRate          float64 `json:"start_rate"`
+	BurstCapacity      int     `json:"burst_capacity"`
+	ConcurrentLimit    int     `json:"concurrent_limit"`
+	CompletionReserved int     `json:"completion_reserved"`
+}
+
+type ResearchPolicy struct {
+	Mode  string               `json:"mode"`
+	Pools []ResearchPoolConfig `json:"pools"`
+}
+
+type ResearchPoolState struct {
+	AccountID        string  `json:"account_id"`
+	Active           int     `json:"active"`
+	ActiveCompletion int     `json:"active_completion"`
+	Deferred         int     `json:"deferred"`
+	Tokens           float64 `json:"tokens"`
+	SettledAt        string  `json:"settled_at"`
+}
+
+type ResearchStatus struct {
+	Mode  string              `json:"mode"`
+	Pools []ResearchPoolState `json:"pools"`
+}
+
+// AdmissionOutcome is the structured admission verdict carried by a 429 denial
+// and by an observe-mode claim's observed_denial.
+type AdmissionOutcome struct {
+	Outcome           string  `json:"outcome"`
+	Reason            string  `json:"reason,omitempty"`
+	NotBefore         *string `json:"not_before,omitempty"`
+	RetryAfterSeconds *int64  `json:"retry_after_seconds,omitempty"`
+}
+
+// ResearchAdmission mirrors the server's research_admission claim field.
+type ResearchAdmission struct {
+	PermitID  string            `json:"permit_id,omitempty"`
+	AttemptID string            `json:"attempt_id,omitempty"`
+	RequestID string            `json:"request_id,omitempty"`
+	AccountID string            `json:"account_id,omitempty"`
+	ExpiresAt string            `json:"expires_at,omitempty"`
+	Replayed  bool              `json:"replayed,omitempty"`
+	Observed  *AdmissionOutcome `json:"observed_denial,omitempty"`
+}
+
 // HTTPClient implements the Client interface.
 type HTTPClient struct {
 	baseURL string
@@ -309,9 +361,13 @@ func NewHTTPClient(baseURL, token string) *HTTPClient {
 // errors.As to inspect the status code and take action — for example, detecting a 409
 // conflict without string-matching on the error message.
 type APIError struct {
-	StatusCode int
-	Code       string
-	Message    string
+	StatusCode        int
+	Code              string
+	Message           string
+	Outcome           string
+	Reason            string
+	NotBefore         *string
+	RetryAfterSeconds *int64
 }
 
 func (e *APIError) Error() string {
@@ -324,8 +380,12 @@ func (e *APIError) Error() string {
 // errorResponse represents the structured error response from the server.
 type errorResponse struct {
 	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
+		Code              string  `json:"code"`
+		Message           string  `json:"message"`
+		Outcome           string  `json:"outcome"`
+		Reason            string  `json:"reason"`
+		NotBefore         *string `json:"not_before"`
+		RetryAfterSeconds *int64  `json:"retry_after_seconds"`
 	} `json:"error"`
 }
 
@@ -374,6 +434,19 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body interface
 			if unmarshalErr := json.Unmarshal(bodyBytes, &errResp); unmarshalErr == nil && errResp.Error.Message != "" {
 				apiErr.Code = errResp.Error.Code
 				apiErr.Message = errResp.Error.Message
+				apiErr.Outcome = errResp.Error.Outcome
+				apiErr.Reason = errResp.Error.Reason
+				apiErr.NotBefore = errResp.Error.NotBefore
+				apiErr.RetryAfterSeconds = errResp.Error.RetryAfterSeconds
+			}
+		}
+
+		// If RetryAfterSeconds is not set in the body, try parsing the Retry-After header.
+		if apiErr.RetryAfterSeconds == nil && resp.StatusCode == 429 {
+			if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+				if seconds, err := strconv.ParseInt(retryAfter, 10, 64); err == nil {
+					apiErr.RetryAfterSeconds = &seconds
+				}
 			}
 		}
 
@@ -632,41 +705,52 @@ func (c *HTTPClient) PromoteTask(ctx context.Context, id string) error {
 
 // claimTaskRequest is the request body for ClaimTask.
 type claimTaskRequest struct {
-	AgentID string `json:"agent_id"`
-	Model   string `json:"model"`
+	AgentID   string `json:"agent_id"`
+	Model     string `json:"model"`
+	RequestID string `json:"request_id,omitempty"`
+	AccountID string `json:"account_id,omitempty"`
+	WorkClass string `json:"work_class,omitempty"`
 }
 
 // ClaimTask claims a task as in_progress by the given agent and model.
-// Returns ErrAlreadyClaimed if the task is already claimed by another worker (409 status).
-func (c *HTTPClient) ClaimTask(ctx context.Context, id, agentID, model string) error {
+// Returns ErrAlreadyClaimed if the task is already claimed by another worker (409 status);
+// a 409 REQUEST_ID_CONFLICT or TASK_BUSY is returned as the *APIError instead.
+// requestID, accountID, and workClass are optional; when provided they enable stable
+// admission identity for transport retry recovery.
+func (c *HTTPClient) ClaimTask(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error) {
 	body := claimTaskRequest{
-		AgentID: agentID,
-		Model:   model,
+		AgentID:   agentID,
+		Model:     model,
+		RequestID: requestID,
+		AccountID: accountID,
+		WorkClass: workClass,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/claim", id), body)
 	if err != nil {
 		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.StatusCode == 409 {
-			return ErrAlreadyClaimed
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 409 &&
+			apiErr.Code != "REQUEST_ID_CONFLICT" && apiErr.Code != "TASK_BUSY" {
+			return nil, ErrAlreadyClaimed
 		}
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// A research claim returns research_admission.attempt_id; keep it so later
+	// A research claim returns research_admission; keep the attempt_id so later
 	// heartbeats and the submit are fenced to this attempt. Anything else (a bare
-	// task, an unreadable body) means there is no attempt to fence.
+	// task, an unreadable body) means there is no admission.
 	var claimed struct {
-		ResearchAdmission *struct {
-			AttemptID string `json:"attempt_id"`
-		} `json:"research_admission"`
+		ResearchAdmission *ResearchAdmission `json:"research_admission"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&claimed) == nil && claimed.ResearchAdmission != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&claimed); err != nil {
+		return nil, nil
+	}
+	if claimed.ResearchAdmission != nil {
 		c.SetAttemptID(id, claimed.ResearchAdmission.AttemptID)
 	}
 
-	return nil
+	return claimed.ResearchAdmission, nil
 }
 
 // reviewTaskRequest is the request body for ReviewTask.
@@ -885,4 +969,98 @@ func (c *HTTPClient) GetResearchReviewerScorecards(ctx context.Context, projectI
 	}
 
 	return scorecards, nil
+}
+
+// GetResearchPolicy fetches the research pacing policy configuration.
+func (c *HTTPClient) GetResearchPolicy(ctx context.Context) (ResearchPolicy, error) {
+	resp, err := c.do(ctx, "GET", "/research/policy", nil)
+	if err != nil {
+		return ResearchPolicy{}, err
+	}
+	defer resp.Body.Close()
+
+	var policy ResearchPolicy
+	if err := json.NewDecoder(resp.Body).Decode(&policy); err != nil {
+		return ResearchPolicy{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return policy, nil
+}
+
+// GetResearchStatus fetches the current research pool status.
+func (c *HTTPClient) GetResearchStatus(ctx context.Context) (ResearchStatus, error) {
+	resp, err := c.do(ctx, "GET", "/research/status", nil)
+	if err != nil {
+		return ResearchStatus{}, err
+	}
+	defer resp.Body.Close()
+
+	var status ResearchStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return ResearchStatus{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return status, nil
+}
+
+// RenewResearchPermit extends the lease on an active research attempt.
+func (c *HTTPClient) RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error) {
+	body := map[string]string{
+		"task_id":    taskID,
+		"model":      model,
+		"agent_id":   agentID,
+		"request_id": requestID,
+		"attempt_id": attemptID,
+	}
+
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/research/permits/%s/renew", url.PathEscape(permitID)), body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Attempt json.RawMessage `json:"attempt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	if len(result.Attempt) == 0 {
+		return nil, fmt.Errorf("failed to decode response: missing attempt")
+	}
+
+	return result.Attempt, nil
+}
+
+// FinalizeResearchPermit ends an active research attempt and records the outcome.
+func (c *HTTPClient) FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error) {
+	body := map[string]interface{}{
+		"task_id":    taskID,
+		"model":      model,
+		"agent_id":   agentID,
+		"request_id": requestID,
+		"attempt_id": attemptID,
+		"exit_class": exitClass,
+	}
+	if usageTokens != nil {
+		body["usage_tokens"] = usageTokens
+	}
+
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/research/permits/%s/finalize", url.PathEscape(permitID)), body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Attempt json.RawMessage `json:"attempt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	if len(result.Attempt) == 0 {
+		return nil, fmt.Errorf("failed to decode response: missing attempt")
+	}
+
+	return result.Attempt, nil
 }

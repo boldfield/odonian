@@ -8,12 +8,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -2272,6 +2275,55 @@ func TestExecuteNextRaced(t *testing.T) {
 
 	if !strings.Contains(claimErr.Error(), "raced") {
 		t.Errorf("expected error message to contain 'raced', got: %v", claimErr.Error())
+	}
+}
+
+func TestExecuteNextClaimSchedulingError(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+
+	retryAfter := int64(30)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/proj-1/tasks" && r.URL.Query().Get("claimable") == "true" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Task{
+				{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
+			})
+		} else if r.URL.Path == "/tasks/task-1/claim" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"code":                "ADMISSION_DEFERRED",
+					"message":             "admission deferred",
+					"retry_after_seconds": retryAfter,
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	err := executeNext(context.Background(), server.URL, "test-token", false, []string{
+		"--project", "proj-1",
+		"--model", "haiku",
+		"--kind", "implement",
+		"--claim",
+	})
+	if err == nil {
+		t.Fatal("expected error for scheduling error, got nil")
+	}
+
+	var schedErr *schedulingError
+	if !errors.As(err, &schedErr) {
+		t.Fatalf("expected schedulingError, got %T: %v", err, err)
+	}
+
+	if schedErr.code != 10 {
+		t.Errorf("expected exit code 10, got %d", schedErr.code)
+	}
+	if schedErr.retryAfterSeconds == nil || *schedErr.retryAfterSeconds != 30 {
+		t.Errorf("expected retryAfterSeconds 30, got %v", schedErr.retryAfterSeconds)
 	}
 }
 
@@ -5818,4 +5870,497 @@ func TestExecuteShowJSONKeepsContinuationAndFollowUpsSeparate(t *testing.T) {
 	if _, ok := raw["finding_follow_ups"]; !ok {
 		t.Errorf("--json has no finding_follow_ups key")
 	}
+}
+
+func TestPermitRenewConflictExitCodes(t *testing.T) {
+	tests := []struct {
+		name      string
+		errorCode string
+		wantExit  int
+	}{
+		{"ATTEMPT_FENCED", "ATTEMPT_FENCED", 11},
+		{"ATTEMPT_EXPIRED", "ATTEMPT_EXPIRED", 11},
+		{"ATTEMPT_FINALIZED", "ATTEMPT_FINALIZED", 11},
+		{"PERMIT_IDENTITY_MISMATCH", "PERMIT_IDENTITY_MISMATCH", 11},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]string{
+						"code":    tt.errorCode,
+						"message": "conflict",
+					},
+				})
+			}))
+			defer server.Close()
+
+			err := executePermitRenew(context.Background(), server.URL, "testtoken",
+				[]string{"permit-1", "--task-id", "task-1", "--model", "haiku", "--agent-id", "agent-1",
+					"--request-id", "req-1", "--attempt-id", "att-1"}, io.Discard)
+
+			var conflErr *conflictError
+			if !errors.As(err, &conflErr) {
+				t.Errorf("expected conflictError, got %T: %v", err, err)
+			} else if conflErr.code != tt.wantExit {
+				t.Errorf("expected exit code %d, got %d", tt.wantExit, conflErr.code)
+			}
+		})
+	}
+}
+
+func TestPermitFinalizeConflictExitCodes(t *testing.T) {
+	tests := []struct {
+		name      string
+		errorCode string
+		wantExit  int
+	}{
+		{"ATTEMPT_FENCED", "ATTEMPT_FENCED", 11},
+		{"ATTEMPT_EXPIRED", "ATTEMPT_EXPIRED", 11},
+		{"ATTEMPT_FINALIZED", "ATTEMPT_FINALIZED", 11},
+		{"PERMIT_IDENTITY_MISMATCH", "PERMIT_IDENTITY_MISMATCH", 11},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]string{
+						"code":    tt.errorCode,
+						"message": "conflict",
+					},
+				})
+			}))
+			defer server.Close()
+
+			err := executePermitFinalize(context.Background(), server.URL, "testtoken",
+				[]string{"permit-1", "--task-id", "task-1", "--model", "haiku", "--agent-id", "agent-1",
+					"--request-id", "req-1", "--attempt-id", "att-1", "--exit-class", "completed"}, io.Discard)
+
+			var conflErr *conflictError
+			if !errors.As(err, &conflErr) {
+				t.Errorf("expected conflictError, got %T: %v", err, err)
+			} else if conflErr.code != tt.wantExit {
+				t.Errorf("expected exit code %d, got %d", tt.wantExit, conflErr.code)
+			}
+		})
+	}
+}
+
+func TestClaimSchedulingError(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+
+	retryAfter := int64(30)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":                "ADMISSION_DEFERRED",
+				"message":             "admission deferred",
+				"retry_after_seconds": retryAfter,
+			},
+		})
+	}))
+	defer server.Close()
+
+	err := executeClaim(context.Background(), server.URL, "testtoken", []string{"task-1"})
+
+	var schedErr *schedulingError
+	if !errors.As(err, &schedErr) {
+		t.Errorf("expected schedulingError, got %T: %v", err, err)
+	} else if schedErr.code != 10 {
+		t.Errorf("expected exit code 10, got %d", schedErr.code)
+	} else if schedErr.retryAfterSeconds == nil || *schedErr.retryAfterSeconds != 30 {
+		t.Errorf("expected retryAfterSeconds 30, got %v", schedErr.retryAfterSeconds)
+	}
+}
+
+func TestResearchStatusFloatTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"mode": "paced",
+			"pools": []map[string]interface{}{
+				{
+					"account_id": "acct-1",
+					"tokens":     1234.5,
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	var buf bytes.Buffer
+	err := executeResearchStatus(context.Background(), server.URL, "testtoken", true, &buf)
+	if err != nil {
+		t.Fatalf("executeResearchStatus failed: %v", err)
+	}
+
+	output := buf.String()
+	var status tuiclient.ResearchStatus
+	if err := json.Unmarshal([]byte(output), &status); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(status.Pools) != 1 {
+		t.Fatalf("expected 1 pool, got %d", len(status.Pools))
+	}
+	if status.Pools[0].Tokens != 1234.5 {
+		t.Errorf("expected tokens 1234.5, got %v", status.Pools[0].Tokens)
+	}
+}
+
+// admissionServer serves one canned response for every request and records
+// the last request body.
+func admissionServer(t *testing.T, status int, header map[string]string, body interface{}, lastBody *map[string]interface{}) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if lastBody != nil && r.Body != nil {
+			*lastBody = map[string]interface{}{}
+			json.NewDecoder(r.Body).Decode(lastBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		for k, v := range header {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func denial(outcome, reason string, extra map[string]interface{}) map[string]interface{} {
+	e := map[string]interface{}{
+		"code":    "ADMISSION_DENIED",
+		"message": "research admission denied",
+		"outcome": outcome,
+		"reason":  reason,
+	}
+	for k, v := range extra {
+		e[k] = v
+	}
+	return map[string]interface{}{"error": e}
+}
+
+func keysOf(m map[string]interface{}) []string {
+	var ks []string
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+func TestClaimNotBeforeOnlyDenialPrintsHints(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+	srv := admissionServer(t, http.StatusTooManyRequests, nil,
+		denial("defer", "rate", map[string]interface{}{"not_before": "2026-10-03T15:00:00Z"}), nil)
+
+	err := executeClaim(context.Background(), srv.URL, "testtoken", []string{"task-1"})
+	var schedErr *schedulingError
+	if !errors.As(err, &schedErr) {
+		t.Fatalf("expected schedulingError, got %T: %v", err, err)
+	}
+	if schedErr.code != 10 {
+		t.Errorf("exit code = %d, want 10", schedErr.code)
+	}
+	if schedErr.retryAfterSeconds != nil {
+		t.Errorf("retryAfterSeconds = %d, want nil", *schedErr.retryAfterSeconds)
+	}
+	var buf bytes.Buffer
+	writeSchedulingHints(&buf, schedErr)
+	for _, want := range []string{"outcome: defer\n", "reason: rate\n", "not-before: 2026-10-03T15:00:00Z\n"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("stderr hints missing %q:\n%s", want, buf.String())
+		}
+	}
+	if strings.Contains(buf.String(), "retry-after") {
+		t.Errorf("unexpected retry-after line:\n%s", buf.String())
+	}
+}
+
+func TestClaimHeaderOnlyRetryAfterPrintsHint(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+	srv := admissionServer(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "45"},
+		denial("retry", "concurrency", nil), nil)
+
+	err := executeClaim(context.Background(), srv.URL, "testtoken", []string{"task-1"})
+	var schedErr *schedulingError
+	if !errors.As(err, &schedErr) {
+		t.Fatalf("expected schedulingError, got %T: %v", err, err)
+	}
+	var buf bytes.Buffer
+	writeSchedulingHints(&buf, schedErr)
+	for _, want := range []string{"outcome: retry\n", "reason: concurrency\n", "retry-after: 45\n"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("stderr hints missing %q:\n%s", want, buf.String())
+		}
+	}
+}
+
+func TestExecuteNextNotBeforeOnlyDenial(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/projects/proj-1/tasks" {
+			json.NewEncoder(w).Encode([]tuiclient.Task{{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement"}})
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(denial("defer", "rate", map[string]interface{}{"not_before": "2026-10-03T15:00:00Z"}))
+	}))
+	defer srv.Close()
+
+	err := executeNext(context.Background(), srv.URL, "testtoken", false,
+		[]string{"--project", "proj-1", "--model", "haiku", "--kind", "implement", "--claim"})
+	var schedErr *schedulingError
+	if !errors.As(err, &schedErr) {
+		t.Fatalf("expected schedulingError, got %T: %v", err, err)
+	}
+	if schedErr.code == 2 {
+		t.Errorf("scheduling exit must differ from nothing-claimable exit 2")
+	}
+	if schedErr.notBefore == nil || *schedErr.notBefore != "2026-10-03T15:00:00Z" || schedErr.reason != "rate" || schedErr.outcome != "defer" {
+		t.Errorf("scheduling metadata lost: %+v", schedErr)
+	}
+}
+
+func TestClaimRequestIdentityConflictsExit11(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+	for _, code := range []string{"REQUEST_ID_CONFLICT", "TASK_BUSY"} {
+		t.Run(code, func(t *testing.T) {
+			srv := admissionServer(t, http.StatusConflict, nil,
+				map[string]interface{}{"error": map[string]string{"code": code, "message": "conflict"}}, nil)
+			err := executeClaim(context.Background(), srv.URL, "testtoken", []string{"task-1", "--request-id", "r1"})
+			var conflErr *conflictError
+			if !errors.As(err, &conflErr) {
+				t.Fatalf("expected conflictError, got %T: %v", err, err)
+			}
+			if conflErr.code != 11 {
+				t.Errorf("exit code = %d, want 11", conflErr.code)
+			}
+			if !strings.Contains(conflErr.Error(), code) {
+				t.Errorf("message %q does not name %s", conflErr.Error(), code)
+			}
+		})
+	}
+}
+
+func TestClaimPlainConflictStaysAlreadyClaimed(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+	srv := admissionServer(t, http.StatusConflict, nil,
+		map[string]interface{}{"error": map[string]string{"code": "CONFLICT", "message": "Task is not claimable"}}, nil)
+	err := executeClaim(context.Background(), srv.URL, "testtoken", []string{"task-1"})
+	var claimErr *claimError
+	if !errors.As(err, &claimErr) || claimErr.code != 3 {
+		t.Fatalf("expected claimError exit 3, got %T: %v", err, err)
+	}
+}
+
+func TestClaimAdmissionJSONAndIdentityFlags(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+	t.Setenv("ODONIAN_STATE_DIR", t.TempDir())
+	var got map[string]interface{}
+	srv := admissionServer(t, http.StatusOK, nil, map[string]interface{}{
+		"id": "task-1",
+		"research_admission": map[string]interface{}{
+			"permit_id":  "permit-1",
+			"attempt_id": "attempt-1",
+			"request_id": "req-1",
+			"account_id": "acct-1",
+			"expires_at": "2026-10-03T16:00:00Z",
+			"replayed":   true,
+			"observed_denial": map[string]interface{}{
+				"outcome": "defer", "reason": "rate", "not_before": "2026-10-03T15:00:00Z",
+			},
+		},
+	}, &got)
+
+	out := captureStdout(t, func() {
+		err := executeClaim(context.Background(), srv.URL, "testtoken",
+			[]string{"task-1", "--request-id", "req-1", "--account-id", "acct-1", "--work-class", "research_review"})
+		if err != nil {
+			t.Fatalf("executeClaim: %v", err)
+		}
+	})
+
+	for k, want := range map[string]string{"request_id": "req-1", "account_id": "acct-1", "work_class": "research_review", "agent_id": "test-agent", "model": "haiku"} {
+		if got[k] != want {
+			t.Errorf("claim body %s = %v, want %s", k, got[k], want)
+		}
+	}
+
+	var adm map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &adm); err != nil {
+		t.Fatalf("claim output is not JSON: %v\n%s", err, out)
+	}
+	wantKeys := []string{"account_id", "attempt_id", "expires_at", "observed_denial", "permit_id", "replayed", "request_id"}
+	if !reflect.DeepEqual(keysOf(adm), wantKeys) {
+		t.Errorf("claim output keys = %v, want %v", keysOf(adm), wantKeys)
+	}
+	if adm["replayed"] != true {
+		t.Errorf("replayed = %v, want true", adm["replayed"])
+	}
+	obs, _ := adm["observed_denial"].(map[string]interface{})
+	if obs["outcome"] != "defer" || obs["reason"] != "rate" || obs["not_before"] != "2026-10-03T15:00:00Z" {
+		t.Errorf("observed_denial = %v", obs)
+	}
+}
+
+func TestClaimOutputOmitsFieldsServerDidNotSend(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+	t.Setenv("ODONIAN_STATE_DIR", t.TempDir())
+	srv := admissionServer(t, http.StatusOK, nil, map[string]interface{}{
+		"id": "task-1",
+		"research_admission": map[string]interface{}{
+			"permit_id": "permit-1", "attempt_id": "attempt-1", "request_id": "req-1",
+			"account_id": "acct-1", "expires_at": "2026-10-03T16:00:00Z",
+		},
+	}, nil)
+	out := captureStdout(t, func() {
+		if err := executeClaim(context.Background(), srv.URL, "testtoken", []string{"task-1"}); err != nil {
+			t.Fatalf("executeClaim: %v", err)
+		}
+	})
+	var adm map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &adm); err != nil {
+		t.Fatalf("claim output is not JSON: %v\n%s", err, out)
+	}
+	wantKeys := []string{"account_id", "attempt_id", "expires_at", "permit_id", "request_id"}
+	if !reflect.DeepEqual(keysOf(adm), wantKeys) {
+		t.Errorf("claim output keys = %v, want %v", keysOf(adm), wantKeys)
+	}
+}
+
+func TestPermitRenewOutputPassesServerAttemptThrough(t *testing.T) {
+	var got map[string]interface{}
+	srv := admissionServer(t, http.StatusOK, nil, map[string]interface{}{
+		"attempt": map[string]interface{}{
+			"id": "attempt-456", "permit_id": "permit-1", "task_id": "task-1",
+			"state": "active", "expires_at": "2026-10-10T12:00:00Z",
+		},
+	}, &got)
+
+	var buf bytes.Buffer
+	err := executePermitRenew(context.Background(), srv.URL, "testtoken",
+		[]string{"permit-1", "--task-id", "task-1", "--model", "haiku", "--agent-id", "agent-1",
+			"--request-id", "req-1", "--attempt-id", "att-1"}, &buf)
+	if err != nil {
+		t.Fatalf("executePermitRenew: %v", err)
+	}
+	if got["attempt_id"] != "att-1" || got["request_id"] != "req-1" || got["task_id"] != "task-1" {
+		t.Errorf("renew request body = %v", got)
+	}
+	var attempt map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &attempt); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, buf.String())
+	}
+	wantKeys := []string{"expires_at", "id", "permit_id", "state", "task_id"}
+	if !reflect.DeepEqual(keysOf(attempt), wantKeys) {
+		t.Errorf("renew output keys = %v, want %v", keysOf(attempt), wantKeys)
+	}
+	if attempt["expires_at"] != "2026-10-10T12:00:00Z" {
+		t.Errorf("expires_at = %v", attempt["expires_at"])
+	}
+}
+
+func TestPermitFinalizeOutputPassesServerAttemptThrough(t *testing.T) {
+	var got map[string]interface{}
+	srv := admissionServer(t, http.StatusOK, nil, map[string]interface{}{
+		"attempt": map[string]interface{}{
+			"id": "attempt-456", "permit_id": "permit-1", "task_id": "task-1",
+			"state": "finalized", "exit_class": "completed",
+		},
+	}, &got)
+
+	var buf bytes.Buffer
+	err := executePermitFinalize(context.Background(), srv.URL, "testtoken",
+		[]string{"permit-1", "--task-id", "task-1", "--model", "haiku", "--agent-id", "agent-1",
+			"--request-id", "req-1", "--attempt-id", "att-1", "--exit-class", "completed", "--usage-tokens", "0"}, &buf)
+	if err != nil {
+		t.Fatalf("executePermitFinalize: %v", err)
+	}
+	if got["exit_class"] != "completed" || got["attempt_id"] != "att-1" {
+		t.Errorf("finalize request body = %v", got)
+	}
+	if v, ok := got["usage_tokens"]; !ok || v != float64(0) {
+		t.Errorf("explicit --usage-tokens 0 not sent: %v", got)
+	}
+	var attempt map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &attempt); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, buf.String())
+	}
+	wantKeys := []string{"exit_class", "id", "permit_id", "state", "task_id"}
+	if !reflect.DeepEqual(keysOf(attempt), wantKeys) {
+		t.Errorf("finalize output keys = %v, want %v", keysOf(attempt), wantKeys)
+	}
+}
+
+func TestPermitRenewFinalizeSchedulingDenial(t *testing.T) {
+	retry := map[string]interface{}{"retry_after_seconds": 12}
+	for _, verb := range []string{"renew", "finalize"} {
+		t.Run(verb, func(t *testing.T) {
+			srv := admissionServer(t, http.StatusTooManyRequests, nil, denial("retry", "concurrency", retry), nil)
+			args := []string{"permit-1", "--task-id", "task-1", "--model", "haiku", "--agent-id", "agent-1",
+				"--request-id", "req-1", "--attempt-id", "att-1"}
+			var err error
+			if verb == "renew" {
+				err = executePermitRenew(context.Background(), srv.URL, "testtoken", args, io.Discard)
+			} else {
+				err = executePermitFinalize(context.Background(), srv.URL, "testtoken", append(args, "--exit-class", "completed"), io.Discard)
+			}
+			var schedErr *schedulingError
+			if !errors.As(err, &schedErr) {
+				t.Fatalf("expected schedulingError, got %T: %v", err, err)
+			}
+			if schedErr.code != 10 || schedErr.retryAfterSeconds == nil || *schedErr.retryAfterSeconds != 12 {
+				t.Errorf("scheduling error = %+v", schedErr)
+			}
+		})
+	}
+}
+
+func TestPermitRenewFinalizeNullFieldsDoNotPanic(t *testing.T) {
+	srv := admissionServer(t, http.StatusOK, nil, map[string]interface{}{
+		"attempt": map[string]interface{}{"id": "a", "exit_class": nil},
+	}, nil)
+	var buf bytes.Buffer
+	if err := executePermitFinalize(context.Background(), srv.URL, "testtoken",
+		[]string{"permit-1", "--task-id", "t", "--model", "haiku", "--agent-id", "a",
+			"--request-id", "r", "--attempt-id", "a", "--exit-class", "completed"}, &buf); err != nil {
+		t.Fatalf("executePermitFinalize: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"exit_class": null`) {
+		t.Errorf("null field not passed through:\n%s", buf.String())
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	backup := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = backup }()
+	fn()
+	w.Close()
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+	return buf.String()
 }

@@ -368,6 +368,61 @@ else
   test_fail "research review prompt missing prohibition on child task creation"
 fi
 
+# Test 31: research prompts support preclaimed task + attempt identity without next/claim
+echo "Test 31: research prompts accept a preclaimed task and attempt identity"
+_pc_ok=1
+for _pc_prompt in "$_ri_prompt" "$_rr_prompt"; do
+  _pc_text="$(tr -s '[:space:]' ' ' < "$_pc_prompt")"
+  for _pc_needle in \
+    'ODONIAN_PRECLAIMED_TASK_ID' \
+    'ODONIAN_PRECLAIMED_ATTEMPT_ID' \
+    'not call `odonian next` or `odonian claim`' \
+    'other than `ODONIAN_PRECLAIMED_TASK_ID`' \
+    'odonian show --json' \
+    "compare the task's assignee to \`\$AGENT_ID\`" \
+    'state is `in_progress`' \
+    '**Ordinary (legacy) mode.**' \
+    'not `enforce`' \
+    'exits 10 (scheduling denial)'; do
+    if ! printf '%s' "$_pc_text" | grep -qF -- "$_pc_needle"; then
+      echo "  $(basename "$_pc_prompt") missing: $_pc_needle"
+      _pc_ok=0
+    fi
+  done
+done
+if [ "$_pc_ok" -eq 1 ]; then
+  test_pass "research prompts document preclaimed mode, ownership check, and enforce-aware ordinary mode"
+else
+  test_fail "research prompts missing preclaimed/ordinary mode guidance"
+fi
+
+# Test 31b: ordinary next+claim flow remains documented in both research prompts
+echo "Test 31b: ordinary next+claim flow remains documented"
+if grep -qF -- '`odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`' "$_ri_prompt" && \
+   grep -qF -- '`odonian claim <id>`' "$_ri_prompt" && \
+   grep -qF -- '--kind review' "$_rr_prompt" && \
+   grep -qF -- '`odonian claim <id>`' "$_rr_prompt"; then
+  test_pass "ordinary next+claim flow remains documented"
+else
+  test_fail "ordinary next+claim flow missing from a research prompt"
+fi
+
+# Test 31c: heartbeat/submit fencing with --attempt, for regular review and adjudication
+echo "Test 31c: heartbeat and submits pass --attempt (implement, regular review, adjudication)"
+_att='--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"'
+_rr_regular="$(awk '/^6\. \*\*Decide the verdict/{f=1} /^6-adjudicate\./{f=0} f' "$_rr_prompt" | tr -s '[:space:]' ' ')"
+_rr_adj="$(awk '/^6-adjudicate\./{f=1} /^7\. \*\*Do NOT merge/{f=0} f' "$_rr_prompt" | tr -s '[:space:]' ' ')"
+if grep -qF -- "odonian heartbeat <id> $_att" "$_ri_prompt" && \
+   tr -s '[:space:]' ' ' < "$_ri_prompt" | grep -qF -- "$_att"'` to bind the submission' && \
+   printf '%s' "$_rr_regular" | grep -qF -- 'odonian submit <review-task-id>' && \
+   printf '%s' "$_rr_regular" | grep -qF -- "$_att" && \
+   printf '%s' "$_rr_adj" | grep -qF -- 'odonian submit <review-task-id>' && \
+   printf '%s' "$_rr_adj" | grep -qF -- "$_att"; then
+  test_pass "heartbeat and submit calls are fenced with --attempt in preclaimed mode"
+else
+  test_fail "a research prompt heartbeat/submit step is missing --attempt fencing"
+fi
+
 echo ""
 echo "=== Test Summary ==="
 echo "Total: $test_count | Passed: $pass_count | Failed: $fail_count"

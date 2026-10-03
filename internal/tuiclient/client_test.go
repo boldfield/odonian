@@ -828,6 +828,38 @@ func TestAPIError_UndecodableBody(t *testing.T) {
 	}
 }
 
+func TestAPIError_RetryAfterHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]string{
+				"code":    "ADMISSION_DEFERRED",
+				"message": "admission deferred",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
+	if err == nil {
+		t.Fatal("Expected error from 429 response, got nil")
+	}
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Expected *APIError, got %T: %v", err, err)
+	}
+	if apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("Expected StatusCode 429, got %d", apiErr.StatusCode)
+	}
+	if apiErr.RetryAfterSeconds == nil || *apiErr.RetryAfterSeconds != 60 {
+		t.Errorf("Expected RetryAfterSeconds 60 from header, got %v", apiErr.RetryAfterSeconds)
+	}
+}
+
 func TestListEvents(t *testing.T) {
 	// Create a test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1006,7 +1038,7 @@ func TestClaimTask(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
 	if err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
@@ -1026,7 +1058,7 @@ func TestClaimTaskAlreadyClaimed(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
 	if err == nil {
 		t.Fatal("Expected error from 409 response, got nil")
 	}
@@ -1050,7 +1082,7 @@ func TestClaimTaskServerError(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
 	if err == nil {
 		t.Fatal("Expected error from 500 response, got nil")
 	}
@@ -1389,5 +1421,114 @@ func TestSubmitTaskWithManifest(t *testing.T) {
 	defer server2.Close()
 	if err := NewHTTPClient(server2.URL, "testtoken").SubmitTask(context.Background(), "task123", "agent123", "done", nil, links); err != nil {
 		t.Fatalf("SubmitTask failed: %v", err)
+	}
+}
+
+func TestGetResearchStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/research/status" {
+			t.Errorf("expected /research/status, got %s", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"mode": "paced",
+			"pools": []map[string]interface{}{
+				{
+					"account_id":        "acct-1",
+					"active":            5,
+					"active_completion": 2,
+					"deferred":          1,
+					"tokens":            1234.5,
+					"settled_at":        "2026-01-01T00:00:00Z",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	status, err := client.GetResearchStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GetResearchStatus failed: %v", err)
+	}
+
+	if status.Mode != "paced" {
+		t.Errorf("expected mode paced, got %s", status.Mode)
+	}
+	if len(status.Pools) != 1 {
+		t.Errorf("expected 1 pool, got %d", len(status.Pools))
+	}
+	pool := status.Pools[0]
+	if pool.AccountID != "acct-1" {
+		t.Errorf("expected account_id acct-1, got %s", pool.AccountID)
+	}
+	if pool.Tokens != 1234.5 {
+		t.Errorf("expected tokens 1234.5, got %v", pool.Tokens)
+	}
+}
+
+func TestClaimTaskAdmissionConflictsAreNotAlreadyClaimed(t *testing.T) {
+	for _, code := range []string{"REQUEST_ID_CONFLICT", "TASK_BUSY"} {
+		t.Run(code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusConflict)
+				w.Write([]byte(`{"error":{"code":"` + code + `","message":"nope"}}`))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(server.URL, "tok")
+			_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "r1", "", "")
+			if errors.Is(err, ErrAlreadyClaimed) {
+				t.Fatalf("%s must not collapse into ErrAlreadyClaimed", code)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Code != code || apiErr.StatusCode != 409 {
+				t.Fatalf("expected 409 APIError %s, got %v", code, err)
+			}
+		})
+	}
+}
+
+func TestAPIErrorParsesAdmissionDenial(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":{"code":"ADMISSION_DENIED","message":"denied","outcome":"defer","reason":"rate","not_before":"2026-10-03T15:00:00Z","retry_after_seconds":null}}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "tok")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected APIError, got %v", err)
+	}
+	if apiErr.Outcome != "defer" || apiErr.Reason != "rate" {
+		t.Errorf("outcome/reason = %q/%q", apiErr.Outcome, apiErr.Reason)
+	}
+	if apiErr.NotBefore == nil || *apiErr.NotBefore != "2026-10-03T15:00:00Z" {
+		t.Errorf("not_before = %v", apiErr.NotBefore)
+	}
+	if apiErr.RetryAfterSeconds != nil {
+		t.Errorf("retry_after_seconds = %d, want nil", *apiErr.RetryAfterSeconds)
+	}
+}
+
+func TestMockClaimTaskPassesAdmissionIdentity(t *testing.T) {
+	var got []string
+	m := &MockClient{ClaimTaskFunc: func(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error) {
+		got = []string{id, agentID, model, requestID, accountID, workClass}
+		return nil, nil
+	}}
+	if _, err := m.ClaimTask(context.Background(), "t", "a", "m", "req", "acct", "research_review"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"t", "a", "m", "req", "acct", "research_review"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("mock args = %v, want %v", got, want)
 	}
 }

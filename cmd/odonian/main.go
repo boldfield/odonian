@@ -59,8 +59,90 @@ func (e *handledError) Error() string {
 	return "handled"
 }
 
+// exitScheduling is the exit code for a research admission denial (429). It is
+// distinct from exit 2, which means "nothing claimable" / "raced, none claimed".
+const exitScheduling = 10
+
+// exitConflict is the exit code for a research permit/attempt/request conflict (409).
+const exitConflict = 11
+
+type schedulingError struct {
+	message           string
+	outcome           string
+	reason            string
+	notBefore         *string
+	retryAfterSeconds *int64
+	code              int
+}
+
+func (e *schedulingError) Error() string {
+	return e.message
+}
+
+type conflictError struct {
+	message string
+	code    int
+}
+
+func (e *conflictError) Error() string {
+	return e.message
+}
+
+// writeSchedulingHints prints a scheduling denial and its retry hints, one
+// key per line, so a caller can tell a rate/time deferral (not-before) from an
+// active-dispatch wait (retry-after).
+func writeSchedulingHints(w io.Writer, e *schedulingError) {
+	fmt.Fprintf(w, "scheduling: %v\n", e.Error())
+	if e.outcome != "" {
+		fmt.Fprintf(w, "outcome: %s\n", e.outcome)
+	}
+	if e.reason != "" {
+		fmt.Fprintf(w, "reason: %s\n", e.reason)
+	}
+	if e.notBefore != nil {
+		fmt.Fprintf(w, "not-before: %s\n", *e.notBefore)
+	}
+	if e.retryAfterSeconds != nil {
+		fmt.Fprintf(w, "retry-after: %d\n", *e.retryAfterSeconds)
+	}
+}
+
+// admissionError maps a research admission API failure to its distinct exit:
+// 429 is a scheduling denial (exitScheduling), 409 a conflict (exitConflict).
+// It returns nil for any other error.
+func admissionError(err error) error {
+	var apiErr *tuiclient.APIError
+	if !errors.As(err, &apiErr) {
+		return nil
+	}
+	switch apiErr.StatusCode {
+	case 429:
+		return &schedulingError{
+			message:           apiErr.Error(),
+			outcome:           apiErr.Outcome,
+			reason:            apiErr.Reason,
+			notBefore:         apiErr.NotBefore,
+			retryAfterSeconds: apiErr.RetryAfterSeconds,
+			code:              exitScheduling,
+		}
+	case 409:
+		return &conflictError{message: apiErr.Error(), code: exitConflict}
+	}
+	return nil
+}
+
 func main() {
 	if err := run(os.Args); err != nil {
+		var schedErr *schedulingError
+		if errors.As(err, &schedErr) {
+			writeSchedulingHints(os.Stderr, schedErr)
+			os.Exit(schedErr.code)
+		}
+		var conflErr *conflictError
+		if errors.As(err, &conflErr) {
+			fmt.Fprintf(os.Stderr, "conflict: %v\n", conflErr.Error())
+			os.Exit(conflErr.code)
+		}
 		var claimErr *claimError
 		if errors.As(err, &claimErr) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", claimErr.Error())
@@ -88,7 +170,7 @@ func run(args []string) error {
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
-	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback":
+	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize":
 		return runClient(args[1], args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command %q\n\n", args[1])
@@ -125,6 +207,10 @@ Commands:
   merge                  Merge a pull request and transition tasks
   wt-ensure              Ensure worktree for task (local_commit mode)
   pr-feedback            Manage PR feedback (list, ack)
+  research-policy        Get research pacing policy configuration
+  research-status        Get current research pool status
+  permit-renew           Renew a research permit
+  permit-finalize        Finalize a research permit
   help, -h, --help       Show this help message
 `, version)
 }
@@ -431,6 +517,14 @@ func runClient(verb string, args []string) error {
 		return executeWtEnsure(ctx, baseURL, token, args)
 	case "pr-feedback":
 		return executePRFeedback(ctx, args, os.Stdout)
+	case "research-policy":
+		return executeResearchPolicy(ctx, baseURL, token, jsonOutput, os.Stdout)
+	case "research-status":
+		return executeResearchStatus(ctx, baseURL, token, jsonOutput, os.Stdout)
+	case "permit-renew":
+		return executePermitRenew(ctx, baseURL, token, args, os.Stdout)
+	case "permit-finalize":
+		return executePermitFinalize(ctx, baseURL, token, args, os.Stdout)
 	default:
 		return fmt.Errorf("unknown command %q", verb)
 	}
@@ -830,6 +924,9 @@ func executeClaim(ctx context.Context, baseURL, token string, args []string) err
 	fs.SetOutput(io.Discard)
 	agentFlag := fs.String("agent", "", "agent ID")
 	modelFlag := fs.String("model", "", "model")
+	requestIDFlag := fs.String("request-id", "", "stable admission request ID")
+	accountIDFlag := fs.String("account-id", "", "account ID assertion")
+	workClassFlag := fs.String("work-class", "", "work class assertion")
 	positionals, err := parseFlagsWithPositionals(fs, args)
 	if err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
@@ -849,13 +946,25 @@ func executeClaim(ctx context.Context, baseURL, token string, args []string) err
 
 	// Create client and claim task
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	if err := client.ClaimTask(ctx, taskID, agentID, model); err != nil {
+	admission, err := client.ClaimTask(ctx, taskID, agentID, model, *requestIDFlag, *accountIDFlag, *workClassFlag)
+	if err != nil {
 		if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 			return &claimError{message: "already claimed", code: 3}
+		}
+		if mapped := admissionError(err); mapped != nil {
+			return mapped
 		}
 		return err
 	}
 	saveAttempt(client, taskID)
+
+	if admission != nil {
+		output, err := json.MarshalIndent(admission, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %w", err)
+		}
+		fmt.Fprintln(os.Stdout, string(output))
+	}
 
 	return nil
 }
@@ -1408,9 +1517,12 @@ func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			return err
 		}
 
-		if err := client.ClaimTask(ctx, task.ID, agentID, model); err != nil {
+		if _, err := client.ClaimTask(ctx, task.ID, agentID, model, "", "", ""); err != nil {
 			if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 				return &claimError{message: "raced, none claimed", code: 2}
+			}
+			if mapped := admissionError(err); mapped != nil {
+				return mapped
 			}
 			return err
 		}
@@ -1957,4 +2069,217 @@ func printContinuation(out io.Writer, task tuiclient.TaskDetail) {
 			fmt.Fprintf(out, "  - %s: %s (%s%s)\n", f.ID, f.Title, f.State, held)
 		}
 	}
+}
+
+func executeResearchPolicy(ctx context.Context, baseURL, token string, jsonOutput bool, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	policy, err := client.GetResearchPolicy(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get research policy: %w", err)
+	}
+
+	if jsonOutput {
+		output, err := json.MarshalIndent(policy, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %w", err)
+		}
+		fmt.Fprintln(out, string(output))
+	} else {
+		fmt.Fprintf(out, "Mode: %s\n", policy.Mode)
+		if len(policy.Pools) > 0 {
+			fmt.Fprintf(out, "Pools:\n")
+			for _, pool := range policy.Pools {
+				fmt.Fprintf(out, "  Account: %s\n", pool.AccountID)
+				fmt.Fprintf(out, "    Start Rate: %.2f\n", pool.StartRate)
+				fmt.Fprintf(out, "    Burst Capacity: %d\n", pool.BurstCapacity)
+				fmt.Fprintf(out, "    Concurrent Limit: %d\n", pool.ConcurrentLimit)
+				fmt.Fprintf(out, "    Completion Reserved: %d\n", pool.CompletionReserved)
+			}
+		}
+	}
+
+	return nil
+}
+
+func executeResearchStatus(ctx context.Context, baseURL, token string, jsonOutput bool, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	status, err := client.GetResearchStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get research status: %w", err)
+	}
+
+	if jsonOutput {
+		output, err := json.MarshalIndent(status, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %w", err)
+		}
+		fmt.Fprintln(out, string(output))
+	} else {
+		fmt.Fprintf(out, "Mode: %s\n", status.Mode)
+		if len(status.Pools) > 0 {
+			fmt.Fprintf(out, "Pool Status:\n")
+			for _, pool := range status.Pools {
+				fmt.Fprintf(out, "  Account: %s\n", pool.AccountID)
+				fmt.Fprintf(out, "    Active: %d\n", pool.Active)
+				fmt.Fprintf(out, "    Active Completion: %d\n", pool.ActiveCompletion)
+				fmt.Fprintf(out, "    Deferred: %d\n", pool.Deferred)
+				fmt.Fprintf(out, "    Tokens: %g\n", pool.Tokens)
+				fmt.Fprintf(out, "    Settled At: %s\n", pool.SettledAt)
+			}
+		}
+	}
+
+	return nil
+}
+
+func executePermitRenew(ctx context.Context, baseURL, token string, args []string, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	fs := flag.NewFlagSet("permit-renew", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	taskIDFlag := fs.String("task-id", "", "task ID")
+	modelFlag := fs.String("model", "", "model")
+	agentIDFlag := fs.String("agent-id", "", "agent ID")
+	requestIDFlag := fs.String("request-id", "", "request ID")
+	attemptIDFlag := fs.String("attempt-id", "", "attempt ID")
+	positionals, err := parseFlagsWithPositionals(fs, args)
+	if err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	if len(positionals) < 1 {
+		return fmt.Errorf("permit ID is required")
+	}
+	permitID := positionals[0]
+
+	if *taskIDFlag == "" {
+		return fmt.Errorf("--task-id flag is required")
+	}
+	if *modelFlag == "" {
+		return fmt.Errorf("--model flag is required")
+	}
+	if *agentIDFlag == "" {
+		return fmt.Errorf("--agent-id flag is required")
+	}
+	if *requestIDFlag == "" {
+		return fmt.Errorf("--request-id flag is required")
+	}
+	if *attemptIDFlag == "" {
+		return fmt.Errorf("--attempt-id flag is required")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	attempt, err := client.RenewResearchPermit(ctx, permitID, *taskIDFlag, *modelFlag, *agentIDFlag, *requestIDFlag, *attemptIDFlag)
+	if err != nil {
+		if mapped := admissionError(err); mapped != nil {
+			return mapped
+		}
+		return fmt.Errorf("failed to renew research permit: %w", err)
+	}
+
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, attempt, "", "  "); err != nil {
+		return fmt.Errorf("failed to format JSON: %w", err)
+	}
+	fmt.Fprintln(out, pretty.String())
+
+	return nil
+}
+
+func executePermitFinalize(ctx context.Context, baseURL, token string, args []string, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	fs := flag.NewFlagSet("permit-finalize", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	taskIDFlag := fs.String("task-id", "", "task ID")
+	modelFlag := fs.String("model", "", "model")
+	agentIDFlag := fs.String("agent-id", "", "agent ID")
+	requestIDFlag := fs.String("request-id", "", "request ID")
+	attemptIDFlag := fs.String("attempt-id", "", "attempt ID")
+	exitClassFlag := fs.String("exit-class", "", "exit class (completed, failed, cancelled, unknown)")
+	usageTokensFlag := fs.Int64("usage-tokens", 0, "usage tokens (optional)")
+	positionals, err := parseFlagsWithPositionals(fs, args)
+	if err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	if len(positionals) < 1 {
+		return fmt.Errorf("permit ID is required")
+	}
+	permitID := positionals[0]
+
+	if *taskIDFlag == "" {
+		return fmt.Errorf("--task-id flag is required")
+	}
+	if *modelFlag == "" {
+		return fmt.Errorf("--model flag is required")
+	}
+	if *agentIDFlag == "" {
+		return fmt.Errorf("--agent-id flag is required")
+	}
+	if *requestIDFlag == "" {
+		return fmt.Errorf("--request-id flag is required")
+	}
+	if *attemptIDFlag == "" {
+		return fmt.Errorf("--attempt-id flag is required")
+	}
+	if *exitClassFlag == "" {
+		return fmt.Errorf("--exit-class flag is required")
+	}
+
+	var usageTokens *int64
+	usageTokensSet := false
+	for i, arg := range args {
+		if arg == "--usage-tokens" && i+1 < len(args) {
+			usageTokensSet = true
+			break
+		} else if strings.HasPrefix(arg, "--usage-tokens=") {
+			usageTokensSet = true
+			break
+		}
+	}
+	if usageTokensSet {
+		usageTokens = usageTokensFlag
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	attempt, err := client.FinalizeResearchPermit(ctx, permitID, *taskIDFlag, *modelFlag, *agentIDFlag, *requestIDFlag, *attemptIDFlag, *exitClassFlag, usageTokens)
+	if err != nil {
+		if mapped := admissionError(err); mapped != nil {
+			return mapped
+		}
+		return fmt.Errorf("failed to finalize research permit: %w", err)
+	}
+
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, attempt, "", "  "); err != nil {
+		return fmt.Errorf("failed to format JSON: %w", err)
+	}
+	fmt.Fprintln(out, pretty.String())
+
+	return nil
 }

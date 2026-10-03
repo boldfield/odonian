@@ -16,14 +16,33 @@ for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
 
 ## Your iteration
 
+**Preclaimed review tasks.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, you are reviewing a preclaimed
+task that has been admitted against the research pacing policy and already claimed. Use the
+preclaimed task ID as-is; do not call `odonian next` or `odonian claim`, and never review any task
+other than `ODONIAN_PRECLAIMED_TASK_ID` (this applies equally to regular reviews and adjudication
+tasks). The permit attempt identity is supplied as `ODONIAN_PRECLAIMED_ATTEMPT_ID`; pass it as
+`--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on every `odonian heartbeat` and `odonian submit`. Step 2
+will validate that the preclaimed task is claimed to your agent identity (compare the task's assignee
+to `$AGENT_ID` and verify state is `in_progress`); if validation fails, the task is invalid or already
+owned by another agent — do NOT proceed, STOP.
+
+**Ordinary (legacy) mode.** If `ODONIAN_PRECLAIMED_TASK_ID` is NOT set, follow step 1 as written
+(`odonian next`, then `odonian claim`). This legacy flow is valid only while the research admission
+policy is not `enforce` (see `odonian research-policy --json`). Under `enforce` the server denies
+unadmitted claims: if `odonian next` or `odonian claim` exits 10 (scheduling denial), report the
+printed reason and retry hint and STOP — do not retry in a loop and do not review any task.
+
 1. **Claim a review task.** Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL"
    --kind review` — it prints the id of the first claimable `review`-kind task (`--kind review`
    excludes `implement`-kind tasks, which belong to a research *worker*, not you). Exit code 2 /
    "nothing claimable" → print "nothing to review" and STOP. Otherwise claim it: `odonian claim <id>`;
    exit code 3 / "already claimed" → another reviewer took it, STOP. (These are auto-spawned
    `review`-kind tasks; `target_task_id` is the implement task under review.)
-2. **Read the brief and detect your role.** `odonian show <id>` — its `spec` contains the **Implementation PR** URL and
-   the **Parent task** id (also in `target_task_id`). First, check whether this task adjudicates one disputed finding: if the spec begins with "Adjudicate one disputed research review finding", this is an **adjudication task** — skip to the adjudication path (step 3-adjudicate). Otherwise, this is a **regular review task** — continue below.
+   **Skip this step if `ODONIAN_PRECLAIMED_TASK_ID` is set.**
+2. **Read the brief and detect your role.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, use that as your task ID; otherwise use the ID from step 1. Run `odonian show --json <id>` and parse the JSON to validate
+   your ownership: if the task's assignee does not match `$AGENT_ID` or the state is not `in_progress`, the
+   preclaimed ID was invalid or already released to another agent; do NOT proceed — STOP. Its `spec` contains the **Implementation PR** URL and
+   the **Parent task** id (also in `target_task_id`). First, check whether this task adjudicates one disputed finding: if the spec begins with "Adjudicate one disputed research review finding", this is an **adjudication task** — skip to the adjudication path (step 3-adjudicate). Otherwise, this is a **regular review task** — continue below. If the task lookup fails (404 or permission denied), the preclaimed ID was invalid or already released to another agent; do NOT proceed — STOP.
    
    Then `odonian show <target_task_id>` (the **parent**): its `spec` is the real acceptance criteria you review against, its `pr` link is the
    PR you review, and its `links` may carry a `no_op` marker. The parent's spec (and any project task
@@ -161,17 +180,18 @@ Submit with an empty findings array. Write your decision reasoning in a short pr
 
    - Submit: `odonian submit <review-task-id> --result "<prose findings + the fenced Findings JSON
      block above>" --verdict approve --findings-file "$F"` (or `--verdict reject --findings-file "$F"`).
-     Pass `--findings-file` on EVERY verdict, including an approve with an empty array `[]`. The
-     server records it on the parent and
-     drives the parent automatically: **reject → parent back to `ready`** (worker reworks); **approve
-     →** once *all* of this round's reviewers approve, the parent moves to `approved`. **Then mirror
-     your verdict as a PR comment** so a human draining the merge queue can see it: `gh pr comment
-     <pr-url> --body "__AGENT_MODEL__-reviewer: APPROVED — <summary>"` (or `"__AGENT_MODEL__-reviewer:
+     If `ODONIAN_PRECLAIMED_ATTEMPT_ID` is set, also pass `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"`
+     to bind the verdict to the preclaimed attempt. Pass `--findings-file` on EVERY verdict, including
+     an approve with an empty array `[]`. The server records it on the parent and drives the parent
+     automatically: **reject → parent back to `ready`** (worker reworks); **approve →** once *all* of
+     this round's reviewers approve, the parent moves to `approved`. **Then mirror your verdict as a
+     PR comment** so a human draining the merge queue can see it: `gh pr comment <pr-url> --body
+     "__AGENT_MODEL__-reviewer: APPROVED — <summary>"` (or `"__AGENT_MODEL__-reviewer:
      CHANGES REQUESTED — <numbered findings>"`).
 
 6-adjudicate. **Submit adjudication verdict (adjudication path only).** 
    - Write a brief summary of your reasoning: whether the finding is valid and blocks despite the worker's evidence, or whether it should be overturned.
-   - Submit: `odonian submit <review-task-id> --result "<your reasoning>" --verdict approve --findings-file <file>` (if the finding should be overturned, with `<file>` containing `[]`) or `--verdict reject --findings-file <file>` (if it should be upheld, with `<file>` containing `[]`).
+   - Submit: `odonian submit <review-task-id> --result "<your reasoning>" --verdict approve --findings-file <file>` (if the finding should be overturned, with `<file>` containing `[]`) or `--verdict reject --findings-file <file>` (if it should be upheld, with `<file>` containing `[]`). If `ODONIAN_PRECLAIMED_ATTEMPT_ID` is set, also pass `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"`.
    - The server records your verdict and it is **binding** for this finding alone. It does not vote on the review round.
    - **Then STOP — do not proceed to steps 3-6 or any other regular review steps.** Your work on the adjudication is complete.
 
