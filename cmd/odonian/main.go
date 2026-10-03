@@ -185,8 +185,8 @@ func runServer() {
 		log.Fatal("ODONIAN_MODELS configuration resulted in empty allowlist")
 	}
 
-	// Validate the research pacing policy. Configuration alone launches nothing and
-	// changes no claim or dispatch behavior.
+	// Validate the research pacing policy. It is installed in the store below and
+	// governs every research claim; the default mode is disabled, which changes nothing.
 	researchPolicy, err := policy.ParseConfig(os.Getenv("ODONIAN_RESEARCH_POLICY_MODE"), os.Getenv("ODONIAN_RESEARCH_POOLS"), allowedModels)
 	if err != nil {
 		log.Fatalf("invalid research pacing policy: %v", err)
@@ -286,6 +286,9 @@ func runServer() {
 
 	// Prune old events on startup
 	ctx := context.Background()
+	if err := s.SetResearchPolicy(ctx, time.Now(), researchPolicy); err != nil {
+		log.Fatalf("failed to apply research pacing policy: %v", err)
+	}
 	deletedCount, err := s.PruneEvents(ctx, eventTerminalRetentionDays)
 	if err != nil {
 		log.Fatalf("failed to prune events: %v", err)

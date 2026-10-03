@@ -6,13 +6,16 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/boldfield/odonian/internal/policy"
 	"github.com/boldfield/odonian/internal/store"
 )
 
@@ -639,7 +642,51 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	s.encodeJSON(w, http.StatusOK, tasks)
 }
 
+// claimResponse is the claim body. A claim with no research admission is the
+// bare task; an admitted research claim adds research_admission, whose
+// attempt_id the worker passes back on heartbeat and submit.
+type claimResponse struct {
+	store.Task
+	ResearchAdmission *researchAdmissionBody `json:"research_admission,omitempty"`
+}
+
+type researchAdmissionBody struct {
+	PermitID  string                `json:"permit_id,omitempty"`
+	AttemptID string                `json:"attempt_id,omitempty"`
+	RequestID string                `json:"request_id,omitempty"`
+	AccountID string                `json:"account_id,omitempty"`
+	ExpiresAt string                `json:"expires_at,omitempty"`
+	Replayed  bool                  `json:"replayed,omitempty"`
+	Observed  *admissionOutcomeBody `json:"observed_denial,omitempty"`
+}
+
+type admissionOutcomeBody struct {
+	Outcome           string  `json:"outcome"`
+	Reason            string  `json:"reason,omitempty"`
+	NotBefore         *string `json:"not_before,omitempty"`
+	RetryAfterSeconds *int    `json:"retry_after_seconds,omitempty"`
+}
+
+func admissionOutcome(d *store.AdmissionDeniedError) *admissionOutcomeBody {
+	out := &admissionOutcomeBody{Outcome: string(d.Outcome), Reason: string(d.Reason)}
+	if !d.NotBefore.IsZero() {
+		nb := d.NotBefore.UTC().Format(time.RFC3339Nano)
+		out.NotBefore = &nb
+	}
+	if d.RetryAfter > 0 {
+		secs := int(math.Ceil(d.RetryAfter.Seconds()))
+		out.RetryAfterSeconds = &secs
+	}
+	return out
+}
+
 // handleClaimTask handles POST /tasks/{id}/claim to claim a task as in_progress.
+// Research tasks are admitted against the research pacing policy whichever
+// fields the client sends; request_id (a stable key, so a transport retry
+// recovers the original admission), account_id and work_class are optional
+// assertions, and a legacy client that omits them is still paced. A denial is 429
+// with the outcome (defer or retry), reason and not_before / retry_after_seconds,
+// and leaves the task untouched.
 func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	taskID, ok := s.resolveTaskID(w, r)
 	if !ok {
@@ -647,8 +694,11 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload struct {
-		AgentID string `json:"agent_id"`
-		Model   string `json:"model"`
+		AgentID   string `json:"agent_id"`
+		Model     string `json:"model"`
+		RequestID string `json:"request_id"`
+		AccountID string `json:"account_id"`
+		WorkClass string `json:"work_class"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
@@ -667,10 +717,25 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	class := policy.WorkClass(payload.WorkClass)
+	if class != "" && !class.Paced() {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_WORK_CLASS", "work_class must be a research class: research_write, research_review, research_rework or research_adjudication")
+		return
+	}
+
 	// Claim the task
-	task, err := s.store.ClaimTask(r.Context(), taskID, payload.AgentID, payload.Model, s.leaseTTL)
+	res, err := s.store.ClaimResearchTask(r.Context(), store.ResearchClaim{
+		RequestID: payload.RequestID, TaskID: taskID, AgentID: payload.AgentID, Model: payload.Model,
+		AccountID: payload.AccountID, Class: class, LeaseTTL: s.leaseTTL,
+	})
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+		return
+	}
+
+	var denied *store.AdmissionDeniedError
+	if errors.As(err, &denied) {
+		s.writeAdmissionDenied(w, denied)
 		return
 	}
 
@@ -681,16 +746,70 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if errors.Is(err, store.ErrConflict) {
+	switch {
+	case errors.Is(err, store.ErrInvalidResearchInput):
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_RESEARCH_CLAIM", err.Error())
+		return
+	case errors.Is(err, store.ErrBindingMismatch):
+		s.errorResponse(w, http.StatusConflict, "REQUEST_ID_CONFLICT", "request_id was already used for a different task, agent, model or pool")
+		return
+	case errors.Is(err, store.ErrTaskBusy):
+		s.errorResponse(w, http.StatusConflict, "TASK_BUSY", "Task still has a live research attempt")
+		return
+	case errors.Is(err, store.ErrConflict):
 		s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not claimable")
 		return
-	}
-	if err != nil {
+	case err != nil:
 		s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim task")
 		return
 	}
 
-	s.encodeJSON(w, http.StatusOK, task)
+	if res.Grant == nil && res.Observed == nil {
+		s.encodeJSON(w, http.StatusOK, res.Task)
+		return
+	}
+	body := claimResponse{Task: res.Task, ResearchAdmission: &researchAdmissionBody{}}
+	if g := res.Grant; g != nil {
+		body.ResearchAdmission = &researchAdmissionBody{
+			PermitID: g.Permit.ID, AttemptID: g.Attempt.ID, RequestID: g.Permit.RequestID,
+			AccountID: g.Permit.AccountID, ExpiresAt: g.Attempt.ExpiresAt, Replayed: g.Replayed,
+		}
+	}
+	if res.Observed != nil {
+		body.ResearchAdmission.Observed = admissionOutcome(res.Observed)
+	}
+	s.encodeJSON(w, http.StatusOK, body)
+}
+
+// writeAdmissionDenied answers a research start the pool refused: 429, with
+// Retry-After when an active dispatch (not time) is what must finish first.
+func (s *Server) writeAdmissionDenied(w http.ResponseWriter, d *store.AdmissionDeniedError) {
+	out := admissionOutcome(d)
+	if out.RetryAfterSeconds != nil {
+		w.Header().Set("Retry-After", strconv.Itoa(*out.RetryAfterSeconds))
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
+			"code":                "ADMISSION_DENIED",
+			"message":             d.Error(),
+			"outcome":             out.Outcome,
+			"reason":              out.Reason,
+			"not_before":          out.NotBefore,
+			"retry_after_seconds": out.RetryAfterSeconds,
+		},
+	})
+}
+
+// attemptConflict writes a 409 for an attempt-fence ConflictError.
+func (s *Server) attemptConflict(w http.ResponseWriter, err error) bool {
+	var conflictErr *store.ConflictError
+	if errors.As(err, &conflictErr) {
+		s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+		return true
+	}
+	return false
 }
 
 // handleHeartbeat handles POST /tasks/{id}/heartbeat to extend a task's lease.
@@ -702,6 +821,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	var payload struct {
 		AgentID string `json:"agent_id"`
+		// AttemptID is the research attempt from the claim response; a heartbeat
+		// from a superseded attempt is rejected with 409 ATTEMPT_FENCED.
+		AttemptID string `json:"attempt_id"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
@@ -715,9 +837,12 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Heartbeat the task
-	task, err := s.store.HeartbeatTask(r.Context(), taskID, payload.AgentID, s.leaseTTL)
+	task, err := s.store.HeartbeatTask(store.WithResearchAttempt(r.Context(), payload.AttemptID), taskID, payload.AgentID, s.leaseTTL)
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+		return
+	}
+	if s.attemptConflict(w, err) {
 		return
 	}
 	if errors.Is(err, store.ErrConflict) {
@@ -772,6 +897,9 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		Findings json.RawMessage   `json:"findings"`
 		Disputes json.RawMessage   `json:"disputes"`
 		Manifest json.RawMessage   `json:"manifest"`
+		// AttemptID is the research attempt from the claim response; a
+		// submission from a superseded attempt is rejected with 409 ATTEMPT_FENCED.
+		AttemptID string `json:"attempt_id"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
@@ -785,7 +913,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Submit the task
-	task, err := s.store.SubmitTaskWithManifest(r.Context(), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget, payload.Findings, payload.Disputes, payload.Manifest)
+	task, err := s.store.SubmitTaskWithManifest(store.WithResearchAttempt(r.Context(), payload.AttemptID), taskID, payload.AgentID, payload.Result, payload.Verdict, payload.Links, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget, payload.Findings, payload.Disputes, payload.Manifest)
 	if err != nil {
 		// Check if it's a ValidationError (invalid link kind)
 		var validationErr *store.ValidationError
@@ -795,6 +923,9 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, store.ErrNotFound) {
 			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+			return
+		}
+		if s.attemptConflict(w, err) {
 			return
 		}
 		if errors.Is(err, store.ErrConflict) {

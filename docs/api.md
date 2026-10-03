@@ -731,6 +731,15 @@ A task is claimable only if:
 
 The claim is atomic — implemented as a conditional UPDATE statement. If the claim succeeds, `rowsAffected == 1` and the task is guaranteed to be in `in_progress` with a fresh lease. If `rowsAffected == 0`, the client lost the race (another agent claimed it first) or the model didn't match, and should retry with a different task.
 
+**Research admission (research-track tasks only):**
+Research claims are admitted against the research pacing policy in the same transaction as the claim, so a start is debited only when the claim succeeds. Legacy clients that send only `agent_id` and `model` are paced identically. Non-research claims and `disabled` mode return the bare task above.
+
+Optional request fields: `request_id` (stable key; retrying the same request recovers the original admission, `replayed: true`), `account_id` and `work_class` (assertions only — the server derives both; a mismatch is `400 INVALID_RESEARCH_CLAIM`, an unknown class is `400 INVALID_WORK_CLASS`).
+
+An admitted claim adds `research_admission` to the task body: `permit_id`, `attempt_id`, `request_id`, `account_id`, `expires_at`, `replayed`, and in `observe` mode `observed_denial` (the hypothetical outcome; the work is still granted). Pass `attempt_id` on heartbeat and submit; a superseded attempt gets `409 ATTEMPT_FENCED` (or `409 ATTEMPT_EXPIRED`) and cannot change its replacement. Heartbeats never spend a start. Rework, adjudication, reclaim and retry each count as a start.
+
+A denial is `429 ADMISSION_DENIED` with `error.outcome` (`defer` or `retry`), `error.reason` (`rate`, `concurrency` or `reserved_capacity`), `error.not_before` and/or `error.retry_after_seconds` (also sent as `Retry-After`). The task is left untouched — not blocked, failed or rejected — and may be claimed again later. Other research errors: `409 TASK_BUSY` (a live research attempt still holds the task), `409 REQUEST_ID_CONFLICT` (`request_id` reused for a different task, agent, model or pool).
+
 ---
 
 #### `POST /tasks/{id}/heartbeat`
