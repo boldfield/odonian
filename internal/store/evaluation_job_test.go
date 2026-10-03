@@ -382,6 +382,13 @@ func TestEvaluationFindingStorage(t *testing.T) {
 
 	attemptID := result.Attempt.ID
 
+	// Finalize the attempt before storing findings
+	status := evaluation.StatusCompleted
+	err := st.FinalizeEvaluationAttempt(ctx, attemptID, attemptID, "completed", &status, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("FinalizeEvaluationAttempt failed: %v", err)
+	}
+
 	// Store a finding
 	summary := "Test finding"
 	findingID, err := st.StoreEvaluationFinding(ctx, attemptID, 0, evaluation.SeverityMaterial, "main.go", 42, &summary, nil)
@@ -391,5 +398,401 @@ func TestEvaluationFindingStorage(t *testing.T) {
 
 	if findingID == "" {
 		t.Error("Finding ID is empty")
+	}
+}
+
+func TestEvaluationRetryAttemptLifecycle(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	// Setup: campaign, candidate, sample
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "retry-test",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 5,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	// First claim creates attempt #1
+	req1 := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result1, err := st.ClaimEvaluationJob(ctx, req1)
+	if err != nil {
+		t.Fatalf("First claim failed: %v", err)
+	}
+	if result1.Attempt.SequenceNumber != 1 {
+		t.Errorf("First attempt should have sequence 1, got %d", result1.Attempt.SequenceNumber)
+	}
+	attempt1ID := result1.Attempt.ID
+
+	// Finalize the first attempt
+	status := evaluation.StatusCompleted
+	err = st.FinalizeEvaluationAttempt(ctx, attempt1ID, attempt1ID, "completed", &status, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Finalize attempt 1 failed: %v", err)
+	}
+
+	// Second claim with new request ID creates attempt #2
+	req2 := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req2",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result2, err := st.ClaimEvaluationJob(ctx, req2)
+	if err != nil {
+		t.Fatalf("Second claim failed: %v", err)
+	}
+	if result2.Attempt.SequenceNumber != 2 {
+		t.Errorf("Second attempt should have sequence 2, got %d", result2.Attempt.SequenceNumber)
+	}
+	if result2.Attempt.PreviousAttemptID == nil || *result2.Attempt.PreviousAttemptID != attempt1ID {
+		t.Error("Previous attempt should be attempt 1")
+	}
+
+	// Idempotent claim with same request ID returns same attempt
+	result2_again, err := st.ClaimEvaluationJob(ctx, req2)
+	if err != nil {
+		t.Fatalf("Idempotent claim failed: %v", err)
+	}
+	if result2_again.Attempt.ID != result2.Attempt.ID {
+		t.Errorf("Idempotent claim should return same attempt")
+	}
+}
+
+func TestEvaluationCapacityEnforcement(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	// Setup: campaign with low attempt cap
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "cap-test",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     2,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 5,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	sample1 := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample1, _ = st.CreateEvaluationSample(ctx, sample1)
+
+	sample2 := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task2",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "def456",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample2, _ = st.CreateEvaluationSample(ctx, sample2)
+
+	// First claim for sample1 uses up attempt 1
+	req1 := EvaluationJobClaim{
+		SampleID:     sample1.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result1, err := st.ClaimEvaluationJob(ctx, req1)
+	if err != nil {
+		t.Fatalf("Claim 1 failed: %v", err)
+	}
+
+	// Finalize and retry for sample1 uses up attempt 2
+	status := evaluation.StatusCompleted
+	st.FinalizeEvaluationAttempt(ctx, result1.Attempt.ID, result1.Attempt.ID, "completed", &status, nil, nil, nil, nil)
+
+	req1_retry := EvaluationJobClaim{
+		SampleID:     sample1.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1_retry",
+		LeaseExpires: 5 * time.Minute,
+	}
+	_, err = st.ClaimEvaluationJob(ctx, req1_retry)
+	if err != nil {
+		t.Fatalf("Retry claim failed: %v", err)
+	}
+
+	// Campaign capacity exhausted, third claim should fail
+	req2 := EvaluationJobClaim{
+		SampleID:     sample2.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req2",
+		LeaseExpires: 5 * time.Minute,
+	}
+	_, err = st.ClaimEvaluationJob(ctx, req2)
+	if err != ErrEvaluationCapacityExhausted {
+		t.Errorf("Expected capacity exhausted error, got %v", err)
+	}
+}
+
+func TestEvaluationFencingLateStaleFence(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	// Setup
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "fence-test",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 5,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	// Claim with short lease
+	req := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 100 * time.Millisecond,
+	}
+	result, _ := st.ClaimEvaluationJob(ctx, req)
+
+	// Wait for lease to expire
+	time.Sleep(150 * time.Millisecond)
+
+	// Try to finalize the expired attempt; should fail
+	status := evaluation.StatusCompleted
+	err := st.FinalizeEvaluationAttempt(ctx, result.Attempt.ID, result.Attempt.ID, "completed", &status, nil, nil, nil, nil)
+	if err != ErrEvaluationAttemptExpired {
+		t.Errorf("Expected expired error, got %v", err)
+	}
+
+	// Verify the attempt is marked as expired
+	attempt, err := st.GetEvaluationAttempt(ctx, result.Attempt.ID)
+	if err != nil {
+		t.Fatalf("Get attempt failed: %v", err)
+	}
+	if attempt.State != EvalAttemptExpired {
+		t.Errorf("Attempt should be expired, got state %s", attempt.State)
+	}
+}
+
+func TestEvaluationFencingWrongAttemptID(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	// Setup
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "fence-wrong-test",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 5,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	// First claim creates attempt #1
+	req1 := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result1, _ := st.ClaimEvaluationJob(ctx, req1)
+
+	// Finalize attempt #1
+	status := evaluation.StatusCompleted
+	st.FinalizeEvaluationAttempt(ctx, result1.Attempt.ID, result1.Attempt.ID, "completed", &status, nil, nil, nil, nil)
+
+	// Create attempt #2
+	req2 := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req2",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result2, _ := st.ClaimEvaluationJob(ctx, req2)
+
+	// Try to finalize attempt #1 again (it's no longer current)
+	err := st.FinalizeEvaluationAttempt(ctx, result1.Attempt.ID, result1.Attempt.ID, "completed", &status, nil, nil, nil, nil)
+	if err != ErrEvaluationAttemptFinalized {
+		t.Errorf("Expected finalized error for non-current attempt, got %v", err)
+	}
+
+	// Try to finalize attempt #2 with wrong fence ID
+	err = st.FinalizeEvaluationAttempt(ctx, result2.Attempt.ID, GenerateID(), "completed", &status, nil, nil, nil, nil)
+	if err != ErrEvaluationFenceMismatch {
+		t.Errorf("Expected fence mismatch error, got %v", err)
+	}
+}
+
+func TestEvaluationFindingValidation(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	// Setup
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "finding-test",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := EvaluationCandidate{
+		ID:              GenerateID(),
+		CampaignID:      campaign.ID,
+		AdapterName:     "fake",
+		ModelIdentity:   "model1",
+		RuntimeVersion:  "v1",
+		PromptVersion:   "v1",
+		AccountPoolID:   "pool1",
+		PerCandidateCap: 5,
+	}
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	req := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result, _ := st.ClaimEvaluationJob(ctx, req)
+
+	// Cannot store findings on active attempt
+	summary := "Test finding"
+	_, err := st.StoreEvaluationFinding(ctx, result.Attempt.ID, 0, evaluation.SeverityMaterial, "main.go", 42, &summary, nil)
+	if err == nil {
+		t.Error("Expected error storing findings on active attempt")
+	}
+
+	// Finalize the attempt
+	status := evaluation.StatusCompleted
+	st.FinalizeEvaluationAttempt(ctx, result.Attempt.ID, result.Attempt.ID, "completed", &status, nil, nil, nil, nil)
+
+	// Can store findings on finalized attempt
+	findingID, err := st.StoreEvaluationFinding(ctx, result.Attempt.ID, 0, evaluation.SeverityMaterial, "main.go", 42, &summary, nil)
+	if err != nil {
+		t.Fatalf("StoreEvaluationFinding on finalized attempt failed: %v", err)
+	}
+	if findingID == "" {
+		t.Error("Finding ID should not be empty")
 	}
 }

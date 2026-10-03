@@ -68,12 +68,10 @@ CREATE TABLE evaluation_job (
   id TEXT PRIMARY KEY,
   sample_id TEXT NOT NULL,
   candidate_id TEXT NOT NULL,
-  request_id TEXT NOT NULL UNIQUE,
   current_attempt_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY (sample_id) REFERENCES evaluation_sample(id),
-  FOREIGN KEY (candidate_id) REFERENCES evaluation_candidate(id),
-  UNIQUE (sample_id, candidate_id)
+  FOREIGN KEY (candidate_id) REFERENCES evaluation_candidate(id)
 );
 
 CREATE INDEX idx_evaluation_job_sample ON evaluation_job(sample_id);
@@ -83,16 +81,25 @@ CREATE INDEX idx_evaluation_job_candidate ON evaluation_job(candidate_id);
 CREATE TABLE evaluation_attempt (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL,
+  request_id TEXT NOT NULL UNIQUE,
   previous_attempt_id TEXT,
   sequence_number INTEGER NOT NULL CHECK (sequence_number >= 1),
   state TEXT NOT NULL CHECK (state IN ('active', 'finalized', 'expired')),
   started_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   ended_at TEXT,
-  exit_class TEXT,
-  status TEXT,
-  error_class TEXT,
-  error_message TEXT,
+  exit_class TEXT CHECK (exit_class IN (
+    'completed', 'failed', 'cancelled', 'unknown', 'lease_expired',
+    'timeout', 'unavailable_snapshot', 'unavailable_source',
+    'invalid_output', 'incomplete_output'
+  )),
+  status TEXT CHECK (status IN ('completed', 'incomplete', 'unsupported', 'interrupted', 'failed', NULL)),
+  error_class TEXT CHECK (error_class IN (
+    'capability_missing', 'output_truncated', 'source_unavailable', 'budget_exhausted',
+    'interrupted', 'timeout', 'runtime_error', 'output_malformed', 'output_missing',
+    'auth_missing', 'launch_error', NULL
+  )),
+  error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 1024),
   duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
   usage_tokens INTEGER CHECK (usage_tokens IS NULL OR usage_tokens >= 0),
   UNIQUE (job_id, sequence_number),
