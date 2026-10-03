@@ -37,7 +37,7 @@ These commands manage model-agnostic reviewer evaluation campaigns.
 ### Create Campaign
 
 ```bash
-odonian campaign create \
+odonian evaluation-create-campaign \
   --name "Muse Spark 1.3 evaluation" \
   --description "Initial comparison study" \
   --cohort-manifest "{...}" \
@@ -49,13 +49,13 @@ odonian campaign create \
 ### Get Campaign
 
 ```bash
-odonian campaign get <campaign_id>
+odonian evaluation-get-campaign <campaign_id>
 ```
 
 ### Get Campaign Status
 
 ```bash
-odonian campaign status <campaign_id>
+odonian evaluation-get-campaign-status <campaign_id>
 ```
 
 Returns compact machine-readable status including pause state, attempt capacity, and per-candidate information.
@@ -63,7 +63,7 @@ Returns compact machine-readable status including pause state, attempt capacity,
 ### Pause Campaign
 
 ```bash
-odonian campaign pause <campaign_id>
+odonian evaluation-pause-campaign <campaign_id>
 ```
 
 Pauses the campaign, blocking new job admission.
@@ -73,7 +73,7 @@ Pauses the campaign, blocking new job admission.
 ### Claim Job
 
 ```bash
-odonian job claim \
+odonian evaluation-claim-job \
   --sample-id sample-123 \
   --candidate-id cand-456 \
   --request-id req-789 \
@@ -99,9 +99,9 @@ odonian job claim \
 ### Renew Attempt
 
 ```bash
-odonian job renew \
-  --job-id job-123 \
-  --attempt-id att-001 \
+odonian evaluation-renew-attempt \
+  --job <job_id> \
+  --attempt <attempt_id> \
   --lease-ttl-ms 300000
 ```
 
@@ -110,15 +110,15 @@ Extends the lease for the current attempt. Uses relative TTL (1-3600000 ms).
 ### Finalize Attempt
 
 ```bash
-odonian job finalize \
-  --job-id job-123 \
-  --attempt-id att-001 \
-  --fence-attempt-id att-001 \
+odonian evaluation-finalize-attempt \
+  --job <job_id> \
+  --attempt <attempt_id> \
+  --fence <fence_attempt_id> \
   --exit-class completed \
-  --status completed \
-  --duration-ms 45000 \
-  --usage-tokens 5000 \
   --result '{
+    "status": "completed",
+    "duration_ms": 45000,
+    "usage_tokens": 5000,
     "findings": [
       {
         "id": "f-001",
@@ -139,9 +139,9 @@ odonian job finalize \
 ### Get Sample
 
 ```bash
-odonian job sample \
-  --campaign-id camp-abc123 \
-  --sample-id sample-123
+odonian evaluation-get-sample \
+  --campaign <campaign_id> \
+  --sample <sample_id>
 ```
 
 ## Authentication & Error Handling

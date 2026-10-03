@@ -2483,18 +2483,18 @@ func executeEvaluationRenewAttempt(ctx context.Context, baseURL, token string, a
 	fs.SetOutput(io.Discard)
 	jobFlag := fs.String("job", "", "Job ID")
 	attemptFlag := fs.String("attempt", "", "Attempt ID")
-	expiresFlag := fs.Int64("expires-at-ms", 0, "Expiration time in milliseconds since epoch")
+	leaseTTLFlag := fs.Int64("lease-ttl-ms", 0, "Lease TTL in milliseconds (1-3600000)")
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
 
-	if *jobFlag == "" || *attemptFlag == "" || *expiresFlag <= 0 {
-		return fmt.Errorf("--job, --attempt, and --expires-at-ms are required")
+	if *jobFlag == "" || *attemptFlag == "" || *leaseTTLFlag <= 0 {
+		return fmt.Errorf("--job, --attempt, and --lease-ttl-ms are required")
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	result, err := client.RenewEvaluationAttempt(ctx, *jobFlag, *attemptFlag, *expiresFlag)
+	result, err := client.RenewEvaluationAttempt(ctx, *jobFlag, *attemptFlag, *leaseTTLFlag)
 	if err != nil {
 		return fmt.Errorf("failed to renew evaluation attempt: %w", err)
 	}

@@ -18,20 +18,22 @@ import (
 // argument (an injectable clock).
 
 var (
-	ErrEvaluationJobNotFound       = errors.New("evaluation job not found")
-	ErrEvaluationAttemptNotFound   = errors.New("evaluation attempt not found")
-	ErrEvaluationCampaignNotFound  = errors.New("evaluation campaign not found")
-	ErrEvaluationSampleNotFound    = errors.New("evaluation sample not found")
-	ErrEvaluationCandidateNotFound = errors.New("evaluation candidate not found")
-	ErrEvaluationFenceMismatch     = errors.New("evaluation attempt identity does not match the job's current attempt")
-	ErrEvaluationAttemptExpired    = errors.New("evaluation attempt lease expired")
-	ErrEvaluationAttemptFinalized  = errors.New("evaluation attempt already finalized")
-	ErrEvaluationAttemptLive       = errors.New("previous evaluation attempt is still live")
-	ErrEvaluationCapacityExhausted = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
-	ErrEvaluationCandidateCorrupt  = errors.New("stored evaluation candidate does not match its recorded digest")
-	ErrEvaluationProjectNotAllowed = errors.New("project is not allowed for this evaluation campaign")
-	ErrEvaluationModelNotAllowed   = errors.New("model is not allowed for this evaluation campaign")
-	ErrEvaluationInvalidInput      = errors.New("invalid evaluation input")
+	ErrEvaluationJobNotFound           = errors.New("evaluation job not found")
+	ErrEvaluationAttemptNotFound       = errors.New("evaluation attempt not found")
+	ErrEvaluationCampaignNotFound      = errors.New("evaluation campaign not found")
+	ErrEvaluationSampleNotFound        = errors.New("evaluation sample not found")
+	ErrEvaluationCandidateNotFound     = errors.New("evaluation candidate not found")
+	ErrEvaluationFenceMismatch         = errors.New("evaluation attempt identity does not match the job's current attempt")
+	ErrEvaluationAttemptExpired        = errors.New("evaluation attempt lease expired")
+	ErrEvaluationAttemptFinalized      = errors.New("evaluation attempt already finalized")
+	ErrEvaluationAttemptLive           = errors.New("previous evaluation attempt is still live")
+	ErrEvaluationCapacityExhausted     = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
+	ErrEvaluationCandidateCorrupt      = errors.New("stored evaluation candidate does not match its recorded digest")
+	ErrEvaluationProjectNotAllowed     = errors.New("project is not allowed for this evaluation campaign")
+	ErrEvaluationModelNotAllowed       = errors.New("model is not allowed for this evaluation campaign")
+	ErrEvaluationCampaignPaused        = errors.New("evaluation campaign is paused")
+	ErrEvaluationCampaignAlreadyPaused = errors.New("evaluation campaign is already paused")
+	ErrEvaluationInvalidInput          = errors.New("invalid evaluation input")
 )
 
 // EvaluationExitClass is the distinct terminal outcome of one attempt.
@@ -229,6 +231,22 @@ func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign Eva
 func (s *sqliteStore) PauseEvaluationCampaign(ctx context.Context, campaignID string) error {
 	now := s.Now().UTC().Format(timestampLayout)
 
+	// First check if campaign exists and its current pause state
+	var exists, alreadyPaused int
+	err := s.conn.QueryRowContext(ctx,
+		`SELECT 1, CASE WHEN paused_at IS NOT NULL THEN 1 ELSE 0 END FROM evaluation_campaign WHERE id = ?`,
+		campaignID).Scan(&exists, &alreadyPaused)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return ErrEvaluationCampaignNotFound
+		}
+		return fmt.Errorf("check campaign: %w", err)
+	}
+
+	if alreadyPaused == 1 {
+		return ErrEvaluationCampaignAlreadyPaused
+	}
+
 	result, err := s.conn.ExecContext(ctx,
 		`UPDATE evaluation_campaign SET paused_at = ? WHERE id = ? AND paused_at IS NULL AND resumed_at IS NULL`,
 		now, campaignID)
@@ -241,7 +259,7 @@ func (s *sqliteStore) PauseEvaluationCampaign(ctx context.Context, campaignID st
 		return fmt.Errorf("check pause result: %w", err)
 	}
 	if rowsAffected == 0 {
-		return ErrEvaluationCampaignNotFound
+		return ErrEvaluationCampaignAlreadyPaused
 	}
 
 	return nil
@@ -625,6 +643,19 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 
 	if err == nil && campaignAttempts >= attemptCap {
 		return EvaluationJobClaimResult{}, ErrEvaluationCapacityExhausted
+	}
+
+	// Check if campaign is paused
+	var pausedAt *string
+	err = tx.QueryRowContext(ctx,
+		`SELECT paused_at FROM evaluation_campaign WHERE id = ?`,
+		campaignID,
+	).Scan(&pausedAt)
+	if err != nil && err != sql.ErrNoRows {
+		return EvaluationJobClaimResult{}, fmt.Errorf("check campaign pause state: %w", err)
+	}
+	if pausedAt != nil {
+		return EvaluationJobClaimResult{}, ErrEvaluationCampaignPaused
 	}
 
 	// Debit the candidate's independent pool. A missing pool is an error and a
@@ -1140,4 +1171,50 @@ func (s *sqliteStore) GetEvaluationCampaign(ctx context.Context, campaignID stri
 		return EvaluationCampaign{}, err
 	}
 	return campaign, nil
+}
+
+// ListEvaluationCandidates fetches all candidates for a campaign.
+func (s *sqliteStore) ListEvaluationCandidates(ctx context.Context, campaignID string) ([]EvaluationCandidate, error) {
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT id, campaign_id, identity_json, candidate_config_digest, account_pool_id, per_candidate_cap, created_at
+		 FROM evaluation_candidate WHERE campaign_id = ? ORDER BY created_at`,
+		campaignID)
+	if err != nil {
+		return nil, fmt.Errorf("query candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var candidates []EvaluationCandidate
+	for rows.Next() {
+		var c EvaluationCandidate
+		var identityJSON, digest, poolID string
+		if err := rows.Scan(&c.ID, &c.CampaignID, &identityJSON, &digest, &poolID,
+			&c.PerCandidateCap, &c.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan candidate: %w", err)
+		}
+
+		if err := json.Unmarshal([]byte(identityJSON), &c.Config); err != nil {
+			return nil, fmt.Errorf("unmarshal candidate identity: %w", err)
+		}
+
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+// CountEvaluationAttempts returns the number of attempts for a candidate.
+func (s *sqliteStore) CountEvaluationAttempts(ctx context.Context, candidateID string) (int, error) {
+	var count int
+	err := s.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM evaluation_attempt ea
+		 JOIN evaluation_job ej ON ea.job_id = ej.id
+		 WHERE ej.candidate_id = ?`,
+		candidateID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count attempts: %w", err)
+	}
+	return count, nil
 }

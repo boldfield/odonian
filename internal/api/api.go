@@ -1871,6 +1871,10 @@ func (s *Server) handleClaimEvaluationJob(w http.ResponseWriter, r *http.Request
 		s.errorResponse(w, http.StatusConflict, "ATTEMPT_LIVE", "Previous evaluation attempt is still active")
 		return
 	}
+	if errors.Is(err, store.ErrEvaluationCampaignPaused) {
+		s.errorResponse(w, http.StatusConflict, "PAUSED_WAITING", "Evaluation campaign is paused, waiting for resume")
+		return
+	}
 	if errors.Is(err, store.ErrEvaluationInvalidInput) {
 		s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
 		return
@@ -2107,7 +2111,11 @@ func (s *Server) handlePauseEvaluationCampaign(w http.ResponseWriter, r *http.Re
 
 	err := s.store.PauseEvaluationCampaign(r.Context(), campaignID)
 	if errors.Is(err, store.ErrEvaluationCampaignNotFound) {
-		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Campaign not found or already paused")
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Campaign not found")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationCampaignAlreadyPaused) {
+		s.errorResponse(w, http.StatusConflict, "ALREADY_PAUSED", "Campaign is already paused")
 		return
 	}
 	if err != nil {
@@ -2147,6 +2155,36 @@ func (s *Server) handleGetEvaluationCampaignStatus(w http.ResponseWriter, r *htt
 
 	isPaused := campaign.PausedAt != nil && campaign.ResumedAt == nil
 
+	// Fetch all candidates for this campaign
+	candidates, err := s.store.ListEvaluationCandidates(r.Context(), campaignID)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FETCH_ERROR", "Failed to fetch candidates")
+		return
+	}
+
+	// Compute per-candidate status
+	candidateStatuses := []map[string]interface{}{}
+	totalAttempts := 0
+	for _, candidate := range candidates {
+		// Count attempts for this candidate
+		attemptCount, err := s.store.CountEvaluationAttempts(r.Context(), candidate.ID)
+		if err != nil {
+			s.errorResponse(w, http.StatusInternalServerError, "FETCH_ERROR", "Failed to count candidate attempts")
+			return
+		}
+		totalAttempts += attemptCount
+
+		isExhausted := attemptCount >= candidate.PerCandidateCap
+		candidateStatus := map[string]interface{}{
+			"id":                 candidate.ID,
+			"attempts_used":      attemptCount,
+			"attempts_remaining": candidate.PerCandidateCap - attemptCount,
+			"per_candidate_cap":  candidate.PerCandidateCap,
+			"is_exhausted":       isExhausted,
+		}
+		candidateStatuses = append(candidateStatuses, candidateStatus)
+	}
+
 	campaignStatus := map[string]interface{}{
 		"id":                  campaign.ID,
 		"name":                campaign.Name,
@@ -2159,6 +2197,8 @@ func (s *Server) handleGetEvaluationCampaignStatus(w http.ResponseWriter, r *htt
 		"resumed_at":          campaign.ResumedAt,
 		"created_at":          campaign.CreatedAt,
 		"updated_at":          campaign.UpdatedAt,
+		"candidates":          candidateStatuses,
+		"total_attempts_used": totalAttempts,
 	}
 
 	s.encodeJSON(w, http.StatusOK, campaignStatus)

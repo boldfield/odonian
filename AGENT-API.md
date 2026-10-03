@@ -539,3 +539,203 @@ backlog ─promote→ ready ─claim→ in_progress ─submit→ review ─(all 
 blocked / failed are off-ramps from any active state. blocked is recoverable via → ready; done/failed are terminal.
 blocked → failed retires a dead-end blocked task cleanly without re-entering the queue.
 ```
+
+## Evaluation Campaign HTTP API
+
+Evaluation campaigns are isolated experiments for evaluating candidate implementations. All endpoints require bearer token authentication.
+
+### Create Campaign
+
+**POST** `/evaluation/campaigns`
+
+```json
+{
+  "name": "Muse Spark 1.3 evaluation",
+  "description": "Initial comparison study",
+  "cohort_manifest": "{...}",
+  "attempt_cap": 100,
+  "allowed_projects": ["proj-1", "proj-2"],
+  "allowed_models": ["muse-spark-1.3"]
+}
+```
+
+**Response:** `201` with campaign object.
+
+### Get Campaign
+
+**GET** `/evaluation/campaigns/{id}`
+
+Returns campaign metadata (name, description, allowed projects/models, caps, timestamps).
+
+### Get Campaign Status
+
+**GET** `/evaluation/campaigns/{id}/status`
+
+Returns compact machine-readable status including candidate list with per-candidate statistics (attempts used/remaining, status, pool info) and campaign pause state.
+
+### Pause Campaign
+
+**POST** `/evaluation/campaigns/{id}/pause`
+
+Pauses the campaign, blocking new job admission. Returns:
+- `200`: Campaign paused
+- `409 ALREADY_PAUSED`: Campaign is already paused
+- `404`: Campaign not found
+
+### Create Candidate
+
+**POST** `/evaluation/campaigns/{id}/candidates`
+
+```json
+{
+  "candidate_config": {...},
+  "per_candidate_cap": 10
+}
+```
+
+**Response:** `201` with candidate object including ID.
+
+### Get Sample
+
+**GET** `/evaluation/campaigns/{campaign_id}/samples/{sample_id}`
+
+Returns sample metadata (project, original task, snapshot digest, etc.).
+
+### Claim Job
+
+**POST** `/evaluation/jobs/claim`
+
+```json
+{
+  "sample_id": "sample-123",
+  "candidate_id": "cand-456",
+  "request_id": "req-789",
+  "lease_ttl_ms": 300000
+}
+```
+
+Request ID must be globally unique per candidate. Returns `200` with job and active attempt.
+
+**Error codes:**
+- `PAUSED_WAITING`: Campaign is paused, admission blocked
+- `CAPACITY_EXHAUSTED`: Campaign or candidate exhausted attempt cap
+- `ATTEMPT_LIVE`: Previous attempt still active (lease not expired)
+
+### Renew Attempt
+
+**POST** `/evaluation/jobs/{job_id}/attempts/{attempt_id}/renew`
+
+```json
+{
+  "lease_ttl_ms": 300000
+}
+```
+
+Extends the lease by the specified TTL (relative duration). TTL must be 1-3600000 ms.
+
+### Finalize Attempt
+
+**POST** `/evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize`
+
+```json
+{
+  "fence_attempt_id": "att-001",
+  "exit_class": "completed",
+  "status": "completed",
+  "duration_ms": 45000,
+  "usage_tokens": 5000,
+  "findings": [
+    {
+      "id": "f-001",
+      "severity": "material",
+      "claim": "Variable not initialized",
+      "summary": "Missing initialization",
+      "evidence": "Line 42"
+    }
+  ]
+}
+```
+
+**Findings Validation:**
+- All fields (id, severity, claim, summary, evidence) must be strings
+- Unknown fields are rejected
+- Findings must comply with `evaluation.Finding` schema
+
+Returns `200` on success, `409` if attempt finalized/expired or job_id mismatches attempt.
+
+## Evaluation Campaign CLI Commands
+
+All evaluation commands use `odonian evaluation-*` with `ODONIAN_URL` and `ODONIAN_TOKEN` environment variables.
+
+### evaluation-create-campaign
+
+```bash
+odonian evaluation-create-campaign \
+  --name "Muse evaluation" \
+  --description "Study" \
+  --cohort-manifest "{...}" \
+  --attempt-cap 100 \
+  --allowed-projects proj-1,proj-2 \
+  --allowed-models muse-spark-1.3
+```
+
+### evaluation-get-campaign
+
+```bash
+odonian evaluation-get-campaign <campaign_id>
+```
+
+### evaluation-get-campaign-status
+
+```bash
+odonian evaluation-get-campaign-status <campaign_id>
+```
+
+### evaluation-pause-campaign
+
+```bash
+odonian evaluation-pause-campaign <campaign_id>
+```
+
+### evaluation-claim-job
+
+```bash
+odonian evaluation-claim-job \
+  --sample-id sample-123 \
+  --candidate-id cand-456 \
+  --request-id req-789 \
+  --lease-ttl-ms 300000
+```
+
+### evaluation-renew-attempt
+
+```bash
+odonian evaluation-renew-attempt \
+  --job <job_id> \
+  --attempt <attempt_id> \
+  --lease-ttl-ms 300000
+```
+
+### evaluation-finalize-attempt
+
+```bash
+odonian evaluation-finalize-attempt \
+  --job <job_id> \
+  --attempt <attempt_id> \
+  --fence <fence_attempt_id> \
+  --exit-class completed \
+  --result '{
+    "status": "completed",
+    "duration_ms": 45000,
+    "usage_tokens": 5000,
+    "findings": [...]
+  }'
+```
+
+### evaluation-get-sample
+
+```bash
+odonian evaluation-get-sample \
+  --campaign <campaign_id> \
+  --sample <sample_id>
+```

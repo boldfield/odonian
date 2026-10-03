@@ -1163,9 +1163,9 @@ func (c *HTTPClient) ClaimEvaluationJob(ctx context.Context, sampleID, candidate
 }
 
 // RenewEvaluationAttempt extends the lease on an active attempt.
-func (c *HTTPClient) RenewEvaluationAttempt(ctx context.Context, jobID, attemptID string, expiresAtMs int64) (map[string]interface{}, error) {
+func (c *HTTPClient) RenewEvaluationAttempt(ctx context.Context, jobID, attemptID string, leaseTTLMs int64) (map[string]interface{}, error) {
 	body := map[string]interface{}{
-		"expires_at_ms": expiresAtMs,
+		"lease_ttl_ms": leaseTTLMs,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/evaluation/jobs/%s/attempts/%s/renew", url.PathEscape(jobID), url.PathEscape(attemptID)), body)
