@@ -71,6 +71,7 @@ const (
 	museExitSignalTERM   = 143
 	museExitUsage        = 2
 	museMissingCapPrefix = "cli_flag:"
+	museSettingsFile     = "settings.json"
 	museHomeMaxEntries   = 5000
 	museHomeMaxScanBytes = 1 << 20
 )
@@ -242,8 +243,8 @@ func flagListed(help, flagName string) bool {
 // to route billing through the browser session. Muse documents no way to ask
 // which credential is active, so the adapter instead prevents the documented
 // bypass: the child only ever sees this directory as HOME, and the directory
-// must be private, separate from the adapter's own HOME, non-empty (so a real
-// session exists) and free of anything that looks like a stored API key.
+// must be private, separate from the adapter's own HOME, show Muse session
+// state (a non-empty file besides settings.json under .config/muse) and free of anything that looks like a stored API key.
 // File contents are inspected in memory only and never reported.
 func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 	home := opts.MuseHome
@@ -274,7 +275,8 @@ func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 			return PreflightAuthAmbiguous, "credential home is the adapter's own HOME, which may hold a stored API key that outranks the subscription session; use a dedicated directory"
 		}
 	}
-	files, hint := 0, ""
+	files, hint, sessionFound := 0, "", false
+	sessionDir := filepath.Join(home, ".config", "muse")
 	walkErr := filepath.WalkDir(home, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -292,6 +294,11 @@ func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 		}
 		if !d.Type().IsRegular() {
 			return nil
+		}
+		if filepath.Dir(path) == sessionDir && d.Name() != museSettingsFile {
+			if fi, err := d.Info(); err == nil && fi.Size() > 0 {
+				sessionFound = true
+			}
 		}
 		f, err := os.Open(path)
 		if err != nil {
@@ -315,6 +322,8 @@ func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 		return PreflightAuthAmbiguous, fmt.Sprintf("credential home could not be fully inspected: %v", walkErr)
 	case files == 0:
 		return PreflightAuthMissing, fmt.Sprintf("credential home %s is empty; sign in with HOME=%s muse (Power browser flow) first", home, home)
+	case !sessionFound:
+		return PreflightAuthMissing, fmt.Sprintf("credential home %s holds no recognizable Muse session state (expected a non-empty file other than %s under .config/muse); sign in with HOME=%s muse (Power browser flow) first", home, museSettingsFile, home)
 	}
 	return PreflightReady, ""
 }

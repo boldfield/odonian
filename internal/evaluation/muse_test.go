@@ -147,6 +147,23 @@ func signedInHome(m fakeMuse) string {
 	return home
 }
 
+// homeWith creates a private credential home holding one file at rel.
+func homeWith(t *testing.T, rel, content string) string {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	full := filepath.Join(home, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
 const operatorHome = "/tmp/operator-home"
 
 func museOpts(m fakeMuse) MuseOptions {
@@ -201,7 +218,7 @@ func TestMusePreflightReadyRecordsRuntime(t *testing.T) {
 }
 
 func TestMusePreflightRuntimeMissing(t *testing.T) {
-	opts := museOpts(fakeMuse{path: filepath.Join(t.TempDir(), "no-such-muse")})
+	opts := museOpts(fakeMuse{dir: t.TempDir(), path: filepath.Join(t.TempDir(), "no-such-muse")})
 	rep := MusePreflight(context.Background(), opts)
 	if rep.Outcome != PreflightRuntimeMissing {
 		t.Fatalf("got %+v", rep)
@@ -296,6 +313,10 @@ func TestMusePreflightAuthRouting(t *testing.T) {
 			_ = os.Symlink(o.MuseHome, link)
 			o.MuseHome = link
 		}, PreflightAuthAmbiguous},
+		{"non-empty home without Muse session state", func(o *MuseOptions) { o.MuseHome = homeWith(t, "random.txt", "not a muse session") }, PreflightAuthMissing},
+		{"settings alone is not a session", func(o *MuseOptions) { o.MuseHome = homeWith(t, ".config/muse/settings.json", `{"theme":"dark"}`) }, PreflightAuthMissing},
+		{"empty session file is not a session", func(o *MuseOptions) { o.MuseHome = homeWith(t, ".config/muse/session.json", "") }, PreflightAuthMissing},
+		{"session file outside .config/muse", func(o *MuseOptions) { o.MuseHome = homeWith(t, "session.json", `{"session":"x"}`) }, PreflightAuthMissing},
 		{"stored key file name", func(o *MuseOptions) {
 			_ = os.WriteFile(filepath.Join(o.MuseHome, "api_key"), []byte("sk-x"), 0o600)
 		}, PreflightAuthAmbiguous},

@@ -69,7 +69,7 @@ out:
    | `outcome` | Condition |
    |---|---|
    | `auth_route_unconfirmed` | `--muse-home` not given or not absolute |
-   | `auth_missing` | directory missing or empty, so no session exists |
+   | `auth_missing` | directory missing or empty, or it holds no recognizable Muse session state: a non-empty file other than `settings.json` directly under `.config/muse` (Muse does not document its storage layout, so this is a heuristic that rejects unrelated or settings-only directories; it does not prove the session is valid or entitled) |
    | `auth_ambiguous` | symlink or not a directory; mode allows group/other access; owned by another user; same directory as the adapter's own `HOME`; unreadable or too large to inspect (over 5000 entries); or any file name or file content (first 1 MiB, inspected in memory, never reported) matching `api key`-style names such as `api_key`, `apiKey`, `api-key` |
 4. `--auth-route browser-session` must also be passed. It is the owner's statement that step 2 was followed and
    `muse auth set` was never run against that home; without it, `auth_route_unconfirmed` and muse is never started.
@@ -101,7 +101,7 @@ stdout (exit `0` when ready, `1` otherwise). The report never contains credentia
 | `capability_missing` | `exec --help` lacks one of `--json --prompt-file --model --disable-approval --max-model-steps` | `unsupported` / `capability_missing`, `missing_capabilities: ["cli_flag:--model", ...]` |
 | `auth_override_present` | `META_API_KEY` is set | `failed` / `auth_missing` |
 | `auth_route_unconfirmed` | `--auth-route browser-session` or a valid `--muse-home` not given | `failed` / `auth_missing` |
-| `auth_missing` | credential home missing or empty | `failed` / `auth_missing` |
+| `auth_missing` | credential home missing, empty, or without recognizable Muse session state | `failed` / `auth_missing` |
 | `auth_ambiguous` | credential home shared, symlinked, the adapter's own `HOME`, or showing a stored key | `failed` / `auth_missing` |
 
 The response `error_message` always starts with the specific outcome name.
