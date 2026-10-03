@@ -387,9 +387,16 @@ func museSessionEntries(home string) ([]string, error) {
 	return out, nil
 }
 
-// checkManifestPath validates where a manifest lives: an absolute path outside
-// the credential home (so the muse child cannot rewrite it), and when it
-// exists a private regular file owned by the adapter's user.
+// pathWithin reports whether path is dir or lies beneath it, lexically.
+func pathWithin(dir, path string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// checkManifestPath validates where a manifest lives: an absolute path whose
+// real location (after resolving symlinks in its parent directories) is
+// outside the credential home, so the muse child cannot rewrite it, and when
+// it exists a private, singly linked regular file owned by the adapter's user.
 func checkManifestPath(path, home string) (PreflightOutcome, string) {
 	if path == "" {
 		return PreflightAuthUnconfirmed, "no session manifest: after verifying the subscription route interactively, record one with --record-session and pass --session-manifest"
@@ -397,8 +404,24 @@ func checkManifestPath(path, home string) (PreflightOutcome, string) {
 	if !filepath.IsAbs(path) {
 		return PreflightAuthUnconfirmed, fmt.Sprintf("--session-manifest %q must be an absolute path", path)
 	}
-	if rel, err := filepath.Rel(filepath.Clean(home), filepath.Clean(path)); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	path, home = filepath.Clean(path), filepath.Clean(home)
+	if pathWithin(home, path) {
 		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s must live outside the credential home", path)
+	}
+	// A symlinked parent can lead a lexically outside path back into the home.
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return PreflightAuthUnconfirmed, fmt.Sprintf("session manifest directory %s does not exist", filepath.Dir(path))
+	case err != nil:
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest directory %s unresolvable: %v", filepath.Dir(path), err)
+	}
+	realHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home %s unresolvable: %v", home, err)
+	}
+	if pathWithin(realHome, filepath.Join(parent, filepath.Base(path))) {
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s resolves into the credential home (%s); keep it outside", path, parent)
 	}
 	info, err := os.Lstat(path)
 	switch {
@@ -411,8 +434,14 @@ func checkManifestPath(path, home string) (PreflightOutcome, string) {
 	case info.Mode().Perm()&0o077 != 0:
 		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s is accessible to other users (mode %o); chmod 600", path, info.Mode().Perm())
 	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
-		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s is not owned by the adapter's user", path)
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		if int(st.Uid) != os.Getuid() {
+			return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s is not owned by the adapter's user", path)
+		}
+		// Another hard link (possibly inside the home) would let it be rewritten.
+		if uint64(st.Nlink) > 1 {
+			return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s has %d hard links; it must have exactly one", path, st.Nlink)
+		}
 	}
 	return PreflightReady, ""
 }
@@ -509,6 +538,11 @@ func RecordMuseSession(opts MuseOptions) (MuseSessionManifest, PreflightOutcome,
 	}
 	if werr != nil {
 		return MuseSessionManifest{}, PreflightAuthAmbiguous, fmt.Sprintf("write session manifest: %v", werr)
+	}
+	// Re-check the written file in case its location changed while writing.
+	if o, msg := checkManifestPath(opts.SessionManifest, opts.MuseHome); o != PreflightReady {
+		_ = os.Remove(opts.SessionManifest)
+		return MuseSessionManifest{}, PreflightAuthAmbiguous, msg
 	}
 	return m, PreflightReady, ""
 }

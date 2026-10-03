@@ -476,7 +476,19 @@ func TestRecordMuseSessionRefusesUnsafeState(t *testing.T) {
 			_ = os.WriteFile(target, []byte("{}"), 0o600)
 			_ = os.Symlink(target, o.SessionManifest)
 		}, PreflightAuthAmbiguous},
+		{"manifest parent symlinks into home", func(o *MuseOptions) {
+			inside := filepath.Join(o.MuseHome, "inside")
+			_ = os.Mkdir(inside, 0o700)
+			link := filepath.Join(t.TempDir(), "outside_link")
+			_ = os.Symlink(inside, link)
+			o.SessionManifest = filepath.Join(link, "manifest.json")
+		}, PreflightAuthAmbiguous},
+		{"manifest hard linked", func(o *MuseOptions) {
+			_ = os.WriteFile(o.SessionManifest, []byte("{}"), 0o600)
+			_ = os.Link(o.SessionManifest, filepath.Join(filepath.Dir(o.SessionManifest), "other.json"))
+		}, PreflightAuthAmbiguous},
 	}
+	preexisting := map[string]bool{"manifest path is a symlink": true, "manifest hard linked": true}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := base()
@@ -485,12 +497,39 @@ func TestRecordMuseSessionRefusesUnsafeState(t *testing.T) {
 			if _, o, msg := RecordMuseSession(opts); o != tc.outcome {
 				t.Fatalf("got %s (%s), want %s", o, msg, tc.outcome)
 			}
-			if tc.name != "manifest path is a symlink" && opts.SessionManifest != "" && filepath.IsAbs(opts.SessionManifest) {
+			if !preexisting[tc.name] && opts.SessionManifest != "" && filepath.IsAbs(opts.SessionManifest) {
 				if _, err := os.Lstat(opts.SessionManifest); err == nil {
 					t.Fatal("a refused record must not write a manifest")
 				}
 			}
 		})
+	}
+}
+
+// A manifest reached through a symlinked parent that resolves into the
+// credential home is writable by the muse child and must not be trusted, even
+// when it was placed there with valid content.
+func TestMusePreflightRejectsManifestResolvingIntoHome(t *testing.T) {
+	m := writeFakeMuse(t, fakeMuseCfg{})
+	opts := museOpts(m)
+	inside := filepath.Join(opts.MuseHome, "inside")
+	if err := os.Mkdir(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inside, "manifest.json"), must(os.ReadFile(opts.SessionManifest)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "outside_link")
+	if err := os.Symlink(inside, link); err != nil {
+		t.Fatal(err)
+	}
+	opts.SessionManifest = filepath.Join(link, "manifest.json")
+	rep := MusePreflight(context.Background(), opts)
+	if rep.Outcome != PreflightAuthAmbiguous || !strings.Contains(rep.Message, "resolves into the credential home") {
+		t.Fatalf("got %+v", rep)
+	}
+	if m.exists("invoked") {
+		t.Fatal("preflight must not start muse while the route is ambiguous")
 	}
 }
 

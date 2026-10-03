@@ -81,7 +81,8 @@ out:
    set. A home that was never recorded fails `auth_route_unconfirmed`, and any later change fails `auth_ambiguous`:
    an added stray file, a key stored with `muse auth set` in a new file, or a logout that removes the session. After
    signing in again, verify the route again and re-record. The manifest must be an absolute path outside the
-   credential home, a regular file (not a symlink), private, and owned by the adapter's user. If Muse itself adds or
+   credential home, also after resolving symlinks in its parent directories, a regular file (not a symlink) with a
+   single hard link, private, and owned by the adapter's user. Recording checks the written file again. If Muse itself adds or
    removes entries under `.config/muse` during normal runs, preflight fails closed after such a run until the owner
    verifies and re-records. That is expected, not a reason to loosen the check.
 4. Preflight inspects the directory before muse is ever started, and reports:
@@ -90,7 +91,7 @@ out:
    |---|---|
    | `auth_route_unconfirmed` | `--muse-home` not given or not absolute; `--session-manifest` not given, not absolute or not recorded |
    | `auth_missing` | directory missing or empty, or no candidate session state: no non-empty file other than `settings.json` directly under `.config/muse` (a necessary condition only; the manifest is what ties the state to a verified sign-in) |
-   | `auth_ambiguous` | symlink or not a directory; mode allows group/other access; owned by another user; same directory as the adapter's own `HOME`; **any symlink, FIFO, socket or device anywhere inside it** (the scan does not follow links, but muse would); unreadable or too large to inspect (over 5000 entries); any file name or file content (first 1 MiB, inspected in memory, never reported) matching `api key`-style names such as `api_key`, `apiKey`, `api-key`; manifest inside the home, a symlink, readable by others, malformed, recorded for another home, or listing different entries than the home now holds |
+   | `auth_ambiguous` | symlink or not a directory; mode allows group/other access; owned by another user; same directory as the adapter's own `HOME`; **any symlink, FIFO, socket or device anywhere inside it** (the scan does not follow links, but muse would); unreadable or too large to inspect (over 5000 entries); any file name or file content (first 1 MiB, inspected in memory, never reported) matching `api key`-style names such as `api_key`, `apiKey`, `api-key`; manifest inside the home (directly or through a symlinked parent directory), a symlink, hard linked, readable by others, malformed, recorded for another home, or listing different entries than the home now holds |
 5. `--auth-route browser-session` must also be passed. It is the owner's statement that step 2 was followed and
    `muse auth set` was never run against that home; without it, `auth_route_unconfirmed` and muse is never started.
 6. The muse child runs with an allowlisted environment only (`PATH`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`, `TZ`,
