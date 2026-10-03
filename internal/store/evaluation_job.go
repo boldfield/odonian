@@ -135,6 +135,9 @@ type EvaluationJobClaim struct {
 	CandidateID  string
 	RequestID    string
 	LeaseExpires time.Duration
+	// RetryHint is the RetryAfter returned for a concurrency denial; zero means
+	// policy.DefaultConcurrencyRetry.
+	RetryHint time.Duration
 }
 
 // EvaluationJobClaimResult bundles the created job and its first attempt.
@@ -151,7 +154,7 @@ func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign Eva
 		return EvaluationCampaign{}, ErrEvaluationInvalidInput
 	}
 
-	now := s.Now().Format(timestampLayout)
+	now := s.Now().UTC().Format(timestampLayout)
 	campaign.CreatedAt = now
 	campaign.UpdatedAt = now
 
@@ -180,7 +183,7 @@ func (s *sqliteStore) CreateEvaluationCandidate(ctx context.Context, candidate E
 		return EvaluationCandidate{}, ErrEvaluationInvalidInput
 	}
 
-	now := s.Now().Format(timestampLayout)
+	now := s.Now().UTC().Format(timestampLayout)
 	candidate.CreatedAt = now
 
 	_, err := s.conn.ExecContext(ctx,
@@ -211,7 +214,7 @@ func (s *sqliteStore) CreateEvaluationSample(ctx context.Context, sample Evaluat
 		return EvaluationSample{}, ErrEvaluationInvalidInput
 	}
 
-	now := s.Now().Format(timestampLayout)
+	now := s.Now().UTC().Format(timestampLayout)
 	sample.CreatedAt = now
 
 	_, err := s.conn.ExecContext(ctx,
@@ -245,7 +248,7 @@ func (s *sqliteStore) ExpireEvaluationAttempts(ctx context.Context, now time.Tim
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, job_id, request_id, previous_attempt_id, sequence_number, state, started_at, expires_at, ended_at, exit_class, status, error_class, error_message, duration_ms, usage_tokens
 		 FROM evaluation_attempt WHERE state = ? AND expires_at <= ?`,
-		EvalAttemptActive, now.Format(timestampLayout))
+		EvalAttemptActive, now.UTC().Format(timestampLayout))
 	if err != nil {
 		return 0, fmt.Errorf("find overdue attempts: %w", err)
 	}
@@ -317,10 +320,10 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 		return EvaluationJobClaimResult{}, ErrEvaluationInvalidInput
 	}
 
-	now := s.Now()
+	now := s.Now().UTC()
 	expiresAt := now.Add(req.LeaseExpires)
-	nowStr := now.Format(timestampLayout)
-	expiresAtStr := expiresAt.Format(timestampLayout)
+	nowStr := now.UTC().Format(timestampLayout)
+	expiresAtStr := expiresAt.UTC().Format(timestampLayout)
 
 	// First, expire any overdue attempts
 	_, err := s.ExpireEvaluationAttempts(ctx, now)
@@ -473,12 +476,13 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 		return EvaluationJobClaimResult{}, fmt.Errorf("check candidate capacity: %w", err)
 	}
 
-	// Fetch candidate cap
+	// Fetch candidate cap and the pool this candidate draws from
 	var candidateCap int
+	var poolID string
 	err = tx.QueryRowContext(ctx,
-		`SELECT per_candidate_cap FROM evaluation_candidate WHERE id = ?`,
+		`SELECT per_candidate_cap, account_pool_id FROM evaluation_candidate WHERE id = ?`,
 		req.CandidateID,
-	).Scan(&candidateCap)
+	).Scan(&candidateCap, &poolID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return EvaluationJobClaimResult{}, ErrEvaluationCandidateNotFound
@@ -508,6 +512,12 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 
 	if err == nil && campaignAttempts >= attemptCap {
 		return EvaluationJobClaimResult{}, ErrEvaluationCapacityExhausted
+	}
+
+	// Debit the candidate's independent pool. A missing pool is an error and a
+	// denial rolls back everything, so a refused start consumes no capacity.
+	if err = admitEvaluationStart(ctx, tx, now, poolID, req.RetryHint); err != nil {
+		return EvaluationJobClaimResult{}, err
 	}
 
 	// Fetch the job and get the next sequence number
@@ -541,9 +551,9 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO evaluation_attempt
-		 (id, job_id, request_id, previous_attempt_id, sequence_number, state, started_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		attemptID, jobID, req.RequestID, prevAttemptID, nextSeqNum, EvalAttemptActive, nowStr, expiresAtStr,
+		 (id, job_id, request_id, account_pool_id, previous_attempt_id, sequence_number, state, started_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		attemptID, jobID, req.RequestID, poolID, prevAttemptID, nextSeqNum, EvalAttemptActive, nowStr, expiresAtStr,
 	)
 	if err != nil {
 		return EvaluationJobClaimResult{}, fmt.Errorf("insert attempt: %w", err)
@@ -584,7 +594,7 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 
 // RenewEvaluationAttempt extends the lease on an active attempt.
 func (s *sqliteStore) RenewEvaluationAttempt(ctx context.Context, attemptID string, expiresAt time.Time) error {
-	now := s.Now()
+	now := s.Now().UTC()
 
 	// Check if attempt exists and is still active with a valid lease
 	attempt, err := s.fetchEvaluationAttempt(ctx, s.conn, attemptID)
@@ -611,7 +621,7 @@ func (s *sqliteStore) RenewEvaluationAttempt(ctx context.Context, attemptID stri
 		return ErrEvaluationAttemptExpired
 	}
 
-	expiresAtStr := expiresAt.Format(timestampLayout)
+	expiresAtStr := expiresAt.UTC().Format(timestampLayout)
 	result, err := s.conn.ExecContext(ctx,
 		`UPDATE evaluation_attempt SET expires_at = ? WHERE id = ? AND state = ?`,
 		expiresAtStr, attemptID, EvalAttemptActive,
@@ -672,8 +682,8 @@ func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, attemptID, 
 		}
 	}
 
-	now := s.Now()
-	nowStr := now.Format(timestampLayout)
+	now := s.Now().UTC()
+	nowStr := now.UTC().Format(timestampLayout)
 
 	var statusVal interface{} = nil
 	if status != nil {
@@ -940,14 +950,14 @@ func (s *sqliteStore) GetEvaluationCandidate(ctx context.Context, candidateID st
 	err := s.conn.QueryRowContext(ctx,
 		`SELECT id, campaign_id, adapter_name, model_identity, model_revision, runtime_version,
 		        reasoning_config, generation_config, prompt_version, tool_access_config,
-		        source_access_config, account_pool_id, per_candidate_cap, created_at
+		        source_access_config, account_pool_id, per_candidate_cap, candidate_config_digest, created_at
 		 FROM evaluation_candidate WHERE id = ?`,
 		candidateID,
 	).Scan(&candidate.ID, &candidate.CampaignID, &candidate.AdapterName, &candidate.ModelIdentity,
 		&candidate.ModelRevision, &candidate.RuntimeVersion, &candidate.ReasoningConfig,
 		&candidate.GenerationConfig, &candidate.PromptVersion, &candidate.ToolAccessConfig,
 		&candidate.SourceAccessConfig, &candidate.AccountPoolID, &candidate.PerCandidateCap,
-		&candidate.CreatedAt)
+		&candidate.CandidateConfigDigest, &candidate.CreatedAt)
 
 	if err != nil {
 		if err == sql.ErrNoRows {

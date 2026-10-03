@@ -91,6 +91,8 @@ type Store interface {
 	CreateEvaluationCampaign(ctx context.Context, campaign EvaluationCampaign) (EvaluationCampaign, error)
 	CreateEvaluationCandidate(ctx context.Context, candidate EvaluationCandidate) (EvaluationCandidate, error)
 	CreateEvaluationSample(ctx context.Context, sample EvaluationSample) (EvaluationSample, error)
+	ConfigureEvaluationPool(ctx context.Context, cfg EvaluationPoolConfig) (EvaluationPoolState, error)
+	GetEvaluationPool(ctx context.Context, id string) (EvaluationPoolState, error)
 	ClaimEvaluationJob(ctx context.Context, req EvaluationJobClaim) (EvaluationJobClaimResult, error)
 	RenewEvaluationAttempt(ctx context.Context, attemptID string, expiresAt time.Time) error
 	FinalizeEvaluationAttempt(ctx context.Context, attemptID, fenceAttemptID string, exitClass string, status *evaluation.Status, errorClass *evaluation.ErrorClass, errorMsg *string, durationMs, usageTokens *int) error

@@ -17,7 +17,17 @@ func newEvaluationStore(t *testing.T) Store {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
+	configureTestEvaluationPool(t, s, "pool1")
 	return s
+}
+
+// configureTestEvaluationPool gives a pool ample concurrency-only capacity so
+// tests that are not about admission are not limited by it.
+func configureTestEvaluationPool(t *testing.T, s Store, id string) {
+	t.Helper()
+	if _, err := s.ConfigureEvaluationPool(context.Background(), EvaluationPoolConfig{ID: id, ConcurrencyOnly: true, ConcurrentLimit: 1000}); err != nil {
+		t.Fatalf("ConfigureEvaluationPool: %v", err)
+	}
 }
 
 func newTestCandidate(campaignID string) EvaluationCandidate {
@@ -746,6 +756,7 @@ func TestEvaluationLeaseExpirySweep(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
+	configureTestEvaluationPool(t, s, "pool1")
 	st := s
 
 	ctx := context.Background()
