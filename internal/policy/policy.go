@@ -13,6 +13,18 @@ const (
 	ModeEnforce  Mode = "enforce"
 )
 
+// WorkClass describes the type of research work being evaluated for rate limiting.
+type WorkClass string
+
+const (
+	// ResearchWrite is writing work (first-pass LLM generation for research)
+	ResearchWrite WorkClass = "research_write"
+	// ResearchReview is review work (review/rework/adjudication)
+	ResearchReview WorkClass = "research_review"
+	// BuildDesign is non-research work (build, design, non-LLM merge)
+	BuildDesign WorkClass = "build_design"
+)
+
 // DeferralReason explains why an admission was deferred.
 type DeferralReason string
 
@@ -116,11 +128,77 @@ func (pe *PolicyEvaluator) SetClock(clock func() time.Time) {
 	pe.clock = clock
 }
 
+// Reconfigure updates the policy configuration while preserving token bucket and concurrency state.
+// Carries over tokens (clamped to the new burst capacity), the high-water mark, and active counts.
+func (pe *PolicyEvaluator) Reconfigure(newPools []*Pool) error {
+	now := pe.clock()
+
+	// Build a map of new pools by name
+	newPoolsMap := make(map[string]*Pool)
+	newModelToPool := make(map[string]string)
+
+	for _, pool := range newPools {
+		newPoolsMap[pool.Name] = pool
+		for model := range pool.Models {
+			newModelToPool[model] = pool.Name
+		}
+	}
+
+	// Update existing buckets with new config, preserving tokens
+	for poolName := range pe.Pools {
+		if newPool, exists := newPoolsMap[poolName]; exists {
+			oldBucket := pe.buckets[poolName]
+			// Clamp tokens to new burst capacity
+			newTokens := oldBucket.tokens
+			if newTokens > float64(newPool.BurstCapacity) {
+				newTokens = float64(newPool.BurstCapacity)
+			}
+			// Update bucket with new config, keeping tokens and high-water mark
+			pe.buckets[poolName] = &tokenBucket{
+				tokens:         newTokens,
+				capacity:       float64(newPool.BurstCapacity),
+				refillRate:     newPool.StartRate,
+				lastRefill:     now,
+				lastRefillMono: oldBucket.lastRefillMono, // Keep the high-water mark
+			}
+		}
+	}
+
+	// Create new buckets for pools that are new
+	for poolName, newPool := range newPoolsMap {
+		if _, exists := pe.buckets[poolName]; !exists {
+			pe.buckets[poolName] = &tokenBucket{
+				tokens:         float64(newPool.BurstCapacity),
+				capacity:       float64(newPool.BurstCapacity),
+				refillRate:     newPool.StartRate,
+				lastRefill:     now,
+				lastRefillMono: now,
+			}
+			// Initialize concurrency tracking for new pool
+			pe.concurrency[poolName] = 0
+			pe.completionActive[poolName] = 0
+		}
+	}
+
+	// Update pool references
+	pe.Pools = newPoolsMap
+	pe.modelToPool = newModelToPool
+
+	return nil
+}
+
 // CheckAdmission evaluates whether a new research task can be admitted.
 // model is the model requested for the task.
-// isCompletion indicates whether this is completion work (review/rework/adjudication).
+// workClass indicates the type of work: ResearchWrite, ResearchReview, or BuildDesign.
 // Returns an AdmissionResult with the decision and any deferral info.
-func (pe *PolicyEvaluator) CheckAdmission(model string, isCompletion bool) AdmissionResult {
+// BuildDesign work is always admitted regardless of policy.
+func (pe *PolicyEvaluator) CheckAdmission(model string, workClass WorkClass) AdmissionResult {
+	// Build/design and non-LLM merge work are not paced
+	if workClass == BuildDesign {
+		return AdmissionResult{Admitted: true}
+	}
+
+	isCompletion := workClass == ResearchReview
 	if pe.Mode == ModeDisabled {
 		return AdmissionResult{Admitted: true}
 	}
@@ -135,9 +213,45 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, isCompletion bool) Admis
 	}
 
 	pool := pe.Pools[poolName]
+	now := pe.clock()
 
-	// Check concurrency limit
-	// For first-pass work: limited to (total - reserved) slots
+	// In observe mode, evaluate what would happen but always admit
+	if pe.Mode == ModeObserve {
+		// Check what would happen, but don't enforce
+		if isCompletion {
+			if pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
+				// Would be denied, but observe mode admits anyway
+				return AdmissionResult{Admitted: true, Reason: ReasonConcurrency}
+			}
+		} else {
+			reserved := pool.CompletionReserved
+			firstPassLimit := pool.ConcurrentDispatchLimit - reserved
+			activeFirstPass := pe.concurrency[poolName] - pe.completionActive[poolName]
+
+			if activeFirstPass >= firstPassLimit {
+				// Would be denied, but observe mode admits anyway
+				return AdmissionResult{Admitted: true, Reason: ReasonConcurrency}
+			}
+		}
+		// Check rate limit in observe mode
+		bucket := pe.buckets[poolName]
+		bucket.refill(now)
+		if bucket.tokens < 1.0 {
+			timeToNextToken := (1.0 - bucket.tokens) / bucket.refillRate
+			if timeToNextToken < 0 {
+				timeToNextToken = 0
+			}
+			return AdmissionResult{
+				Admitted:  true,
+				Reason:    ReasonRateLimit,
+				NotBefore: now.Add(time.Duration(timeToNextToken * float64(time.Second))),
+			}
+		}
+		return AdmissionResult{Admitted: true}
+	}
+
+	// Enforce mode: check concurrency limit
+	// For first-pass work: limited to (total - reserved) slots AND total ceiling
 	// For completion work: limited to total slots
 	if isCompletion {
 		// Completion work: check against total concurrent limit
@@ -149,12 +263,13 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, isCompletion bool) Admis
 			}
 		}
 	} else {
-		// First-pass work: limited to (total - reserved) slots
+		// First-pass work: limited to (total - reserved) slots and total ceiling
 		reserved := pool.CompletionReserved
 		firstPassLimit := pool.ConcurrentDispatchLimit - reserved
 		activeFirstPass := pe.concurrency[poolName] - pe.completionActive[poolName]
 
-		if activeFirstPass >= firstPassLimit {
+		// Check both reserved-aware limit and total ceiling
+		if activeFirstPass >= firstPassLimit || pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
 			return AdmissionResult{
 				Admitted:     false,
 				Reason:       ReasonConcurrency,
@@ -165,12 +280,10 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, isCompletion bool) Admis
 
 	// Check rate limit using token bucket
 	bucket := pe.buckets[poolName]
-	now := pe.clock()
 	bucket.refill(now)
 
 	if bucket.tokens >= 1.0 {
 		bucket.tokens -= 1.0
-		bucket.lastRefillMono = now
 		return AdmissionResult{Admitted: true}
 	}
 
@@ -190,19 +303,29 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, isCompletion bool) Admis
 }
 
 // RecordAdmission records that an attempt was admitted (for concurrency tracking).
-func (pe *PolicyEvaluator) RecordAdmission(model string, isCompletion bool) {
+func (pe *PolicyEvaluator) RecordAdmission(model string, workClass WorkClass) {
+	// Build/design work doesn't affect concurrency tracking
+	if workClass == BuildDesign {
+		return
+	}
+
 	poolName, ok := pe.modelToPool[model]
 	if !ok {
 		return
 	}
 	pe.concurrency[poolName]++
-	if isCompletion {
+	if workClass == ResearchReview {
 		pe.completionActive[poolName]++
 	}
 }
 
 // ReleaseAdmission records that an active attempt ended (for concurrency tracking).
-func (pe *PolicyEvaluator) ReleaseAdmission(model string, isCompletion bool) {
+func (pe *PolicyEvaluator) ReleaseAdmission(model string, workClass WorkClass) {
+	// Build/design work doesn't affect concurrency tracking
+	if workClass == BuildDesign {
+		return
+	}
+
 	poolName, ok := pe.modelToPool[model]
 	if !ok {
 		return
@@ -210,7 +333,7 @@ func (pe *PolicyEvaluator) ReleaseAdmission(model string, isCompletion bool) {
 	if pe.concurrency[poolName] > 0 {
 		pe.concurrency[poolName]--
 	}
-	if isCompletion && pe.completionActive[poolName] > 0 {
+	if workClass == ResearchReview && pe.completionActive[poolName] > 0 {
 		pe.completionActive[poolName]--
 	}
 }
@@ -218,18 +341,19 @@ func (pe *PolicyEvaluator) ReleaseAdmission(model string, isCompletion bool) {
 // refill updates the token bucket based on elapsed time.
 // Uses a monotonic high-water mark to handle clock rollback safely.
 func (b *tokenBucket) refill(now time.Time) {
-	// Use monotonic high-water mark to handle clock rollback
-	// If now is earlier than lastRefillMono, don't refill (clock rolled back)
-	// If now is later, calculate elapsed from the last actual monotonic time
+	// Protect against clock rollback
 	if now.Before(b.lastRefillMono) {
-		// Clock rolled back - don't refill, don't update lastRefill
 		return
 	}
 
 	elapsed := now.Sub(b.lastRefillMono)
 	if elapsed > 0 {
 		tokensToAdd := elapsed.Seconds() * b.refillRate
-		b.tokens = min(b.capacity, b.tokens+tokensToAdd)
+		newTokens := b.tokens + tokensToAdd
+		if newTokens > b.capacity {
+			newTokens = b.capacity
+		}
+		b.tokens = newTokens
 		b.lastRefillMono = now
 	}
 }

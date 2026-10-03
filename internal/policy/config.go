@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -51,11 +52,19 @@ func ParseConfig(allowedModels map[string]bool) (*Config, error) {
 		return nil, fmt.Errorf("invalid JSON in ODONIAN_RESEARCH_POOLS: %w", err)
 	}
 
+	// Sort pool names for deterministic iteration
+	poolNames := make([]string, 0, len(poolsData))
+	for name := range poolsData {
+		poolNames = append(poolNames, name)
+	}
+	sort.Strings(poolNames)
+
 	pools := make([]*Pool, 0, len(poolsData))
 	seenAccounts := make(map[string]bool)    // track duplicates
 	allPoolModels := make(map[string]string) // model -> pool name, for duplicate detection
 
-	for poolName, poolConfig := range poolsData {
+	for _, poolName := range poolNames {
+		poolConfig := poolsData[poolName]
 		pool, err := parsePoolConfig(poolName, poolConfig, allowedModels)
 		if err != nil {
 			return nil, fmt.Errorf("pool %s: %w", poolName, err)
@@ -93,6 +102,7 @@ func ParseConfig(allowedModels map[string]bool) (*Config, error) {
 			for model := range unmappedModels {
 				unmapped = append(unmapped, model)
 			}
+			sort.Strings(unmapped) // deterministic error message
 			return nil, fmt.Errorf("enforce mode requires all allowed models to be in a pool; unmapped: %v", unmapped)
 		}
 	}
@@ -235,7 +245,7 @@ func parseInt(val interface{}) (int, error) {
 }
 
 // ValidateConfig checks that a configuration is valid.
-// This is called automatically by ParseConfig, but provided separately for testing.
+// Provided for external validation; ParseConfig does its own validation inline.
 func ValidateConfig(config *Config, allowedModels map[string]bool) error {
 	if config.Mode != ModeDisabled && config.Mode != ModeObserve && config.Mode != ModeEnforce {
 		return fmt.Errorf("invalid mode: %s", config.Mode)
