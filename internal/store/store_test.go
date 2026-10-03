@@ -18864,6 +18864,15 @@ func TestConcurrentClaimsRaceAllowance(t *testing.T) {
 		t.Errorf("second claim should be denied: got %v", err)
 	}
 
+	// CRITICAL: Verify denied task remains ready and unassigned
+	deniedTask, _ := s.GetTask(ctx, tasks[1].ID)
+	if deniedTask.State != "ready" {
+		t.Errorf("denied task state = %q, want ready (must not be claimed)", deniedTask.State)
+	}
+	if deniedTask.Assignee != nil {
+		t.Errorf("denied task assignee = %q, want nil (must not be assigned)", *deniedTask.Assignee)
+	}
+
 	// Verify pool reflects only one debit
 	pool, _ := s.GetResearchPool(ctx, now, "acct")
 	startAllowance := float64(1)

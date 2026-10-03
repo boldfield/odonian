@@ -2072,8 +2072,8 @@ func (s *sqliteStore) ClaimTaskWithPermit(ctx context.Context, taskID, agentID, 
 	}
 
 	// Step 5: Claim the task (now that claimability and admission are verified)
-	// Skip claiming if we have an existing permit (replay case) - it's already claimed
-	if existingPermit == nil {
+	// Skip claiming if we have an existing permit (replay case) or if admission was denied
+	if existingPermit == nil && denialForRecord == nil {
 		leaseExpiry := leaseExpiryTimestamp(leaseTTL)
 		result, err := tx.ExecContext(ctx, `
 			UPDATE task
@@ -2099,6 +2099,29 @@ func (s *sqliteStore) ClaimTaskWithPermit(ctx context.Context, taskID, agentID, 
 		_, err = s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to append claim event: %w", err)
+		}
+	} else if existingPermit != nil {
+		// Replay case: verify the task is still owned by this agent
+		// and refresh the lease
+		leaseExpiry := leaseExpiryTimestamp(leaseTTL)
+		result, err := tx.ExecContext(ctx, `
+			UPDATE task
+			SET lease_expires_at=?, updated_at=?
+			WHERE id=? AND assignee=? AND state='in_progress'`,
+			leaseExpiry, now_ts, taskID, agentID)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to refresh lease: %w", err)
+		}
+
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
+		}
+
+		if rowsAffected != 1 {
+			// Task is not in_progress with this agent, or has been replaced
+			// Return conflict - stale attempt rejected
+			return Task{}, ErrConflict
 		}
 	}
 

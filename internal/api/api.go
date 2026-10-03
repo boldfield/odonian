@@ -716,6 +716,7 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 
 		// Enforce or Observe modes: handle research context
 		var permitReq *store.PermitRequest
+		var tryRegularClaim bool
 
 		// Check if client provided research context
 		hasResearchContext := payload.RequestID != "" && payload.AccountID != "" && payload.WorkClass != ""
@@ -756,43 +757,46 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 			// Handle admission denial
 			var admissionErr *store.AdmissionDeniedError
 			if errors.As(err, &admissionErr) {
-				// In observe mode, ignore denial and claim anyway
+				// In observe mode, record the hypothetical denial but grant work anyway
 				if s.researchPolicy.Mode == policy.ModeObserve {
-					// TODO: Log the hypothetical denial decision, then fall through to regular claim
-					// For now, just honor the denial like enforce mode
+					// TODO: Record the hypothetical denial decision for diagnostics
+					// Fall through to regular claim to grant the work
+					tryRegularClaim = true
+				} else {
+					// Enforce mode: honor the denial
 					s.errorResponse(w, http.StatusConflict, "ADMISSION_DENIED", admissionErr.Error())
 					return
 				}
-				// Enforce mode: honor the denial
-				s.errorResponse(w, http.StatusConflict, "ADMISSION_DENIED", admissionErr.Error())
+			} else if err == nil {
+				// Permit granted: return the claimed task
+				s.encodeJSON(w, http.StatusOK, task)
 				return
 			}
 
-			// Handle other errors
-			var conflictErr *store.ConflictError
-			if errors.As(err, &conflictErr) {
-				s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
-				return
-			}
+			// Handle other errors (only if not trying regular claim in observe mode)
+			if !tryRegularClaim {
+				var conflictErr *store.ConflictError
+				if errors.As(err, &conflictErr) {
+					s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+					return
+				}
 
-			if errors.Is(err, store.ErrConflict) {
-				s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not claimable")
-				return
-			}
+				if errors.Is(err, store.ErrConflict) {
+					s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not claimable")
+					return
+				}
 
-			// Handle input validation errors from ClaimTaskWithPermit
-			if errors.Is(err, store.ErrInvalidResearchInput) {
-				s.errorResponse(w, http.StatusBadRequest, "INVALID_RESEARCH_REQUEST", err.Error())
-				return
-			}
+				// Handle input validation errors from ClaimTaskWithPermit
+				if errors.Is(err, store.ErrInvalidResearchInput) {
+					s.errorResponse(w, http.StatusBadRequest, "INVALID_RESEARCH_REQUEST", err.Error())
+					return
+				}
 
-			if err != nil {
-				s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim task")
-				return
+				if err != nil {
+					s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim task")
+					return
+				}
 			}
-
-			s.encodeJSON(w, http.StatusOK, task)
-			return
 		}
 	}
 
