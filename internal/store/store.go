@@ -116,6 +116,8 @@ type Store interface {
 	RecordFindingDisposition(ctx context.Context, disposition FindingDisposition) (FindingDisposition, error)
 	GetFindingDisposition(ctx context.Context, campaignID, sampleID, candidateID, findingID string) (FindingDisposition, error)
 	ListDispositionsForCampaignSample(ctx context.Context, campaignID, sampleID string) ([]FindingDisposition, error)
+	ListCampaignDispositions(ctx context.Context, campaignID string) ([]FindingDisposition, error)
+	ListCampaignAttempts(ctx context.Context, campaignID string) (CampaignAttemptStats, error)
 	StoreEvaluationReport(ctx context.Context, report EvaluationReport) (EvaluationReport, error)
 	GetEvaluationReport(ctx context.Context, id string) (EvaluationReport, error)
 }

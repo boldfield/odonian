@@ -617,7 +617,7 @@ func (s *Server) handleRecordFindingDisposition(w http.ResponseWriter, r *http.R
 }
 
 // handleGetEvaluationReport handles GET /evaluation/campaigns/{campaign_id}/report.
-// Returns a previously generated report or generates one if not cached.
+// Generates a report with findings, dispositions, and metrics for the campaign.
 func (s *Server) handleGetEvaluationReport(w http.ResponseWriter, r *http.Request) {
 	campaignID := r.PathValue("campaign_id")
 
@@ -627,21 +627,130 @@ func (s *Server) handleGetEvaluationReport(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// For now, return a minimal structure. A full implementation would
-	// compute metrics from dispositions and findings.
+	// Fetch all attempts, findings, and dispositions for the campaign.
+	stats, err := s.store.ListCampaignAttempts(r.Context(), campaignID)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to fetch campaign data: "+err.Error())
+		return
+	}
+
+	// Build candidate report data.
+	candidates := []store.CandidateReportData{}
+	for _, cs := range stats.Candidates {
+		cr := store.CandidateReportData{
+			CandidateID:      cs.CandidateID,
+			Model:            cs.ModelID,
+			Runtime:          cs.Runtime,
+			CompletedCount:   cs.CompletedAttempts,
+			FailedCount:      cs.FailedAttempts,
+			AverageLatencyMs: cs.AverageDurationMs,
+		}
+		if cs.TotalUsageTokens > 0 {
+			if cr.Usage == nil {
+				cr.Usage = make(map[string]float64)
+			}
+			cr.Usage["tokens"] = float64(cs.TotalUsageTokens)
+		}
+		candidates = append(candidates, cr)
+	}
+
+	// Fetch all dispositions for the campaign.
+	dispositions := make(map[string]*store.FindingDisposition)
+	dispRows, err := s.store.ListCampaignDispositions(r.Context(), campaignID)
+	if err == nil {
+		for _, disp := range dispRows {
+			key := fmt.Sprintf("%s-%s-%s", disp.SampleID, disp.CandidateID, disp.FindingID)
+			dispositions[key] = &disp
+		}
+	}
+
+	// Group findings by summary (same issue across candidates).
+	groupedByIssue := make(map[string]*store.FindingGroupData)
+	for _, finding := range stats.AllFindings {
+		key := finding.Summary
+		if _, exists := groupedByIssue[key]; !exists {
+			groupedByIssue[key] = &store.FindingGroupData{
+				GroupID:    fmt.Sprintf("%s-%s", finding.CandidateID, finding.FindingID),
+				Summary:    finding.Summary,
+				Candidates: []store.CandidateFindingData{},
+			}
+		}
+
+		group := groupedByIssue[key]
+		cfd := store.CandidateFindingData{
+			CandidateID: finding.CandidateID,
+			Model:       finding.FindingID,
+			Severity:    finding.Severity,
+			Claim:       finding.Claim,
+			Evidence:    finding.Evidence,
+			Found:       true,
+		}
+		group.Candidates = append(group.Candidates, cfd)
+
+		// Check for disposition.
+		dispKey := fmt.Sprintf("%s-%s-%s", finding.SampleID, finding.CandidateID, finding.FindingID)
+		if disp, ok := dispositions[dispKey]; ok {
+			if group.Dispositions == nil {
+				group.Dispositions = []store.DispositionData{}
+			}
+			group.Dispositions = append(group.Dispositions, store.DispositionData{
+				Disposition: disp.Disposition,
+				Evidence:    disp.Evidence,
+				DecidedBy:   disp.DecidedBy,
+				DecidedAt:   disp.DecidedAt,
+			})
+		}
+	}
+
+	// Convert grouped findings to slice.
+	groupedFindings := []store.FindingGroupData{}
+	for _, group := range groupedByIssue {
+		groupedFindings = append(groupedFindings, *group)
+	}
+
+	// Compute metrics.
+	metrics := computeReportMetrics(stats, dispositions)
+
+	// Build the final report.
 	report := store.EvaluationReportData{
-		CampaignID:       campaignID,
-		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
-		GeneratedBy:      "system",
-		CohortSize:       0,
-		CompletedSamples: 0,
-		FailedSamples:    0,
-		Candidates:       []store.CandidateReportData{},
-		GroupedFindings:  []store.FindingGroupData{},
-		Metrics:          store.ReportMetrics{},
+		CampaignID:         campaignID,
+		GeneratedAt:        time.Now().UTC().Format(time.RFC3339),
+		GeneratedBy:        "system",
+		CohortSize:         stats.CohortSize,
+		CompletedSamples:   stats.CompletedSamples,
+		FailedSamples:      stats.FailedSamples,
+		UnavailableSamples: stats.UnavailableSamples,
+		Candidates:         candidates,
+		GroupedFindings:    groupedFindings,
+		Metrics:            metrics,
 	}
 
 	s.encodeJSON(w, http.StatusOK, map[string]interface{}{"campaign": campaign, "report": report})
+}
+
+// computeReportMetrics calculates accuracy metrics from findings and dispositions.
+func computeReportMetrics(stats store.CampaignAttemptStats, dispositions map[string]*store.FindingDisposition) store.ReportMetrics {
+	metrics := store.ReportMetrics{}
+	validCount := 0
+	invalidCount := 0
+	unresolvedCount := 0
+
+	for _, disp := range dispositions {
+		switch disp.Disposition {
+		case "valid":
+			validCount++
+		case "invalid":
+			invalidCount++
+		case "unresolved":
+			unresolvedCount++
+		}
+	}
+
+	metrics.ConfirmedMaterial = validCount
+	metrics.FalsePositives = invalidCount
+	metrics.UnresolvedCount = unresolvedCount
+
+	return metrics
 }
 
 // handleListFindingDispositions handles GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}/dispositions.

@@ -225,3 +225,234 @@ func (s *sqliteStore) ListDispositionsForCampaignSample(ctx context.Context, cam
 	}
 	return dispositions, nil
 }
+
+// ListCampaignDispositions lists all dispositions for a campaign.
+func (s *sqliteStore) ListCampaignDispositions(ctx context.Context, campaignID string) ([]FindingDisposition, error) {
+	rows, err := s.readConn.QueryContext(ctx,
+		`SELECT id, campaign_id, sample_id, candidate_id, finding_id, disposition, evidence, decided_by, decided_at
+		 FROM evaluation_finding_disposition
+		 WHERE campaign_id = ?
+		 ORDER BY decided_at`,
+		campaignID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list campaign dispositions: %w", err)
+	}
+	defer rows.Close()
+
+	var dispositions []FindingDisposition
+	for rows.Next() {
+		var d FindingDisposition
+		if err := rows.Scan(&d.ID, &d.CampaignID, &d.SampleID, &d.CandidateID, &d.FindingID,
+			&d.Disposition, &d.Evidence, &d.DecidedBy, &d.DecidedAt); err != nil {
+			return nil, fmt.Errorf("scan disposition: %w", err)
+		}
+		dispositions = append(dispositions, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dispositions: %w", err)
+	}
+	return dispositions, nil
+}
+
+// CampaignAttemptStats aggregates attempt and finding data for report generation.
+type CampaignAttemptStats struct {
+	CohortSize         int
+	CompletedSamples   int
+	FailedSamples      int
+	UnavailableSamples int
+	Candidates         map[string]*CandidateStats
+	AllFindings        map[string]*StoredFinding
+}
+
+// CandidateStats aggregates findings per candidate.
+type CandidateStats struct {
+	CandidateID       string
+	ModelID           string
+	ModelRevision     string
+	AdapterName       string
+	Runtime           string
+	CompletedAttempts int
+	FailedAttempts    int
+	ActiveAttempts    int
+	AverageDurationMs *int
+	TotalUsageTokens  int
+	Attempts          []*EvaluationAttempt
+}
+
+// StoredFinding represents a finding with its attempt context.
+type StoredFinding struct {
+	FindingID      string
+	AttemptID      string
+	CandidateID    string
+	SampleID       string
+	Severity       string
+	Claim          string
+	Summary        string
+	Evidence       string
+	ExitClass      *EvaluationExitClass
+	Status         *string
+	Disposition    *string
+	DispositionEv  string
+}
+
+// ListCampaignAttempts returns all attempts for a campaign with findings grouped by sample and candidate.
+func (s *sqliteStore) ListCampaignAttempts(ctx context.Context, campaignID string) (CampaignAttemptStats, error) {
+	stats := CampaignAttemptStats{
+		Candidates:  make(map[string]*CandidateStats),
+		AllFindings: make(map[string]*StoredFinding),
+	}
+
+	// Get sample count.
+	var sampleCount int
+	err := s.readConn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM evaluation_sample WHERE campaign_id = ?`, campaignID).Scan(&sampleCount)
+	if err != nil && err != sql.ErrNoRows {
+		return stats, fmt.Errorf("count samples: %w", err)
+	}
+	stats.CohortSize = sampleCount
+
+	// Get all candidates for this campaign.
+	candRows, err := s.readConn.QueryContext(ctx,
+		`SELECT id, identity_json FROM evaluation_candidate WHERE campaign_id = ?`, campaignID)
+	if err != nil {
+		return stats, fmt.Errorf("list candidates: %w", err)
+	}
+	defer candRows.Close()
+
+	for candRows.Next() {
+		var cID, identityJSON string
+		if err := candRows.Scan(&cID, &identityJSON); err != nil {
+			return stats, fmt.Errorf("scan candidate: %w", err)
+		}
+		cs := &CandidateStats{
+			CandidateID: cID,
+			Attempts:    []*EvaluationAttempt{},
+		}
+		var identity map[string]interface{}
+		if err := json.Unmarshal([]byte(identityJSON), &identity); err == nil {
+			if modelID, ok := identity["model_id"].(string); ok {
+				cs.ModelID = modelID
+			}
+			if adapter, ok := identity["adapter_name"].(string); ok {
+				cs.AdapterName = adapter
+			}
+			if runtime, ok := identity["runtime"].(string); ok {
+				cs.Runtime = runtime
+			}
+		}
+		stats.Candidates[cID] = cs
+	}
+	if err := candRows.Err(); err != nil {
+		return stats, fmt.Errorf("iterate candidates: %w", err)
+	}
+
+	// Get all attempts for this campaign.
+	attemptRows, err := s.readConn.QueryContext(ctx, `
+		SELECT ea.id, ea.job_id, ea.state, ea.exit_class, ea.status, ea.duration_ms, ea.usage_tokens,
+		       ej.sample_id, ej.candidate_id
+		FROM evaluation_attempt ea
+		JOIN evaluation_job ej ON ea.job_id = ej.id
+		JOIN evaluation_sample es ON ej.sample_id = es.id
+		WHERE es.campaign_id = ?
+		ORDER BY ea.started_at
+	`, campaignID)
+	if err != nil {
+		return stats, fmt.Errorf("list attempts: %w", err)
+	}
+	defer attemptRows.Close()
+
+	attemptsByID := make(map[string]*EvaluationAttempt)
+	for attemptRows.Next() {
+		var attempt EvaluationAttempt
+		var candidateID, sampleID string
+		var exitClass, status sql.NullString
+		var durationMs, usageTokens sql.NullInt64
+		if err := attemptRows.Scan(&attempt.ID, &attempt.JobID, &attempt.State, &exitClass, &status, &durationMs, &usageTokens,
+			&sampleID, &candidateID); err != nil {
+			return stats, fmt.Errorf("scan attempt: %w", err)
+		}
+		if exitClass.Valid {
+			ec := EvaluationExitClass(exitClass.String)
+			attempt.ExitClass = &ec
+		}
+		if status.Valid {
+			attempt.Status = &status.String
+		}
+		if durationMs.Valid {
+			d := int(durationMs.Int64)
+			attempt.DurationMs = &d
+		}
+		if usageTokens.Valid {
+			d := int(usageTokens.Int64)
+			attempt.UsageTokens = &d
+		}
+		attemptsByID[attempt.ID] = &attempt
+
+		// Update candidate stats.
+		if cand, ok := stats.Candidates[candidateID]; ok {
+			cand.Attempts = append(cand.Attempts, &attempt)
+			if ec := attempt.ExitClass; ec != nil {
+				switch *ec {
+				case EvalExitCompleted:
+					cand.CompletedAttempts++
+				case EvalExitFailed:
+					cand.FailedAttempts++
+				case EvalExitUnavailableSnapshot, EvalExitUnavailableSource:
+					stats.UnavailableSamples++
+				}
+			}
+			if attempt.DurationMs != nil && *attempt.DurationMs > 0 {
+				if cand.AverageDurationMs == nil {
+					d := *attempt.DurationMs
+					cand.AverageDurationMs = &d
+				} else {
+					*cand.AverageDurationMs = (*cand.AverageDurationMs + *attempt.DurationMs) / 2
+				}
+			}
+			if attempt.UsageTokens != nil {
+				cand.TotalUsageTokens += *attempt.UsageTokens
+			}
+		}
+	}
+	if err := attemptRows.Err(); err != nil {
+		return stats, fmt.Errorf("iterate attempts: %w", err)
+	}
+
+	// Get all findings.
+	findingRows, err := s.readConn.QueryContext(ctx, `
+		SELECT ef.finding_id, ef.attempt_id, ef.severity, ef.claim, ef.summary, ef.evidence,
+		       ej.sample_id, ej.candidate_id
+		FROM evaluation_finding ef
+		JOIN evaluation_attempt ea ON ef.attempt_id = ea.id
+		JOIN evaluation_job ej ON ea.job_id = ej.id
+		JOIN evaluation_sample es ON ej.sample_id = es.id
+		WHERE es.campaign_id = ?
+	`, campaignID)
+	if err != nil {
+		return stats, fmt.Errorf("list findings: %w", err)
+	}
+	defer findingRows.Close()
+
+	for findingRows.Next() {
+		var finding StoredFinding
+		var sampleID, candidateID string
+		if err := findingRows.Scan(&finding.FindingID, &finding.AttemptID, &finding.Severity,
+			&finding.Claim, &finding.Summary, &finding.Evidence, &sampleID, &candidateID); err != nil {
+			return stats, fmt.Errorf("scan finding: %w", err)
+		}
+		finding.SampleID = sampleID
+		finding.CandidateID = candidateID
+		if attempt, ok := attemptsByID[finding.AttemptID]; ok {
+			finding.ExitClass = attempt.ExitClass
+			finding.Status = attempt.Status
+		}
+		key := fmt.Sprintf("%s-%s-%s", sampleID, candidateID, finding.FindingID)
+		stats.AllFindings[key] = &finding
+	}
+	if err := findingRows.Err(); err != nil {
+		return stats, fmt.Errorf("iterate findings: %w", err)
+	}
+
+	return stats, nil
+}
