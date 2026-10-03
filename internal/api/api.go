@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/boldfield/odonian/internal/policy"
 	"github.com/boldfield/odonian/internal/store"
 )
 
@@ -640,6 +641,8 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleClaimTask handles POST /tasks/{id}/claim to claim a task as in_progress.
+// Optional research permit parameters: request_id, account_id, work_class. If provided,
+// research admission and claim are performed atomically.
 func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	taskID, ok := s.resolveTaskID(w, r)
 	if !ok {
@@ -647,8 +650,11 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload struct {
-		AgentID string `json:"agent_id"`
-		Model   string `json:"model"`
+		AgentID   string `json:"agent_id"`
+		Model     string `json:"model"`
+		RequestID string `json:"request_id"`
+		AccountID string `json:"account_id"`
+		WorkClass string `json:"work_class"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
@@ -667,7 +673,64 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Claim the task
+	// If research permit parameters are provided, use ClaimTaskWithPermit
+	if payload.RequestID != "" && payload.AccountID != "" && payload.WorkClass != "" {
+		// Fetch the task to get project_id
+		t, err := s.store.GetTask(r.Context(), taskID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+			} else {
+				s.errorResponse(w, http.StatusInternalServerError, "TASK_FETCH_ERROR", "Failed to fetch task")
+			}
+			return
+		}
+
+		permitReq := &store.PermitRequest{
+			RequestID: payload.RequestID,
+			TaskID:    taskID,
+			ProjectID: t.ProjectID,
+			AgentID:   payload.AgentID,
+			Model:     payload.Model,
+			AccountID: payload.AccountID,
+			Class:     policy.WorkClass(payload.WorkClass),
+			LeaseTTL:  s.leaseTTL,
+		}
+
+		task, err := s.store.ClaimTaskWithPermit(r.Context(), taskID, payload.AgentID, payload.Model, s.leaseTTL, permitReq, time.Now())
+		if errors.Is(err, store.ErrNotFound) {
+			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+			return
+		}
+
+		// Check for AdmissionDeniedError
+		var admissionErr *store.AdmissionDeniedError
+		if errors.As(err, &admissionErr) {
+			s.errorResponse(w, http.StatusConflict, "ADMISSION_DENIED", admissionErr.Error())
+			return
+		}
+
+		// Check for ConflictError with specific code
+		var conflictErr *store.ConflictError
+		if errors.As(err, &conflictErr) {
+			s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+			return
+		}
+
+		if errors.Is(err, store.ErrConflict) {
+			s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not claimable")
+			return
+		}
+		if err != nil {
+			s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim task")
+			return
+		}
+
+		s.encodeJSON(w, http.StatusOK, task)
+		return
+	}
+
+	// Claim the task without permit
 	task, err := s.store.ClaimTask(r.Context(), taskID, payload.AgentID, payload.Model, s.leaseTTL)
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
