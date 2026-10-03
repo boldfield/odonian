@@ -582,6 +582,123 @@ func TestSnapshotLeakageExclusion(t *testing.T) {
 	}
 }
 
+// TestRealRoundResolutionWithLeakageCheck verifies that when a cohort uses
+// a FirstRoundResolver to fetch actual submissions, the resolver can prevent
+// later fixes or reviewer findings from entering the staged workspace.
+func TestRealRoundResolutionWithLeakageCheck(t *testing.T) {
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+
+	// Simulate task records with multiple review rounds
+	// The resolver will return the first-round SHA even if later rounds exist
+	taskSubmissions := map[string]map[int]string{
+		"task-reviewed": {
+			1: "original-sha-1",      // first round - original submission
+			2: "fixed-sha-2",         // second round - after rejection
+			3: "further-fixed-sha-3", // third round - latest
+		},
+		"task-clean": {
+			1: "clean-sha-1",
+		},
+	}
+
+	// Resolver returns the first-round submission only
+	resolver := func(taskID string, reviewRound int) (string, bool, error) {
+		if submissions, ok := taskSubmissions[taskID]; ok {
+			if sha, found := submissions[1]; found {
+				return sha, false, nil
+			}
+		}
+		return "", true, nil // unavailable
+	}
+
+	samples := []CohortSampleSelection{
+		{
+			OriginalTaskID:      "task-reviewed",
+			OriginalReviewRound: 1,
+			SubmittedSHA:        "", // Will be resolved
+			SelectionReason:     "task with later rounds - resolver must pin round 1",
+			MateriallyRejected:  true,
+		},
+		{
+			OriginalTaskID:      "task-clean",
+			OriginalReviewRound: 1,
+			SubmittedSHA:        "", // Will be resolved
+			SelectionReason:     "clean submission",
+			MateriallyRejected:  false,
+		},
+	}
+
+	builder := DeterministicCohortBuilder{
+		Version:            1,
+		Samples:            samples,
+		TotalDenominator:   100,
+		SelectionReason:    "test cohort with real round resolution",
+		CreatedAt:          now,
+		FirstRoundResolver: resolver,
+	}
+
+	cohort, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build() failed: %v", err)
+	}
+
+	// Verify that resolver resolved the SHAs
+	// After sorting, task-clean comes before task-reviewed alphabetically
+	if cohort.Samples[0].OriginalTaskID != "task-clean" {
+		t.Errorf("expected first sample to be task-clean after sorting, got %s", cohort.Samples[0].OriginalTaskID)
+	}
+	if cohort.Samples[0].SubmittedSHA != "clean-sha-1" {
+		t.Errorf("expected resolved SHA clean-sha-1 for task-clean, got %s", cohort.Samples[0].SubmittedSHA)
+	}
+	if cohort.Samples[1].OriginalTaskID != "task-reviewed" {
+		t.Errorf("expected second sample to be task-reviewed after sorting, got %s", cohort.Samples[1].OriginalTaskID)
+	}
+	if cohort.Samples[1].SubmittedSHA != "original-sha-1" {
+		t.Errorf("expected resolved SHA original-sha-1 for task-reviewed, got %s", cohort.Samples[1].SubmittedSHA)
+	}
+
+	// Build snapshots and verify they use the resolved SHAs
+	for _, sample := range cohort.Samples {
+		// Provide fetchers that include reviewer finding markers
+		// The snapshot should stage the original, not any later fixes
+		var artifactContent []byte
+		if sample.SubmittedSHA == "original-sha-1" {
+			artifactContent = []byte("// Original implementation\nfunc process() { /* initial */ }")
+		} else if sample.SubmittedSHA == "clean-sha-1" {
+			artifactContent = []byte("// Clean implementation\nfunc process() { /* clean */ }")
+		}
+
+		builder := SnapshotBuilder{
+			SampleID:       "snap-" + sample.OriginalTaskID,
+			OriginalTaskID: sample.OriginalTaskID,
+			SubmittedSHA:   sample.SubmittedSHA,
+			CandidateID:    "test-resolver",
+			ArtifactFetcher: func(sha string) ([]byte, error) {
+				// Verify the SHA is the first-round one, not a later fix
+				if sha == "fixed-sha-2" || sha == "further-fixed-sha-3" {
+					t.Errorf("builder passed later SHA %s instead of first-round", sha)
+				}
+				return artifactContent, nil
+			},
+		}
+
+		snap, err := builder.Build()
+		if err != nil {
+			t.Fatalf("failed to build snapshot for %s: %v", sample.OriginalTaskID, err)
+		}
+
+		// Verify artifact path exists
+		if snap.ArtifactPath != "" {
+			data, _ := os.ReadFile(snap.ArtifactPath)
+			artifactStr := string(data)
+			// Verify no later revision markers appear
+			if strings.Contains(artifactStr, "fixed-sha") || strings.Contains(artifactStr, "reviewer") {
+				t.Errorf("staged artifact should not contain later fixes or reviewer markers")
+			}
+		}
+	}
+}
+
 // TestLeakageWithRejectedAndCleanMix verifies that when a cohort contains
 // both rejected and clean samples, snapshots properly exclude reviewer
 // feedback and preserve only the original artifacts. The MateriallyRejected

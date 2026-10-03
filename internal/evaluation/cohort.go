@@ -289,18 +289,35 @@ func (b *SnapshotBuilder) hashFile(path, workspaceRoot string, h io.Writer) erro
 	return nil
 }
 
+// ProjectSelectionCriteria defines how to select samples from a project.
+type ProjectSelectionCriteria struct {
+	ProjectID       string // explicit project ID for selection
+	SampleCap       int    // finite sample limit
+	RandomSeed      int64  // seed for reproducible random selection
+	IncludeRejected bool   // whether to include materially rejected submissions
+}
+
+// FirstRoundResolver resolves the original first-round submission details for a sample.
+// It returns the submitted SHA, manifest context, and whether the original is unavailable.
+type FirstRoundResolver func(taskID string, reviewRound int) (submittedSHA string, unavailable bool, err error)
+
 // DeterministicCohortBuilder helps construct a reproducible cohort.
-// It sorts samples deterministically and validates their consistency.
+// It sorts samples deterministically, validates their consistency, and optionally
+// resolves first-round submissions from project records.
 type DeterministicCohortBuilder struct {
 	Version          int
 	Samples          []CohortSampleSelection
 	TotalDenominator int
 	SelectionReason  string
 	CreatedAt        string
+	// Optional: for real selection from project records
+	SelectionCriteria  *ProjectSelectionCriteria
+	FirstRoundResolver FirstRoundResolver
 }
 
 // Build creates and validates the cohort manifest, ensuring deterministic
-// sample ordering and consistency.
+// sample ordering and consistency. If FirstRoundResolver is provided, it resolves
+// the actual first-round SHAs instead of trusting caller-provided values.
 func (b *DeterministicCohortBuilder) Build() (CohortManifest, error) {
 	if b.Version == 0 {
 		b.Version = 1
@@ -309,19 +326,38 @@ func (b *DeterministicCohortBuilder) Build() (CohortManifest, error) {
 		return CohortManifest{}, fmt.Errorf("cannot build cohort with no samples")
 	}
 
-	// Sort samples deterministically by task ID and review round
-	sortedSamples := make([]CohortSampleSelection, len(b.Samples))
-	copy(sortedSamples, b.Samples)
-	sort.Slice(sortedSamples, func(i, j int) bool {
-		if sortedSamples[i].OriginalTaskID != sortedSamples[j].OriginalTaskID {
-			return sortedSamples[i].OriginalTaskID < sortedSamples[j].OriginalTaskID
+	// Resolve first-round SHAs if resolver is provided
+	resolvedSamples := make([]CohortSampleSelection, len(b.Samples))
+	copy(resolvedSamples, b.Samples)
+
+	if b.FirstRoundResolver != nil {
+		for i, sample := range resolvedSamples {
+			resolvedSHA, unavailable, err := b.FirstRoundResolver(sample.OriginalTaskID, sample.OriginalReviewRound)
+			if err != nil {
+				return CohortManifest{}, fmt.Errorf("resolve first-round SHA for %s round %d: %w",
+					sample.OriginalTaskID, sample.OriginalReviewRound, err)
+			}
+			if unavailable {
+				resolvedSamples[i].Unavailable = true
+				resolvedSamples[i].SubmittedSHA = ""
+			} else {
+				resolvedSamples[i].SubmittedSHA = resolvedSHA
+				resolvedSamples[i].Unavailable = false
+			}
 		}
-		return sortedSamples[i].OriginalReviewRound < sortedSamples[j].OriginalReviewRound
+	}
+
+	// Sort samples deterministically by task ID and review round
+	sort.Slice(resolvedSamples, func(i, j int) bool {
+		if resolvedSamples[i].OriginalTaskID != resolvedSamples[j].OriginalTaskID {
+			return resolvedSamples[i].OriginalTaskID < resolvedSamples[j].OriginalTaskID
+		}
+		return resolvedSamples[i].OriginalReviewRound < resolvedSamples[j].OriginalReviewRound
 	})
 
 	manifest := CohortManifest{
 		Version:          b.Version,
-		Samples:          sortedSamples,
+		Samples:          resolvedSamples,
 		TotalDenominator: b.TotalDenominator,
 		SelectionReason:  b.SelectionReason,
 		CreatedAt:        b.CreatedAt,
