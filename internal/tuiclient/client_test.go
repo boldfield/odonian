@@ -1391,3 +1391,51 @@ func TestSubmitTaskWithManifest(t *testing.T) {
 		t.Fatalf("SubmitTask failed: %v", err)
 	}
 }
+
+func TestGetResearchStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/research/status" {
+			t.Errorf("expected /research/status, got %s", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"mode": "paced",
+			"pools": []map[string]interface{}{
+				{
+					"account_id":        "acct-1",
+					"active":            5,
+					"active_completion": 2,
+					"deferred":          1,
+					"tokens":            1234.5,
+					"settled_at":        "2026-01-01T00:00:00Z",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	status, err := client.GetResearchStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GetResearchStatus failed: %v", err)
+	}
+
+	if status.Mode != "paced" {
+		t.Errorf("expected mode paced, got %s", status.Mode)
+	}
+	if len(status.Pools) != 1 {
+		t.Errorf("expected 1 pool, got %d", len(status.Pools))
+	}
+	pool := status.Pools[0]
+	if pool.AccountID != "acct-1" {
+		t.Errorf("expected account_id acct-1, got %s", pool.AccountID)
+	}
+	if pool.Tokens != 1234.5 {
+		t.Errorf("expected tokens 1234.5, got %v", pool.Tokens)
+	}
+}
