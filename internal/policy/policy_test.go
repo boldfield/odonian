@@ -1,954 +1,676 @@
 package policy
 
 import (
-	"os"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestAdmissionDisabledMode(t *testing.T) {
-	pe := New(ModeDisabled, []*Pool{})
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("disabled mode should always admit, got %+v", result)
+var t0 = time.Unix(1_000_000, 0)
+
+func at(sec float64) time.Time { return t0.Add(time.Duration(sec * float64(time.Second))) }
+
+func pool(name, acct string, rate float64, burst, limit, reserved int, models ...string) Pool {
+	return Pool{Name: name, AccountID: acct, Models: models, StartRate: rate,
+		BurstCapacity: burst, ConcurrentDispatchLimit: limit, CompletionReserved: reserved}
+}
+
+func cfgOf(mode Mode, pools ...Pool) Config {
+	return Config{Mode: mode, AllowedModels: []string{"haiku", "sonnet", "opus"}, Pools: pools}
+}
+
+func newEval(t *testing.T, now time.Time, cfg Config) *Evaluator {
+	t.Helper()
+	e, err := New(now, cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return e
+}
+
+func eval(t *testing.T, e *Evaluator, now time.Time, model string, class WorkClass) Decision {
+	t.Helper()
+	d, err := e.Evaluate(now, model, class)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	return d
+}
+
+func allModelsPool(rate float64, burst, limit, reserved int) Pool {
+	return pool("p", "acct", rate, burst, limit, reserved, "haiku", "sonnet", "opus")
+}
+
+func TestWorkClassTable(t *testing.T) {
+	cases := []struct {
+		class      WorkClass
+		paced      bool
+		completion bool
+	}{
+		{ResearchWrite, true, false},
+		{ResearchReview, true, true},
+		{ResearchRework, true, true},
+		{ResearchAdjudication, true, true},
+		{BuildWork, false, false},
+		{DesignWork, false, false},
+		{MergeWork, false, false},
+	}
+	for _, c := range cases {
+		if c.class.Paced() != c.paced || c.class.Completion() != c.completion {
+			t.Errorf("%s: paced=%v completion=%v, want %v %v", c.class, c.class.Paced(), c.class.Completion(), c.paced, c.completion)
+		}
 	}
 }
 
-func TestAdmissionUnmappedModel(t *testing.T) {
-	tests := []struct {
-		name     string
-		mode     Mode
-		admitted bool
-	}{
-		{"observe unmapped", ModeObserve, true},
-		{"enforce unmapped", ModeEnforce, false},
+// Every class in every mode, against a pool with exactly one start and one
+// slot available. Paced classes consume it; unpaced classes never touch it.
+func TestClassesByMode(t *testing.T) {
+	classes := []WorkClass{ResearchWrite, ResearchReview, ResearchRework, ResearchAdjudication, BuildWork, DesignWork, MergeWork}
+	for _, mode := range []Mode{ModeDisabled, ModeObserve, ModeEnforce} {
+		for _, class := range classes {
+			t.Run(string(mode)+"/"+string(class), func(t *testing.T) {
+				e := newEval(t, t0, cfgOf(mode, allModelsPool(0.001, 1, 1, 0)))
+				first := eval(t, e, t0, "opus", class)
+				if first.Outcome != OutcomeAdmit || first.Shadow.Outcome != OutcomeAdmit {
+					t.Fatalf("first start: %+v", first)
+				}
+				second := eval(t, e, t0, "opus", class)
+				pacedActive := class.Paced() && mode != ModeDisabled
+
+				if pacedActive {
+					if first.Ticket == nil {
+						t.Fatal("paced start should be tracked")
+					}
+					if second.Shadow.Outcome != OutcomeRetry || second.Shadow.Reason != ReasonConcurrency {
+						t.Fatalf("shadow second = %+v, want concurrency retry", second.Shadow)
+					}
+					wantActual := OutcomeRetry
+					if mode == ModeObserve {
+						wantActual = OutcomeAdmit
+					}
+					if second.Outcome != wantActual {
+						t.Fatalf("second outcome %s, want %s", second.Outcome, wantActual)
+					}
+				} else {
+					if first.Ticket != nil || second.Outcome != OutcomeAdmit || second.Shadow.Outcome != OutcomeAdmit {
+						t.Fatalf("unpaced/disabled must be untouched: first=%+v second=%+v", first, second)
+					}
+					// And it must not have consumed anything a paced start needs.
+					if got := eval(t, e, t0, "opus", ResearchWrite); mode != ModeDisabled && got.Outcome != OutcomeAdmit {
+						t.Fatalf("unpaced work consumed allowance: %+v", got)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestUnknownWorkClass(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(1, 1, 1, 0)))
+	if _, err := e.Evaluate(t0, "opus", WorkClass("bogus")); err == nil {
+		t.Fatal("expected error for unknown class")
+	}
+}
+
+func TestUnmappedModel(t *testing.T) {
+	cfg := cfgOf(ModeEnforce, pool("p", "a", 1, 1, 1, 0, "opus"))
+	cfg.AllowedModels = []string{"opus"}
+	e := newEval(t, t0, cfg)
+	d := eval(t, e, t0, "gpt", ResearchWrite)
+	if d.Outcome != OutcomeUnmapped || !d.NotBefore.IsZero() || d.RetryAfter != 0 || d.Ticket != nil {
+		t.Fatalf("enforce unmapped = %+v", d)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pe := New(tt.mode, []*Pool{
-				{
-					Name:                    "default",
-					Models:                  map[string]bool{"haiku": true},
-					StartRate:               1.0,
-					BurstCapacity:           10,
-					ConcurrentDispatchLimit: 5,
-				},
-			})
-			result := pe.CheckAdmission("unknown-model", ResearchWrite)
-			if result.Admitted != tt.admitted {
-				t.Errorf("mode %s: expected admitted=%v, got %v", tt.mode, tt.admitted, result.Admitted)
+	cfg.Mode = ModeObserve
+	e = newEval(t, t0, cfg)
+	d = eval(t, e, t0, "gpt", ResearchWrite)
+	if d.Outcome != OutcomeAdmit || d.Shadow.Outcome != OutcomeUnmapped {
+		t.Fatalf("observe unmapped = %+v", d)
+	}
+}
+
+func TestEnforceBurstThenRate(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(0.5, 3, 100, 0)))
+	for i := 0; i < 3; i++ {
+		if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeAdmit {
+			t.Fatalf("burst start %d: %+v", i, d)
+		}
+	}
+	d := eval(t, e, t0, "opus", ResearchWrite)
+	if d.Outcome != OutcomeDefer || d.Reason != ReasonRate || !d.NotBefore.Equal(at(2)) || d.Ticket != nil {
+		t.Fatalf("after burst = %+v, want defer rate until +2s", d)
+	}
+	if d := eval(t, e, at(2).Add(-time.Millisecond), "opus", ResearchWrite); d.Outcome != OutcomeDefer {
+		t.Fatalf("just before NotBefore: %+v", d)
+	}
+	if d := eval(t, e, d.NotBefore, "opus", ResearchWrite); d.Outcome != OutcomeAdmit {
+		t.Fatalf("at NotBefore: %+v", d)
+	}
+}
+
+func admitsOver(t *testing.T, e *Evaluator, from, to, step float64, class WorkClass) int {
+	t.Helper()
+	n := 0
+	steps := int((to-from)/step + 0.5)
+	for i := 0; i <= steps; i++ {
+		d := eval(t, e, at(from+float64(i)*step), "opus", class)
+		if d.Outcome == OutcomeAdmit {
+			n++
+			e.Release(d.Ticket)
+		}
+	}
+	return n
+}
+
+func TestFractionalRefillExactCounts(t *testing.T) {
+	cases := []struct {
+		name      string
+		rate      float64
+		burst     int
+		step, end float64
+		want      int
+	}{
+		// Bursts of denied checks must not be credited the same time twice.
+		{"0.1/s burst1 checked every 100ms for 10s", 0.1, 1, 0.1, 10, 2},
+		{"0.1/s burst1 checked every 1s for 10s", 0.1, 1, 1, 10, 2},
+		{"0.1/s burst1 checked every 1s for 9s", 0.1, 1, 1, 9, 1},
+		{"0.25/s burst2 checked every 1s for 8s", 0.25, 2, 1, 8, 4},
+		{"2/s burst1 checked every 0.25s for 3s", 2, 1, 0.25, 3, 7},
+		{"0.001/s burst3 for 100s", 0.001, 3, 1, 100, 3},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEval(t, at(0), cfgOf(ModeEnforce, allModelsPool(c.rate, c.burst, 100, 0)))
+			if got := admitsOver(t, e, 0, c.end, c.step, ResearchWrite); got != c.want {
+				t.Fatalf("admits = %d, want %d", got, c.want)
 			}
 		})
 	}
 }
 
-func TestRateLimitingWithTokenBucket(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0, // 1 start per second
-			BurstCapacity:           3,
-			ConcurrentDispatchLimit: 10,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
-
-	// Should admit the first 3 (burst capacity)
-	for i := 0; i < 3; i++ {
-		result := pe.CheckAdmission("haiku", ResearchWrite)
-		if !result.Admitted {
-			t.Fatalf("expected admission %d, got denied: %+v", i+1, result)
-		}
-		pe.RecordAdmission("haiku", ResearchWrite)
+func TestIdleBurstCeiling(t *testing.T) {
+	e := newEval(t, at(0), cfgOf(ModeEnforce, allModelsPool(1, 4, 100, 0)))
+	for i := 0; i < 4; i++ {
+		eval(t, e, at(0), "opus", ResearchWrite)
 	}
-
-	// Next attempt should be denied (out of tokens)
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("expected denial after burst capacity exhausted, got admitted")
-	}
-	if result.Reason != ReasonRateLimit {
-		t.Errorf("expected rate limit reason, got %s", result.Reason)
-	}
-
-	// Move time forward by 1 second - should gain 1 token
-	now = now.Add(1 * time.Second)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("after 1 second, should have 1 new token")
-	}
-}
-
-func TestRateLimitClockRollback(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           1,
-			ConcurrentDispatchLimit: 10,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
-
-	// Consume the burst token
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("initial token should be available")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Move forward 1 second and consume it
-	now = now.Add(1 * time.Second)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("should admit after refill")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Roll clock backward - should NOT refill
-	now = now.Add(-500 * time.Millisecond)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("clock rollback should not grant new tokens")
-	}
-
-	// Move forward again - should refill normally from the rollback point
-	now = now.Add(2 * time.Second)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("should admit after sufficient time forward")
-	}
-}
-
-func TestConcurrencyLimit(t *testing.T) {
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               100.0, // High rate to avoid rate limiting
-			BurstCapacity:           1000,
-			ConcurrentDispatchLimit: 3,
-		},
-	})
-
-	// Admit up to concurrency limit
-	for i := 0; i < 3; i++ {
-		result := pe.CheckAdmission("haiku", ResearchWrite)
-		if !result.Admitted {
-			t.Fatalf("admission %d should succeed", i+1)
-		}
-		pe.RecordAdmission("haiku", ResearchWrite)
-	}
-
-	// Next should be denied
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("should deny when concurrency limit reached")
-	}
-	if result.Reason != ReasonConcurrency {
-		t.Errorf("expected concurrency reason, got %s", result.Reason)
-	}
-	if result.RetryAfterMs == 0 {
-		t.Errorf("expected retry interval for concurrency deferral")
-	}
-
-	// Release one and retry
-	pe.ReleaseAdmission("haiku", ResearchWrite)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("should admit after release")
-	}
-}
-
-func TestCompletionReservation(t *testing.T) {
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               100.0,
-			BurstCapacity:           1000,
-			ConcurrentDispatchLimit: 5,
-			CompletionReserved:      2,
-		},
-	})
-
-	// First-pass work can only use (total - reserved) = 3 slots
-	// Admit 3 fresh starts
-	for i := 0; i < 3; i++ {
-		result := pe.CheckAdmission("haiku", ResearchWrite)
-		if !result.Admitted {
-			t.Fatalf("fresh admission %d should succeed", i+1)
-		}
-		pe.RecordAdmission("haiku", ResearchWrite)
-	}
-
-	// Try to admit another fresh start - should fail (reserved capacity held)
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("should deny fresh start when reserved capacity held")
-	}
-	if result.Reason != ReasonConcurrency {
-		t.Errorf("expected concurrency reason, got %s", result.Reason)
-	}
-
-	// Completion work can use up to total limit = 5 slots
-	// With 3 fresh starts, we have 2 slots available for completion
-	for i := 0; i < 2; i++ {
-		result := pe.CheckAdmission("haiku", ResearchReview)
-		if !result.Admitted {
-			t.Fatalf("completion admission %d should succeed", i+1)
-		}
-		pe.RecordAdmission("haiku", ResearchReview)
-	}
-
-	// We're now at total capacity (3 fresh + 2 completion = 5)
-	// Next completion should fail (total limit reached)
-	result = pe.CheckAdmission("haiku", ResearchReview)
-	if result.Admitted {
-		t.Errorf("should deny completion when total capacity exhausted")
-	}
-	if result.Reason != ReasonConcurrency {
-		t.Errorf("expected concurrency reason, got %s", result.Reason)
-	}
-
-	// Release a fresh start, now we should be able to admit completion
-	pe.ReleaseAdmission("haiku", ResearchWrite)
-	result = pe.CheckAdmission("haiku", ResearchReview)
-	if !result.Admitted {
-		t.Errorf("should admit completion after fresh start release")
-	}
-}
-
-func TestMultiplePools(t *testing.T) {
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "pool1",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           2,
-			ConcurrentDispatchLimit: 2,
-		},
-		{
-			Name:                    "pool2",
-			Models:                  map[string]bool{"opus": true},
-			AccountID:               "acct2",
-			StartRate:               0.5,
-			BurstCapacity:           1,
-			ConcurrentDispatchLimit: 1,
-		},
-	})
-
-	// Haiku and opus should have independent limits
-	// Haiku: burst of 2
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("haiku admission 1 failed")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("haiku admission 2 failed")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Opus: burst of 1
-	result = pe.CheckAdmission("opus", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("opus admission 1 failed")
-	}
-	pe.RecordAdmission("opus", ResearchWrite)
-
-	// Both at their limits now
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("haiku should be at concurrency limit")
-	}
-
-	result = pe.CheckAdmission("opus", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("opus should be at concurrency limit")
-	}
-}
-
-func TestFractionalRefill(t *testing.T) {
-	now := time.Now()
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               0.5, // 1 per 2 seconds
-			BurstCapacity:           1,
-			ConcurrentDispatchLimit: 10,
-		},
-	})
-	pe.SetClock(func() time.Time { return now })
-
-	// Consume initial token
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("initial token unavailable")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// After 1 second, should have 0.5 tokens (not enough)
-	now = now.Add(1 * time.Second)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("with 0.5 tokens, should be denied")
-	}
-
-	// After 2 more seconds (3 total), should have 1.5 tokens
-	now = now.Add(2 * time.Second)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("with 1.5 tokens, should be admitted")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Token count should be capped at burst capacity
-	// Current: 1.5 - 1.0 (just consumed) + some fractional from the last refill
-	// Next check should have some tokens
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("after consuming, should need more time")
-	}
-}
-
-func TestBurstCeiling(t *testing.T) {
-	now := time.Now()
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           3,
-			ConcurrentDispatchLimit: 10,
-		},
-	})
-	pe.SetClock(func() time.Time { return now })
-
-	// Consume initial burst
-	for i := 0; i < 3; i++ {
-		result := pe.CheckAdmission("haiku", ResearchWrite)
-		if !result.Admitted {
-			t.Fatalf("burst %d failed", i+1)
-		}
-		pe.RecordAdmission("haiku", ResearchWrite)
-	}
-
-	// Wait 100 seconds - should NOT exceed burst ceiling
-	now = now.Add(100 * time.Second)
-	for i := 0; i < 3; i++ {
-		result := pe.CheckAdmission("haiku", ResearchWrite)
-		if !result.Admitted {
-			t.Fatalf("after 100s wait, should have capacity, iteration %d", i+1)
-		}
-		pe.RecordAdmission("haiku", ResearchWrite)
-	}
-
-	// Next should be denied (at ceiling)
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("should hit burst ceiling limit")
-	}
-}
-
-func TestConfigurationChangesWithoutMintingCapacity(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           2,
-			ConcurrentDispatchLimit: 10,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
-
-	// Consume burst
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("admission 1 failed")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("admission 2 failed")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Exhausted
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Fatal("should be exhausted")
-	}
-
-	// Reconfigure with lower burst - should stay exhausted
-	err := pe.Reconfigure([]*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           1, // lower burst
-			ConcurrentDispatchLimit: 10,
-		},
-	})
-	if err != nil {
-		t.Fatalf("reconfigure failed: %v", err)
-	}
-
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("after reconfigure with lower burst, should still be exhausted")
-	}
-
-	// Reconfigure with higher burst - should NOT mint new capacity
-	err = pe.Reconfigure([]*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           5, // higher burst
-			ConcurrentDispatchLimit: 10,
-		},
-	})
-	if err != nil {
-		t.Fatalf("reconfigure failed: %v", err)
-	}
-
-	// Move forward by 1 second to earn exactly 1 token
-	now = now.Add(1 * time.Second)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("after 1 second refill, should admit 1 token")
-	}
-
-	// Next should fail (no more tokens)
-	pe.RecordAdmission("haiku", ResearchWrite)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("should not have more tokens immediately after")
-	}
-}
-
-func TestFractionalRefillExactCounts(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               0.1, // 1 token per 10 seconds
-			BurstCapacity:           1,
-			ConcurrentDispatchLimit: 10,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
-
-	// Consume initial burst token
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("initial token should be available")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Check every 100ms for 10 seconds - should get exactly 1 more token
-	admitCount := 0
-	for i := 0; i < 100; i++ {
-		now = now.Add(100 * time.Millisecond)
-		result = pe.CheckAdmission("haiku", ResearchWrite)
-		if result.Admitted {
-			admitCount++
-			pe.RecordAdmission("haiku", ResearchWrite)
-		}
-	}
-
-	// At 0.1 tokens/second, after 10 seconds we should have earned exactly 1 token
-	if admitCount != 1 {
-		t.Errorf("with 0.1 tokens/sec over 10s, expected 1 admission, got %d", admitCount)
-	}
-}
-
-func TestClockRollbackAndRecovery(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0, // 1 token per second
-			BurstCapacity:           2,
-			ConcurrentDispatchLimit: 10,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
-
-	// Consume initial burst (2 tokens)
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("initial token 1 should be available")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("initial token 2 should be available")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Move forward 1 second and consume
-	now = now.Add(1 * time.Second)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("should admit after 1 second")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Roll clock back by 100ms
-	now = now.Add(-100 * time.Millisecond)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("clock rollback should not grant new tokens")
-	}
-
-	// Move forward by 1.1 seconds (net +1 second from start of rollback)
-	now = now.Add(1100 * time.Millisecond)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("after net +1 second from start, should admit")
-	}
-
-	// The next immediate check should fail (no more tokens earned)
-	pe.RecordAdmission("haiku", ResearchWrite)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("should not have more tokens immediately after")
-	}
-}
-
-func TestMultiPoolEnforceValidConfig(t *testing.T) {
-	jsonStr := `{
-		"pool_a": {
-			"account_id": "acct1",
-			"models": ["haiku"],
-			"start_rate": 1.0,
-			"burst_capacity": 5,
-			"concurrent_dispatch_limit": 3,
-			"completion_reserved": 1
-		},
-		"pool_b": {
-			"account_id": "acct2",
-			"models": ["sonnet", "opus"],
-			"start_rate": 0.5,
-			"burst_capacity": 2,
-			"concurrent_dispatch_limit": 2,
-			"completion_reserved": 1
-		}
-	}`
-
-	os.Setenv("ODONIAN_RESEARCH_POOLS", jsonStr)
-	os.Setenv("ODONIAN_RESEARCH_POLICY_MODE", string(ModeEnforce))
-	defer func() {
-		os.Unsetenv("ODONIAN_RESEARCH_POOLS")
-		os.Unsetenv("ODONIAN_RESEARCH_POLICY_MODE")
-	}()
-
-	allowedModels := map[string]bool{
-		"haiku":  true,
-		"sonnet": true,
-		"opus":   true,
-	}
-
-	config, err := ParseConfig(allowedModels)
-	if err != nil {
-		t.Fatalf("ParseConfig failed for valid multi-pool config: %v", err)
-	}
-
-	if len(config.Pools) != 2 {
-		t.Fatalf("expected 2 pools, got %d", len(config.Pools))
-	}
-
-	// Create evaluator and test independent pools
-	pe := New(config.Mode, config.Pools)
-
-	// Haiku: pool_a, limit 3, reserved 1, so first-pass max is 2
-	pe.CheckAdmission("haiku", ResearchWrite)
-	pe.RecordAdmission("haiku", ResearchWrite)
-	pe.CheckAdmission("haiku", ResearchWrite)
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Third fresh start should fail (at limit - reserved)
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("haiku pool: should block third fresh start")
-	}
-
-	// Sonnet: pool_b, limit 2, reserved 1, so first-pass max is 1
-	result = pe.CheckAdmission("sonnet", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("sonnet pool: first fresh start should succeed")
-	}
-	pe.RecordAdmission("sonnet", ResearchWrite)
-
-	// Second should fail (at limit - reserved)
-	result = pe.CheckAdmission("sonnet", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("sonnet pool: should block second fresh start")
-	}
-}
-
-func TestUnmappedModelEnforceReason(t *testing.T) {
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           10,
-			ConcurrentDispatchLimit: 5,
-		},
-	})
-
-	result := pe.CheckAdmission("unknown-model", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("unmapped model in enforce mode should be rejected")
-	}
-	if result.Reason != ReasonUnmappedModel {
-		t.Errorf("expected ReasonUnmappedModel, got %s", result.Reason)
-	}
-	if !result.NotBefore.IsZero() {
-		t.Errorf("unmapped model should not set NotBefore")
-	}
-}
-
-func TestTokenBucketNoCapacityMinting(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               0.1, // 1 token per 10 seconds
-			BurstCapacity:           1,
-			ConcurrentDispatchLimit: 10,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
-
-	// Consume burst
-	pe.CheckAdmission("haiku", ResearchWrite)
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Check 20 times at 100ms intervals - should NOT accumulate extra tokens
-	denialCount := 0
+	// A very long idle period refills to the burst and no further.
+	n := 0
 	for i := 0; i < 20; i++ {
-		now = now.Add(100 * time.Millisecond)
-		result := pe.CheckAdmission("haiku", ResearchWrite)
-		if !result.Admitted {
-			denialCount++
+		if eval(t, e, at(86400), "opus", ResearchWrite).Outcome == OutcomeAdmit {
+			n++
 		}
 	}
-
-	// All 20 should be denied (only 0.2 tokens earned, not enough for 1)
-	if denialCount != 20 {
-		t.Errorf("expected 20 denials over 2 seconds at 0.1 tokens/sec, got %d admissions", 20-denialCount)
-	}
-
-	// After 10 total seconds, should have exactly 1 token earned
-	now = now.Add(8 * time.Second) // total 10 seconds from start
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("after 10 seconds at 0.1 tokens/sec, should have 1 token")
+	if n != 4 {
+		t.Fatalf("admits after long idle = %d, want burst of 4", n)
 	}
 }
 
-// TestFirstPassWithCompletionAtCeiling tests that first-pass work respects total ceiling
-// even when completion work is at the ceiling.
-func TestFirstPassWithCompletionAtCeiling(t *testing.T) {
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               100.0,
-			BurstCapacity:           1000,
-			ConcurrentDispatchLimit: 2,
-			CompletionReserved:      1,
-		},
-	})
-
-	// Admit 2 completion work (uses all capacity)
-	for i := 0; i < 2; i++ {
-		result := pe.CheckAdmission("haiku", ResearchReview)
-		if !result.Admitted {
-			t.Fatalf("completion admission %d should succeed", i+1)
-		}
-		pe.RecordAdmission("haiku", ResearchReview)
-	}
-
-	// Now we're at total capacity (2 completion work)
-	// Try to admit first-pass work - should fail (total ceiling exceeded)
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("should deny first-pass when total ceiling reached")
-	}
-	if result.Reason != ReasonConcurrency {
-		t.Errorf("expected concurrency reason, got %s", result.Reason)
+func TestClockRollback(t *testing.T) {
+	for _, mode := range []Mode{ModeEnforce, ModeObserve} {
+		t.Run(string(mode), func(t *testing.T) {
+			e := newEval(t, at(1000), cfgOf(mode, allModelsPool(0.1, 2, 100, 0)))
+			count := func(now float64, n int) int {
+				got := 0
+				for i := 0; i < n; i++ {
+					d := eval(t, e, at(now), "opus", ResearchWrite)
+					if d.Shadow.Outcome == OutcomeAdmit {
+						got++
+					}
+				}
+				return got
+			}
+			total := count(1000, 1) // burst token 1
+			total += count(900, 3)  // rolled back: burst token 2 only
+			if total != 2 {
+				t.Fatalf("admits before recovery = %d, want 2", total)
+			}
+			// Rolled-back time must not have moved the high-water mark:
+			// 10s of real time past 1000 earns exactly one token.
+			if got := count(1010, 3); got != 1 {
+				t.Fatalf("admits after clock recovers = %d, want 1", got)
+			}
+		})
 	}
 }
 
-// TestObserveModeNeverDenies tests that observe mode always admits.
-func TestObserveModeNeverDenies(t *testing.T) {
-	now := time.Now()
-	pe := New(ModeObserve, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               0.01, // very slow rate
-			BurstCapacity:           1,
-			ConcurrentDispatchLimit: 1,
-		},
-	})
-	pe.SetClock(func() time.Time { return now })
-
-	// Admit first one
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("first check should admit")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Try many more - should all be admitted in observe mode
-	for i := 0; i < 10; i++ {
-		result = pe.CheckAdmission("haiku", ResearchWrite)
-		if !result.Admitted {
-			t.Errorf("observe mode iteration %d: should admit", i+1)
-		}
+func TestRollbackDeferralIsRelativeToHighWaterMark(t *testing.T) {
+	e := newEval(t, at(1000), cfgOf(ModeEnforce, allModelsPool(0.1, 1, 100, 0)))
+	eval(t, e, at(1000), "opus", ResearchWrite)
+	d := eval(t, e, at(500), "opus", ResearchWrite)
+	if d.Outcome != OutcomeDefer || !d.NotBefore.Equal(at(1010)) {
+		t.Fatalf("rolled-back deferral = %+v, want NotBefore +1010", d)
 	}
 }
 
-// TestWorkClassesCovered tests that all work classes behave correctly.
-func TestWorkClassesCovered(t *testing.T) {
-	tests := []struct {
-		name     string
-		class    WorkClass
-		admitted bool
-		enforced bool
+func TestReservationSplit(t *testing.T) {
+	type step struct {
+		class WorkClass
+		want  Outcome
+		why   Reason
+	}
+	cases := []struct {
+		name    string
+		limit   int
+		reserve int
+		steps   []step
 	}{
-		{"ResearchWrite", ResearchWrite, true, true},
-		{"ResearchReview", ResearchReview, true, true},
-		{"BuildDesign", BuildDesign, true, false}, // always admitted, not paced
+		{"writers stop at limit-reserved, leaving the reserve", 3, 1, []step{
+			{ResearchWrite, OutcomeAdmit, ""},
+			{ResearchWrite, OutcomeAdmit, ""},
+			{ResearchWrite, OutcomeRetry, ReasonReservedCapacity},
+		}},
+		{"completion may use the whole ceiling, not beyond", 3, 1, []step{
+			{ResearchReview, OutcomeAdmit, ""},
+			{ResearchRework, OutcomeAdmit, ""},
+			{ResearchAdjudication, OutcomeAdmit, ""},
+			{ResearchReview, OutcomeRetry, ReasonConcurrency},
+		}},
+		{"writers cannot borrow reserve while completion is idle", 2, 1, []step{
+			{ResearchWrite, OutcomeAdmit, ""},
+			{ResearchWrite, OutcomeRetry, ReasonReservedCapacity},
+			{ResearchReview, OutcomeAdmit, ""},
+		}},
+		{"completion at the ceiling also blocks a writer on the total", 2, 1, []step{
+			{ResearchReview, OutcomeAdmit, ""},
+			{ResearchReview, OutcomeAdmit, ""},
+			{ResearchWrite, OutcomeRetry, ReasonConcurrency},
+		}},
+		{"completion that spilled into writer slots blocks a writer", 2, 1, []step{
+			{ResearchReview, OutcomeAdmit, ""},
+			{ResearchWrite, OutcomeAdmit, ""},
+			{ResearchWrite, OutcomeRetry, ReasonConcurrency},
+		}},
+		{"reserve equal to limit makes a review-only pool", 2, 2, []step{
+			{ResearchWrite, OutcomeRetry, ReasonReservedCapacity},
+			{ResearchReview, OutcomeAdmit, ""},
+			{ResearchReview, OutcomeAdmit, ""},
+			{ResearchReview, OutcomeRetry, ReasonConcurrency},
+		}},
+		{"no reservation: writers use the full limit", 2, 0, []step{
+			{ResearchWrite, OutcomeAdmit, ""},
+			{ResearchWrite, OutcomeAdmit, ""},
+			{ResearchWrite, OutcomeRetry, ReasonConcurrency},
+		}},
 	}
-
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           10,
-			ConcurrentDispatchLimit: 10,
-		},
-	})
-
-	for _, tt := range tests {
-		result := pe.CheckAdmission("haiku", tt.class)
-		if !result.Admitted {
-			t.Errorf("%s: expected admitted, got denied", tt.name)
-		}
-
-		// BuildDesign work should not affect concurrency
-		if tt.class != BuildDesign {
-			pe.RecordAdmission("haiku", tt.class)
-		}
-	}
-
-	// Check that only ResearchWrite and ResearchReview affected concurrency
-	// BuildDesign did not count
-	pe2 := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               100.0,
-			BurstCapacity:           1000,
-			ConcurrentDispatchLimit: 2,
-		},
-	})
-
-	// Admit 2 research writes
-	for i := 0; i < 2; i++ {
-		result := pe2.CheckAdmission("haiku", ResearchWrite)
-		if !result.Admitted {
-			t.Fatalf("research write admission %d should succeed", i+1)
-		}
-		pe2.RecordAdmission("haiku", ResearchWrite)
-	}
-
-	// BuildDesign should still be admitted even though we're at capacity
-	result := pe2.CheckAdmission("haiku", BuildDesign)
-	if !result.Admitted {
-		t.Errorf("build/design should always be admitted, even at capacity")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(1, 100, c.limit, c.reserve)))
+			for i, s := range c.steps {
+				d := eval(t, e, t0, "opus", s.class)
+				if d.Outcome != s.want || d.Reason != s.why {
+					t.Fatalf("step %d (%s): %s/%s, want %s/%s", i, s.class, d.Outcome, d.Reason, s.want, s.why)
+				}
+				if s.want == OutcomeRetry && d.RetryAfter != DefaultConcurrencyRetry {
+					t.Fatalf("step %d RetryAfter = %v", i, d.RetryAfter)
+				}
+			}
+		})
 	}
 }
 
-func TestObserveModeReportsRateLimitDecisions(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeObserve, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           1,
-			ConcurrentDispatchLimit: 10,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
-
-	// Consume the burst token (in observe mode, still admits)
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("observe mode should admit during burst")
+func TestConcurrencyRetrySpendsNoToken(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(0.001, 2, 1, 0)))
+	first := eval(t, e, t0, "opus", ResearchWrite)
+	for i := 0; i < 5; i++ {
+		if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeRetry {
+			t.Fatalf("expected retry, got %+v", d)
+		}
 	}
-	// Simulate an admission happening externally
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Move forward by 100ms - not enough for a full token at 1/sec
-	now = now.Add(100 * time.Millisecond)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("observe mode should admit even if rate-limited")
-	}
-	if result.Reason != ReasonRateLimit {
-		t.Errorf("observe mode should report rate limit reason, got %s", result.Reason)
-	}
-
-	// Move forward by 1 second total - should have 1 new token
-	now = now.Add(900 * time.Millisecond)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("observe mode should admit after refill")
-	}
-	if result.Reason != "" && result.Reason != "admit" {
-		t.Errorf("observe mode should not report a limit reason when tokens available, got %s", result.Reason)
+	e.Release(first.Ticket)
+	if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeAdmit {
+		t.Fatalf("second burst token should remain: %+v", d)
 	}
 }
 
-func TestReconfigurePoolRemovalAndReadding(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           10,
-			ConcurrentDispatchLimit: 10,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
-
-	// Reconfigure to remove the pool
-	err := pe.Reconfigure([]*Pool{})
-	if err != nil {
-		t.Fatalf("reconfigure to remove pool failed: %v", err)
-	}
-
-	// Re-add the pool with lower burst (should start fresh, not keep old burst)
-	err = pe.Reconfigure([]*Pool{
-		{
-			Name:                    "main",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               1.0,
-			BurstCapacity:           1, // Lower than before
-			ConcurrentDispatchLimit: 10,
-		},
-	})
-	if err != nil {
-		t.Fatalf("reconfigure to re-add pool failed: %v", err)
-	}
-
-	// Should only have 1 token (new burst), not the old 10
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("should admit with new burst capacity")
-	}
-	pe.RecordAdmission("haiku", ResearchWrite)
-
-	// Next should fail (no more tokens)
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("should be at capacity after using the 1 token")
+func TestConfiguredRetryAfter(t *testing.T) {
+	cfg := cfgOf(ModeEnforce, allModelsPool(1, 5, 1, 0))
+	cfg.ConcurrencyRetry = 7 * time.Second
+	e := newEval(t, t0, cfg)
+	eval(t, e, t0, "opus", ResearchWrite)
+	if d := eval(t, e, t0, "opus", ResearchWrite); d.RetryAfter != 7*time.Second {
+		t.Fatalf("RetryAfter = %v", d.RetryAfter)
 	}
 }
 
-func TestReconfigureAddsNewModelsToPool(t *testing.T) {
-	now := time.Unix(1000, 0)
-	pe := New(ModeEnforce, []*Pool{
-		{
-			Name:                    "pool_a",
-			Models:                  map[string]bool{"haiku": true},
-			AccountID:               "acct1",
-			StartRate:               100.0,
-			BurstCapacity:           10,
-			ConcurrentDispatchLimit: 2,
-		},
-	}, now)
-	pe.SetClock(func() time.Time { return now })
+func TestReleaseIsIdempotentAndScoped(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(1, 100, 1, 0)))
+	other := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(1, 100, 1, 0)))
+	a := eval(t, e, t0, "opus", ResearchWrite)
 
-	// Admit haiku
-	result := pe.CheckAdmission("haiku", ResearchWrite)
-	if !result.Admitted {
-		t.Fatal("haiku should be admitted")
+	e.Release(nil)
+	other.Release(a.Ticket) // wrong evaluator: ignored
+	if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeRetry {
+		t.Fatalf("foreign release freed a slot: %+v", d)
 	}
-	pe.RecordAdmission("haiku", ResearchWrite)
+	e.Release(a.Ticket)
+	e.Release(a.Ticket) // double release must not free a second slot
+	b := eval(t, e, t0, "opus", ResearchWrite)
+	if b.Outcome != OutcomeAdmit {
+		t.Fatalf("release did not free slot: %+v", b)
+	}
+	if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeRetry {
+		t.Fatalf("double release over-freed: %+v", d)
+	}
+}
 
-	// Reconfigure: add opus to pool_a
-	err := pe.Reconfigure([]*Pool{
-		{
-			Name:                    "pool_a",
-			Models:                  map[string]bool{"haiku": true, "opus": true},
-			AccountID:               "acct1",
-			StartRate:               100.0,
-			BurstCapacity:           10,
-			ConcurrentDispatchLimit: 2,
-		},
+func TestReleaseDoesNotRefundStart(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(0.001, 1, 5, 0)))
+	d := eval(t, e, t0, "opus", ResearchWrite)
+	e.Release(d.Ticket)
+	if got := eval(t, e, t0, "opus", ResearchWrite); got.Outcome != OutcomeDefer {
+		t.Fatalf("release refunded a start: %+v", got)
+	}
+}
+
+func TestAliasesShareOnePool(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeEnforce,
+		pool("shared", "anthropic", 0.001, 2, 10, 0, "opus", "sonnet"),
+		pool("other", "meta", 0.001, 1, 10, 0, "haiku")))
+	eval(t, e, t0, "opus", ResearchWrite)
+	eval(t, e, t0, "sonnet", ResearchWrite)
+	if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeDefer {
+		t.Fatalf("aliases did not share allowance: %+v", d)
+	}
+	if d := eval(t, e, t0, "haiku", ResearchWrite); d.Outcome != OutcomeAdmit {
+		t.Fatalf("other account affected: %+v", d)
+	}
+}
+
+func TestObserveNeverDeniesAndReportsShadow(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeObserve, allModelsPool(0.001, 1, 100, 0)))
+	shadow := map[Outcome]int{}
+	for i := 0; i < 5; i++ {
+		d := eval(t, e, t0, "opus", ResearchWrite)
+		if d.Outcome != OutcomeAdmit {
+			t.Fatalf("observe denied: %+v", d)
+		}
+		shadow[d.Shadow.Outcome]++
+		if d.Shadow.Outcome == OutcomeDefer && (d.Shadow.Reason != ReasonRate || d.Shadow.NotBefore.IsZero()) {
+			t.Fatalf("bad shadow deferral: %+v", d.Shadow)
+		}
+	}
+	if shadow[OutcomeAdmit] != 1 || shadow[OutcomeDefer] != 4 {
+		t.Fatalf("shadow counts = %v, want 1 admit and 4 defer", shadow)
+	}
+}
+
+func TestObserveShadowConcurrencyAndReservation(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeObserve, allModelsPool(1, 100, 2, 1)))
+	w1 := eval(t, e, t0, "opus", ResearchWrite)
+	w2 := eval(t, e, t0, "opus", ResearchWrite)
+	if w1.Shadow.Outcome != OutcomeAdmit || w2.Shadow.Reason != ReasonReservedCapacity || w2.Outcome != OutcomeAdmit {
+		t.Fatalf("w1=%+v w2=%+v", w1, w2)
+	}
+	c := eval(t, e, t0, "opus", ResearchReview)
+	if c.Shadow.Reason != ReasonConcurrency {
+		t.Fatalf("review shadow = %+v (two writers are running)", c.Shadow)
+	}
+}
+
+func TestDisabledTracksNothing(t *testing.T) {
+	e := newEval(t, t0, cfgOf(ModeDisabled, allModelsPool(0.001, 1, 1, 0)))
+	for i := 0; i < 10; i++ {
+		d := eval(t, e, t0, "opus", ResearchWrite)
+		if d.Outcome != OutcomeAdmit || d.Ticket != nil {
+			t.Fatalf("disabled: %+v", d)
+		}
+	}
+}
+
+func TestReconfigure(t *testing.T) {
+	drain := func(e *Evaluator, now time.Time) int {
+		n := 0
+		for i := 0; i < 50; i++ {
+			d := eval(t, e, now, "opus", ResearchWrite)
+			if d.Outcome != OutcomeAdmit {
+				break
+			}
+			e.Release(d.Ticket)
+			n++
+		}
+		return n
+	}
+	one := func(rate float64, burst int) Config {
+		return cfgOf(ModeEnforce, allModelsPool(rate, burst, 100, 0))
+	}
+
+	t.Run("raising burst does not refill", func(t *testing.T) {
+		e := newEval(t, t0, one(0.001, 2))
+		if drain(e, t0) != 2 {
+			t.Fatal("setup")
+		}
+		if err := e.Reconfigure(t0, one(0.001, 10)); err != nil {
+			t.Fatal(err)
+		}
+		if got := drain(e, t0); got != 0 {
+			t.Fatalf("admits after raising burst = %d, want 0", got)
+		}
+		// Refill then proceeds toward the new, larger burst.
+		if got := drain(e, at(3000)); got != 3 {
+			t.Fatalf("admits after 3000s at 0.001/s = %d, want 3", got)
+		}
 	})
-	if err != nil {
-		t.Fatalf("reconfigure failed: %v", err)
-	}
 
-	// opus should now be mapped to pool_a and should be able to be admitted
-	result = pe.CheckAdmission("opus", ResearchWrite)
-	if !result.Admitted {
-		t.Errorf("opus should be admitted to pool_a after reconfigure")
-	}
-	pe.RecordAdmission("opus", ResearchWrite)
+	t.Run("lowering burst clamps tokens", func(t *testing.T) {
+		e := newEval(t, t0, one(0.001, 10))
+		if err := e.Reconfigure(t0, one(0.001, 2)); err != nil {
+			t.Fatal(err)
+		}
+		if got := drain(e, t0); got != 2 {
+			t.Fatalf("admits = %d, want 2", got)
+		}
+	})
 
-	// Both haiku and opus are active at limit 2, so next should fail
-	result = pe.CheckAdmission("haiku", ResearchWrite)
-	if result.Admitted {
-		t.Errorf("should be at capacity with both models active")
+	t.Run("rate change settles old rate first", func(t *testing.T) {
+		e := newEval(t, t0, one(1, 5))
+		drain(e, t0)
+		// 3s pass at the old rate of 1/s before the change.
+		if err := e.Reconfigure(at(3), one(0.001, 5)); err != nil {
+			t.Fatal(err)
+		}
+		if got := drain(e, at(3)); got != 3 {
+			t.Fatalf("admits = %d, want 3 earned at the old rate", got)
+		}
+		if got := drain(e, at(13)); got != 0 {
+			t.Fatalf("admits 10s later at the new rate = %d, want 0", got)
+		}
+	})
+
+	t.Run("reconfigure at a rolled-back time mints nothing", func(t *testing.T) {
+		e := newEval(t, at(100), one(1, 5))
+		drain(e, at(100))
+		if err := e.Reconfigure(at(50), one(1, 5)); err != nil {
+			t.Fatal(err)
+		}
+		if got := drain(e, at(100)); got != 0 {
+			t.Fatalf("admits = %d, want 0", got)
+		}
+	})
+
+	t.Run("removing and re-adding a pool does not refill it", func(t *testing.T) {
+		e := newEval(t, t0, one(0.001, 5))
+		drain(e, t0)
+		if err := e.Reconfigure(t0, cfgOf(ModeObserve)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Reconfigure(t0, one(0.001, 5)); err != nil {
+			t.Fatal(err)
+		}
+		if got := drain(e, t0); got != 0 {
+			t.Fatalf("admits = %d, want 0", got)
+		}
+	})
+
+	t.Run("renaming a pool keeps its account state", func(t *testing.T) {
+		e := newEval(t, t0, one(0.001, 5))
+		drain(e, t0)
+		renamed := cfgOf(ModeEnforce, pool("renamed", "acct", 0.001, 5, 100, 0, "haiku", "sonnet", "opus"))
+		if err := e.Reconfigure(t0, renamed); err != nil {
+			t.Fatal(err)
+		}
+		if got := drain(e, t0); got != 0 {
+			t.Fatalf("admits = %d, want 0", got)
+		}
+	})
+
+	t.Run("disabling then enforcing again does not refill", func(t *testing.T) {
+		e := newEval(t, t0, one(0.001, 5))
+		drain(e, t0)
+		if err := e.Reconfigure(t0, cfgOf(ModeDisabled)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Reconfigure(t0, one(0.001, 5)); err != nil {
+			t.Fatal(err)
+		}
+		if got := drain(e, t0); got != 0 {
+			t.Fatalf("admits = %d, want 0", got)
+		}
+	})
+
+	t.Run("a never-seen account starts full", func(t *testing.T) {
+		e := newEval(t, t0, cfgOf(ModeObserve, pool("a", "a1", 0.001, 2, 100, 0, "opus")))
+		cfg := cfgOf(ModeEnforce,
+			pool("a", "a1", 0.001, 2, 100, 0, "opus"),
+			pool("b", "b1", 0.001, 3, 100, 0, "haiku", "sonnet"))
+		if err := e.Reconfigure(t0, cfg); err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for i := 0; i < 10; i++ {
+			if eval(t, e, t0, "haiku", ResearchWrite).Outcome == OutcomeAdmit {
+				n++
+			}
+		}
+		if n != 3 {
+			t.Fatalf("new account admits = %d, want its burst of 3", n)
+		}
+	})
+
+	t.Run("invalid config is rejected and state untouched", func(t *testing.T) {
+		e := newEval(t, t0, one(0.001, 2))
+		eval(t, e, t0, "opus", ResearchWrite)
+		bad := []Config{
+			cfgOf(ModeEnforce, allModelsPool(-1, 5, 5, 0)),
+			cfgOf(ModeEnforce, allModelsPool(1, -3, 5, 0)),
+			cfgOf(ModeEnforce, allModelsPool(1, 5, 2, 3)),
+			cfgOf(ModeEnforce, pool("p", "a", 1, 1, 1, 0, "opus")),
+			cfgOf(Mode("bogus")),
+		}
+		for i, cfg := range bad {
+			if err := e.Reconfigure(t0, cfg); err == nil {
+				t.Fatalf("bad config %d accepted", i)
+			}
+		}
+		if got := drain(e, t0); got != 1 {
+			t.Fatalf("state changed by rejected reconfigure: admits = %d, want 1", got)
+		}
+	})
+
+	t.Run("active dispatches survive removal and re-adding", func(t *testing.T) {
+		e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(1, 100, 1, 0)))
+		first := eval(t, e, t0, "opus", ResearchWrite)
+		if err := e.Reconfigure(t0, cfgOf(ModeObserve)); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Reconfigure(t0, cfgOf(ModeEnforce, allModelsPool(1, 100, 1, 0))); err != nil {
+			t.Fatal(err)
+		}
+		if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeRetry {
+			t.Fatalf("in-flight dispatch forgotten: %+v", d)
+		}
+		e.Release(first.Ticket)
+		if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeAdmit {
+			t.Fatalf("release after reconfigure failed: %+v", d)
+		}
+	})
+
+	t.Run("release is attributed to the admitting pool after a model moves", func(t *testing.T) {
+		twoPools := func(haikuPool string) Config {
+			a := pool("a", "acct-a", 100, 100, 1, 0, "sonnet")
+			b := pool("b", "acct-b", 100, 100, 1, 0, "opus")
+			if haikuPool == "a" {
+				a.Models = append(a.Models, "haiku")
+			} else {
+				b.Models = append(b.Models, "haiku")
+			}
+			return cfgOf(ModeEnforce, a, b)
+		}
+		e := newEval(t, t0, twoPools("a"))
+		haiku := eval(t, e, t0, "haiku", ResearchWrite)
+		opus := eval(t, e, t0, "opus", ResearchWrite)
+		if haiku.Outcome != OutcomeAdmit || opus.Outcome != OutcomeAdmit {
+			t.Fatal("setup")
+		}
+		if err := e.Reconfigure(t0, twoPools("b")); err != nil {
+			t.Fatal(err)
+		}
+		e.Release(haiku.Ticket) // frees pool a, not pool b
+		if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeRetry {
+			t.Fatalf("pool b ceiling exceeded after cross-pool release: %+v", d)
+		}
+		if d := eval(t, e, t0, "sonnet", ResearchWrite); d.Outcome != OutcomeAdmit {
+			t.Fatalf("pool a slot not freed: %+v", d)
+		}
+	})
+
+	t.Run("lowering the limit below active blocks without interrupting", func(t *testing.T) {
+		e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(100, 100, 3, 0)))
+		var tickets []*Ticket
+		for i := 0; i < 3; i++ {
+			tickets = append(tickets, eval(t, e, t0, "opus", ResearchWrite).Ticket)
+		}
+		if err := e.Reconfigure(t0, cfgOf(ModeEnforce, allModelsPool(100, 100, 1, 0))); err != nil {
+			t.Fatal(err)
+		}
+		for i, tk := range tickets {
+			if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeRetry {
+				t.Fatalf("after %d releases still over limit: %+v", i, d)
+			}
+			e.Release(tk)
+		}
+		if d := eval(t, e, t0, "opus", ResearchWrite); d.Outcome != OutcomeAdmit {
+			t.Fatalf("not admitted once drained: %+v", d)
+		}
+	})
+}
+
+func TestEvaluatorDoesNotAliasCallerConfig(t *testing.T) {
+	cfg := cfgOf(ModeEnforce, allModelsPool(0.001, 1, 5, 0))
+	e := newEval(t, t0, cfg)
+	cfg.Pools[0].Models[0] = "mutated"
+	cfg.Pools[0].BurstCapacity = 99
+	if d := eval(t, e, t0, "haiku", ResearchWrite); d.Outcome != OutcomeAdmit {
+		t.Fatalf("haiku should still be mapped: %+v", d)
+	}
+	if d := eval(t, e, t0, "haiku", ResearchWrite); d.Outcome != OutcomeDefer {
+		t.Fatalf("mutating caller config changed evaluator: %+v", d)
+	}
+}
+
+func TestConcurrentEvaluateNeverOverspends(t *testing.T) {
+	const burst = 7
+	e := newEval(t, t0, cfgOf(ModeEnforce, allModelsPool(0.0001, burst, 100, 0)))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	admits := 0
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d, err := e.Evaluate(t0, "opus", ResearchWrite)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if d.Outcome == OutcomeAdmit {
+				mu.Lock()
+				admits++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if admits != burst {
+		t.Fatalf("admits = %d, want %d", admits, burst)
 	}
 }

@@ -24,8 +24,8 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_PPROF` | unset | Enable Go runtime profiling on `/debug/pprof/` when set to exactly `true`. All pprof endpoints require the same bearer-token auth as every other protected route. When unset or any other value, `/debug/pprof/` returns 404. See [Runtime profiling with pprof](#runtime-profiling-with-pprof). |
 | `ODONIAN_SLOW_REQUEST_MS` | `500` | Per-request latency logging threshold in milliseconds. Requests at or above this threshold log at INFO level; below it log at DEBUG. `/healthz` is never logged. A non-integer or negative value logs one warning at startup and falls back to the default. |
 | `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by PR-watch, supersession PR cleanup, and `odonian merge`. See [Forge tokens](#forge-tokens). |
-| `ODONIAN_RESEARCH_POLICY_MODE` | `disabled` | Research admission policy mode: `disabled` (no rate limiting), `observe` (log hypothetical denials without enforcing), or `enforce` (enforce rate limits). Applies only to research track tasks. Requires `ODONIAN_RESEARCH_POOLS` to be configured when set to `enforce`. |
-| `ODONIAN_RESEARCH_POOLS` | unset | JSON object defining account/quota pools for research work. Each pool maps a set of models to rate-limiting configuration. See [Research pacing pools](#research-pacing-pools). |
+| `ODONIAN_RESEARCH_POLICY_MODE` | `disabled` | Research admission policy mode: `disabled`, `observe` or `enforce`. Validated at startup; an invalid value or pool configuration stops the server. This release only defines and validates the policy — it does not yet gate claims or dispatch. See [Research pacing pools](#research-pacing-pools). |
+| `ODONIAN_RESEARCH_POOLS` | unset | JSON object mapping pool names to account pools for research LLM work; ignored when the mode is `disabled`. See [Research pacing pools](#research-pacing-pools). |
 
 ### Research tasks and escalation
 
@@ -56,81 +56,109 @@ Research tasks use a dedicated escalation ladder and thresholds, separate from t
 
 ### Research pacing pools
 
-The `ODONIAN_RESEARCH_POOLS` environment variable configures rate-limiting pools for research work when
-`ODONIAN_RESEARCH_POLICY_MODE` is set to `observe` or `enforce`. The variable contains a JSON object
-where each key is a pool name and each value defines the pool's configuration.
+The research pacing policy (`internal/policy`) decides, for one research LLM start, whether to admit it,
+defer it until a time, or ask the caller to retry after an active dispatch finishes. It is a pure
+module: the server parses and validates its configuration at startup, but nothing evaluates it yet, so
+setting these variables launches no model and changes no task, claim or dispatch. No production rate is
+assumed; with the defaults the policy is `disabled`.
 
-**Pool configuration schema** (JSON object):
+**Modes** (`ODONIAN_RESEARCH_POLICY_MODE`):
+
+- `disabled` (default): everything is admitted and nothing is tracked. `ODONIAN_RESEARCH_POOLS` is ignored.
+- `observe`: everything is admitted; each decision also reports what `enforce` would have decided, so
+  hypothetical denials can be counted. Observe does not limit spending.
+- `enforce`: decisions are applied. Every model in `ODONIAN_MODELS` must be mapped to a pool, otherwise
+  startup fails.
+
+**Pools** (`ODONIAN_RESEARCH_POOLS`) is a JSON object keyed by pool name. Unknown fields are rejected.
 
 ```json
 {
   "pool_name": {
-    "account_id": "string (required, unique per pool)",
+    "account_id": "string",
     "models": ["model1", "model2"],
-    "start_rate": 1.5,
-    "burst_capacity": 10,
-    "concurrent_dispatch_limit": 5,
-    "completion_reserved": 2
-  }
-}
-```
-
-**Pool fields:**
-
-- `account_id` (string, required): Unique identifier for the external subscription/account. Aliases
-  sharing the same account pool share one rate limit across all projects.
-- `models` (array of strings, required): List of model names from `ODONIAN_MODELS` that use this pool.
-  Each model can be in only one pool. In `enforce` mode, all models in `ODONIAN_MODELS` must be assigned
-  to a pool.
-- `start_rate` (number, required): Sustained rate in starts per second. Must be positive and finite.
-  This is a proxy for subscription rate, not exact billing; actual usage depends on task complexity and
-  concurrent workers.
-- `burst_capacity` (positive integer, required): Maximum burst capacity (tokens in the bucket). Allows
-  short bursts above the sustained rate, up to this capacity.
-- `concurrent_dispatch_limit` (positive integer, required): Maximum concurrent active dispatches from
-  this pool. Completion work (reviews, rework, adjudication) shares this limit with fresh starts.
-- `completion_reserved` (non-negative integer, required): Capacity reserved for completion work (must
-  be ≤ `concurrent_dispatch_limit`). New first-pass writers cannot consume reserved slots. Completion
-  work still obeys the total ceiling; reserved capacity is not borrowed.
-
-**Example:**
-
-```bash
-export ODONIAN_RESEARCH_POLICY_MODE=enforce
-export ODONIAN_RESEARCH_POOLS='
-{
-  "muse": {
-    "account_id": "meta-power-acct",
-    "models": ["haiku"],
     "start_rate": 0.5,
     "burst_capacity": 5,
     "concurrent_dispatch_limit": 3,
     "completion_reserved": 1
+  }
+}
+```
+
+- `account_id`: the external subscription/account. Pool state is keyed by it and shared across all
+  projects and workers, so every alias on one account belongs in one pool; two pools with the same
+  account are rejected.
+- `models`: non-empty list from `ODONIAN_MODELS`. A model may appear in one pool only.
+- `start_rate`: sustained starts per second; finite and greater than zero.
+- `burst_capacity`: integer of at least 1; starts available at once when idle. Allowance never exceeds it.
+- `concurrent_dispatch_limit`: integer of at least 1; total active dispatches, completion work included.
+- `completion_reserved`: integer from 0 to `concurrent_dispatch_limit`. Slots only completion work may
+  use. A reservation equal to the limit makes a review-only pool.
+
+Missing, non-numeric, nonfinite, negative or fractional-where-integer values, duplicate model
+mappings and reservations above the limit are all rejected.
+
+**Which work is paced.** Only research LLM work: first-pass writing, reviews, rework and adjudication each
+spend one start. Build, design and non-LLM merge work is always admitted and uses no allowance.
+
+**Reservation.** First-pass writers may hold at most `concurrent_dispatch_limit - completion_reserved`
+slots and can never take a reserved slot, even when none is in use; there is no automatic borrowing.
+Completion work may use any free slot up to the total limit. The reservation is on concurrency only; every
+paced start spends from the same start-rate allowance.
+
+**Outcomes.**
+
+- Admit: start now; one start is debited and a ticket tracks the active dispatch until released.
+- Timed deferral (`rate`): the bucket is empty; retry at the returned not-before time.
+- Concurrency-dependent retry (`concurrency` or `reserved_capacity`): an active dispatch must finish
+  first. No finish time is invented; a bounded retry interval is returned and no start is spent.
+- Unmapped: the model has no pool. Validation prevents this under `enforce` for allowed models; it is
+  reported separately so it is never read as a timed deferral.
+
+**Time and changes never mint allowance.** The caller supplies server time. Time earlier than any time
+already seen is treated as the latest time seen, so a clock rollback refills nothing and deferral times are
+measured from that high-water mark. Refill is fractional and capped at `burst_capacity`. On a policy
+change, allowance is first settled at the old rate, then clamped to the new burst; active dispatches are
+kept and never interrupted, and a lowered limit simply blocks new starts until the count drains. Removing
+and re-adding an account does not refill it, and a ticket releases against the account that admitted it
+even if its model has since moved pools. Only an account never seen before starts with a full burst.
+Released dispatches free concurrency but do not refund starts.
+
+**Start-rate proxy versus billing.** `start_rate`, `burst_capacity` and the concurrency limit count task
+starts and active dispatches. They are proxies for subscription consumption, not exact billing: a start
+can use very little or a great deal of quota, other activity on the same external account is invisible,
+and nothing here translates starts into a percentage of a subscription. Choose values from observed
+dispatch durations and quota trends with headroom.
+
+**Example:**
+
+```bash
+export ODONIAN_RESEARCH_POLICY_MODE=observe
+export ODONIAN_RESEARCH_POOLS='
+{
+  "meta": {
+    "account_id": "meta-power",
+    "models": ["haiku"],
+    "start_rate": 0.1,
+    "burst_capacity": 2,
+    "concurrent_dispatch_limit": 2,
+    "completion_reserved": 1
   },
-  "opus": {
-    "account_id": "anthropic-prod",
+  "anthropic": {
+    "account_id": "anthropic-main",
     "models": ["opus", "sonnet"],
-    "start_rate": 2.0,
-    "burst_capacity": 20,
-    "concurrent_dispatch_limit": 10,
-    "completion_reserved": 5
+    "start_rate": 0.2,
+    "burst_capacity": 4,
+    "concurrent_dispatch_limit": 4,
+    "completion_reserved": 2
   }
 }
 '
 ```
 
-**Admission outcomes:**
+The numbers above are illustrative only, not recommendations.
 
-When a new research task is claimed, the policy checks token availability, concurrency, and reserved
-capacity. Admission results in one of:
-
-- **Admit**: The task is launched; one token is consumed.
-- **Timed deferral**: The task's claim is deferred until a specific time (rate limit). The response
-  includes `not_before` timestamp.
-- **Concurrency dependent retry**: Too many concurrent dispatches are active. The response suggests a
-  bounded retry interval.
-
-See `docs/features/research-pacing-and-reviewer-evaluation.md` for detailed design and behavior.
+See `docs/features/research-pacing-and-reviewer-evaluation.md` for the full design.
 
 ### Runtime profiling with pprof
 

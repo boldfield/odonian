@@ -1,389 +1,301 @@
+// Package policy is the pure research admission policy: given explicit
+// account-pool configuration and a caller-supplied server time it decides
+// whether one research LLM start is admitted, deferred until a time, or must
+// wait for an active dispatch to finish. It reads no clock, launches nothing
+// and touches no tasks; wiring it into claim or dispatch is separate work.
 package policy
 
 import (
+	"fmt"
+	"math"
+	"sync"
 	"time"
 )
 
-// Mode controls whether policy enforcement is enabled.
+// Mode selects how decisions are applied.
 type Mode string
 
 const (
+	// ModeDisabled admits everything and tracks nothing.
 	ModeDisabled Mode = "disabled"
-	ModeObserve  Mode = "observe"
-	ModeEnforce  Mode = "enforce"
+	// ModeObserve always admits and reports the decision enforcement would
+	// have made in Decision.Shadow.
+	ModeObserve Mode = "observe"
+	// ModeEnforce applies decisions.
+	ModeEnforce Mode = "enforce"
 )
 
-// WorkClass describes the type of research work being evaluated for rate limiting.
+func (m Mode) valid() bool {
+	return m == ModeDisabled || m == ModeObserve || m == ModeEnforce
+}
+
+// WorkClass is the kind of work asking to start. Only research LLM work is
+// paced; build, design and non-LLM merge work is always admitted untouched.
 type WorkClass string
 
 const (
-	// ResearchWrite is writing work (first-pass LLM generation for research)
-	ResearchWrite WorkClass = "research_write"
-	// ResearchReview is review work (review/rework/adjudication)
-	ResearchReview WorkClass = "research_review"
-	// BuildDesign is non-research work (build, design, non-LLM merge)
-	BuildDesign WorkClass = "build_design"
+	ResearchWrite        WorkClass = "research_write"
+	ResearchReview       WorkClass = "research_review"
+	ResearchRework       WorkClass = "research_rework"
+	ResearchAdjudication WorkClass = "research_adjudication"
+	BuildWork            WorkClass = "build"
+	DesignWork           WorkClass = "design"
+	MergeWork            WorkClass = "merge"
 )
 
-// DeferralReason explains why an admission was deferred.
-type DeferralReason string
+func (c WorkClass) known() bool {
+	switch c {
+	case ResearchWrite, ResearchReview, ResearchRework, ResearchAdjudication, BuildWork, DesignWork, MergeWork:
+		return true
+	}
+	return false
+}
+
+// Paced reports whether the class consumes research allowance.
+func (c WorkClass) Paced() bool {
+	switch c {
+	case ResearchWrite, ResearchReview, ResearchRework, ResearchAdjudication:
+		return true
+	}
+	return false
+}
+
+// Completion reports whether the class is completion work (review, rework,
+// adjudication), which may use reserved capacity. ResearchWrite is first-pass.
+func (c WorkClass) Completion() bool {
+	return c == ResearchReview || c == ResearchRework || c == ResearchAdjudication
+}
+
+// Outcome is the kind of answer to an admission request.
+type Outcome string
 
 const (
-	ReasonRateLimit     DeferralReason = "rate_limit"
-	ReasonConcurrency   DeferralReason = "concurrency"
-	ReasonCompletionCap DeferralReason = "completion_cap"
-	ReasonUnmappedModel DeferralReason = "unmapped_model"
+	// OutcomeAdmit: start now; one start was debited.
+	OutcomeAdmit Outcome = "admit"
+	// OutcomeDefer: time alone allows progress; retry at NotBefore.
+	OutcomeDefer Outcome = "defer"
+	// OutcomeRetry: an active dispatch must finish first; there is no finish
+	// time, so retry after RetryAfter.
+	OutcomeRetry Outcome = "retry"
+	// OutcomeUnmapped: the model has no pool. Config validation makes this
+	// impossible under enforcement for allowed models; it is reported
+	// separately so it is never mistaken for a timed deferral.
+	OutcomeUnmapped Outcome = "unmapped"
 )
 
-// AdmissionResult describes the outcome of an admission check.
-type AdmissionResult struct {
-	Admitted bool
-	Reason   DeferralReason
-	// NotBefore is set if the caller should retry after this time (rate limit case).
-	NotBefore time.Time
-	// RetryAfterMs is set if concurrency is the reason (bounded retry interval).
-	RetryAfterMs int
+// Reason refines OutcomeDefer and OutcomeRetry.
+type Reason string
+
+const (
+	ReasonRate             Reason = "rate"
+	ReasonConcurrency      Reason = "concurrency"
+	ReasonReservedCapacity Reason = "reserved_capacity"
+)
+
+// Verdict is one policy decision.
+type Verdict struct {
+	Outcome    Outcome
+	Reason     Reason        // set for OutcomeDefer and OutcomeRetry
+	NotBefore  time.Time     // set for OutcomeDefer
+	RetryAfter time.Duration // set for OutcomeRetry
 }
 
-// Pool represents a configured rate-limit pool for a set of models.
-type Pool struct {
-	// Name of the pool
-	Name string
-	// Models that use this pool
-	Models map[string]bool
-	// AccountID for billing/quota tracking
-	AccountID string
-	// StartRate is the sustained rate in starts per second
-	StartRate float64
-	// BurstCapacity is the maximum tokens in the bucket
-	BurstCapacity int
-	// ConcurrentDispatchLimit is the max concurrent active dispatches
-	ConcurrentDispatchLimit int
-	// CompletionReserved is the capacity reserved for completion work
-	CompletionReserved int
+// Decision is the result of Evaluate. Verdict is what the caller must do.
+// Shadow is what enforcement would decide; it equals Verdict except in
+// ModeObserve, where Verdict always admits.
+type Decision struct {
+	Verdict
+	Shadow Verdict
+	// Ticket is non-nil when an active dispatch is now tracked. The caller
+	// must Release it exactly when the dispatch ends.
+	Ticket *Ticket
 }
 
-// PolicyEvaluator holds the state and logic for evaluating admission.
-type PolicyEvaluator struct {
-	Mode  Mode
-	Pools map[string]*Pool // pool name -> pool
-
-	// In-memory state: model -> pool name
-	modelToPool map[string]string
-
-	// Token bucket state: pool name -> bucket state
-	buckets map[string]*tokenBucket
-
-	// Concurrency tracking: pool name -> active count
-	concurrency map[string]int
-
-	// Completion work tracking: pool name -> active count
-	completionActive map[string]int
-
-	// Clock is injected for testing
-	clock func() time.Time
+// Ticket attributes one tracked dispatch to the account that admitted it, so
+// a later Reconfigure cannot make the release hit a different pool.
+type Ticket struct {
+	owner      *Evaluator
+	account    string
+	completion bool
+	released   bool
 }
 
-// tokenBucket tracks a rate-limit bucket with refill logic.
-type tokenBucket struct {
-	tokens         float64
-	capacity       float64
-	refillRate     float64
-	lastRefill     time.Time
-	lastRefillMono time.Time // monotonic high-water mark for clock rollback safety
+// tokenEpsilon absorbs float rounding so a deferral's NotBefore is honored.
+const tokenEpsilon = 1e-9
+
+type account struct {
+	tokens           float64
+	last             time.Time // high-water mark of every time seen; never moves backward
+	rate             float64
+	burst            float64
+	active           int
+	activeCompletion int
 }
 
-// New creates a PolicyEvaluator with the given configuration.
-// startTime is used to initialize token bucket high-water marks; if zero, the current time is used.
-// This is primarily for testing deterministic behavior with injected clocks.
-func New(mode Mode, pools []*Pool, startTime ...time.Time) *PolicyEvaluator {
-	pe := &PolicyEvaluator{
-		Mode:             mode,
-		Pools:            make(map[string]*Pool),
-		modelToPool:      make(map[string]string),
-		buckets:          make(map[string]*tokenBucket),
-		concurrency:      make(map[string]int),
-		completionActive: make(map[string]int),
-		clock:            time.Now,
+// settle credits refill for time elapsed past the high-water mark, capped at
+// burst. A time at or before the mark credits nothing and leaves it alone.
+func (a *account) settle(now time.Time) {
+	if !now.After(a.last) {
+		return
 	}
-
-	// Determine the initial time for bucket initialization
-	var initTime time.Time
-	if len(startTime) > 0 {
-		initTime = startTime[0]
-	} else {
-		initTime = time.Now()
-	}
-
-	for _, pool := range pools {
-		pe.Pools[pool.Name] = pool
-		for model := range pool.Models {
-			pe.modelToPool[model] = pool.Name
-		}
-		pe.buckets[pool.Name] = &tokenBucket{
-			tokens:         float64(pool.BurstCapacity),
-			capacity:       float64(pool.BurstCapacity),
-			refillRate:     pool.StartRate,
-			lastRefillMono: initTime,
-		}
-	}
-
-	return pe
+	a.tokens = math.Min(a.burst, a.tokens+now.Sub(a.last).Seconds()*a.rate)
+	a.last = now
 }
 
-// SetClock allows injection of a test clock.
-func (pe *PolicyEvaluator) SetClock(clock func() time.Time) {
-	pe.clock = clock
+// Evaluator holds pool allowance and active-dispatch state. It is safe for
+// concurrent use.
+type Evaluator struct {
+	mu        sync.Mutex
+	cfg       Config
+	modelPool map[string]Pool
+	accounts  map[string]*account // by account ID; kept after a pool is removed
 }
 
-// Reconfigure updates the policy configuration while preserving token bucket and concurrency state.
-// Carries over tokens (clamped to the new burst capacity), the high-water mark, and active counts.
-// Removed pools reset their bucket state, and re-added pools start fresh.
-func (pe *PolicyEvaluator) Reconfigure(newPools []*Pool) error {
-	now := pe.clock()
-
-	// Build a map of new pools by name
-	newPoolsMap := make(map[string]*Pool)
-	newModelToPool := make(map[string]string)
-
-	for _, pool := range newPools {
-		newPoolsMap[pool.Name] = pool
-		for model := range pool.Models {
-			newModelToPool[model] = pool.Name
-		}
+// New validates cfg and returns an Evaluator whose pools start with a full
+// burst as of now.
+func New(now time.Time, cfg Config) (*Evaluator, error) {
+	e := &Evaluator{accounts: make(map[string]*account)}
+	if err := e.apply(now, cfg); err != nil {
+		return nil, err
 	}
+	return e, nil
+}
 
-	// Update existing buckets with new config, preserving tokens
-	for poolName := range pe.Pools {
-		if newPool, exists := newPoolsMap[poolName]; exists {
-			oldBucket := pe.buckets[poolName]
-			// Clamp tokens to new burst capacity
-			newTokens := oldBucket.tokens
-			if newTokens > float64(newPool.BurstCapacity) {
-				newTokens = float64(newPool.BurstCapacity)
+// Reconfigure atomically swaps in a new configuration, or returns an error
+// and changes nothing. Existing accounts keep their allowance (settled up to
+// now under the old rate, then clamped to the new burst), their high-water
+// mark and their active dispatches; new rate/limits apply from now on. State
+// of a removed account is retained so removing and re-adding a pool cannot
+// refill it. An account never seen before starts with a full burst.
+func (e *Evaluator) Reconfigure(now time.Time, cfg Config) error {
+	return e.apply(now, cfg)
+}
+
+func (e *Evaluator) apply(now time.Time, cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	cfg = cfg.clone()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	modelPool := make(map[string]Pool)
+	if cfg.Mode != ModeDisabled {
+		for _, p := range cfg.Pools {
+			for _, m := range p.Models {
+				modelPool[m] = p
 			}
-			// Update bucket with new config, keeping tokens and high-water mark
-			pe.buckets[poolName] = &tokenBucket{
-				tokens:         newTokens,
-				capacity:       float64(newPool.BurstCapacity),
-				refillRate:     newPool.StartRate,
-				lastRefillMono: oldBucket.lastRefillMono, // Keep the high-water mark
+			acct, ok := e.accounts[p.AccountID]
+			if !ok {
+				e.accounts[p.AccountID] = &account{
+					tokens: float64(p.BurstCapacity),
+					last:   now,
+					rate:   p.StartRate,
+					burst:  float64(p.BurstCapacity),
+				}
+				continue
 			}
-		} else {
-			// Pool is being removed - reset its bucket state
-			delete(pe.buckets, poolName)
-			delete(pe.concurrency, poolName)
-			delete(pe.completionActive, poolName)
+			acct.settle(now)
+			acct.rate = p.StartRate
+			acct.burst = float64(p.BurstCapacity)
+			acct.tokens = math.Min(acct.tokens, acct.burst)
 		}
 	}
-
-	// Create new buckets for pools that are new
-	for poolName, newPool := range newPoolsMap {
-		if _, exists := pe.buckets[poolName]; !exists {
-			pe.buckets[poolName] = &tokenBucket{
-				tokens:         float64(newPool.BurstCapacity),
-				capacity:       float64(newPool.BurstCapacity),
-				refillRate:     newPool.StartRate,
-				lastRefillMono: now,
-			}
-			// Initialize concurrency tracking for new pool
-			pe.concurrency[poolName] = 0
-			pe.completionActive[poolName] = 0
-		}
-	}
-
-	// Update pool references
-	pe.Pools = newPoolsMap
-	pe.modelToPool = newModelToPool
-
+	e.cfg = cfg
+	e.modelPool = modelPool
 	return nil
 }
 
-// CheckAdmission evaluates whether a new research task can be admitted.
-// model is the model requested for the task.
-// workClass indicates the type of work: ResearchWrite, ResearchReview, or BuildDesign.
-// Returns an AdmissionResult with the decision and any deferral info.
-// BuildDesign work is always admitted regardless of policy.
-func (pe *PolicyEvaluator) CheckAdmission(model string, workClass WorkClass) AdmissionResult {
-	// Build/design and non-LLM merge work are not paced
-	if workClass == BuildDesign {
-		return AdmissionResult{Admitted: true}
+// Evaluate decides one start request at server time now. Time earlier than
+// any time already seen is treated as the latest time seen, so a clock
+// rollback never refills allowance. An unknown WorkClass is an error.
+func (e *Evaluator) Evaluate(now time.Time, model string, class WorkClass) (Decision, error) {
+	if !class.known() {
+		return Decision{}, fmt.Errorf("unknown work class %q", class)
+	}
+	admit := Verdict{Outcome: OutcomeAdmit}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if !class.Paced() || e.cfg.Mode == ModeDisabled {
+		return Decision{Verdict: admit, Shadow: admit}, nil
 	}
 
-	isCompletion := workClass == ResearchReview
-	if pe.Mode == ModeDisabled {
-		return AdmissionResult{Admitted: true}
-	}
-
-	poolName, ok := pe.modelToPool[model]
+	pool, ok := e.modelPool[model]
 	if !ok {
-		// Unmapped model - only reject if enforcing
-		if pe.Mode == ModeEnforce {
-			return AdmissionResult{Admitted: false, Reason: ReasonUnmappedModel}
+		v := Verdict{Outcome: OutcomeUnmapped}
+		if e.cfg.Mode == ModeObserve {
+			return Decision{Verdict: admit, Shadow: v}, nil
 		}
-		return AdmissionResult{Admitted: true}
+		return Decision{Verdict: v, Shadow: v}, nil
 	}
 
-	pool := pe.Pools[poolName]
-	now := pe.clock()
+	acct := e.accounts[pool.AccountID]
+	acct.settle(now)
+	at := acct.last
 
-	// In observe mode, evaluate what would happen but always admit
-	if pe.Mode == ModeObserve {
-		// Check what would happen, but don't enforce
-		if isCompletion {
-			if pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
-				// Would be denied, but observe mode admits anyway
-				return AdmissionResult{Admitted: true, Reason: ReasonConcurrency}
-			}
-		} else {
-			reserved := pool.CompletionReserved
-			firstPassLimit := pool.ConcurrentDispatchLimit - reserved
-			activeFirstPass := pe.concurrency[poolName] - pe.completionActive[poolName]
-
-			// Check both reserved-aware limit and total ceiling
-			if activeFirstPass >= firstPassLimit || pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
-				// Would be denied, but observe mode admits anyway
-				return AdmissionResult{Admitted: true, Reason: ReasonConcurrency}
-			}
-		}
-		// Check rate limit in observe mode using a shadow bucket
-		// to report accurate decisions while keeping real buckets unchanged
-		bucket := pe.buckets[poolName]
-		// Create a shadow bucket copy to check what would happen
-		shadowBucket := &tokenBucket{
-			tokens:         bucket.tokens,
-			capacity:       bucket.capacity,
-			refillRate:     bucket.refillRate,
-			lastRefillMono: bucket.lastRefillMono,
-		}
-		shadowBucket.refill(now)
-		if shadowBucket.tokens >= 1.0 {
-			// Would be admitted - deduct from shadow for next check
-			// but don't modify the real bucket
-			bucket.tokens = shadowBucket.tokens - 1.0
-			bucket.lastRefillMono = now
-			return AdmissionResult{Admitted: true}
-		}
-		// Would be rate-limited
-		bucket.tokens = shadowBucket.tokens
-		bucket.lastRefillMono = now
-		timeToNextToken := (1.0 - shadowBucket.tokens) / shadowBucket.refillRate
-		if timeToNextToken < 0 {
-			timeToNextToken = 0
-		}
-		return AdmissionResult{
-			Admitted:  true,
-			Reason:    ReasonRateLimit,
-			NotBefore: now.Add(time.Duration(timeToNextToken * float64(time.Second))),
-		}
+	v := e.decide(pool, acct, class, at)
+	if v.Outcome == OutcomeAdmit {
+		acct.tokens = math.Max(0, acct.tokens-1)
 	}
 
-	// Enforce mode: check concurrency limit
-	// For first-pass work: limited to (total - reserved) slots AND total ceiling
-	// For completion work: limited to total slots
-	if isCompletion {
-		// Completion work: check against total concurrent limit
-		if pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
-			return AdmissionResult{
-				Admitted:     false,
-				Reason:       ReasonConcurrency,
-				RetryAfterMs: defaultRetryAfterMs,
-			}
+	d := Decision{Verdict: v, Shadow: v}
+	if e.cfg.Mode == ModeObserve {
+		d.Verdict = admit
+	}
+	if d.Verdict.Outcome == OutcomeAdmit {
+		acct.active++
+		if class.Completion() {
+			acct.activeCompletion++
 		}
-	} else {
-		// First-pass work: limited to (total - reserved) slots and total ceiling
-		reserved := pool.CompletionReserved
-		firstPassLimit := pool.ConcurrentDispatchLimit - reserved
-		activeFirstPass := pe.concurrency[poolName] - pe.completionActive[poolName]
-
-		// Check both reserved-aware limit and total ceiling
-		if activeFirstPass >= firstPassLimit || pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
-			return AdmissionResult{
-				Admitted:     false,
-				Reason:       ReasonConcurrency,
-				RetryAfterMs: defaultRetryAfterMs,
-			}
-		}
+		d.Ticket = &Ticket{owner: e, account: pool.AccountID, completion: class.Completion()}
 	}
-
-	// Check rate limit using token bucket
-	bucket := pe.buckets[poolName]
-	bucket.refill(now)
-
-	if bucket.tokens >= 1.0 {
-		bucket.tokens -= 1.0
-		return AdmissionResult{Admitted: true}
-	}
-
-	// Rate limit exceeded - calculate when next token will be available
-	// The bucket already has the refilled tokens, so we just need to know
-	// when the current tokens + future refill will reach 1.0
-	timeToNextToken := (1.0 - bucket.tokens) / bucket.refillRate
-	if timeToNextToken < 0 {
-		timeToNextToken = 0
-	}
-
-	return AdmissionResult{
-		Admitted:  false,
-		Reason:    ReasonRateLimit,
-		NotBefore: now.Add(time.Duration(timeToNextToken * float64(time.Second))),
-	}
+	return d, nil
 }
 
-const defaultRetryAfterMs = 1000
-
-// RecordAdmission records that an attempt was admitted (for concurrency tracking).
-func (pe *PolicyEvaluator) RecordAdmission(model string, workClass WorkClass) {
-	// Build/design work doesn't affect concurrency tracking
-	if workClass == BuildDesign {
-		return
+// decide applies concurrency first (no token is spent while waiting on an
+// active dispatch), then the start-rate bucket. It does not mutate the account.
+func (e *Evaluator) decide(pool Pool, acct *account, class WorkClass, at time.Time) Verdict {
+	limit := pool.ConcurrentDispatchLimit
+	retry := func(r Reason) Verdict {
+		return Verdict{Outcome: OutcomeRetry, Reason: r, RetryAfter: e.cfg.retryAfter()}
+	}
+	if acct.active >= limit {
+		return retry(ReasonConcurrency)
+	}
+	if !class.Completion() && acct.active-acct.activeCompletion >= limit-pool.CompletionReserved {
+		return retry(ReasonReservedCapacity)
 	}
 
-	poolName, ok := pe.modelToPool[model]
-	if !ok {
-		return
+	if acct.tokens >= 1-tokenEpsilon {
+		return Verdict{Outcome: OutcomeAdmit}
 	}
-	pe.concurrency[poolName]++
-	if workClass == ResearchReview {
-		pe.completionActive[poolName]++
+	wait := (1 - acct.tokens) / acct.rate * float64(time.Second)
+	d := time.Duration(math.MaxInt64 / 2)
+	if wait < float64(d) {
+		d = time.Duration(math.Ceil(wait))
 	}
+	return Verdict{Outcome: OutcomeDefer, Reason: ReasonRate, NotBefore: at.Add(d)}
 }
 
-// ReleaseAdmission records that an active attempt ended (for concurrency tracking).
-func (pe *PolicyEvaluator) ReleaseAdmission(model string, workClass WorkClass) {
-	// Build/design work doesn't affect concurrency tracking
-	if workClass == BuildDesign {
+// Release ends a tracked dispatch. It is idempotent, and a nil ticket or one
+// from another Evaluator is ignored. It frees concurrency only; a spent start
+// is never refunded.
+func (e *Evaluator) Release(t *Ticket) {
+	if t == nil || t.owner != e {
 		return
 	}
-
-	poolName, ok := pe.modelToPool[model]
-	if !ok {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if t.released {
 		return
 	}
-	if pe.concurrency[poolName] > 0 {
-		pe.concurrency[poolName]--
-	}
-	if workClass == ResearchReview && pe.completionActive[poolName] > 0 {
-		pe.completionActive[poolName]--
-	}
-}
-
-// refill updates the token bucket based on elapsed time.
-// Uses a monotonic high-water mark to handle clock rollback safely.
-func (b *tokenBucket) refill(now time.Time) {
-	// Protect against clock rollback
-	if now.Before(b.lastRefillMono) {
-		return
-	}
-
-	elapsed := now.Sub(b.lastRefillMono)
-	if elapsed > 0 {
-		tokensToAdd := elapsed.Seconds() * b.refillRate
-		newTokens := b.tokens + tokensToAdd
-		if newTokens > b.capacity {
-			newTokens = b.capacity
-		}
-		b.tokens = newTokens
-		b.lastRefillMono = now
+	t.released = true
+	acct := e.accounts[t.account]
+	acct.active--
+	if t.completion {
+		acct.activeCompletion--
 	}
 }
