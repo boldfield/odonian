@@ -20,6 +20,9 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == fakeAdapterArg {
 		os.Exit(FakeMain(os.Args[2:], os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == museAdapterArg {
+		os.Exit(MuseMain(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	os.Exit(m.Run())
 }
 
