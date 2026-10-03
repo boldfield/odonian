@@ -483,6 +483,20 @@ func (s *sqliteStore) ListResearchPoolStates(ctx context.Context, now time.Time)
 		}
 		state.SettledAt = formatTS(at)
 
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	// Counts run after the pool rows are drained so no query is nested inside an open cursor.
+	for i := range states {
+		state := &states[i]
+		at, err := parseTS(state.SettledAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse settled_at: %w", err)
+		}
 		// Count active attempts
 		var active, activeCompletion int
 		err = tx.QueryRowContext(ctx, `
@@ -494,11 +508,11 @@ func (s *sqliteStore) ListResearchPoolStates(ctx context.Context, now time.Time)
 		state.Active = active
 		state.ActiveCompletion = activeCompletion
 
-		// Count deferred tasks: only non-hypothetical defers with tasks still claimable (state='ready')
+		// Count waiting tasks: non-hypothetical rate defers and concurrency retries whose task is still claimable (state='ready')
 		var deferred int
 		err = tx.QueryRowContext(ctx, `
 			SELECT COUNT(*) FROM research_admission_diagnostic
-			WHERE account_id = ? AND outcome = 'defer' AND hypothetical = 0 AND task_id IN (
+			WHERE account_id = ? AND outcome IN ('defer', 'retry') AND hypothetical = 0 AND task_id IN (
 				SELECT id FROM task WHERE state = 'ready'
 			)`, state.AccountID).Scan(&deferred)
 		if err != nil {
@@ -506,9 +520,8 @@ func (s *sqliteStore) ListResearchPoolStates(ctx context.Context, now time.Time)
 		}
 		state.Deferred = deferred
 
-		states = append(states, state)
 	}
-	return states, rows.Err()
+	return states, nil
 }
 
 const tokenEpsilon = 1e-9

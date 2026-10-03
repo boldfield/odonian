@@ -383,7 +383,9 @@ Fields:
 - `mode`: Current admission mode (`enforce`, `observe`, or `disabled`)
 - `active`: Number of active research attempts
 - `active_completion`: Number of active completion-class attempts
-- `deferred`: Number of currently deferred tasks waiting for capacity/rate limit
+- `deferred`: Number of tasks still `ready` whose latest real (non-hypothetical, i.e. enforce-mode) admission was denied for
+  either rate (`defer`) or concurrency/reserved capacity (`retry`). Observe-mode hypothetical denials are not counted, and a task
+  leaves the count once it is claimed, cancelled or otherwise no longer `ready`
 - `tokens`: Current token bucket level (capped at `burst_capacity`)
 - `settled_at`: Timestamp when tokens were last settled
 
