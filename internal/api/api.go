@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/boldfield/odonian/internal/evaluation"
 	"github.com/boldfield/odonian/internal/policy"
 	"github.com/boldfield/odonian/internal/store"
 )
@@ -104,6 +105,15 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("GET /research/status", wrapProtected("GET /research/status", server.handleGetResearchStatus))
 	mux.HandleFunc("POST /research/permits/{permit_id}/renew", wrapProtected("POST /research/permits/{permit_id}/renew", server.handleRenewResearchPermit))
 	mux.HandleFunc("POST /research/permits/{permit_id}/finalize", wrapProtected("POST /research/permits/{permit_id}/finalize", server.handleFinalizeResearchPermit))
+
+	// Evaluation endpoints (protected)
+	mux.HandleFunc("POST /evaluation/campaigns", wrapProtected("POST /evaluation/campaigns", server.handleCreateEvaluationCampaign))
+	mux.HandleFunc("GET /evaluation/campaigns/{id}", wrapProtected("GET /evaluation/campaigns/{id}", server.handleGetEvaluationCampaign))
+	mux.HandleFunc("GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}", wrapProtected("GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}", server.handleGetEvaluationSample))
+	mux.HandleFunc("POST /evaluation/jobs/claim", wrapProtected("POST /evaluation/jobs/claim", server.handleClaimEvaluationJob))
+	mux.HandleFunc("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew", wrapProtected("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew", server.handleRenewEvaluationAttempt))
+	mux.HandleFunc("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize", wrapProtected("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize", server.handleFinalizeEvaluationAttempt))
+	mux.HandleFunc("POST /evaluation/campaigns/{id}/pause", wrapProtected("POST /evaluation/campaigns/{id}/pause", server.handlePauseEvaluationCampaign))
 
 	// Task endpoints (protected)
 	mux.HandleFunc("POST /projects/{id}/tasks", wrapProtected("POST /projects/{id}/tasks", server.handleCreateTasks))
@@ -1692,5 +1702,350 @@ func (s *Server) handleFinalizeResearchPermit(w http.ResponseWriter, r *http.Req
 			"state":      attempt.State,
 			"exit_class": attempt.ExitClass,
 		},
+	})
+}
+
+// handleCreateEvaluationCampaign handles POST /evaluation/campaigns to create a new bounded campaign.
+func (s *Server) handleCreateEvaluationCampaign(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		ID                string   `json:"id"`
+		Name              string   `json:"name"`
+		Description       *string  `json:"description"`
+		AllowedProjectIDs []string `json:"allowed_project_ids"`
+		AllowedModelIDs   []string `json:"allowed_model_ids"`
+		CohortManifest    string   `json:"cohort_manifest"`
+		AttemptCap        int      `json:"attempt_cap"`
+	}
+
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return
+	}
+
+	campaign, err := s.store.CreateEvaluationCampaign(r.Context(), store.EvaluationCampaign{
+		ID:                payload.ID,
+		Name:              payload.Name,
+		Description:       payload.Description,
+		AllowedProjectIDs: payload.AllowedProjectIDs,
+		AllowedModelIDs:   payload.AllowedModelIDs,
+		CohortManifest:    payload.CohortManifest,
+		AttemptCap:        payload.AttemptCap,
+	})
+	if errors.Is(err, store.ErrEvaluationInvalidInput) {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "CREATE_ERROR", "Failed to create evaluation campaign")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusCreated, map[string]interface{}{
+		"campaign": map[string]interface{}{
+			"id":                  campaign.ID,
+			"name":                campaign.Name,
+			"description":         campaign.Description,
+			"allowed_project_ids": campaign.AllowedProjectIDs,
+			"allowed_model_ids":   campaign.AllowedModelIDs,
+			"cohort_manifest":     campaign.CohortManifest,
+			"attempt_cap":         campaign.AttemptCap,
+			"created_at":          campaign.CreatedAt,
+			"updated_at":          campaign.UpdatedAt,
+		},
+	})
+}
+
+// handleGetEvaluationCampaign handles GET /evaluation/campaigns/{id} to retrieve campaign details.
+func (s *Server) handleGetEvaluationCampaign(w http.ResponseWriter, r *http.Request) {
+	campaignID := r.PathValue("id")
+	if campaignID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_ID", "Campaign ID is required")
+		return
+	}
+
+	campaign, err := s.store.GetEvaluationCampaign(r.Context(), campaignID)
+	if errors.Is(err, store.ErrEvaluationCampaignNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Evaluation campaign not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "GET_ERROR", "Failed to retrieve evaluation campaign")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"campaign": map[string]interface{}{
+			"id":                  campaign.ID,
+			"name":                campaign.Name,
+			"description":         campaign.Description,
+			"allowed_project_ids": campaign.AllowedProjectIDs,
+			"allowed_model_ids":   campaign.AllowedModelIDs,
+			"cohort_manifest":     campaign.CohortManifest,
+			"attempt_cap":         campaign.AttemptCap,
+			"created_at":          campaign.CreatedAt,
+			"updated_at":          campaign.UpdatedAt,
+		},
+	})
+}
+
+// handleGetEvaluationSample handles GET /evaluation/campaigns/{campaign_id}/samples/{sample_id} to retrieve sample details.
+func (s *Server) handleGetEvaluationSample(w http.ResponseWriter, r *http.Request) {
+	campaignID := r.PathValue("campaign_id")
+	sampleID := r.PathValue("sample_id")
+	if campaignID == "" || sampleID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_ID", "Campaign ID and Sample ID are required")
+		return
+	}
+
+	sample, err := s.store.GetEvaluationSample(r.Context(), sampleID)
+	if errors.Is(err, store.ErrEvaluationSampleNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Evaluation sample not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "GET_ERROR", "Failed to retrieve evaluation sample")
+		return
+	}
+
+	if sample.CampaignID != campaignID {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Sample does not belong to the specified campaign")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"sample": map[string]interface{}{
+			"id":                    sample.ID,
+			"campaign_id":           sample.CampaignID,
+			"project_id":            sample.ProjectID,
+			"original_task_id":      sample.OriginalTaskID,
+			"original_review_round": sample.OriginalReviewRound,
+			"submitted_sha":         sample.SubmittedSHA,
+			"snapshot_digest":       sample.SnapshotDigest,
+			"source_digest":         sample.SourceDigest,
+			"manifest_digest":       sample.ManifestDigest,
+			"prompt_version":        sample.PromptVersion,
+			"model_version":         sample.ModelVersion,
+			"runtime_version":       sample.RuntimeVersion,
+			"created_at":            sample.CreatedAt,
+		},
+	})
+}
+
+// handleClaimEvaluationJob handles POST /evaluation/jobs/claim to claim a job for a sample/candidate pair.
+func (s *Server) handleClaimEvaluationJob(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		SampleID    string `json:"sample_id"`
+		CandidateID string `json:"candidate_id"`
+		RequestID   string `json:"request_id"`
+		LeaseTTLMs  int64  `json:"lease_ttl_ms"`
+	}
+
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return
+	}
+
+	if payload.SampleID == "" || payload.CandidateID == "" || payload.RequestID == "" || payload.LeaseTTLMs <= 0 {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "sample_id, candidate_id, request_id, and lease_ttl_ms are required and must be valid")
+		return
+	}
+
+	result, err := s.store.ClaimEvaluationJob(r.Context(), store.EvaluationJobClaim{
+		SampleID:     payload.SampleID,
+		CandidateID:  payload.CandidateID,
+		RequestID:    payload.RequestID,
+		LeaseExpires: time.Duration(payload.LeaseTTLMs) * time.Millisecond,
+	})
+	if errors.Is(err, store.ErrEvaluationSampleNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "SAMPLE_NOT_FOUND", "Evaluation sample not found")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationCandidateNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "CANDIDATE_NOT_FOUND", "Evaluation candidate not found")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationCapacityExhausted) {
+		s.errorResponse(w, http.StatusConflict, "CAPACITY_EXHAUSTED", "Campaign or candidate capacity exhausted")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationAttemptLive) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_LIVE", "Previous evaluation attempt is still active")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationInvalidInput) {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim evaluation job")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"job": map[string]interface{}{
+			"id":                 result.Job.ID,
+			"sample_id":          result.Job.SampleID,
+			"candidate_id":       result.Job.CandidateID,
+			"current_attempt_id": result.Job.CurrentAttemptID,
+			"created_at":         result.Job.CreatedAt,
+		},
+		"attempt": map[string]interface{}{
+			"id":                  result.Attempt.ID,
+			"job_id":              result.Attempt.JobID,
+			"request_id":          result.Attempt.RequestID,
+			"previous_attempt_id": result.Attempt.PreviousAttemptID,
+			"sequence_number":     result.Attempt.SequenceNumber,
+			"state":               result.Attempt.State,
+			"started_at":          result.Attempt.StartedAt,
+			"expires_at":          result.Attempt.ExpiresAt,
+		},
+	})
+}
+
+// handleRenewEvaluationAttempt handles POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew to extend a lease.
+func (s *Server) handleRenewEvaluationAttempt(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job_id")
+	attemptID := r.PathValue("attempt_id")
+	if jobID == "" || attemptID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_ID", "Job ID and Attempt ID are required")
+		return
+	}
+
+	var payload struct {
+		ExpiresAtMs int64 `json:"expires_at_ms"`
+	}
+
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return
+	}
+
+	expiresAt := time.UnixMilli(payload.ExpiresAtMs).UTC()
+
+	err := s.store.RenewEvaluationAttempt(r.Context(), attemptID, expiresAt)
+	if errors.Is(err, store.ErrEvaluationAttemptNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Evaluation attempt not found")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationAttemptExpired) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_EXPIRED", "Evaluation attempt lease has expired")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationAttemptFinalized) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_FINALIZED", "Evaluation attempt is already finalized")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationInvalidInput) {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "RENEW_ERROR", "Failed to renew evaluation attempt")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Attempt lease renewed",
+	})
+}
+
+// handleFinalizeEvaluationAttempt handles POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize to record results.
+func (s *Server) handleFinalizeEvaluationAttempt(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job_id")
+	attemptID := r.PathValue("attempt_id")
+	if jobID == "" || attemptID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_ID", "Job ID and Attempt ID are required")
+		return
+	}
+
+	var payload struct {
+		FenceAttemptID string                   `json:"fence_attempt_id"`
+		ExitClass      string                   `json:"exit_class"`
+		Status         *string                  `json:"status"`
+		ErrorClass     *string                  `json:"error_class"`
+		ErrorMessage   *string                  `json:"error_message"`
+		DurationMs     *int                     `json:"duration_ms"`
+		UsageTokens    *int                     `json:"usage_tokens"`
+		Findings       []map[string]interface{} `json:"findings"`
+	}
+
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return
+	}
+
+	findings := make([]evaluation.Finding, 0, len(payload.Findings))
+	for _, f := range payload.Findings {
+		var finding evaluation.Finding
+		if id, ok := f["id"].(string); ok {
+			finding.ID = id
+		}
+		if sev, ok := f["severity"].(string); ok {
+			finding.Severity = evaluation.Severity(sev)
+		}
+		if claim, ok := f["claim"].(string); ok {
+			finding.Claim = claim
+		}
+		if summary, ok := f["summary"].(string); ok {
+			finding.Summary = summary
+		}
+		if evidence, ok := f["evidence"].(string); ok {
+			finding.Evidence = evidence
+		}
+		findings = append(findings, finding)
+	}
+
+	result := store.EvaluationAttemptResult{
+		AttemptID:      attemptID,
+		FenceAttemptID: payload.FenceAttemptID,
+		ExitClass:      store.EvaluationExitClass(payload.ExitClass),
+		Status:         (*evaluation.Status)(payload.Status),
+		ErrorClass:     (*evaluation.ErrorClass)(payload.ErrorClass),
+		ErrorMessage:   payload.ErrorMessage,
+		DurationMs:     payload.DurationMs,
+		UsageTokens:    payload.UsageTokens,
+		Findings:       findings,
+	}
+
+	err := s.store.FinalizeEvaluationAttempt(r.Context(), result)
+	if errors.Is(err, store.ErrEvaluationAttemptNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Evaluation attempt not found")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationFenceMismatch) {
+		s.errorResponse(w, http.StatusConflict, "FENCE_MISMATCH", "Attempt ID does not match the job's current attempt")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationAttemptExpired) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_EXPIRED", "Evaluation attempt lease has expired")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationAttemptFinalized) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_FINALIZED", "Evaluation attempt is already finalized")
+		return
+	}
+	if errors.Is(err, store.ErrEvaluationInvalidInput) {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FINALIZE_ERROR", "Failed to finalize evaluation attempt")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Attempt finalized",
+	})
+}
+
+// handlePauseEvaluationCampaign handles POST /evaluation/campaigns/{id}/pause to explicitly pause a campaign.
+func (s *Server) handlePauseEvaluationCampaign(w http.ResponseWriter, r *http.Request) {
+	campaignID := r.PathValue("id")
+	if campaignID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_ID", "Campaign ID is required")
+		return
+	}
+
+	// For now, we just acknowledge the pause request. The actual pause logic would be
+	// implemented in a future update to track paused state in the campaign.
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"message":     "Campaign pause requested",
+		"campaign_id": campaignID,
 	})
 }

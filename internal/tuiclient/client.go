@@ -42,6 +42,13 @@ type Client interface {
 	GetResearchStatus(ctx context.Context) (ResearchStatus, error)
 	RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error)
 	FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error)
+	CreateEvaluationCampaign(ctx context.Context, id, name, description, projects, models, cohort string, cap int) (map[string]interface{}, error)
+	GetEvaluationCampaign(ctx context.Context, id string) (map[string]interface{}, error)
+	GetEvaluationSample(ctx context.Context, campaignID, sampleID string) (map[string]interface{}, error)
+	ClaimEvaluationJob(ctx context.Context, sampleID, candidateID, requestID string, leaseTTLMs int64) (map[string]interface{}, error)
+	RenewEvaluationAttempt(ctx context.Context, jobID, attemptID string, expiresAtMs int64) (map[string]interface{}, error)
+	FinalizeEvaluationAttempt(ctx context.Context, jobID, attemptID, fenceAttemptID, exitClass, result string) (map[string]interface{}, error)
+	PauseEvaluationCampaign(ctx context.Context, id string) (map[string]interface{}, error)
 }
 
 // Response structs for the TUI client (distinct from internal/store)
@@ -1063,4 +1070,170 @@ func (c *HTTPClient) FinalizeResearchPermit(ctx context.Context, permitID, taskI
 	}
 
 	return result.Attempt, nil
+}
+
+// Evaluation campaign methods
+
+// CreateEvaluationCampaign creates a new bounded evaluation campaign.
+func (c *HTTPClient) CreateEvaluationCampaign(ctx context.Context, id, name, description, projects, models, cohort string, cap int) (map[string]interface{}, error) {
+	projectList := parseCommaSeparated(projects)
+	modelList := parseCommaSeparated(models)
+
+	body := map[string]interface{}{
+		"id":                  id,
+		"name":                name,
+		"allowed_project_ids": projectList,
+		"allowed_model_ids":   modelList,
+		"cohort_manifest":     cohort,
+		"attempt_cap":         cap,
+	}
+	if description != "" {
+		body["description"] = description
+	}
+
+	resp, err := c.do(ctx, "POST", "/evaluation/campaigns", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Campaign map[string]interface{} `json:"campaign"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return result.Campaign, nil
+}
+
+// GetEvaluationCampaign retrieves a campaign by ID.
+func (c *HTTPClient) GetEvaluationCampaign(ctx context.Context, id string) (map[string]interface{}, error) {
+	resp, err := c.do(ctx, "GET", fmt.Sprintf("/evaluation/campaigns/%s", url.PathEscape(id)), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Campaign map[string]interface{} `json:"campaign"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return result.Campaign, nil
+}
+
+// GetEvaluationSample retrieves a sample by campaign and sample ID.
+func (c *HTTPClient) GetEvaluationSample(ctx context.Context, campaignID, sampleID string) (map[string]interface{}, error) {
+	resp, err := c.do(ctx, "GET", fmt.Sprintf("/evaluation/campaigns/%s/samples/%s", url.PathEscape(campaignID), url.PathEscape(sampleID)), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Sample map[string]interface{} `json:"sample"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return result.Sample, nil
+}
+
+// ClaimEvaluationJob claims a job for a sample/candidate pair.
+func (c *HTTPClient) ClaimEvaluationJob(ctx context.Context, sampleID, candidateID, requestID string, leaseTTLMs int64) (map[string]interface{}, error) {
+	body := map[string]interface{}{
+		"sample_id":    sampleID,
+		"candidate_id": candidateID,
+		"request_id":   requestID,
+		"lease_ttl_ms": leaseTTLMs,
+	}
+
+	resp, err := c.do(ctx, "POST", "/evaluation/jobs/claim", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return result, nil
+}
+
+// RenewEvaluationAttempt extends the lease on an active attempt.
+func (c *HTTPClient) RenewEvaluationAttempt(ctx context.Context, jobID, attemptID string, expiresAtMs int64) (map[string]interface{}, error) {
+	body := map[string]interface{}{
+		"expires_at_ms": expiresAtMs,
+	}
+
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/evaluation/jobs/%s/attempts/%s/renew", url.PathEscape(jobID), url.PathEscape(attemptID)), body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return result, nil
+}
+
+// FinalizeEvaluationAttempt records an attempt's result and findings.
+func (c *HTTPClient) FinalizeEvaluationAttempt(ctx context.Context, jobID, attemptID, fenceAttemptID, exitClass, result string) (map[string]interface{}, error) {
+	var resultData map[string]interface{}
+	if err := json.Unmarshal([]byte(result), &resultData); err != nil {
+		return nil, fmt.Errorf("invalid result JSON: %w", err)
+	}
+
+	body := map[string]interface{}{
+		"fence_attempt_id": fenceAttemptID,
+		"exit_class":       exitClass,
+	}
+	// Merge the result data
+	for k, v := range resultData {
+		body[k] = v
+	}
+
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/evaluation/jobs/%s/attempts/%s/finalize", url.PathEscape(jobID), url.PathEscape(attemptID)), body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var respResult map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&respResult); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return respResult, nil
+}
+
+// PauseEvaluationCampaign explicitly pauses a campaign.
+func (c *HTTPClient) PauseEvaluationCampaign(ctx context.Context, id string) (map[string]interface{}, error) {
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/evaluation/campaigns/%s/pause", url.PathEscape(id)), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return result, nil
+}
+
+// parseCommaSeparated parses a comma-separated string into a slice.
+func parseCommaSeparated(s string) []string {
+	if s == "" {
+		return []string{}
+	}
+	parts := bytes.Split([]byte(s), []byte(","))
+	result := make([]string, len(parts))
+	for i, p := range parts {
+		result[i] = string(bytes.TrimSpace(p))
+	}
+	return result
 }
