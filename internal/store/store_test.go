@@ -46,6 +46,40 @@ func ptrString(s string) *string {
 	return &s
 }
 
+// fakeTimeProvider provides a controllable time for testing.
+type fakeTimeProvider struct {
+	mu       sync.Mutex
+	fakeTime time.Time
+}
+
+func newFakeTimeProvider(t time.Time) *fakeTimeProvider {
+	return &fakeTimeProvider{fakeTime: t}
+}
+
+func (f *fakeTimeProvider) Now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fakeTime
+}
+
+func (f *fakeTimeProvider) NowTimestamp() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fakeTime.UTC().Format(timestampLayout)
+}
+
+func (f *fakeTimeProvider) LeaseExpiryTimestamp(ttl time.Duration) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fakeTime.UTC().Add(ttl).Format(timestampLayout)
+}
+
+func (f *fakeTimeProvider) Advance(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fakeTime = f.fakeTime.Add(d)
+}
+
 // createTestFSWithBadMigration creates a test filesystem with the standard migrations
 // plus a bad migration (0003_bad.sql) that leaves a dangling foreign key.
 // It wraps the embedded migrations and adds the bad migration on top.
@@ -18703,6 +18737,12 @@ func TestRequestPermitNewPermit(t *testing.T) {
 	accountPool := "test-pool"
 	requestID := "req-1"
 
+	// Initialize pool
+	err = store.InitializePool(ctx, accountPool, 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	permit, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, model, accountPool)
 	if err != nil {
 		t.Fatalf("RequestPermit failed: %v", err)
@@ -18749,6 +18789,12 @@ func TestRequestPermitReplay(t *testing.T) {
 	accountPool := "test-pool"
 	requestID := "req-1"
 
+	// Initialize pool
+	err = store.InitializePool(ctx, accountPool, 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, model, accountPool)
 	if err != nil {
 		t.Fatalf("first RequestPermit failed: %v", err)
@@ -18781,6 +18827,12 @@ func TestRequestPermitReplayMismatch(t *testing.T) {
 	agentID := GenerateID()
 	requestID := "req-1"
 	accountPool := "test-pool"
+
+	// Initialize pool
+	err = store.InitializePool(ctx, accountPool, 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
 
 	_, err = store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", accountPool)
 	if err != nil {
@@ -18819,6 +18871,12 @@ func TestGetPermit(t *testing.T) {
 	taskID := GenerateID()
 	agentID := GenerateID()
 	requestID := "req-1"
+
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
 
 	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
 	if err != nil {
@@ -18865,6 +18923,12 @@ func TestRenewPermit(t *testing.T) {
 	agentID := GenerateID()
 	requestID := "req-1"
 
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
 	if err != nil {
 		t.Fatalf("RequestPermit failed: %v", err)
@@ -18898,6 +18962,12 @@ func TestRenewPermitFenceMismatch(t *testing.T) {
 	agentID := GenerateID()
 	requestID := "req-1"
 
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	permit, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
 	if err != nil {
 		t.Fatalf("RequestPermit failed: %v", err)
@@ -18922,6 +18992,12 @@ func TestFinalizePermit(t *testing.T) {
 	taskID := GenerateID()
 	agentID := GenerateID()
 	requestID := "req-1"
+
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
 
 	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
 	if err != nil {
@@ -18968,6 +19044,12 @@ func TestFinalizePermitIdempotent(t *testing.T) {
 	agentID := GenerateID()
 	requestID := "req-1"
 
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
 	if err != nil {
 		t.Fatalf("RequestPermit failed: %v", err)
@@ -18982,15 +19064,11 @@ func TestFinalizePermitIdempotent(t *testing.T) {
 		t.Fatalf("first FinalizePermit failed: %v", err)
 	}
 
-	// Second finalize with same parameters should preserve the first outcome
+	// Second finalize should fail with fence mismatch (already finalized)
 	usage2 := "2000"
 	_, err = store.FinalizePermit(ctx, permit1.ID, permit1.AttemptID, &exitClass, &usage2)
-	if err == nil {
-		// Finalize on finalized permit should fail (fence mismatch)
-		t.Errorf("expected error on second finalize, got nil")
-	}
 	if err != ErrFenceMismatch {
-		t.Errorf("expected ErrFenceMismatch on finalized permit, got %v", err)
+		t.Errorf("expected ErrFenceMismatch on second finalize, got %v", err)
 	}
 
 	// Verify usage is still the first value
@@ -19016,6 +19094,12 @@ func TestFinalizePermitFenceMismatch(t *testing.T) {
 	agentID := GenerateID()
 	requestID := "req-1"
 
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	permit, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
 	if err != nil {
 		t.Fatalf("RequestPermit failed: %v", err)
@@ -19031,7 +19115,10 @@ func TestFinalizePermitFenceMismatch(t *testing.T) {
 
 func TestExpirePermit(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	baseTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	fakeTime := newFakeTimeProvider(baseTime)
+
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels(), WithTimeProvider(fakeTime))
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -19042,14 +19129,20 @@ func TestExpirePermit(t *testing.T) {
 	agentID := GenerateID()
 	requestID := "req-1"
 
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
 	if err != nil {
 		t.Fatalf("RequestPermit failed: %v", err)
 	}
 
-	// Expire using a time after the permit's expires_at
-	futureTime := time.Now().Add(2 * time.Hour).Format(time.RFC3339)
-	count, err := store.ExpirePermit(ctx, futureTime)
+	// Expire using a time after the permit's expires_at (advance by 2 hours)
+	fakeTime.Advance(2 * time.Hour)
+	count, err := store.ExpirePermit(ctx, fakeTime.Now())
 	if err != nil {
 		t.Fatalf("ExpirePermit failed: %v", err)
 	}
@@ -19081,12 +19174,18 @@ func TestCreateNextAttempt(t *testing.T) {
 	agentID := GenerateID()
 	requestID := "req-1"
 
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
 	if err != nil {
 		t.Fatalf("RequestPermit failed: %v", err)
 	}
 
-	att1, permit2, err := store.CreateNextAttempt(ctx, permit1.ID)
+	att1, permit2, err := store.CreateNextAttempt(ctx, permit1.ID, permit1.AttemptID)
 	if err != nil {
 		t.Fatalf("CreateNextAttempt failed: %v", err)
 	}
@@ -19099,7 +19198,7 @@ func TestCreateNextAttempt(t *testing.T) {
 	}
 
 	// Create another attempt
-	att2, permit3, err := store.CreateNextAttempt(ctx, permit1.ID)
+	att2, permit3, err := store.CreateNextAttempt(ctx, permit1.ID, permit2.AttemptID)
 	if err != nil {
 		t.Fatalf("second CreateNextAttempt failed: %v", err)
 	}
@@ -19125,10 +19224,16 @@ func TestConcurrentPermitRequests(t *testing.T) {
 	agentID := GenerateID()
 	accountPool := "test-pool"
 
-	// Simulate concurrent requests with different request IDs for the same task
-	// They should each get their own permit
+	// Initialize pool with capacity for 3 concurrent permits
+	err = store.InitializePool(ctx, accountPool, 10, 3)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
+	// Try to create 5 concurrent permits when only 3 can fit
 	const numRequests = 5
-	permits := make([]*ResearchPermit, numRequests)
+	successCount := 0
+	failCount := 0
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -19139,32 +19244,33 @@ func TestConcurrentPermitRequests(t *testing.T) {
 			requestID := fmt.Sprintf("req-%d", index)
 			permit, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", accountPool)
 			if err != nil {
-				t.Errorf("RequestPermit failed: %v", err)
+				if err == ErrInsufficientCapacity {
+					mu.Lock()
+					failCount++
+					mu.Unlock()
+				} else {
+					t.Errorf("unexpected error: %v", err)
+				}
+				return
+			}
+			if permit.ID == "" {
+				t.Errorf("permit has no ID")
 				return
 			}
 			mu.Lock()
-			permits[index] = &permit
+			successCount++
 			mu.Unlock()
 		}(i)
 	}
 
 	wg.Wait()
 
-	// Verify all permits were created and have unique IDs
-	seen := make(map[string]bool)
-	for i, permit := range permits {
-		if permit == nil {
-			t.Errorf("permit %d is nil", i)
-			continue
-		}
-		if seen[permit.ID] {
-			t.Errorf("permit ID %q seen multiple times", permit.ID)
-		}
-		seen[permit.ID] = true
+	// Exactly 3 should succeed (capacity), and 2 should fail with ErrInsufficientCapacity
+	if successCount != 3 {
+		t.Errorf("expected 3 successful permits (capacity limit), got %d", successCount)
 	}
-
-	if len(seen) != numRequests {
-		t.Errorf("expected %d unique permits, got %d", numRequests, len(seen))
+	if failCount != 2 {
+		t.Errorf("expected 2 capacity rejections, got %d", failCount)
 	}
 }
 
@@ -19179,6 +19285,12 @@ func TestListActivePermits(t *testing.T) {
 	projectID := GenerateID()
 	taskID := GenerateID()
 	agentID := GenerateID()
+
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
 
 	// Create a few permits
 	permit1, _ := store.RequestPermit(ctx, "req-1", taskID, projectID, agentID, "haiku", "pool-1")
@@ -19225,6 +19337,12 @@ func TestListPermitsByProject(t *testing.T) {
 	taskID2 := GenerateID()
 	agentID := GenerateID()
 
+	// Initialize pool
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+
 	store.RequestPermit(ctx, "req-1", taskID1, projectID1, agentID, "haiku", "pool-1")
 	store.RequestPermit(ctx, "req-2", taskID2, projectID1, agentID, "haiku", "pool-1")
 	store.RequestPermit(ctx, "req-3", taskID1, projectID2, agentID, "haiku", "pool-1")
@@ -19261,6 +19379,16 @@ func TestListPermitsByPool(t *testing.T) {
 	taskID2 := GenerateID()
 	taskID3 := GenerateID()
 	agentID := GenerateID()
+
+	// Initialize pools
+	err = store.InitializePool(ctx, "pool-1", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
+	err = store.InitializePool(ctx, "pool-2", 10, 5)
+	if err != nil {
+		t.Fatalf("InitializePool failed: %v", err)
+	}
 
 	store.RequestPermit(ctx, "req-1", taskID1, projectID, agentID, "haiku", "pool-1")
 	store.RequestPermit(ctx, "req-2", taskID2, projectID, agentID, "haiku", "pool-1")
