@@ -17,8 +17,8 @@ import (
 // read. The file belongs to the claiming worker session, not just the task: a
 // replacement session reclaiming the same task (even under the same agent ID)
 // writes its own file and can never overwrite the one a stale session reads.
-// The session is ODONIAN_SESSION_ID, else CLAUDE_CODE_SESSION_ID; with neither
-// set the file is per-task only, which cannot tell two sessions apart. --attempt
+// The session is the first of sessionVars that is set; with none set the file is
+// per-task only, which cannot tell two sessions apart. --attempt
 // overrides the file; a task with no file sends no attempt.
 
 var safeTaskID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -45,8 +45,12 @@ func attemptPath(taskID string) (string, bool) {
 	return filepath.Join(attemptDir(), name), true
 }
 
+// sessionVars name the worker session: an explicit Odonian session first, then
+// the IDs the Claude Code and Codex harnesses export to each session.
+var sessionVars = []string{"ODONIAN_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID"}
+
 func workerSession() string {
-	for _, k := range []string{"ODONIAN_SESSION_ID", "CLAUDE_CODE_SESSION_ID"} {
+	for _, k := range sessionVars {
 		if v := os.Getenv(k); v != "" {
 			return v
 		}

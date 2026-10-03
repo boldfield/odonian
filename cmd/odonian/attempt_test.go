@@ -133,56 +133,73 @@ func newResearchServer(t *testing.T) (url string, advance func(time.Duration), t
 }
 
 // Each worker session is its own process environment sharing one state dir, as two
-// sessions of the same agent on one host would.
+// sessions of the same agent on one host would. Every harness's session variable
+// is exercised alone, with the others unset.
 func TestCLIFencesStaleSameAgentSessionAfterReclaim(t *testing.T) {
-	t.Setenv("ODONIAN_STATE_DIR", t.TempDir())
-	t.Setenv("ODONIAN_SESSION_ID", "")
-	url, advance, id := newResearchServer(t)
-	ctx := t.Context()
-	agent := []string{"--agent", "agent", "--model", "opus"}
-	prArgs := []string{"--agent", "agent", "--pr", "https://github.com/test/repo/pull/1", "--branch", "mr/x"}
+	for _, sessVar := range sessionVars {
+		t.Run(sessVar, func(t *testing.T) {
+			t.Setenv("ODONIAN_STATE_DIR", t.TempDir())
+			for _, k := range sessionVars {
+				t.Setenv(k, "")
+			}
+			url, advance, id := newResearchServer(t)
+			ctx := t.Context()
+			agent := []string{"--agent", "agent", "--model", "opus"}
+			prArgs := []string{"--agent", "agent", "--pr", "https://github.com/test/repo/pull/1", "--branch", "mr/x"}
 
-	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-old")
-	if err := executeClaim(ctx, url, "tok", append([]string{id}, agent...)); err != nil {
-		t.Fatalf("first claim: %v", err)
-	}
-	advance(6 * time.Minute)
-	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-new")
-	if err := executeClaim(ctx, url, "tok", append([]string{id}, agent...)); err != nil {
-		t.Fatalf("reclaim: %v", err)
-	}
+			t.Setenv(sessVar, "session-old")
+			if err := executeClaim(ctx, url, "tok", append([]string{id}, agent...)); err != nil {
+				t.Fatalf("first claim: %v", err)
+			}
+			advance(6 * time.Minute)
+			t.Setenv(sessVar, "session-new")
+			if err := executeClaim(ctx, url, "tok", append([]string{id}, agent...)); err != nil {
+				t.Fatalf("reclaim: %v", err)
+			}
 
-	fenced := func(err error) bool {
-		var apiErr *tuiclient.APIError
-		return errors.As(err, &apiErr) && apiErr.Code == "ATTEMPT_FENCED"
-	}
-	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-old")
-	if err := executeHeartbeat(ctx, url, "tok", []string{id, "--agent", "agent"}); !fenced(err) {
-		t.Fatalf("stale heartbeat = %v, want ATTEMPT_FENCED", err)
-	}
-	if err := executeSubmit(ctx, url, "tok", append([]string{id, "--result", "STALE"}, prArgs...)); !fenced(err) {
-		t.Fatalf("stale submit = %v, want ATTEMPT_FENCED", err)
-	}
+			fenced := func(err error) bool {
+				var apiErr *tuiclient.APIError
+				return errors.As(err, &apiErr) && apiErr.Code == "ATTEMPT_FENCED"
+			}
+			t.Setenv(sessVar, "session-old")
+			if err := executeHeartbeat(ctx, url, "tok", []string{id, "--agent", "agent"}); !fenced(err) {
+				t.Fatalf("stale heartbeat = %v, want ATTEMPT_FENCED", err)
+			}
+			if err := executeSubmit(ctx, url, "tok", append([]string{id, "--result", "STALE"}, prArgs...)); !fenced(err) {
+				t.Fatalf("stale submit = %v, want ATTEMPT_FENCED", err)
+			}
 
-	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-new")
-	if err := executeHeartbeat(ctx, url, "tok", []string{id, "--agent", "agent"}); err != nil {
-		t.Fatalf("current heartbeat: %v", err)
-	}
-	if err := executeSubmit(ctx, url, "tok", append([]string{id, "--result", "real"}, prArgs...)); err != nil {
-		t.Fatalf("current submit: %v", err)
+			t.Setenv(sessVar, "session-new")
+			if err := executeHeartbeat(ctx, url, "tok", []string{id, "--agent", "agent"}); err != nil {
+				t.Fatalf("current heartbeat: %v", err)
+			}
+			if err := executeSubmit(ctx, url, "tok", append([]string{id, "--result", "real"}, prArgs...)); err != nil {
+				t.Fatalf("current submit: %v", err)
+			}
+		})
 	}
 }
 
 func TestAttemptFileIsPerSession(t *testing.T) {
 	t.Setenv("ODONIAN_STATE_DIR", t.TempDir())
-	t.Setenv("ODONIAN_SESSION_ID", "")
-	t.Setenv("CLAUDE_CODE_SESSION_ID", "s1")
+	for _, k := range sessionVars {
+		t.Setenv(k, "")
+	}
+	t.Setenv("CODEX_SESSION_ID", "codex-old")
 	p1, _ := attemptPath("task-1")
-	t.Setenv("CLAUDE_CODE_SESSION_ID", "s2")
+	t.Setenv("CODEX_SESSION_ID", "codex-new")
 	p2, _ := attemptPath("task-1")
-	t.Setenv("ODONIAN_SESSION_ID", "explicit")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "s1")
 	p3, _ := attemptPath("task-1")
-	if p1 == p2 || p1 == p3 || p2 == p3 {
-		t.Fatalf("sessions share an attempt file: %s %s %s", p1, p2, p3)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "s2")
+	p4, _ := attemptPath("task-1")
+	t.Setenv("ODONIAN_SESSION_ID", "explicit")
+	p5, _ := attemptPath("task-1")
+	seen := map[string]bool{}
+	for _, p := range []string{p1, p2, p3, p4, p5} {
+		if seen[p] {
+			t.Fatalf("sessions share an attempt file: %s %s %s %s %s", p1, p2, p3, p4, p5)
+		}
+		seen[p] = true
 	}
 }
