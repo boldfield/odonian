@@ -386,6 +386,49 @@ pick_claimable_task() {
   return 0
 }
 
+# Request research admission for a task. On success, outputs JSON with admission details
+# (permit_id, attempt_id, etc.) and returns 0. On deferral, outputs to stderr and returns 10.
+# On other errors, outputs and returns non-zero.
+request_research_admission() {
+  local task_id="$1" model="$2"
+  local claim_output claim_rc
+
+  # Use a stable request ID based on task ID and agent ID for idempotent retries.
+  local request_id="$AGENT_ID:$task_id"
+  local claim_cmd="odonian claim $task_id --model $model --request-id $request_id"
+
+  claim_output=$($claim_cmd 2>&1)
+  claim_rc=$?
+
+  if [ "$claim_rc" -eq 10 ]; then
+    echo "$claim_output" >&2
+    return 10
+  fi
+
+  if [ "$claim_rc" -ne 0 ]; then
+    echo "[$AGENT_ID] research admission failed for $task_id: $claim_output" >&2
+    return "$claim_rc"
+  fi
+
+  echo "$claim_output"
+  return 0
+}
+
+extract_admission_field() {
+  local json="$1" field="$2"
+  echo "$json" | jq -r ".research_admission.$field // empty" 2>/dev/null || echo ""
+}
+
+renew_permit() {
+  local permit_id="$1" attempt_id="$2"
+  odonian permit-renew "$permit_id" --attempt-id "$attempt_id" 2>/dev/null || return 1
+}
+
+finalize_permit() {
+  local permit_id="$1" attempt_id="$2" exit_class="${3:-unknown}"
+  odonian permit-finalize "$permit_id" --attempt-id "$attempt_id" --exit-class "$exit_class" 2>/dev/null || return 1
+}
+
 # Run one claude task, shielded from Ctrl-C, waiting until it truly finishes. Captures claude's
 # exit code: a non-zero exit means claude could not run (out of credits, auth, missing binary) —
 # NOT that the task is bad. On failure this marks $AGENT_MODEL's backend unavailable (see above)
@@ -400,6 +443,9 @@ dispatch() {
 
   # Export ODONIAN_MODEL for the dispatched agent to use (pr-feedback ack marker default is ${ODONIAN_MODEL:-fleet}-worker:)
   export ODONIAN_MODEL="$AGENT_MODEL"
+
+  [ -n "${ODONIAN_ATTEMPT_ID:-}" ] && export ODONIAN_ATTEMPT_ID
+  [ -n "${ODONIAN_PERMIT_ID:-}" ] && export ODONIAN_PERMIT_ID
 
   # Check if AGENT_MODEL is in AGENT_CODEX_MODELS (comma-separated list)
   local use_codex=0
@@ -422,9 +468,32 @@ dispatch() {
   fi
 
   CLAUDE_PID=$!   # tracked so request_stop()/cleanup() can tear down this claude's process group
-  local pid=$CLAUDE_PID rc=0
-  while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
+  local pid=$CLAUDE_PID rc=0 permit_id="${ODONIAN_PERMIT_ID:-}" attempt_id="${ODONIAN_ATTEMPT_ID:-}"
+  local last_renew=$(date +%s)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    wait "$pid" 2>/dev/null && break
+
+    if [ -n "$permit_id" ] && [ -n "$attempt_id" ]; then
+      local now=$(date +%s)
+      if [ $((now - last_renew)) -ge 30 ]; then
+        renew_permit "$permit_id" "$attempt_id" || true
+        last_renew=$now
+      fi
+    fi
+  done
+  rc=$?
+
   CLAUDE_PID=""
+
+  if [ -n "$permit_id" ] && [ -n "$attempt_id" ]; then
+    local exit_class="success"
+    [ "$rc" -ne 0 ] && exit_class="failure"
+    [ "$STOP" -eq 1 ] && exit_class="shutdown"
+    finalize_permit "$permit_id" "$attempt_id" "$exit_class" || true
+  fi
+
   # If we're shutting down, the non-zero rc is our own TERM of claude — don't treat it as a credit
   # failure and don't back off; just unwind so the loop can exit promptly.
   [ "$STOP" -eq 1 ] && return "$rc"
@@ -509,6 +578,31 @@ if [ "$MULTI" = 0 ]; then
         odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
         echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
       fi
+
+      # Handle research admission before dispatch
+      unset ODONIAN_ATTEMPT_ID ODONIAN_PERMIT_ID
+      if [ "$task_track" = "research" ]; then
+        odonian heartbeat "$task_id" 2>/dev/null || true
+        admission_output=$(request_research_admission "$task_id" "$task_model")
+        admission_rc=$?
+
+        if [ "$admission_rc" -eq 10 ]; then
+          echo "[$AGENT_ID] $(date '+%H:%M:%S') research task $task_id deferred (scheduling); skipping"
+          continue
+        fi
+
+        if [ "$admission_rc" -ne 0 ]; then
+          echo "[$AGENT_ID] $(date '+%H:%M:%S') research admission failed for $task_id; skipping"; nap 10; continue
+        fi
+
+        ODONIAN_ATTEMPT_ID=$(extract_admission_field "$admission_output" "attempt_id")
+        ODONIAN_PERMIT_ID=$(extract_admission_field "$admission_output" "permit_id")
+        if [ -z "$ODONIAN_ATTEMPT_ID" ] || [ -z "$ODONIAN_PERMIT_ID" ]; then
+          echo "[$AGENT_ID] $(date '+%H:%M:%S') failed to extract research admission details; skipping"
+          continue
+        fi
+      fi
+
       echo "[$AGENT_ID] $(date '+%H:%M:%S') claimable $KIND; dispatching ($task_model/$task_track)…"
       export AGENT_MODEL="$task_model"
       dispatch
@@ -577,6 +671,32 @@ while true; do
       odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
       echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
     fi
+
+    # Handle research admission before dispatch
+    unset ODONIAN_ATTEMPT_ID ODONIAN_PERMIT_ID
+    if [ "$task_track" = "research" ]; then
+      odonian heartbeat "$task_id" 2>/dev/null || true
+      admission_output=$(request_research_admission "$task_id" "$task_model")
+      admission_rc=$?
+
+      if [ "$admission_rc" -eq 10 ]; then
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') research task $task_id deferred (scheduling); skipping to next project"
+        continue
+      fi
+
+      if [ "$admission_rc" -ne 0 ]; then
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') research admission failed for $task_id; skipping to next project"
+        continue
+      fi
+
+      ODONIAN_ATTEMPT_ID=$(extract_admission_field "$admission_output" "attempt_id")
+      ODONIAN_PERMIT_ID=$(extract_admission_field "$admission_output" "permit_id")
+      if [ -z "$ODONIAN_ATTEMPT_ID" ] || [ -z "$ODONIAN_PERMIT_ID" ]; then
+        echo "[$AGENT_ID] $(date '+%H:%M:%S') failed to extract research admission details; skipping to next project"
+        continue
+      fi
+    fi
+
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatching ($task_model/$task_track/$KIND) on $(norm_repo "$prepo") [${pid:0:8}]…"
     export AGENT_MODEL="$task_model"
     dispatch
