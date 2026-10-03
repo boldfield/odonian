@@ -367,5 +367,48 @@ not recommendations for a deployment.
 Command and exact output, from a run on the merged tree:
 
 ```text
-OUTPUT_PLACEHOLDER
+$ bash harness/research_pacing_smoke_test.sh
+== setup: real server (enforce), temp DB, fake claude
+  ✓ server reports enforce mode with the configured pool
+== 1. concurrency limit shared across two projects
+  ✓ exactly one research model process launched across both projects
+  ✓ the denied task is untouched: still ready, unassigned, round 0, no model process
+  ✓ the denial was a reserved-capacity deferral (a slot was free but held for completion work)
+  ✓ pool shows 1 active dispatch and 1 deferred task
+== 2. review is admitted into the reserved completion slot
+  ✓ a fable review launched while the second writer is still denied
+  ✓ pool shows 2 active dispatches, 1 of them completion work
+  ✓ the denied writer still has not launched
+  ✓ the denial is now concurrency-bound (both slots busy)
+== 3. restart persistence
+  ✓ active permits survived the restart (2 active, 1 completion)
+  ✓ the restart did not refill the allowance (tokens within refill-rate drift of before)
+  ✓ renewals after the restart kept both dispatches alive (still 2 active, no process fenced)
+  ✓ no model process was launched or duplicated by the restart
+  ✓ the denied task is still waiting after the restart
+== 4. build work is unaffected by the saturated research pool
+  ✓ the build task launched while the research pool was full
+  ✓ the build task is in progress and took no research permit (pool still 2 active)
+  ✓ the build agent never asked for research admission
+== 5. deferred task resumes automatically when capacity frees
+  ✓ the denied task is still plain ready work (never promoted or edited by hand)
+  ✓ the denied task launched on its own after the release
+  ✓ its task is now owned by its own agent (launched, then submitted for review)
+  ✓ the released dispatches exited normally and finalized their permits
+== 6. rework is completion work: reserved slot while first-pass writers are denied
+  ✓ all permits are released once the agents stop
+  ✓ writer W3 is admitted
+  ✓ the no-op submission spawned a review task targeting W3
+  ✓ W3's review is admitted as completion work
+  ✓ W3 is back in ready with review_round >= 1 (rework), nothing active
+  ✓ first-pass writer X is admitted (takes the writer slot)
+  ✓ second first-pass writer Y is denied although a slot is free (reserved_capacity)
+  ✓ the rework claim is admitted into the reserved slot (server derived work class research_rework)
+  ✓ pool shows 2 active, 1 completion
+  ✓ writer Y is now denied for concurrency (all slots busy)
+  ✓ after X's permit is finalized, writer Y is admitted
+
+passed: 32  failed: 0
+$ echo $?
+0
 ```

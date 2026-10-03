@@ -25,7 +25,7 @@ pass_count=0; fail_count=0
 pass() { pass_count=$((pass_count + 1)); echo "  ✓ $1"; }
 fail() { fail_count=$((fail_count + 1)); echo "  ✗ $1"; }
 info() { [ -z "${SMOKE_VERBOSE:-}" ] || echo "   $*"; }  # run-specific detail (ports, ids, allowance); kept out of the default output so it is reproducible
-die() { echo "FATAL: $*" >&2; exit 2; }
+die() { echo "FATAL: $*" >&2; kill -TERM $$ 2>/dev/null; exit 2; }  # $$ is the main shell even inside $(...), so a helper failure always aborts the run
 ok() { # ok "<description>" '<shell expression>'  — evaluated now, in this shell; pass when it succeeds
   if eval "$2"; then pass "$1"; else fail "$1"; fi
 }
