@@ -33,6 +33,7 @@ type MockClient struct {
 	FinalizeResearchPermitFunc        func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error)
 	CreateEvaluationCampaignFunc      func(ctx context.Context, id, name, description, projects, models, cohort string, cap int) (map[string]interface{}, error)
 	GetEvaluationCampaignFunc         func(ctx context.Context, id string) (map[string]interface{}, error)
+	GetEvaluationCampaignStatusFunc   func(ctx context.Context, id string) (map[string]interface{}, error)
 	GetEvaluationSampleFunc           func(ctx context.Context, campaignID, sampleID string) (map[string]interface{}, error)
 	ClaimEvaluationJobFunc            func(ctx context.Context, sampleID, candidateID, requestID string, leaseTTLMs int64) (map[string]interface{}, error)
 	RenewEvaluationAttemptFunc        func(ctx context.Context, jobID, attemptID string, expiresAtMs int64) (map[string]interface{}, error)
@@ -210,6 +211,13 @@ func (m *MockClient) CreateEvaluationCampaign(ctx context.Context, id, name, des
 func (m *MockClient) GetEvaluationCampaign(ctx context.Context, id string) (map[string]interface{}, error) {
 	if m.GetEvaluationCampaignFunc != nil {
 		return m.GetEvaluationCampaignFunc(ctx, id)
+	}
+	return make(map[string]interface{}), nil
+}
+
+func (m *MockClient) GetEvaluationCampaignStatus(ctx context.Context, id string) (map[string]interface{}, error) {
+	if m.GetEvaluationCampaignStatusFunc != nil {
+		return m.GetEvaluationCampaignStatusFunc(ctx, id)
 	}
 	return make(map[string]interface{}), nil
 }

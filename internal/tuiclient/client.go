@@ -44,6 +44,7 @@ type Client interface {
 	FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error)
 	CreateEvaluationCampaign(ctx context.Context, id, name, description, projects, models, cohort string, cap int) (map[string]interface{}, error)
 	GetEvaluationCampaign(ctx context.Context, id string) (map[string]interface{}, error)
+	GetEvaluationCampaignStatus(ctx context.Context, id string) (map[string]interface{}, error)
 	GetEvaluationSample(ctx context.Context, campaignID, sampleID string) (map[string]interface{}, error)
 	ClaimEvaluationJob(ctx context.Context, sampleID, candidateID, requestID string, leaseTTLMs int64) (map[string]interface{}, error)
 	RenewEvaluationAttempt(ctx context.Context, jobID, attemptID string, expiresAtMs int64) (map[string]interface{}, error)
@@ -1213,6 +1214,21 @@ func (c *HTTPClient) FinalizeEvaluationAttempt(ctx context.Context, jobID, attem
 // PauseEvaluationCampaign explicitly pauses a campaign.
 func (c *HTTPClient) PauseEvaluationCampaign(ctx context.Context, id string) (map[string]interface{}, error) {
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/evaluation/campaigns/%s/pause", url.PathEscape(id)), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return result, nil
+}
+
+// GetEvaluationCampaignStatus retrieves the compact status of a campaign.
+func (c *HTTPClient) GetEvaluationCampaignStatus(ctx context.Context, id string) (map[string]interface{}, error) {
+	resp, err := c.do(ctx, "GET", fmt.Sprintf("/evaluation/campaigns/%s/status", url.PathEscape(id)), nil)
 	if err != nil {
 		return nil, err
 	}

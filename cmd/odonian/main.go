@@ -170,7 +170,7 @@ func run(args []string) error {
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
-	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize", "evaluation-create-campaign", "evaluation-get-campaign", "evaluation-get-sample", "evaluation-claim-job", "evaluation-renew-attempt", "evaluation-finalize-attempt", "evaluation-pause-campaign":
+	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize", "evaluation-create-campaign", "evaluation-get-campaign", "evaluation-get-campaign-status", "evaluation-get-sample", "evaluation-claim-job", "evaluation-renew-attempt", "evaluation-finalize-attempt", "evaluation-pause-campaign":
 		return runClient(args[1], args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command %q\n\n", args[1])
@@ -529,6 +529,8 @@ func runClient(verb string, args []string) error {
 		return executeEvaluationCreateCampaign(ctx, baseURL, token, args, os.Stdout)
 	case "evaluation-get-campaign":
 		return executeEvaluationGetCampaign(ctx, baseURL, token, args, jsonOutput, os.Stdout)
+	case "evaluation-get-campaign-status":
+		return executeEvaluationGetCampaignStatus(ctx, baseURL, token, args, jsonOutput, os.Stdout)
 	case "evaluation-get-sample":
 		return executeEvaluationGetSample(ctx, baseURL, token, args, jsonOutput, os.Stdout)
 	case "evaluation-claim-job":
@@ -2386,6 +2388,54 @@ func executeEvaluationGetCampaign(ctx context.Context, baseURL, token string, ar
 		}
 		fmt.Fprintf(out, "Attempt Cap: %v\n", campaign["attempt_cap"])
 		fmt.Fprintf(out, "Created At: %v\n", campaign["created_at"])
+	}
+	return nil
+}
+
+func executeEvaluationGetCampaignStatus(ctx context.Context, baseURL, token string, args []string, jsonOutput bool, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	fs := flag.NewFlagSet("evaluation-get-campaign-status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	idFlag := fs.String("id", "", "Campaign ID")
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	if *idFlag == "" {
+		return fmt.Errorf("--id flag is required")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	status, err := client.GetEvaluationCampaignStatus(ctx, *idFlag)
+	if err != nil {
+		return fmt.Errorf("failed to get evaluation campaign status: %w", err)
+	}
+
+	if jsonOutput {
+		output, err := json.MarshalIndent(status, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %w", err)
+		}
+		fmt.Fprintln(out, string(output))
+	} else {
+		fmt.Fprintf(out, "Campaign ID: %v\n", status["id"])
+		fmt.Fprintf(out, "Paused: %v\n", status["is_paused"])
+		if cap, ok := status["attempt_cap"]; ok {
+			fmt.Fprintf(out, "Attempt Cap: %v\n", cap)
+		}
+		if used, ok := status["total_attempts_used"]; ok {
+			fmt.Fprintf(out, "Total Attempts Used: %v\n", used)
+		}
+		if candidates, ok := status["candidates"]; ok {
+			fmt.Fprintf(out, "Candidates: %v\n", candidates)
+		}
 	}
 	return nil
 }

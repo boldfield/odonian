@@ -582,19 +582,6 @@ Pauses the campaign, blocking new job admission. Returns:
 - `409 ALREADY_PAUSED`: Campaign is already paused
 - `404`: Campaign not found
 
-### Create Candidate
-
-**POST** `/evaluation/campaigns/{id}/candidates`
-
-```json
-{
-  "candidate_config": {...},
-  "per_candidate_cap": 10
-}
-```
-
-**Response:** `201` with candidate object including ID.
-
 ### Get Sample
 
 **GET** `/evaluation/campaigns/{campaign_id}/samples/{sample_id}`
