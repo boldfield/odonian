@@ -263,6 +263,15 @@ type CampaignAttemptStats struct {
 	UnavailableSamples int
 	Candidates         map[string]*CandidateStats
 	AllFindings        map[string]*StoredFinding
+	SampleStates       map[string]*SampleState
+}
+
+// SampleState tracks the completion state of a sample across all candidates.
+type SampleState struct {
+	SampleID       string
+	HasCompleted   bool
+	HasFailed      bool
+	HasUnavailable bool
 }
 
 // CandidateStats aggregates findings per candidate.
@@ -303,14 +312,26 @@ func (s *sqliteStore) ListCampaignAttempts(ctx context.Context, campaignID strin
 		AllFindings: make(map[string]*StoredFinding),
 	}
 
-	// Get sample count.
-	var sampleCount int
-	err := s.readConn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM evaluation_sample WHERE campaign_id = ?`, campaignID).Scan(&sampleCount)
-	if err != nil && err != sql.ErrNoRows {
-		return stats, fmt.Errorf("count samples: %w", err)
+	// Get all samples and initialize their states.
+	sampleRows, err := s.readConn.QueryContext(ctx,
+		`SELECT id FROM evaluation_sample WHERE campaign_id = ? ORDER BY id`, campaignID)
+	if err != nil {
+		return stats, fmt.Errorf("list samples: %w", err)
 	}
-	stats.CohortSize = sampleCount
+	defer sampleRows.Close()
+
+	stats.SampleStates = make(map[string]*SampleState)
+	for sampleRows.Next() {
+		var sampleID string
+		if err := sampleRows.Scan(&sampleID); err != nil {
+			return stats, fmt.Errorf("scan sample: %w", err)
+		}
+		stats.SampleStates[sampleID] = &SampleState{SampleID: sampleID}
+	}
+	if err := sampleRows.Err(); err != nil {
+		return stats, fmt.Errorf("iterate samples: %w", err)
+	}
+	stats.CohortSize = len(stats.SampleStates)
 
 	// Get all candidates for this campaign.
 	candRows, err := s.readConn.QueryContext(ctx,
@@ -399,7 +420,7 @@ func (s *sqliteStore) ListCampaignAttempts(ctx context.Context, campaignID strin
 				case EvalExitFailed:
 					cand.FailedAttempts++
 				case EvalExitUnavailableSnapshot, EvalExitUnavailableSource:
-					stats.UnavailableSamples++
+					cand.ActiveAttempts++
 				}
 			}
 			if attempt.DurationMs != nil && *attempt.DurationMs > 0 {
@@ -414,9 +435,34 @@ func (s *sqliteStore) ListCampaignAttempts(ctx context.Context, campaignID strin
 				cand.TotalUsageTokens += *attempt.UsageTokens
 			}
 		}
+
+		// Update sample state.
+		if sampleState, ok := stats.SampleStates[sampleID]; ok {
+			if ec := attempt.ExitClass; ec != nil {
+				switch *ec {
+				case EvalExitCompleted:
+					sampleState.HasCompleted = true
+				case EvalExitFailed:
+					sampleState.HasFailed = true
+				case EvalExitUnavailableSnapshot, EvalExitUnavailableSource:
+					sampleState.HasUnavailable = true
+				}
+			}
+		}
 	}
 	if err := attemptRows.Err(); err != nil {
 		return stats, fmt.Errorf("iterate attempts: %w", err)
+	}
+
+	// Count samples by state.
+	for _, sampleState := range stats.SampleStates {
+		if sampleState.HasCompleted {
+			stats.CompletedSamples++
+		} else if sampleState.HasFailed {
+			stats.FailedSamples++
+		} else if sampleState.HasUnavailable {
+			stats.UnavailableSamples++
+		}
 	}
 
 	// Get all findings.

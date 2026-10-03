@@ -677,9 +677,13 @@ func (s *Server) handleGetEvaluationReport(w http.ResponseWriter, r *http.Reques
 		}
 
 		group := groupedByIssue[key]
+		model := ""
+		if cand, ok := stats.Candidates[finding.CandidateID]; ok {
+			model = cand.ModelID
+		}
 		cfd := store.CandidateFindingData{
 			CandidateID: finding.CandidateID,
-			Model:       finding.FindingID,
+			Model:       model,
 			Severity:    finding.Severity,
 			Claim:       finding.Claim,
 			Evidence:    finding.Evidence,
