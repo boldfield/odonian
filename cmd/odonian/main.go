@@ -59,8 +59,18 @@ func (e *handledError) Error() string {
 	return "handled"
 }
 
+// exitScheduling is the exit code for a research admission denial (429). It is
+// distinct from exit 2, which means "nothing claimable" / "raced, none claimed".
+const exitScheduling = 10
+
+// exitConflict is the exit code for a research permit/attempt/request conflict (409).
+const exitConflict = 11
+
 type schedulingError struct {
 	message           string
+	outcome           string
+	reason            string
+	notBefore         *string
 	retryAfterSeconds *int64
 	code              int
 }
@@ -78,14 +88,54 @@ func (e *conflictError) Error() string {
 	return e.message
 }
 
+// writeSchedulingHints prints a scheduling denial and its retry hints, one
+// key per line, so a caller can tell a rate/time deferral (not-before) from an
+// active-dispatch wait (retry-after).
+func writeSchedulingHints(w io.Writer, e *schedulingError) {
+	fmt.Fprintf(w, "scheduling: %v\n", e.Error())
+	if e.outcome != "" {
+		fmt.Fprintf(w, "outcome: %s\n", e.outcome)
+	}
+	if e.reason != "" {
+		fmt.Fprintf(w, "reason: %s\n", e.reason)
+	}
+	if e.notBefore != nil {
+		fmt.Fprintf(w, "not-before: %s\n", *e.notBefore)
+	}
+	if e.retryAfterSeconds != nil {
+		fmt.Fprintf(w, "retry-after: %d\n", *e.retryAfterSeconds)
+	}
+}
+
+// admissionError maps a research admission API failure to its distinct exit:
+// 429 is a scheduling denial (exitScheduling), 409 a conflict (exitConflict).
+// It returns nil for any other error.
+func admissionError(err error) error {
+	var apiErr *tuiclient.APIError
+	if !errors.As(err, &apiErr) {
+		return nil
+	}
+	switch apiErr.StatusCode {
+	case 429:
+		return &schedulingError{
+			message:           apiErr.Error(),
+			outcome:           apiErr.Outcome,
+			reason:            apiErr.Reason,
+			notBefore:         apiErr.NotBefore,
+			retryAfterSeconds: apiErr.RetryAfterSeconds,
+			code:              exitScheduling,
+		}
+	case 409:
+		return &conflictError{message: apiErr.Error(), code: exitConflict}
+	}
+	return nil
+}
+
 func main() {
 	if err := run(os.Args); err != nil {
 		var schedErr *schedulingError
 		if errors.As(err, &schedErr) {
-			fmt.Fprintf(os.Stderr, "scheduling: %v\n", schedErr.Error())
-			if schedErr.retryAfterSeconds != nil {
-				fmt.Fprintf(os.Stderr, "retry-after: %d\n", *schedErr.retryAfterSeconds)
-			}
+			writeSchedulingHints(os.Stderr, schedErr)
 			os.Exit(schedErr.code)
 		}
 		var conflErr *conflictError
@@ -901,18 +951,8 @@ func executeClaim(ctx context.Context, baseURL, token string, args []string) err
 		if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 			return &claimError{message: "already claimed", code: 3}
 		}
-		var apiErr *tuiclient.APIError
-		if errors.As(err, &apiErr) {
-			if apiErr.StatusCode == 429 {
-				return &schedulingError{
-					message:           apiErr.Error(),
-					retryAfterSeconds: apiErr.RetryAfterSeconds,
-					code:              2,
-				}
-			}
-			if apiErr.StatusCode == 409 {
-				return &conflictError{message: apiErr.Error(), code: 11}
-			}
+		if mapped := admissionError(err); mapped != nil {
+			return mapped
 		}
 		return err
 	}
@@ -1481,15 +1521,8 @@ func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 				return &claimError{message: "raced, none claimed", code: 2}
 			}
-			var apiErr *tuiclient.APIError
-			if errors.As(err, &apiErr) {
-				if apiErr.StatusCode == 429 {
-					return &schedulingError{
-						message:           apiErr.Error(),
-						retryAfterSeconds: apiErr.RetryAfterSeconds,
-						code:              2,
-					}
-				}
+			if mapped := admissionError(err); mapped != nil {
+				return mapped
 			}
 			return err
 		}
@@ -2157,28 +2190,17 @@ func executePermitRenew(ctx context.Context, baseURL, token string, args []strin
 	client := tuiclient.NewHTTPClient(baseURL, token)
 	attempt, err := client.RenewResearchPermit(ctx, permitID, *taskIDFlag, *modelFlag, *agentIDFlag, *requestIDFlag, *attemptIDFlag)
 	if err != nil {
-		var apiErr *tuiclient.APIError
-		if errors.As(err, &apiErr) {
-			switch apiErr.Code {
-			case "ATTEMPT_FENCED", "ATTEMPT_EXPIRED", "ATTEMPT_FINALIZED", "PERMIT_IDENTITY_MISMATCH":
-				return &conflictError{message: apiErr.Error(), code: 11}
-			}
-			if apiErr.StatusCode == 429 {
-				return &schedulingError{
-					message:           apiErr.Error(),
-					retryAfterSeconds: apiErr.RetryAfterSeconds,
-					code:              2,
-				}
-			}
+		if mapped := admissionError(err); mapped != nil {
+			return mapped
 		}
 		return fmt.Errorf("failed to renew research permit: %w", err)
 	}
 
-	output, err := json.MarshalIndent(attempt, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, attempt, "", "  "); err != nil {
+		return fmt.Errorf("failed to format JSON: %w", err)
 	}
-	fmt.Fprintln(out, string(output))
+	fmt.Fprintln(out, pretty.String())
 
 	return nil
 }
@@ -2247,28 +2269,17 @@ func executePermitFinalize(ctx context.Context, baseURL, token string, args []st
 	client := tuiclient.NewHTTPClient(baseURL, token)
 	attempt, err := client.FinalizeResearchPermit(ctx, permitID, *taskIDFlag, *modelFlag, *agentIDFlag, *requestIDFlag, *attemptIDFlag, *exitClassFlag, usageTokens)
 	if err != nil {
-		var apiErr *tuiclient.APIError
-		if errors.As(err, &apiErr) {
-			switch apiErr.Code {
-			case "ATTEMPT_FENCED", "ATTEMPT_EXPIRED", "ATTEMPT_FINALIZED", "PERMIT_IDENTITY_MISMATCH":
-				return &conflictError{message: apiErr.Error(), code: 11}
-			}
-			if apiErr.StatusCode == 429 {
-				return &schedulingError{
-					message:           apiErr.Error(),
-					retryAfterSeconds: apiErr.RetryAfterSeconds,
-					code:              2,
-				}
-			}
+		if mapped := admissionError(err); mapped != nil {
+			return mapped
 		}
 		return fmt.Errorf("failed to finalize research permit: %w", err)
 	}
 
-	output, err := json.MarshalIndent(attempt, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, attempt, "", "  "); err != nil {
+		return fmt.Errorf("failed to format JSON: %w", err)
 	}
-	fmt.Fprintln(out, string(output))
+	fmt.Fprintln(out, pretty.String())
 
 	return nil
 }

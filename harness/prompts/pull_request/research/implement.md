@@ -35,7 +35,7 @@ agent — do NOT proceed, STOP.
 **Ordinary (legacy) mode.** If `ODONIAN_PRECLAIMED_TASK_ID` is NOT set, follow steps 1–2 below as
 written (`odonian next`, then `odonian claim`). This legacy flow is valid only while the research
 admission policy is not `enforce` (see `odonian research-policy --json`). Under `enforce` the server
-denies unadmitted claims: if `odonian next` or `odonian claim` exits 2 (scheduling denial), report the
+denies unadmitted claims: if `odonian next` or `odonian claim` exits 10 (scheduling denial), report the
 printed reason and retry hint and STOP — do not retry in a loop and do not work any task.
 
 **Keep your lease alive.** A lease lapses if you go quiet too long, and a lapsed lease lets

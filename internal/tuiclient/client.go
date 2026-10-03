@@ -40,8 +40,8 @@ type Client interface {
 	GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error)
 	GetResearchPolicy(ctx context.Context) (ResearchPolicy, error)
 	GetResearchStatus(ctx context.Context) (ResearchStatus, error)
-	RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (ResearchAttempt, error)
-	FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (ResearchAttempt, error)
+	RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error)
+	FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error)
 }
 
 // Response structs for the TUI client (distinct from internal/store)
@@ -289,30 +289,24 @@ type ResearchStatus struct {
 	Pools []ResearchPoolState `json:"pools"`
 }
 
-type ResearchAdmission struct {
-	PermitID  string `json:"permit_id"`
-	AttemptID string `json:"attempt_id"`
-	RequestID string `json:"request_id"`
-	AccountID string `json:"account_id"`
-	ExpiresAt string `json:"expires_at"`
-	WorkClass string `json:"work_class"`
+// AdmissionOutcome is the structured admission verdict carried by a 429 denial
+// and by an observe-mode claim's observed_denial.
+type AdmissionOutcome struct {
+	Outcome           string  `json:"outcome"`
+	Reason            string  `json:"reason,omitempty"`
+	NotBefore         *string `json:"not_before,omitempty"`
+	RetryAfterSeconds *int64  `json:"retry_after_seconds,omitempty"`
 }
 
-type ResearchAttempt struct {
-	ID                string  `json:"id"`
-	PermitID          string  `json:"permit_id"`
-	TaskID            string  `json:"task_id"`
-	AccountID         string  `json:"account_id"`
-	State             string  `json:"state"`
-	StartedAt         string  `json:"started_at"`
-	ExpiresAt         string  `json:"expires_at"`
-	EndedAt           *string `json:"ended_at,omitempty"`
-	ExitClass         *string `json:"exit_class,omitempty"`
-	DurationMS        *int64  `json:"duration_ms,omitempty"`
-	UsageTokens       *int64  `json:"usage_tokens,omitempty"`
-	SequenceNumber    int     `json:"sequence_number"`
-	PreviousAttemptID *string `json:"previous_attempt_id,omitempty"`
-	Completion        bool    `json:"completion"`
+// ResearchAdmission mirrors the server's research_admission claim field.
+type ResearchAdmission struct {
+	PermitID  string            `json:"permit_id,omitempty"`
+	AttemptID string            `json:"attempt_id,omitempty"`
+	RequestID string            `json:"request_id,omitempty"`
+	AccountID string            `json:"account_id,omitempty"`
+	ExpiresAt string            `json:"expires_at,omitempty"`
+	Replayed  bool              `json:"replayed,omitempty"`
+	Observed  *AdmissionOutcome `json:"observed_denial,omitempty"`
 }
 
 // HTTPClient implements the Client interface.
@@ -370,6 +364,7 @@ type APIError struct {
 	StatusCode        int
 	Code              string
 	Message           string
+	Outcome           string
 	Reason            string
 	NotBefore         *string
 	RetryAfterSeconds *int64
@@ -387,6 +382,7 @@ type errorResponse struct {
 	Error struct {
 		Code              string  `json:"code"`
 		Message           string  `json:"message"`
+		Outcome           string  `json:"outcome"`
 		Reason            string  `json:"reason"`
 		NotBefore         *string `json:"not_before"`
 		RetryAfterSeconds *int64  `json:"retry_after_seconds"`
@@ -438,6 +434,7 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body interface
 			if unmarshalErr := json.Unmarshal(bodyBytes, &errResp); unmarshalErr == nil && errResp.Error.Message != "" {
 				apiErr.Code = errResp.Error.Code
 				apiErr.Message = errResp.Error.Message
+				apiErr.Outcome = errResp.Error.Outcome
 				apiErr.Reason = errResp.Error.Reason
 				apiErr.NotBefore = errResp.Error.NotBefore
 				apiErr.RetryAfterSeconds = errResp.Error.RetryAfterSeconds
@@ -716,7 +713,8 @@ type claimTaskRequest struct {
 }
 
 // ClaimTask claims a task as in_progress by the given agent and model.
-// Returns ErrAlreadyClaimed if the task is already claimed by another worker (409 status).
+// Returns ErrAlreadyClaimed if the task is already claimed by another worker (409 status);
+// a 409 REQUEST_ID_CONFLICT or TASK_BUSY is returned as the *APIError instead.
 // requestID, accountID, and workClass are optional; when provided they enable stable
 // admission identity for transport retry recovery.
 func (c *HTTPClient) ClaimTask(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error) {
@@ -731,7 +729,8 @@ func (c *HTTPClient) ClaimTask(ctx context.Context, id, agentID, model, requestI
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/claim", id), body)
 	if err != nil {
 		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.StatusCode == 409 {
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 409 &&
+			apiErr.Code != "REQUEST_ID_CONFLICT" && apiErr.Code != "TASK_BUSY" {
 			return nil, ErrAlreadyClaimed
 		}
 		return nil, err
@@ -1005,7 +1004,7 @@ func (c *HTTPClient) GetResearchStatus(ctx context.Context) (ResearchStatus, err
 }
 
 // RenewResearchPermit extends the lease on an active research attempt.
-func (c *HTTPClient) RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (ResearchAttempt, error) {
+func (c *HTTPClient) RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error) {
 	body := map[string]string{
 		"task_id":    taskID,
 		"model":      model,
@@ -1016,22 +1015,25 @@ func (c *HTTPClient) RenewResearchPermit(ctx context.Context, permitID, taskID, 
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/research/permits/%s/renew", url.PathEscape(permitID)), body)
 	if err != nil {
-		return ResearchAttempt{}, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var result struct {
-		Attempt ResearchAttempt `json:"attempt"`
+		Attempt json.RawMessage `json:"attempt"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return ResearchAttempt{}, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	if len(result.Attempt) == 0 {
+		return nil, fmt.Errorf("failed to decode response: missing attempt")
 	}
 
 	return result.Attempt, nil
 }
 
 // FinalizeResearchPermit ends an active research attempt and records the outcome.
-func (c *HTTPClient) FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (ResearchAttempt, error) {
+func (c *HTTPClient) FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error) {
 	body := map[string]interface{}{
 		"task_id":    taskID,
 		"model":      model,
@@ -1046,15 +1048,18 @@ func (c *HTTPClient) FinalizeResearchPermit(ctx context.Context, permitID, taskI
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/research/permits/%s/finalize", url.PathEscape(permitID)), body)
 	if err != nil {
-		return ResearchAttempt{}, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var result struct {
-		Attempt ResearchAttempt `json:"attempt"`
+		Attempt json.RawMessage `json:"attempt"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return ResearchAttempt{}, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	if len(result.Attempt) == 0 {
+		return nil, fmt.Errorf("failed to decode response: missing attempt")
 	}
 
 	return result.Attempt, nil

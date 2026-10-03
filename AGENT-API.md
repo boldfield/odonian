@@ -363,7 +363,11 @@ stable admission request identity for transport retry recovery: `request-id` (id
 `account-id` (account assertion), and `work-class` (work type assertion). These optional fields
 allow a caller to safely retry an ambiguous admission/claim in case of transport failure, as a
 repeated claim with matching identity returns the original admission instead of spending again.
-Returns the research admission record (permit ID, attempt ID, request ID, expires_at) as JSON.
+For an admitted research claim, prints the server's `research_admission` object as JSON, with
+only the keys the server sent: `permit_id`, `attempt_id`, `request_id`, `account_id`, `expires_at`,
+`replayed` (present and `true` when a `--request-id` retry recovered the original admission instead
+of spending again) and `observed_denial` (observe mode only: the `outcome`, `reason`, `not_before`
+and `retry_after_seconds` the pool would have denied with). A non-research claim prints nothing.
 
 ### Renew a research permit
 
@@ -377,7 +381,8 @@ odonian permit-renew <permit_id> \
 ```
 
 Extends the lease on an active research attempt. All parameters are required and must match the
-permit's identity. Returns the renewed attempt with its updated lease expiry time as JSON.
+permit's identity. Prints the server's `attempt` object unchanged as JSON (`id`, `permit_id`, `task_id`, `state`,
+`expires_at`), including the updated lease expiry time.
 
 ### Finalize a research permit
 
@@ -394,7 +399,8 @@ odonian permit-finalize <permit_id> \
 
 Ends an active research attempt and records the outcome. `exit_class` must be one of: `completed`,
 `failed`, `cancelled`, `unknown`. `usage_tokens` is optional and specifies the token usage if
-reported by the runtime. Returns the finalized attempt with its exit status as JSON.
+reported by the runtime. Prints the server's `attempt` object unchanged as JSON (`id`, `permit_id`, `task_id`, `state`,
+`exit_class`). An explicit `--usage-tokens 0` is sent as zero, distinct from omitting the flag.
 
 ### Preclaimed task support
 
@@ -416,7 +422,7 @@ Research prompts (`harness/prompts/pull_request/research/implement.md` and
   so no attempt file was saved for it).
 - When `ODONIAN_PRECLAIMED_TASK_ID` is not set, the prompts run the ordinary `odonian next` +
   `odonian claim` flow. That legacy flow is valid only while the research admission policy mode is
-  not `enforce`; under `enforce`, an exit code 2 (scheduling denial) from `next`/`claim` means the
+  not `enforce`; under `enforce`, an exit code 10 (scheduling denial) from `next`/`claim` means the
   worker reports the reason and retry hint and stops.
 - Preserve all source checks, findings, adjudication, manifestation and submission requirements
   from the regular prompt flow.
@@ -434,20 +440,25 @@ transient admission deferral (which may succeed on retry) from fatal conflicts:
 - **Exit 0:** Command succeeded.
 - **Exit 1:** Generic error (misconfiguration, network failure, server error, etc.). Retry strategy
   depends on the nature of the error; inspect stderr for details.
-- **Exit 2:** Scheduling error — the task/permit encountered admission scheduling constraints
-  (e.g., 429 Too Many Requests due to quota exhaustion or deferral). The command prints
-  `scheduling: <reason>` to stderr. If available, `retry-after: <seconds>` is also printed,
-  indicating how long to wait before retrying. Callers should back off and retry after the
-  specified delay.
+- **Exit 2:** `next` only — nothing claimable, or a `next --claim` race lost. Not a scheduling
+  denial and not an error; the queue simply has nothing for this worker right now.
+- **Exit 10:** Scheduling denial — the admission pool refused the start (429 Too Many Requests).
+  The command prints `scheduling: <message>` to stderr followed by whichever hints the server sent,
+  one per line: `outcome: defer|retry`, `reason: <reason>`, `not-before: <RFC 3339 time>` and
+  `retry-after: <seconds>`. A rate/time deferral carries `not-before` only; `retry-after` is sent
+  when an active dispatch must finish first (also read from the `Retry-After` header). Callers
+  should wait until `not-before` / `retry-after` and retry; this exit applies to `claim`,
+  `next --claim`, `permit-renew` and `permit-finalize`.
 - **Exit 3:** Already claimed (claim-specific) — the task was claimed by another agent or worker
   between the `next` query and the claim attempt. A racing claim succeeded first. Retry by calling
   `next` again.
-- **Exit 11:** Conflict error — the permit or attempt is in an invalid state for the requested
-  operation. The command prints `conflict: <reason>` to stderr. Possible reasons include
+- **Exit 11:** Conflict error (409) — the permit, attempt or request identity is in an invalid
+  state for the requested operation. The command prints `conflict: <reason>` to stderr. Possible reasons include
   `ATTEMPT_FENCED` (the attempt ID doesn't match the permit's current attempt), `ATTEMPT_EXPIRED`
-  (the permit's lease has expired), `ATTEMPT_FINALIZED` (the attempt is already finalized), or
-  `PERMIT_IDENTITY_MISMATCH` (the supplied identity parameters don't match the permit's record).
-  These are fatal conditions and do not benefit from retry.
+  (the permit's lease has expired), `ATTEMPT_FINALIZED` (the attempt is already finalized), `PERMIT_IDENTITY_MISMATCH` (the supplied identity parameters don't match the permit's record),
+  `REQUEST_ID_CONFLICT` (a `claim --request-id` already used for a different task, agent, model or
+  pool) or `TASK_BUSY` (the task still has a live research attempt).
+  These are not transient scheduling conditions; do not retry them blindly.
 
 ## Task creation
 

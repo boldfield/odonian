@@ -29,7 +29,7 @@ owned by another agent — do NOT proceed, STOP.
 **Ordinary (legacy) mode.** If `ODONIAN_PRECLAIMED_TASK_ID` is NOT set, follow step 1 as written
 (`odonian next`, then `odonian claim`). This legacy flow is valid only while the research admission
 policy is not `enforce` (see `odonian research-policy --json`). Under `enforce` the server denies
-unadmitted claims: if `odonian next` or `odonian claim` exits 2 (scheduling denial), report the
+unadmitted claims: if `odonian next` or `odonian claim` exits 10 (scheduling denial), report the
 printed reason and retry hint and STOP — do not retry in a loop and do not review any task.
 
 1. **Claim a review task.** Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL"

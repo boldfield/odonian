@@ -383,7 +383,7 @@ for _pc_prompt in "$_ri_prompt" "$_rr_prompt"; do
     'state is `in_progress`' \
     '**Ordinary (legacy) mode.**' \
     'not `enforce`' \
-    'exits 2 (scheduling denial)'; do
+    'exits 10 (scheduling denial)'; do
     if ! printf '%s' "$_pc_text" | grep -qF -- "$_pc_needle"; then
       echo "  $(basename "$_pc_prompt") missing: $_pc_needle"
       _pc_ok=0

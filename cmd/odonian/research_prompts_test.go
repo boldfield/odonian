@@ -57,7 +57,7 @@ func TestResearchPromptsOrdinaryModeStillDocumented(t *testing.T) {
 		"**Ordinary (legacy) mode.**",
 		"valid only while the research",
 		"not `enforce`",
-		"exits 2 (scheduling denial)",
+		"exits 10 (scheduling denial)",
 	)
 	rev := readResearchPrompt(t, "review.md")
 	requireAll(t, "review.md", rev,
@@ -67,7 +67,7 @@ func TestResearchPromptsOrdinaryModeStillDocumented(t *testing.T) {
 		"**Ordinary (legacy) mode.**",
 		"valid only while the research admission",
 		"not `enforce`",
-		"exits 2 (scheduling denial)",
+		"exits 10 (scheduling denial)",
 	)
 }
 

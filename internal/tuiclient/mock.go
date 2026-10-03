@@ -2,6 +2,7 @@ package tuiclient
 
 import (
 	"context"
+	"encoding/json"
 )
 
 // MockClient is a mock implementation of the Client interface for testing.
@@ -13,7 +14,7 @@ type MockClient struct {
 	ListEventsFunc                    func(ctx context.Context, taskID string) ([]Event, error)
 	ListDocumentsFunc                 func(ctx context.Context, projectID string) ([]Document, error)
 	PromoteTaskFunc                   func(ctx context.Context, id string) error
-	ClaimTaskFunc                     func(ctx context.Context, id, agentID, model string) (*ResearchAdmission, error)
+	ClaimTaskFunc                     func(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error)
 	ReviewTaskFunc                    func(ctx context.Context, id, actor, verdict string, note *string) error
 	TransitionTaskFunc                func(ctx context.Context, id, to string, note *string) error
 	HeartbeatTaskFunc                 func(ctx context.Context, id, agentID string) error
@@ -28,8 +29,8 @@ type MockClient struct {
 	GetResearchReviewerScorecardsFunc func(ctx context.Context, projectID string) (ReviewerScorecards, error)
 	GetResearchPolicyFunc             func(ctx context.Context) (ResearchPolicy, error)
 	GetResearchStatusFunc             func(ctx context.Context) (ResearchStatus, error)
-	RenewResearchPermitFunc           func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (ResearchAttempt, error)
-	FinalizeResearchPermitFunc        func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (ResearchAttempt, error)
+	RenewResearchPermitFunc           func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error)
+	FinalizeResearchPermitFunc        func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error)
 	Tasks                             []Task // for simple test data
 }
 
@@ -81,7 +82,7 @@ func (m *MockClient) PromoteTask(ctx context.Context, id string) error {
 
 func (m *MockClient) ClaimTask(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error) {
 	if m.ClaimTaskFunc != nil {
-		return m.ClaimTaskFunc(ctx, id, agentID, model)
+		return m.ClaimTaskFunc(ctx, id, agentID, model, requestID, accountID, workClass)
 	}
 	return nil, nil
 }
@@ -178,16 +179,16 @@ func (m *MockClient) GetResearchStatus(ctx context.Context) (ResearchStatus, err
 	return ResearchStatus{}, nil
 }
 
-func (m *MockClient) RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (ResearchAttempt, error) {
+func (m *MockClient) RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error) {
 	if m.RenewResearchPermitFunc != nil {
 		return m.RenewResearchPermitFunc(ctx, permitID, taskID, model, agentID, requestID, attemptID)
 	}
-	return ResearchAttempt{}, nil
+	return nil, nil
 }
 
-func (m *MockClient) FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (ResearchAttempt, error) {
+func (m *MockClient) FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error) {
 	if m.FinalizeResearchPermitFunc != nil {
 		return m.FinalizeResearchPermitFunc(ctx, permitID, taskID, model, agentID, requestID, attemptID, exitClass, usageTokens)
 	}
-	return ResearchAttempt{}, nil
+	return nil, nil
 }
