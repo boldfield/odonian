@@ -95,6 +95,7 @@ func (p *Pipeline) Execute(ctx context.Context, runtimeName string, req Candidat
 	}
 
 	env, secrets, missingRef := p.childEnv(rt)
+	rd := newRedactor(secrets)
 	if missingRef != "" {
 		resp := p.synth(req, StatusFailed, ErrClassAuthMissing,
 			fmt.Sprintf("credential reference %q is not resolvable", missingRef), started)
@@ -117,7 +118,7 @@ func (p *Pipeline) Execute(ctx context.Context, runtimeName string, req Candidat
 	}
 
 	res.Launched = true
-	runErr, timedOut, stderr := p.launch(ctx, rt, req, reqPath, env, secrets)
+	runErr, timedOut, stderr := p.launch(ctx, rt, req, reqPath, env, rd)
 	res.Stderr = stderr
 	finished := p.now()
 	var exitErr *exec.ExitError
@@ -128,7 +129,12 @@ func (p *Pipeline) Execute(ctx context.Context, runtimeName string, req Candidat
 		res.ExitCode = exitErr.ExitCode()
 	}
 	fin := func(resp CandidateResponse) (Result, error) {
+		resp = rd.response(resp)
 		resp.Timing = Timing{StartedAt: started, FinishedAt: finished}
+		if err := resp.Validate(); err != nil {
+			resp = p.synth(req, StatusFailed, ErrClassOutputMalformed, "result rejected after redaction: "+rd.str(err.Error()), started)
+			resp.Timing = Timing{StartedAt: started, FinishedAt: finished}
+		}
 		return p.finish(res, resp)
 	}
 
@@ -162,8 +168,8 @@ func (p *Pipeline) Execute(ctx context.Context, runtimeName string, req Candidat
 		decErr = invalid("response run_id %q does not match request %q", resp.RunID, req.RunID)
 	}
 	if decErr != nil {
-		res.RawOutput = raw[:min(len(raw), rawOutputKeep)]
-		return fin(p.synth(req, StatusFailed, ErrClassOutputMalformed, truncate("result rejected: "+decErr.Error()), started))
+		res.RawOutput = truncateBytes(rd.bytes(raw), rawOutputKeep)
+		return fin(p.synth(req, StatusFailed, ErrClassOutputMalformed, "result rejected: "+rd.str(decErr.Error()), started))
 	}
 	if res.ExitCode != 0 && resp.Status == StatusCompleted {
 		return fin(p.synth(req, StatusFailed, ErrClassRuntimeError,
@@ -219,7 +225,7 @@ func (p *Pipeline) childEnv(rt Runtime) (env, secrets []string, missingRef strin
 	return env, secrets, ""
 }
 
-func (p *Pipeline) launch(ctx context.Context, rt Runtime, req CandidateRequest, reqPath string, env, secrets []string) (runErr error, timedOut bool, stderr string) {
+func (p *Pipeline) launch(ctx context.Context, rt Runtime, req CandidateRequest, reqPath string, env []string, rd *redactor) (runErr error, timedOut bool, stderr string) {
 	args := make([]string, len(rt.Args))
 	repl := strings.NewReplacer(
 		PlaceholderRequestPath, reqPath,
@@ -235,15 +241,17 @@ func (p *Pipeline) launch(ctx context.Context, rt Runtime, req CandidateRequest,
 	cmd.Dir = req.SnapshotPath
 	cmd.Env = env
 	cmd.WaitDelay = killWaitDelay
-	out, errBuf := &capped{limit: maxCapture}, &capped{limit: maxCapture}
+	// Capture past the cap by the longest secret so redaction sees any secret
+	// that starts inside the cap whole; the cap is applied after redaction.
+	out, errBuf := &capped{limit: maxCapture}, &capped{limit: maxCapture + rd.longest}
 	cmd.Stdout, cmd.Stderr = out, errBuf
 	runErr = cmd.Run()
 	timedOut = errors.Is(tctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
-	s := errBuf.String()
-	for _, sec := range secrets {
-		s = strings.ReplaceAll(s, sec, "[redacted]")
+	s := rd.str(errBuf.String())
+	if errBuf.truncated {
+		s = rd.dropPartialTail(s)
 	}
-	return runErr, timedOut, s
+	return runErr, timedOut, truncateTo(s, maxCapture)
 }
 
 var errTooLarge = errors.New("result exceeds size limit")
@@ -282,28 +290,35 @@ func DecodeResponse(data []byte) (CandidateResponse, error) {
 	return resp, nil
 }
 
-func truncate(s string) string {
-	if len(s) <= maxErrorMessage {
+func truncate(s string) string { return truncateTo(s, maxErrorMessage) }
+
+func truncateTo(s string, n int) string {
+	if len(s) <= n {
 		return s
 	}
-	cut := maxErrorMessage
+	cut := n
 	for cut > 0 && !isRuneStart(s[cut]) {
 		cut--
 	}
 	return s[:cut]
 }
 
+func truncateBytes(b []byte, n int) []byte { return []byte(truncateTo(string(b), n)) }
+
 func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
 
 type capped struct {
-	buf   bytes.Buffer
-	limit int
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
 }
 
 func (c *capped) Write(p []byte) (int, error) {
-	if room := c.limit - c.buf.Len(); room > 0 {
-		c.buf.Write(p[:min(room, len(p))])
+	room := max(c.limit-c.buf.Len(), 0)
+	if len(p) > room {
+		c.truncated = true
 	}
+	c.buf.Write(p[:min(room, len(p))])
 	return len(p), nil
 }
 

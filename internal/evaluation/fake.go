@@ -31,6 +31,13 @@ const (
 	FakeModeLeak        = "leak"      // prints its environment to stderr, then exits non-zero
 	FakeModeWrongRun    = "wrongrun"  // success, but for a different run ID
 	FakeModeDirtyExit   = "dirtyexit" // success result, but exits non-zero
+
+	// Credential-leak fixtures: the adapter echoes the credential held in the
+	// environment variable named by --secret-env into places the host records.
+	FakeModeLeakMalformed = "leakmalformed" // undecodable result containing the secret
+	FakeModeLeakField     = "leakfield"     // decodable result whose unknown field name is the secret
+	FakeModeLeakValid     = "leakvalid"     // valid result carrying the secret in every free-text field
+	FakeModeLeakBoundary  = "leakboundary"  // stderr where the secret straddles the host capture cap
 )
 
 // FakeProbePath is where probe mode records what the child observed.
@@ -52,6 +59,7 @@ func FakeMain(args []string, stderr io.Writer) int {
 	mode := fs.String("mode", "", "fixture mode")
 	reqPath := fs.String("request", "", "request file")
 	identityJSON := fs.String("identity", "", "effective identity as JSON")
+	secretEnv := fs.String("secret-env", "", "environment variable holding a credential to leak (leak fixtures)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -92,8 +100,28 @@ func FakeMain(args []string, stderr io.Writer) int {
 		return write(b)
 	}
 	base := CandidateResponse{Version: ProtocolVersion, RunID: req.RunID, Identity: identity}
+	secret := os.Getenv(*secretEnv)
 
 	switch *mode {
+	case FakeModeLeakMalformed:
+		return write([]byte(`{"version":1,"run_id":"` + req.RunID + `","status":"comple <` + secret + `>`))
+	case FakeModeLeakField:
+		return write([]byte(`{"version":1,"run_id":"` + req.RunID + `","` + secret + `":1}`))
+	case FakeModeLeakValid:
+		base.Status, base.ErrorClass, base.ErrorMessage = StatusFailed, ErrClassRuntimeError, "fake: auth failed for "+secret
+		base.Identity.ModelRevision = "rev-" + secret
+		return writeResp(base)
+	case FakeModeLeakBoundary:
+		// Units of growing padding put secret starts at every offset around the
+		// host's capture limit, so some secret straddles it whatever the limit is.
+		// Earlier secrets shrink under redaction, pulling a leftover fragment
+		// from beyond the cap to inside it.
+		fmt.Fprint(stderr, strings.Repeat(secret, 200))
+		fmt.Fprint(stderr, strings.Repeat("x", maxCapture-204*len(secret)))
+		for i := 0; i < 8*len(secret); i++ {
+			fmt.Fprint(stderr, strings.Repeat("x", i)+secret)
+		}
+		return 3
 	case FakeModeSuccess, FakeModeProbe:
 		if *mode == FakeModeProbe {
 			if code := writeProbe(req, stderr); code != 0 {

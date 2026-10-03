@@ -404,6 +404,71 @@ func TestStderrIsRedacted(t *testing.T) {
 	}
 }
 
+func leakPipeline(t *testing.T, mode string) (*Pipeline, string) {
+	t.Helper()
+	reg := NewRegistry()
+	registerFake(t, reg, "leak", mode, baseIdentity(), fullCaps, func(rt *Runtime) {
+		rt.Credentials = []CredentialRef{{EnvName: "REVIEW_KEY", Ref: "vault/review"}}
+		rt.Args = append(rt.Args, "--secret-env", "REVIEW_KEY")
+	})
+	p := newPipeline(reg)
+	p.Credentials = MapCredentials{"vault/review": leakSecret}
+	return p, leakSecret
+}
+
+const leakSecret = `s3cret-"value"<&>`
+
+func TestCredentialsAreRedactedFromRecordedResults(t *testing.T) {
+	for _, mode := range []string{FakeModeLeakMalformed, FakeModeLeakField, FakeModeLeakValid} {
+		t.Run(mode, func(t *testing.T) {
+			p, secret := leakPipeline(t, mode)
+			res, err := p.Execute(context.Background(), "leak", baseRequest(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorded := mustJSON(t, res) + string(res.RawOutput) + res.Stderr + res.Response.ErrorMessage
+			for _, form := range []string{secret, "s3cret-", jsonEscaped(secret, true), jsonEscaped(secret, false)} {
+				if strings.Contains(recorded, form) {
+					t.Fatalf("%q leaked into result: %s", form, recorded)
+				}
+			}
+			switch mode {
+			case FakeModeLeakMalformed:
+				if res.Response.ErrorClass != ErrClassOutputMalformed || !strings.Contains(string(res.RawOutput), redactedMarker) {
+					t.Fatalf("got %+v raw=%q", res.Response, res.RawOutput)
+				}
+			case FakeModeLeakField:
+				if res.Response.ErrorClass != ErrClassOutputMalformed {
+					t.Fatalf("got %+v", res.Response)
+				}
+			case FakeModeLeakValid:
+				if res.Response.ErrorClass != ErrClassRuntimeError || !strings.Contains(res.Response.ErrorMessage, redactedMarker) ||
+					res.Response.Identity.ModelRevision != "rev-"+redactedMarker {
+					t.Fatalf("got %+v", res.Response)
+				}
+			}
+		})
+	}
+}
+
+func TestSecretStraddlingStderrCapIsNotLeaked(t *testing.T) {
+	p, secret := leakPipeline(t, FakeModeLeakBoundary)
+	res, err := p.Execute(context.Background(), "leak", baseRequest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, form := range []string{secret, jsonEscaped(secret, true), jsonEscaped(secret, false)} {
+		for k := 1; k < len(form); k++ {
+			if strings.HasSuffix(res.Stderr, form[:k]) {
+				t.Fatalf("stderr ends with secret fragment %q", form[:k])
+			}
+		}
+	}
+	if len(res.Stderr) > maxCapture {
+		t.Fatalf("stderr exceeds cap: %d", len(res.Stderr))
+	}
+}
+
 func TestTimeoutAndCancellation(t *testing.T) {
 	reg := NewRegistry()
 	registerFake(t, reg, "slow", FakeModeHang, baseIdentity(), fullCaps, func(rt *Runtime) { rt.Timeout = 300 * time.Millisecond })
