@@ -828,6 +828,38 @@ func TestAPIError_UndecodableBody(t *testing.T) {
 	}
 }
 
+func TestAPIError_RetryAfterHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]string{
+				"code":    "ADMISSION_DEFERRED",
+				"message": "admission deferred",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
+	if err == nil {
+		t.Fatal("Expected error from 429 response, got nil")
+	}
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Expected *APIError, got %T: %v", err, err)
+	}
+	if apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("Expected StatusCode 429, got %d", apiErr.StatusCode)
+	}
+	if apiErr.RetryAfterSeconds == nil || *apiErr.RetryAfterSeconds != 60 {
+		t.Errorf("Expected RetryAfterSeconds 60 from header, got %v", apiErr.RetryAfterSeconds)
+	}
+}
+
 func TestListEvents(t *testing.T) {
 	// Create a test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1006,7 +1038,7 @@ func TestClaimTask(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
 	if err != nil {
 		t.Fatalf("ClaimTask failed: %v", err)
 	}
@@ -1026,7 +1058,7 @@ func TestClaimTaskAlreadyClaimed(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
 	if err == nil {
 		t.Fatal("Expected error from 409 response, got nil")
 	}
@@ -1050,7 +1082,7 @@ func TestClaimTaskServerError(t *testing.T) {
 	defer server.Close()
 
 	client := NewHTTPClient(server.URL, "testtoken")
-	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku")
+	_, err := client.ClaimTask(context.Background(), "task123", "agent-1", "haiku", "", "", "")
 	if err == nil {
 		t.Fatal("Expected error from 500 response, got nil")
 	}

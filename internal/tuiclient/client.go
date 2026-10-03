@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -24,7 +25,7 @@ type Client interface {
 	ListEvents(ctx context.Context, taskID string) ([]Event, error)
 	ListDocuments(ctx context.Context, projectID string) ([]Document, error)
 	PromoteTask(ctx context.Context, id string) error
-	ClaimTask(ctx context.Context, id, agentID, model string) (*ResearchAdmission, error)
+	ClaimTask(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error)
 	ReviewTask(ctx context.Context, id, actor, verdict string, note *string) error
 	TransitionTask(ctx context.Context, id, to string, note *string) error
 	HeartbeatTask(ctx context.Context, id, agentID string) error
@@ -443,6 +444,15 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body interface
 			}
 		}
 
+		// If RetryAfterSeconds is not set in the body, try parsing the Retry-After header.
+		if apiErr.RetryAfterSeconds == nil && resp.StatusCode == 429 {
+			if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+				if seconds, err := strconv.ParseInt(retryAfter, 10, 64); err == nil {
+					apiErr.RetryAfterSeconds = &seconds
+				}
+			}
+		}
+
 		return nil, apiErr
 	}
 
@@ -698,16 +708,24 @@ func (c *HTTPClient) PromoteTask(ctx context.Context, id string) error {
 
 // claimTaskRequest is the request body for ClaimTask.
 type claimTaskRequest struct {
-	AgentID string `json:"agent_id"`
-	Model   string `json:"model"`
+	AgentID   string `json:"agent_id"`
+	Model     string `json:"model"`
+	RequestID string `json:"request_id,omitempty"`
+	AccountID string `json:"account_id,omitempty"`
+	WorkClass string `json:"work_class,omitempty"`
 }
 
 // ClaimTask claims a task as in_progress by the given agent and model.
 // Returns ErrAlreadyClaimed if the task is already claimed by another worker (409 status).
-func (c *HTTPClient) ClaimTask(ctx context.Context, id, agentID, model string) (*ResearchAdmission, error) {
+// requestID, accountID, and workClass are optional; when provided they enable stable
+// admission identity for transport retry recovery.
+func (c *HTTPClient) ClaimTask(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error) {
 	body := claimTaskRequest{
-		AgentID: agentID,
-		Model:   model,
+		AgentID:   agentID,
+		Model:     model,
+		RequestID: requestID,
+		AccountID: accountID,
+		WorkClass: workClass,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/claim", id), body)

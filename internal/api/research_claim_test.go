@@ -307,7 +307,7 @@ func TestResearchClientPathFencesStaleSameAgentAfterReplacement(t *testing.T) {
 
 	// Two processes of the same agent identity, as after a lease expiry and reclaim.
 	oldWorker := tuiclient.NewHTTPClient(ts.URL, "test-token")
-	if _, err := oldWorker.ClaimTask(ctx, id, "agent", "opus"); err != nil {
+	if _, err := oldWorker.ClaimTask(ctx, id, "agent", "opus", "", "", ""); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
 	if oldWorker.AttemptID(id) == "" {
@@ -315,7 +315,7 @@ func TestResearchClientPathFencesStaleSameAgentAfterReplacement(t *testing.T) {
 	}
 	r.clock.Advance(6 * time.Minute)
 	newWorker := tuiclient.NewHTTPClient(ts.URL, "test-token")
-	if _, err := newWorker.ClaimTask(ctx, id, "agent", "opus"); err != nil {
+	if _, err := newWorker.ClaimTask(ctx, id, "agent", "opus", "", "", ""); err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}
 	if newWorker.AttemptID(id) == oldWorker.AttemptID(id) {
@@ -352,7 +352,7 @@ func TestResearchClientAttemptSetExplicitly(t *testing.T) {
 	id := r.task("research")
 
 	claimer := tuiclient.NewHTTPClient(ts.URL, "test-token")
-	if _, err := claimer.ClaimTask(ctx, id, "agent", "opus"); err != nil {
+	if _, err := claimer.ClaimTask(ctx, id, "agent", "opus", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	// A later process (the CLI) is handed the attempt ID.
@@ -369,7 +369,7 @@ func TestResearchClientAttemptSetExplicitly(t *testing.T) {
 
 	// A non-research claim carries no attempt.
 	plain := r.task("build")
-	if _, err := claimer.ClaimTask(ctx, plain, "agent", "opus"); err != nil {
+	if _, err := claimer.ClaimTask(ctx, plain, "agent", "opus", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if claimer.AttemptID(plain) != "" {

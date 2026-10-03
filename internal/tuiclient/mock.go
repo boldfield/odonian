@@ -79,7 +79,7 @@ func (m *MockClient) PromoteTask(ctx context.Context, id string) error {
 	return m.PromoteTaskFunc(ctx, id)
 }
 
-func (m *MockClient) ClaimTask(ctx context.Context, id, agentID, model string) (*ResearchAdmission, error) {
+func (m *MockClient) ClaimTask(ctx context.Context, id, agentID, model, requestID, accountID, workClass string) (*ResearchAdmission, error) {
 	if m.ClaimTaskFunc != nil {
 		return m.ClaimTaskFunc(ctx, id, agentID, model)
 	}

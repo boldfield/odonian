@@ -874,6 +874,9 @@ func executeClaim(ctx context.Context, baseURL, token string, args []string) err
 	fs.SetOutput(io.Discard)
 	agentFlag := fs.String("agent", "", "agent ID")
 	modelFlag := fs.String("model", "", "model")
+	requestIDFlag := fs.String("request-id", "", "stable admission request ID")
+	accountIDFlag := fs.String("account-id", "", "account ID assertion")
+	workClassFlag := fs.String("work-class", "", "work class assertion")
 	positionals, err := parseFlagsWithPositionals(fs, args)
 	if err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
@@ -893,7 +896,7 @@ func executeClaim(ctx context.Context, baseURL, token string, args []string) err
 
 	// Create client and claim task
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	admission, err := client.ClaimTask(ctx, taskID, agentID, model)
+	admission, err := client.ClaimTask(ctx, taskID, agentID, model, *requestIDFlag, *accountIDFlag, *workClassFlag)
 	if err != nil {
 		if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 			return &claimError{message: "already claimed", code: 3}
@@ -1474,7 +1477,7 @@ func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			return err
 		}
 
-		if _, err := client.ClaimTask(ctx, task.ID, agentID, model); err != nil {
+		if _, err := client.ClaimTask(ctx, task.ID, agentID, model, "", "", ""); err != nil {
 			if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 				return &claimError{message: "raced, none claimed", code: 2}
 			}

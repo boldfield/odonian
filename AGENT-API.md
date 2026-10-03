@@ -346,6 +346,25 @@ odonian research-status [--json]
 Returns the current effective state of each research pool: active attempts, deferred tasks, tokens,
 and time of last settlement. With `--json`, output is JSON; otherwise formatted as text.
 
+### Claim a research task
+
+```bash
+odonian claim <task-id> \
+  [--agent <agent-id>] \
+  [--model <model>] \
+  [--request-id <request-id>] \
+  [--account-id <account-id>] \
+  [--work-class <work-class>]
+```
+
+Claims a task as `in_progress` for the given agent and model. `agent-id` and `model` default to
+the `AGENT_ID` and `AGENT_MODEL` environment variables if not provided. Optional flags support
+stable admission request identity for transport retry recovery: `request-id` (idempotency key),
+`account-id` (account assertion), and `work-class` (work type assertion). These optional fields
+allow a caller to safely retry an ambiguous admission/claim in case of transport failure, as a
+repeated claim with matching identity returns the original admission instead of spending again.
+Returns the research admission record (permit ID, attempt ID, request ID, expires_at) as JSON.
+
 ### Renew a research permit
 
 ```bash

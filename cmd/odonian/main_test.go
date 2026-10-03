@@ -2276,6 +2276,55 @@ func TestExecuteNextRaced(t *testing.T) {
 	}
 }
 
+func TestExecuteNextClaimSchedulingError(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+
+	retryAfter := int64(30)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/proj-1/tasks" && r.URL.Query().Get("claimable") == "true" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Task{
+				{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "Task 1"},
+			})
+		} else if r.URL.Path == "/tasks/task-1/claim" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"code":                "ADMISSION_DEFERRED",
+					"message":             "admission deferred",
+					"retry_after_seconds": retryAfter,
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	err := executeNext(context.Background(), server.URL, "test-token", false, []string{
+		"--project", "proj-1",
+		"--model", "haiku",
+		"--kind", "implement",
+		"--claim",
+	})
+	if err == nil {
+		t.Fatal("expected error for scheduling error, got nil")
+	}
+
+	var schedErr *schedulingError
+	if !errors.As(err, &schedErr) {
+		t.Fatalf("expected schedulingError, got %T: %v", err, err)
+	}
+
+	if schedErr.code != 2 {
+		t.Errorf("expected exit code 2, got %d", schedErr.code)
+	}
+	if schedErr.retryAfterSeconds == nil || *schedErr.retryAfterSeconds != 30 {
+		t.Errorf("expected retryAfterSeconds 30, got %v", schedErr.retryAfterSeconds)
+	}
+}
+
 func TestExecuteNextNothingClaimable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" && r.URL.Query().Get("claimable") == "true" {
@@ -5900,6 +5949,9 @@ func TestPermitFinalizeConflictExitCodes(t *testing.T) {
 }
 
 func TestClaimSchedulingError(t *testing.T) {
+	t.Setenv("AGENT_ID", "test-agent")
+	t.Setenv("AGENT_MODEL", "haiku")
+
 	retryAfter := int64(30)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
