@@ -34,6 +34,7 @@ type FakeAdapterConfig struct {
 
 // ExecuteFakeAdapter runs the fake adapter with the given mode.
 // In a real scenario, this would be called via the registered executable.
+// It respects the request's ResultPath field and writes there instead of the supplied resultPath.
 func ExecuteFakeAdapter(requestPath, resultPath string, cfg FakeAdapterConfig) error {
 	startTime := time.Now()
 
@@ -48,40 +49,69 @@ func ExecuteFakeAdapter(requestPath, resultPath string, cfg FakeAdapterConfig) e
 		return fmt.Errorf("unmarshal request: %w", err)
 	}
 
+	// Validate the request
+	if err := req.Validate(); err != nil {
+		return fmt.Errorf("invalid request: %w", err)
+	}
+
+	// Use the request's ResultPath
+	actualResultPath := req.ResultPath
+
 	// Simulate processing delay.
 	if cfg.ResponseDelay > 0 {
 		time.Sleep(cfg.ResponseDelay)
 	}
 
 	// Generate response based on mode.
-	var response CandidateResponse
+	var responseData []byte
+	var err2 error
 
 	switch cfg.Mode {
 	case FakeModeSuccess:
-		response = generateSuccessResponse(req, startTime, cfg)
+		response := generateSuccessResponse(req, startTime, cfg)
+		if err := response.Validate(); err != nil {
+			return fmt.Errorf("invalid success response: %w", err)
+		}
+		responseData, err2 = json.MarshalIndent(response, "", "  ")
 	case FakeModeMalformed:
-		response = generateMalformedResponse(req, startTime, cfg)
+		// For malformed mode, emit genuinely invalid JSON
+		responseData = []byte("{ invalid json that won't parse }")
+		err2 = nil
 	case FakeModeUnsupported:
-		response = generateUnsupportedResponse(req, startTime, cfg)
+		response := generateUnsupportedResponse(req, startTime, cfg)
+		if err := response.Validate(); err != nil {
+			return fmt.Errorf("invalid unsupported response: %w", err)
+		}
+		responseData, err2 = json.MarshalIndent(response, "", "  ")
 	case FakeModeInterrupted:
-		response = generateInterruptedResponse(req, startTime, cfg)
+		response := generateInterruptedResponse(req, startTime, cfg)
+		if err := response.Validate(); err != nil {
+			return fmt.Errorf("invalid interrupted response: %w", err)
+		}
+		responseData, err2 = json.MarshalIndent(response, "", "  ")
 	case FakeModeExecutionFail:
-		response = generateFailedResponse(req, startTime, cfg)
+		response := generateFailedResponse(req, startTime, cfg)
+		if err := response.Validate(); err != nil {
+			return fmt.Errorf("invalid failed response: %w", err)
+		}
+		responseData, err2 = json.MarshalIndent(response, "", "  ")
 	default:
-		response = generateSuccessResponse(req, startTime, cfg)
+		response := generateSuccessResponse(req, startTime, cfg)
+		if err := response.Validate(); err != nil {
+			return fmt.Errorf("invalid success response: %w", err)
+		}
+		responseData, err2 = json.MarshalIndent(response, "", "  ")
 	}
 
-	// Write result.
-	resultData, err := json.MarshalIndent(response, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal response: %w", err)
+	if err2 != nil {
+		return fmt.Errorf("marshal response: %w", err2)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(resultPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(actualResultPath), 0755); err != nil {
 		return fmt.Errorf("create result directory: %w", err)
 	}
 
-	if err := os.WriteFile(resultPath, resultData, 0644); err != nil {
+	if err := os.WriteFile(actualResultPath, responseData, 0644); err != nil {
 		return fmt.Errorf("write result: %w", err)
 	}
 
@@ -110,7 +140,7 @@ func generateSuccessResponse(req CandidateRequest, startTime time.Time, cfg Fake
 
 	return CandidateResponse{
 		Version:         AdapterVersion,
-		Status:          "completed",
+		Status:          StatusCompleted,
 		Findings:        findings,
 		ReviewCompleted: true,
 		EffectiveCandidate: CandidateIdentity{
@@ -135,13 +165,17 @@ func generateSuccessResponse(req CandidateRequest, startTime time.Time, cfg Fake
 
 func generateMalformedResponse(req CandidateRequest, startTime time.Time, cfg FakeAdapterConfig) CandidateResponse {
 	endTime := time.Now()
+	reason := cfg.MalformedReason
+	if reason == "" {
+		reason = "Adapter output was malformed"
+	}
 
-	response := CandidateResponse{
+	return CandidateResponse{
 		Version:         AdapterVersion,
-		Status:          "failed",
+		Status:          StatusFailed,
 		ReviewCompleted: false,
 		ErrorClass:      ptrString("output_malformed"),
-		ErrorMessage:    ptrString(cfg.MalformedReason),
+		ErrorMessage:    ptrString(reason),
 		EffectiveCandidate: CandidateIdentity{
 			AdapterName:    cfg.CandidateName,
 			AdapterVersion: "1.0",
@@ -157,13 +191,6 @@ func generateMalformedResponse(req CandidateRequest, startTime time.Time, cfg Fa
 			Duration:    endTime.Sub(startTime),
 		},
 	}
-
-	// For malformed mode, optionally include raw output that doesn't parse properly
-	if cfg.MalformedReason == "" {
-		response.RawOutput = ptrString("{ invalid json }")
-	}
-
-	return response
 }
 
 func generateUnsupportedResponse(req CandidateRequest, startTime time.Time, cfg FakeAdapterConfig) CandidateResponse {
@@ -176,7 +203,7 @@ func generateUnsupportedResponse(req CandidateRequest, startTime time.Time, cfg 
 
 	return CandidateResponse{
 		Version:         AdapterVersion,
-		Status:          "unsupported",
+		Status:          StatusUnsupported,
 		ReviewCompleted: false,
 		ErrorClass:      ptrString("capability_unsupported"),
 		ErrorMessage:    ptrString(reason),
@@ -202,7 +229,7 @@ func generateInterruptedResponse(req CandidateRequest, startTime time.Time, cfg 
 
 	return CandidateResponse{
 		Version:         AdapterVersion,
-		Status:          "incomplete",
+		Status:          StatusIncomplete,
 		ReviewCompleted: false,
 		ErrorClass:      ptrString("timeout"),
 		ErrorMessage:    ptrString("Review interrupted before completion"),
@@ -233,7 +260,7 @@ func generateFailedResponse(req CandidateRequest, startTime time.Time, cfg FakeA
 
 	return CandidateResponse{
 		Version:         AdapterVersion,
-		Status:          "failed",
+		Status:          StatusFailed,
 		ReviewCompleted: false,
 		ErrorClass:      ptrString("execution_error"),
 		ErrorMessage:    ptrString(reason),
@@ -260,4 +287,55 @@ func ptrString(s string) *string {
 
 func ptrInt(i int) *int {
 	return &i
+}
+
+// HostRequestPipeline is the unified pipeline that processes requests through adapters.
+// All adapters (including multiple candidate configurations) use this same pipeline:
+// 1. Validate the request
+// 2. Check preflight capabilities
+// 3. Execute the adapter
+// 4. Validate and normalize the result
+type HostRequestPipeline struct {
+	RequestPath string
+	ResultPath  string
+	Config      FakeAdapterConfig
+}
+
+// Execute runs the full request/result pipeline for this candidate.
+// It returns the parsed response and any errors encountered.
+func (p *HostRequestPipeline) Execute() (*CandidateResponse, error) {
+	// Step 1: Execute the adapter (which validates request internally)
+	if err := ExecuteFakeAdapter(p.RequestPath, p.ResultPath, p.Config); err != nil {
+		return nil, fmt.Errorf("adapter execution failed: %w", err)
+	}
+
+	// Step 2: Read and parse the result
+	resultData, err := os.ReadFile(p.ResultPath)
+	if err != nil {
+		return nil, fmt.Errorf("read result: %w", err)
+	}
+
+	// For malformed mode, we expect invalid JSON
+	if p.Config.Mode == FakeModeMalformed {
+		// Try to parse but expect failure
+		var resp CandidateResponse
+		if err := json.Unmarshal(resultData, &resp); err == nil {
+			return nil, fmt.Errorf("expected malformed output, but got valid JSON")
+		}
+		// Malformed output detected as expected
+		return nil, fmt.Errorf("adapter produced malformed output (expected for testing)")
+	}
+
+	// Step 3: Unmarshal and validate the response
+	var resp CandidateResponse
+	if err := json.Unmarshal(resultData, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshal result: %w", err)
+	}
+
+	// Step 4: Validate the response against the protocol
+	if err := resp.Validate(); err != nil {
+		return nil, fmt.Errorf("response validation failed: %w", err)
+	}
+
+	return &resp, nil
 }

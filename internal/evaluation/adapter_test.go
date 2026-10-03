@@ -94,6 +94,62 @@ func TestCandidateIdentityDigestImmutable(t *testing.T) {
 	}
 }
 
+func TestCandidateIdentityDigestWithSettingsChange(t *testing.T) {
+	baseIdentity := CandidateIdentity{
+		AdapterName:    "test_adapter",
+		AdapterVersion: "1.0",
+		ModelID:        "model-v1",
+		RuntimeName:    "runtime",
+		RuntimeVersion: "1.0",
+		PromptVersion:  "v1",
+		AccountOrPool:  "pool",
+		ReasoningSettings: map[string]interface{}{
+			"temperature": 0.7,
+		},
+	}
+
+	digest1, _ := baseIdentity.Digest()
+
+	// Change reasoning settings
+	modifiedIdentity := baseIdentity
+	modifiedIdentity.ReasoningSettings["temperature"] = 0.9
+
+	digest2, _ := modifiedIdentity.Digest()
+
+	if digest1 == digest2 {
+		t.Error("digest should change when reasoning settings change")
+	}
+}
+
+func TestCandidateIdentityDigestWithToolConfigChange(t *testing.T) {
+	baseIdentity := CandidateIdentity{
+		AdapterName:    "test_adapter",
+		AdapterVersion: "1.0",
+		ModelID:        "model-v1",
+		RuntimeName:    "runtime",
+		RuntimeVersion: "1.0",
+		PromptVersion:  "v1",
+		AccountOrPool:  "pool",
+		ToolConfiguration: []ToolConfig{
+			{Name: "bash", Version: "5.1"},
+		},
+	}
+
+	digest1, _ := baseIdentity.Digest()
+
+	// Change tool configuration
+	modifiedIdentity := baseIdentity
+	modifiedIdentity.ToolConfiguration = []ToolConfig{
+		{Name: "bash", Version: "5.2"},
+	}
+
+	digest2, _ := modifiedIdentity.Digest()
+
+	if digest1 == digest2 {
+		t.Error("digest should change when tool configuration changes")
+	}
+}
+
 func TestCandidateRequestStructure(t *testing.T) {
 	req := CandidateRequest{
 		Version:         AdapterVersion,
@@ -359,5 +415,139 @@ func TestToolConfigStructure(t *testing.T) {
 
 	if unmarshaled.Name != "bash" {
 		t.Error("tool name not preserved")
+	}
+}
+
+func TestCandidateRequestValidation(t *testing.T) {
+	validReq := CandidateRequest{
+		Version:      AdapterVersion,
+		RunID:        "test-run-1",
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   "/tmp/result.json",
+	}
+
+	if err := validReq.Validate(); err != nil {
+		t.Errorf("valid request should not error: %v", err)
+	}
+
+	// Missing RunID
+	invalidReq := validReq
+	invalidReq.RunID = ""
+	if err := invalidReq.Validate(); err == nil {
+		t.Error("request without RunID should fail validation")
+	}
+
+	// Missing SnapshotPath
+	invalidReq = validReq
+	invalidReq.SnapshotPath = ""
+	if err := invalidReq.Validate(); err == nil {
+		t.Error("request without SnapshotPath should fail validation")
+	}
+
+	// Missing ResultPath
+	invalidReq = validReq
+	invalidReq.ResultPath = ""
+	if err := invalidReq.Validate(); err == nil {
+		t.Error("request without ResultPath should fail validation")
+	}
+
+	// Wrong version
+	invalidReq = validReq
+	invalidReq.Version = "2.0"
+	if err := invalidReq.Validate(); err == nil {
+		t.Error("request with wrong version should fail validation")
+	}
+}
+
+func TestCandidateResponseValidation(t *testing.T) {
+	validResp := CandidateResponse{
+		Version:         AdapterVersion,
+		Status:          "completed",
+		ReviewCompleted: true,
+		Findings:        []Finding{},
+		EffectiveCandidate: CandidateIdentity{
+			AdapterName:    "test",
+			AdapterVersion: "1.0",
+			ModelID:        "model",
+			RuntimeName:    "runtime",
+			RuntimeVersion: "1.0",
+			PromptVersion:  "v1",
+			AccountOrPool:  "pool",
+		},
+		Timing: ResponseTiming{
+			StartedAt:   time.Now(),
+			CompletedAt: time.Now(),
+			Duration:    0,
+		},
+	}
+
+	if err := validResp.Validate(); err != nil {
+		t.Errorf("valid response should not error: %v", err)
+	}
+
+	// Completed without ReviewCompleted=true
+	invalidResp := validResp
+	invalidResp.ReviewCompleted = false
+	if err := invalidResp.Validate(); err == nil {
+		t.Error("completed status requires ReviewCompleted=true")
+	}
+
+	// Completed with error fields
+	invalidResp = validResp
+	invalidResp.ErrorClass = ptrString("test_error")
+	if err := invalidResp.Validate(); err == nil {
+		t.Error("completed status must not have error fields")
+	}
+
+	// Failed without ErrorClass
+	invalidResp = validResp
+	invalidResp.Status = "failed"
+	invalidResp.ReviewCompleted = false
+	invalidResp.ErrorClass = nil
+	if err := invalidResp.Validate(); err == nil {
+		t.Error("failed status requires ErrorClass")
+	}
+
+	// Invalid status
+	invalidResp = validResp
+	invalidResp.Status = "unknown_status"
+	if err := invalidResp.Validate(); err == nil {
+		t.Error("invalid status should fail validation")
+	}
+}
+
+func TestCapabilityPreflightCheck(t *testing.T) {
+	req := CandidateRequest{
+		Version: AdapterVersion,
+		ToolAccess: ToolAccessRequirements{
+			RequireSourceRetrieval: true,
+			RequirePDFSupport:      false,
+		},
+	}
+
+	// Adapter with required capability
+	preflight := &CapabilityPreflight{}
+	preflight.CheckCapabilities(&req, []string{"source_retrieval"})
+	if !preflight.Supported {
+		t.Error("preflight should support request with source_retrieval")
+	}
+
+	// Adapter without required capability
+	preflight = &CapabilityPreflight{}
+	preflight.CheckCapabilities(&req, []string{"other_capability"})
+	if preflight.Supported {
+		t.Error("preflight should not support request without source_retrieval")
+	}
+	if preflight.Error == nil {
+		t.Error("preflight error should be set")
+	}
+
+	// Request requiring PDF support
+	req.ToolAccess.RequireSourceRetrieval = false
+	req.ToolAccess.RequirePDFSupport = true
+	preflight = &CapabilityPreflight{}
+	preflight.CheckCapabilities(&req, []string{"other_capability"})
+	if preflight.Supported {
+		t.Error("preflight should not support request without pdf_support")
 	}
 }

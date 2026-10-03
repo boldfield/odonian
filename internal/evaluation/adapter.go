@@ -5,11 +5,20 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 )
 
 // AdapterVersion is a string identifier for the adapter protocol version.
 const AdapterVersion = "1.0"
+
+// Valid status values for CandidateResponse
+const (
+	StatusCompleted   = "completed"
+	StatusUnsupported = "unsupported"
+	StatusIncomplete  = "incomplete"
+	StatusFailed      = "failed"
+)
 
 // CandidateRequest is a versioned evaluation request sent to a comparison reviewer adapter.
 type CandidateRequest struct {
@@ -40,6 +49,23 @@ type CandidateRequest struct {
 
 	// ResultPath is where the adapter should write its structured result.
 	ResultPath string `json:"result_path"`
+}
+
+// Validate checks that the request is complete and valid.
+func (r *CandidateRequest) Validate() error {
+	if r.Version != AdapterVersion {
+		return fmt.Errorf("unsupported request version: %s", r.Version)
+	}
+	if r.RunID == "" {
+		return fmt.Errorf("RunID is required")
+	}
+	if r.SnapshotPath == "" {
+		return fmt.Errorf("SnapshotPath is required")
+	}
+	if r.ResultPath == "" {
+		return fmt.Errorf("ResultPath is required")
+	}
+	return nil
 }
 
 // ToolAccessRequirements declares what tools and source access the review needs.
@@ -83,6 +109,37 @@ type CandidateResponse struct {
 	RawOutput *string `json:"raw_output,omitempty"`
 }
 
+// Validate checks that the response is complete and consistent.
+func (r *CandidateResponse) Validate() error {
+	if r.Version != AdapterVersion {
+		return fmt.Errorf("unsupported response version: %s", r.Version)
+	}
+
+	validStatuses := []string{StatusCompleted, StatusUnsupported, StatusIncomplete, StatusFailed}
+	if !slices.Contains(validStatuses, r.Status) {
+		return fmt.Errorf("invalid status: %s", r.Status)
+	}
+
+	switch r.Status {
+	case StatusCompleted:
+		if !r.ReviewCompleted {
+			return fmt.Errorf("completed status requires ReviewCompleted=true")
+		}
+		if r.ErrorClass != nil || r.ErrorMessage != nil {
+			return fmt.Errorf("completed status must not have error fields")
+		}
+	case StatusFailed, StatusUnsupported, StatusIncomplete:
+		if r.ReviewCompleted && r.Status != StatusIncomplete {
+			return fmt.Errorf("%s status must have ReviewCompleted=false", r.Status)
+		}
+		if r.ErrorClass == nil {
+			return fmt.Errorf("%s status requires ErrorClass", r.Status)
+		}
+	}
+
+	return nil
+}
+
 // Finding represents a single structured finding from the review.
 type Finding struct {
 	Severity string `json:"severity"`       // "critical", "major", "minor", "info"
@@ -112,6 +169,7 @@ type ResponseUsage struct {
 
 // CandidateIdentity uniquely identifies a reviewer configuration for reproducibility.
 // Changing any field creates a new candidate version.
+// Use Unknown() to mark a field as explicitly unknown rather than empty.
 type CandidateIdentity struct {
 	// AdapterName is the registered adapter identifier (e.g., "muse_code", "pi_spark").
 	AdapterName string `json:"adapter_name"`
@@ -123,6 +181,7 @@ type CandidateIdentity struct {
 	ModelID string `json:"model_id"`
 
 	// ModelRevision is the model version if the provider reports one; may be empty.
+	// Empty string means unknown.
 	ModelRevision string `json:"model_revision,omitempty"`
 
 	// RuntimeName is the runtime environment (e.g., "muse_code_cli", "pi_api").
@@ -132,15 +191,18 @@ type CandidateIdentity struct {
 	RuntimeVersion string `json:"runtime_version"`
 
 	// ReasoningSettings are the configured reasoning parameters (if applicable).
+	// Nil means unknown/not applicable; empty map means no settings.
 	ReasoningSettings map[string]interface{} `json:"reasoning_settings,omitempty"`
 
 	// GenerationSettings are the configured generation parameters.
+	// Nil means unknown/not applicable; empty map means no settings.
 	GenerationSettings map[string]interface{} `json:"generation_settings,omitempty"`
 
 	// PromptVersion is the exact prompt version used.
 	PromptVersion string `json:"prompt_version"`
 
 	// ToolConfiguration describes what tools are available.
+	// Nil means unknown/not applicable; empty slice means no tools.
 	ToolConfiguration []ToolConfig `json:"tool_configuration,omitempty"`
 
 	// AccountOrPool identifies the subscription/compute pool used.
@@ -179,6 +241,36 @@ type CapabilityPreflight struct {
 
 	// DeclaredCapabilities describes what this runtime can actually do.
 	DeclaredCapabilities map[string]bool `json:"declared_capabilities"`
+}
+
+// CheckCapabilities validates whether the adapter can fulfill a request's tool access needs.
+func (cp *CapabilityPreflight) CheckCapabilities(req *CandidateRequest, adapterCaps []string) {
+	cp.DeclaredCapabilities = make(map[string]bool)
+	for _, cap := range adapterCaps {
+		cp.DeclaredCapabilities[cap] = true
+	}
+
+	cp.Supported = true
+	var missing []string
+
+	if req.ToolAccess.RequireSourceRetrieval && !cp.DeclaredCapabilities["source_retrieval"] {
+		cp.Supported = false
+		missing = append(missing, "source_retrieval")
+	}
+	if req.ToolAccess.RequirePDFSupport && !cp.DeclaredCapabilities["pdf_support"] {
+		cp.Supported = false
+		missing = append(missing, "pdf_support")
+	}
+
+	if len(req.ToolAccess.DeclaredTools) > 0 && !cp.DeclaredCapabilities["tool_execution"] {
+		cp.Supported = false
+		missing = append(missing, "tool_execution")
+	}
+
+	if !cp.Supported {
+		errMsg := fmt.Sprintf("missing capabilities: %v", missing)
+		cp.Error = &errMsg
+	}
 }
 
 // RegistrationExecutable describes a trusted executable and its argument template.

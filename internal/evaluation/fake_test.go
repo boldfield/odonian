@@ -28,8 +28,13 @@ func TestFakeAdapterSuccessMode(t *testing.T) {
 		ResultPath: resultPath,
 	}
 
-	reqData, _ := json.Marshal(req)
-	os.WriteFile(requestPath, reqData, 0644)
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
 
 	cfg := FakeAdapterConfig{
 		Mode:           FakeModeSuccess,
@@ -52,6 +57,10 @@ func TestFakeAdapterSuccessMode(t *testing.T) {
 	var response CandidateResponse
 	if err := json.Unmarshal(resultData, &response); err != nil {
 		t.Fatalf("unmarshal result failed: %v", err)
+	}
+
+	if err := response.Validate(); err != nil {
+		t.Fatalf("response validation failed: %v", err)
 	}
 
 	if response.Status != "completed" {
@@ -77,15 +86,21 @@ func TestFakeAdapterMalformedMode(t *testing.T) {
 	resultPath := filepath.Join(tmpDir, "result.json")
 
 	req := CandidateRequest{
-		Version:     AdapterVersion,
-		RunID:       "test-malformed-1",
-		TaskID:      "task-123",
-		ReviewRound: 1,
-		ResultPath:  resultPath,
+		Version:      AdapterVersion,
+		RunID:        "test-malformed-1",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   resultPath,
 	}
 
-	reqData, _ := json.Marshal(req)
-	os.WriteFile(requestPath, reqData, 0644)
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
 
 	cfg := FakeAdapterConfig{
 		Mode:            FakeModeMalformed,
@@ -100,21 +115,15 @@ func TestFakeAdapterMalformedMode(t *testing.T) {
 		t.Fatalf("execution failed: %v", err)
 	}
 
-	resultData, _ := os.ReadFile(resultPath)
-	var response CandidateResponse
-	json.Unmarshal(resultData, &response)
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result failed: %v", err)
+	}
 
-	if response.Status != "failed" {
-		t.Errorf("expected failed status, got %s", response.Status)
-	}
-	if response.ReviewCompleted {
-		t.Error("review should not be completed on malformed")
-	}
-	if response.ErrorClass == nil || *response.ErrorClass != "output_malformed" {
-		t.Error("error class should be output_malformed")
-	}
-	if response.ErrorMessage == nil || *response.ErrorMessage != "Adapter produced invalid JSON" {
-		t.Error("error message not preserved")
+	// The result should be genuinely invalid JSON
+	var response CandidateResponse
+	if err := json.Unmarshal(resultData, &response); err == nil {
+		t.Error("malformed output should not parse as valid JSON")
 	}
 }
 
@@ -124,10 +133,11 @@ func TestFakeAdapterUnsupportedMode(t *testing.T) {
 	resultPath := filepath.Join(tmpDir, "result.json")
 
 	req := CandidateRequest{
-		Version:     AdapterVersion,
-		RunID:       "test-unsupported-1",
-		TaskID:      "task-123",
-		ReviewRound: 1,
+		Version:      AdapterVersion,
+		RunID:        "test-unsupported-1",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
 		ToolAccess: ToolAccessRequirements{
 			RequirePDFSupport: true,
 		},
@@ -171,11 +181,12 @@ func TestFakeAdapterInterruptedMode(t *testing.T) {
 	resultPath := filepath.Join(tmpDir, "result.json")
 
 	req := CandidateRequest{
-		Version:     AdapterVersion,
-		RunID:       "test-interrupted-1",
-		TaskID:      "task-123",
-		ReviewRound: 1,
-		ResultPath:  resultPath,
+		Version:      AdapterVersion,
+		RunID:        "test-interrupted-1",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   resultPath,
 	}
 
 	reqData, _ := json.Marshal(req)
@@ -211,11 +222,12 @@ func TestFakeAdapterFailedMode(t *testing.T) {
 	resultPath := filepath.Join(tmpDir, "result.json")
 
 	req := CandidateRequest{
-		Version:     AdapterVersion,
-		RunID:       "test-failed-1",
-		TaskID:      "task-123",
-		ReviewRound: 1,
-		ResultPath:  resultPath,
+		Version:      AdapterVersion,
+		RunID:        "test-failed-1",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   resultPath,
 	}
 
 	reqData, _ := json.Marshal(req)
@@ -344,11 +356,23 @@ func TestTwoCandidateConfigurationsSameRequestPipeline(t *testing.T) {
 	req1Path := filepath.Join(tmpDir, "request_candidate1.json")
 	result1Path := filepath.Join(tmpDir, "result_candidate1.json")
 	req.ResultPath = result1Path
-	req1Data, _ := json.Marshal(req)
-	os.WriteFile(req1Path, req1Data, 0644)
+	req1Data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request 1 failed: %v", err)
+	}
+	if err := os.WriteFile(req1Path, req1Data, 0644); err != nil {
+		t.Fatalf("write request 1 failed: %v", err)
+	}
 
-	if err := ExecuteFakeAdapter(req1Path, result1Path, candidate1Config); err != nil {
-		t.Fatalf("candidate 1 execution failed: %v", err)
+	// Use the shared host pipeline for candidate 1
+	pipeline1 := &HostRequestPipeline{
+		RequestPath: req1Path,
+		ResultPath:  result1Path,
+		Config:      candidate1Config,
+	}
+	response1, err := pipeline1.Execute()
+	if err != nil {
+		t.Fatalf("candidate 1 pipeline failed: %v", err)
 	}
 
 	// Candidate 2: Pi model
@@ -364,21 +388,24 @@ func TestTwoCandidateConfigurationsSameRequestPipeline(t *testing.T) {
 	req2Path := filepath.Join(tmpDir, "request_candidate2.json")
 	result2Path := filepath.Join(tmpDir, "result_candidate2.json")
 	req.ResultPath = result2Path
-	req2Data, _ := json.Marshal(req)
-	os.WriteFile(req2Path, req2Data, 0644)
-
-	if err := ExecuteFakeAdapter(req2Path, result2Path, candidate2Config); err != nil {
-		t.Fatalf("candidate 2 execution failed: %v", err)
+	req2Data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request 2 failed: %v", err)
+	}
+	if err := os.WriteFile(req2Path, req2Data, 0644); err != nil {
+		t.Fatalf("write request 2 failed: %v", err)
 	}
 
-	// Verify both responses were generated from same request structure
-	result1Data, _ := os.ReadFile(result1Path)
-	var response1 CandidateResponse
-	json.Unmarshal(result1Data, &response1)
-
-	result2Data, _ := os.ReadFile(result2Path)
-	var response2 CandidateResponse
-	json.Unmarshal(result2Data, &response2)
+	// Use the shared host pipeline for candidate 2
+	pipeline2 := &HostRequestPipeline{
+		RequestPath: req2Path,
+		ResultPath:  result2Path,
+		Config:      candidate2Config,
+	}
+	response2, err := pipeline2.Execute()
+	if err != nil {
+		t.Fatalf("candidate 2 pipeline failed: %v", err)
+	}
 
 	// Both should be completed
 	if response1.Status != "completed" {
@@ -391,6 +418,14 @@ func TestTwoCandidateConfigurationsSameRequestPipeline(t *testing.T) {
 	// Both should process the same number of findings
 	if len(response1.Findings) != len(response2.Findings) {
 		t.Errorf("finding counts differ: %d vs %d", len(response1.Findings), len(response2.Findings))
+	}
+
+	// Both should validate successfully
+	if err := response1.Validate(); err != nil {
+		t.Errorf("candidate 1 validation failed: %v", err)
+	}
+	if err := response2.Validate(); err != nil {
+		t.Errorf("candidate 2 validation failed: %v", err)
 	}
 
 	// But have different identities
@@ -416,11 +451,12 @@ func TestFakeAdapterResponseDelay(t *testing.T) {
 	resultPath := filepath.Join(tmpDir, "result.json")
 
 	req := CandidateRequest{
-		Version:     AdapterVersion,
-		RunID:       "test-delay-1",
-		TaskID:      "task-123",
-		ReviewRound: 1,
-		ResultPath:  resultPath,
+		Version:      AdapterVersion,
+		RunID:        "test-delay-1",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   resultPath,
 	}
 
 	reqData, _ := json.Marshal(req)
@@ -461,11 +497,12 @@ func TestFakeAdapterFindingDetails(t *testing.T) {
 	resultPath := filepath.Join(tmpDir, "result.json")
 
 	req := CandidateRequest{
-		Version:     AdapterVersion,
-		RunID:       "test-findings-1",
-		TaskID:      "task-123",
-		ReviewRound: 1,
-		ResultPath:  resultPath,
+		Version:      AdapterVersion,
+		RunID:        "test-findings-1",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   resultPath,
 	}
 
 	reqData, _ := json.Marshal(req)
