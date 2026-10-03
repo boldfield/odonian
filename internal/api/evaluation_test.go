@@ -815,3 +815,53 @@ func TestEvaluationAPIFinalizeRecordsAttemptDetail(t *testing.T) {
 		t.Fatalf("recorded detail = %+v, %v", got, err)
 	}
 }
+
+func TestRecordFindingDisposition(t *testing.T) {
+	e := newEvalAPI(t)
+	e.basicSetup(5, 5, 5)
+
+	status, response := e.call("POST", "/evaluation/campaigns/camp1/samples/s1/disposition",
+		map[string]interface{}{
+			"candidate_id": "cand-a",
+			"finding_id":   "f1",
+			"disposition":  "valid",
+			"evidence":     "verified in source",
+			"decided_by":   "operator@example.com",
+		})
+	if status != 201 {
+		t.Errorf("POST disposition status: got %d, want 201; response: %v", status, response)
+	}
+
+	disp, ok := response["disposition"].(map[string]interface{})
+	if !ok {
+		t.Errorf("response missing disposition field: %v", response)
+	} else if disp["disposition"] != "valid" {
+		t.Errorf("disposition value: got %v, want valid", disp["disposition"])
+	}
+}
+
+func TestGetEvaluationReport(t *testing.T) {
+	e := newEvalAPI(t)
+	e.basicSetup(5, 5, 5)
+
+	status, response := e.call("GET", "/evaluation/campaigns/camp1/report", nil)
+	if status != 200 && status != 404 {
+		t.Errorf("GET report status: got %d, expected 200 or 404", status)
+	}
+	if _, ok := response["report"]; !ok {
+		t.Errorf("response missing report field")
+	}
+}
+
+func TestListFindingDispositions(t *testing.T) {
+	e := newEvalAPI(t)
+	e.basicSetup(5, 5, 5)
+
+	status, response := e.call("GET", "/evaluation/campaigns/camp1/samples/s1/dispositions", nil)
+	if status != 200 && status != 404 {
+		t.Errorf("GET dispositions status: got %d, expected 200 or 404", status)
+	}
+	if _, ok := response["dispositions"]; !ok {
+		t.Errorf("response missing dispositions field")
+	}
+}

@@ -118,6 +118,9 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("POST /evaluation/jobs/claim", wrapProtected("POST /evaluation/jobs/claim", server.handleClaimEvaluationJob))
 	mux.HandleFunc("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew", wrapProtected("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/renew", server.handleRenewEvaluationAttempt))
 	mux.HandleFunc("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize", wrapProtected("POST /evaluation/jobs/{job_id}/attempts/{attempt_id}/finalize", server.handleFinalizeEvaluationAttempt))
+	mux.HandleFunc("POST /evaluation/campaigns/{campaign_id}/samples/{sample_id}/disposition", wrapProtected("POST /evaluation/campaigns/{campaign_id}/samples/{sample_id}/disposition", server.handleRecordFindingDisposition))
+	mux.HandleFunc("GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}/dispositions", wrapProtected("GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}/dispositions", server.handleListFindingDispositions))
+	mux.HandleFunc("GET /evaluation/campaigns/{campaign_id}/report", wrapProtected("GET /evaluation/campaigns/{campaign_id}/report", server.handleGetEvaluationReport))
 
 	// Task endpoints (protected)
 	mux.HandleFunc("POST /projects/{id}/tasks", wrapProtected("POST /projects/{id}/tasks", server.handleCreateTasks))

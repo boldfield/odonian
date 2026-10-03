@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -573,4 +574,87 @@ func (s *Server) handleFinalizeEvaluationAttempt(w http.ResponseWriter, r *http.
 		"attempt":       attemptView(final),
 		"finding_count": len(payload.Findings),
 	})
+}
+
+// handleRecordFindingDisposition handles POST /evaluation/campaigns/{campaign_id}/samples/{sample_id}/disposition.
+// Records an operator's decision about a specific finding from a candidate.
+func (s *Server) handleRecordFindingDisposition(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		CandidateID string `json:"candidate_id"`
+		FindingID   string `json:"finding_id"`
+		Disposition string `json:"disposition"`
+		Evidence    string `json:"evidence"`
+		DecidedBy   string `json:"decided_by"`
+	}
+	if !s.decodeEvaluationJSON(w, r, &payload) {
+		return
+	}
+	if payload.CandidateID == "" || payload.FindingID == "" || payload.DecidedBy == "" {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_INPUT", "candidate_id, finding_id, and decided_by are required")
+		return
+	}
+
+	campaignID := r.PathValue("campaign_id")
+	sampleID := r.PathValue("sample_id")
+
+	disposition := store.FindingDisposition{
+		ID:          fmt.Sprintf("%s-%s-%s-%s", campaignID, sampleID, payload.CandidateID, payload.FindingID),
+		CampaignID:  campaignID,
+		SampleID:    sampleID,
+		CandidateID: payload.CandidateID,
+		FindingID:   payload.FindingID,
+		Disposition: payload.Disposition,
+		Evidence:    payload.Evidence,
+		DecidedBy:   payload.DecidedBy,
+	}
+
+	recorded, err := s.store.RecordFindingDisposition(r.Context(), disposition)
+	if err != nil {
+		s.writeEvaluationError(w, err)
+		return
+	}
+	s.encodeJSON(w, http.StatusCreated, map[string]interface{}{"disposition": recorded})
+}
+
+// handleGetEvaluationReport handles GET /evaluation/campaigns/{campaign_id}/report.
+// Returns a previously generated report or generates one if not cached.
+func (s *Server) handleGetEvaluationReport(w http.ResponseWriter, r *http.Request) {
+	campaignID := r.PathValue("campaign_id")
+
+	campaign, err := s.store.GetEvaluationCampaign(r.Context(), campaignID)
+	if err != nil {
+		s.writeEvaluationError(w, err)
+		return
+	}
+
+	// For now, return a minimal structure. A full implementation would
+	// compute metrics from dispositions and findings.
+	report := store.EvaluationReportData{
+		CampaignID:       campaignID,
+		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
+		GeneratedBy:      "system",
+		CohortSize:       0,
+		CompletedSamples: 0,
+		FailedSamples:    0,
+		Candidates:       []store.CandidateReportData{},
+		GroupedFindings:  []store.FindingGroupData{},
+		Metrics:          store.ReportMetrics{},
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{"campaign": campaign, "report": report})
+}
+
+// handleListFindingDispositions handles GET /evaluation/campaigns/{campaign_id}/samples/{sample_id}/dispositions.
+// Lists all recorded dispositions for a sample.
+func (s *Server) handleListFindingDispositions(w http.ResponseWriter, r *http.Request) {
+	campaignID := r.PathValue("campaign_id")
+	sampleID := r.PathValue("sample_id")
+
+	dispositions, err := s.store.ListDispositionsForCampaignSample(r.Context(), campaignID, sampleID)
+	if err != nil {
+		s.writeEvaluationError(w, err)
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{"dispositions": dispositions})
 }

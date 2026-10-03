@@ -34,6 +34,9 @@ var evaluationVerbs = map[string]bool{
 	"evaluation-claim-job":           true,
 	"evaluation-renew-attempt":       true,
 	"evaluation-finalize-attempt":    true,
+	"evaluation-record-disposition":  true,
+	"evaluation-list-dispositions":   true,
+	"evaluation-get-report":          true,
 }
 
 func executeEvaluation(ctx context.Context, verb, baseURL, token string, args []string, out io.Writer) error {
@@ -93,6 +96,19 @@ func executeEvaluation(ctx context.Context, verb, baseURL, token string, args []
 		method, path, body, err = evaluationRenewAttempt(fs, args)
 	case "evaluation-finalize-attempt":
 		method, path, body, err = evaluationFinalizeAttempt(fs, args)
+	case "evaluation-record-disposition":
+		method, path, body, err = evaluationRecordDisposition(fs, args)
+	case "evaluation-list-dispositions":
+		campaign := fs.String("campaign", "", "campaign ID")
+		sample := fs.String("sample", "", "sample ID")
+		if err = parseEvalFlags(fs, args, requireFlags(campaign, "--campaign", sample, "--sample")); err == nil {
+			method, path = http.MethodGet, "/evaluation/campaigns/"+url.PathEscape(*campaign)+"/samples/"+url.PathEscape(*sample)+"/dispositions"
+		}
+	case "evaluation-get-report":
+		campaign := fs.String("campaign", "", "campaign ID")
+		if err = parseEvalFlags(fs, args, requireFlags(campaign, "--campaign")); err == nil {
+			method, path = http.MethodGet, "/evaluation/campaigns/"+url.PathEscape(*campaign)+"/report"
+		}
 	default:
 		return fmt.Errorf("unknown command %q", verb)
 	}
@@ -279,6 +295,27 @@ func evaluationRenewAttempt(fs *flag.FlagSet, args []string) (string, string, in
 
 func evaluationAttemptPath(job, attempt, action string) string {
 	return "/evaluation/jobs/" + url.PathEscape(job) + "/attempts/" + url.PathEscape(attempt) + "/" + action
+}
+
+func evaluationRecordDisposition(fs *flag.FlagSet, args []string) (string, string, interface{}, error) {
+	campaign := fs.String("campaign", "", "campaign ID")
+	sample := fs.String("sample", "", "sample ID")
+	candidate := fs.String("candidate", "", "candidate ID")
+	finding := fs.String("finding", "", "finding ID")
+	disposition := fs.String("disposition", "", "disposition: valid/invalid/unresolved")
+	evidence := fs.String("evidence", "", "evidence for the decision")
+	decidedBy := fs.String("decided-by", "", "actor recording the decision")
+	if err := parseEvalFlags(fs, args, requireFlags(campaign, "--campaign", sample, "--sample",
+		candidate, "--candidate", finding, "--finding", disposition, "--disposition",
+		evidence, "--evidence", decidedBy, "--decided-by")); err != nil {
+		return "", "", nil, err
+	}
+	body := map[string]interface{}{
+		"candidate_id": *candidate, "finding_id": *finding, "disposition": *disposition,
+		"evidence": *evidence, "decided_by": *decidedBy,
+	}
+	path := "/evaluation/campaigns/" + url.PathEscape(*campaign) + "/samples/" + url.PathEscape(*sample) + "/disposition"
+	return http.MethodPost, path, body, nil
 }
 
 // evaluationResult is the result payload a runner may supply. The attempt
