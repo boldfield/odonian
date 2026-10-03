@@ -4,27 +4,35 @@
 -- No credentials are stored. Evaluation jobs cannot vote, reject, create follow-ups,
 -- adjudicate disputes or affect production review scorecards.
 
--- Evaluation campaign: finite experiment config with allowed projects, model,
--- cohort manifest, attempt cap and account pool.
+-- Evaluation campaign: a finite experiment with allowed projects, a cohort
+-- manifest and an overall attempt cap. Account pools belong to candidates (each
+-- draws from its own evaluation_pool), so a campaign holds none itself.
 CREATE TABLE evaluation_campaign (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT,
-  project_id TEXT NOT NULL,
   allowed_model_id TEXT NOT NULL,
   cohort_manifest TEXT NOT NULL,
   attempt_cap INTEGER NOT NULL CHECK (attempt_cap >= 1),
-  account_pool_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
-CREATE INDEX idx_evaluation_campaign_project ON evaluation_campaign(project_id);
+-- Projects a campaign may sample from.
+CREATE TABLE evaluation_campaign_project (
+  campaign_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  PRIMARY KEY (campaign_id, project_id),
+  FOREIGN KEY (campaign_id) REFERENCES evaluation_campaign(id)
+);
+
+CREATE INDEX idx_evaluation_campaign_project_project ON evaluation_campaign_project(project_id);
 
 -- Evaluation sample: original task/review round, submitted SHA, digests and manifests
 CREATE TABLE evaluation_sample (
   id TEXT PRIMARY KEY,
   campaign_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
   original_task_id TEXT NOT NULL,
   original_review_round INTEGER NOT NULL,
   submitted_sha TEXT NOT NULL,
@@ -42,27 +50,33 @@ CREATE TABLE evaluation_sample (
 CREATE INDEX idx_evaluation_sample_campaign ON evaluation_sample(campaign_id);
 CREATE INDEX idx_evaluation_sample_task ON evaluation_sample(original_task_id);
 
--- Evaluation candidate: immutable model version, adapter, runtime config
+-- A sample freezes the exact input it was drawn from; no column may change.
+CREATE TRIGGER evaluation_sample_frozen BEFORE UPDATE ON evaluation_sample
+BEGIN SELECT RAISE(ABORT, 'evaluation sample is immutable'); END;
+CREATE TRIGGER evaluation_sample_no_delete BEFORE DELETE ON evaluation_sample
+BEGIN SELECT RAISE(ABORT, 'evaluation sample is immutable'); END;
+
+-- Evaluation candidate: an immutable candidate version. identity_json is the
+-- canonical M1 CandidateIdentity and candidate_config_digest its digest; the
+-- store recomputes the digest on write and verifies it on read. account_pool_id
+-- is denormalized from the identity for admission and is only the pool name.
 CREATE TABLE evaluation_candidate (
   id TEXT PRIMARY KEY,
   campaign_id TEXT NOT NULL,
-  adapter_name TEXT NOT NULL,
-  model_identity TEXT NOT NULL,
-  model_revision TEXT,
-  runtime_version TEXT NOT NULL,
-  reasoning_config TEXT,
-  generation_config TEXT,
-  prompt_version TEXT NOT NULL,
-  tool_access_config TEXT,
-  source_access_config TEXT,
-  account_pool_id TEXT NOT NULL,
+  identity_json TEXT NOT NULL CHECK (json_valid(identity_json)),
+  candidate_config_digest TEXT NOT NULL CHECK (length(candidate_config_digest) > 0),
+  account_pool_id TEXT NOT NULL CHECK (length(account_pool_id) > 0),
   per_candidate_cap INTEGER NOT NULL CHECK (per_candidate_cap >= 1),
-  candidate_config_digest TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY (campaign_id) REFERENCES evaluation_campaign(id)
 );
 
 CREATE INDEX idx_evaluation_candidate_campaign ON evaluation_candidate(campaign_id);
+
+CREATE TRIGGER evaluation_candidate_frozen BEFORE UPDATE ON evaluation_candidate
+BEGIN SELECT RAISE(ABORT, 'evaluation candidate is immutable'); END;
+CREATE TRIGGER evaluation_candidate_no_delete BEFORE DELETE ON evaluation_candidate
+BEGIN SELECT RAISE(ABORT, 'evaluation candidate is immutable'); END;
 
 -- Evaluation pool: an account/compute pool owned by evaluation, deliberately
 -- separate from research_pool so evaluation starts can never spend or occupy
@@ -132,18 +146,32 @@ CREATE INDEX idx_evaluation_attempt_live ON evaluation_attempt(expires_at) WHERE
 CREATE INDEX idx_evaluation_attempt_live_pool ON evaluation_attempt(account_pool_id, expires_at) WHERE state = 'active';
 CREATE INDEX idx_evaluation_attempt_job ON evaluation_attempt(job_id);
 
--- Evaluation findings: immutable structured findings from a completed attempt
+-- A finalized or expired attempt is a recorded result and never changes.
+CREATE TRIGGER evaluation_attempt_terminal_frozen BEFORE UPDATE ON evaluation_attempt
+WHEN OLD.state <> 'active'
+BEGIN SELECT RAISE(ABORT, 'evaluation attempt result is immutable'); END;
+CREATE TRIGGER evaluation_attempt_no_delete BEFORE DELETE ON evaluation_attempt
+BEGIN SELECT RAISE(ABORT, 'evaluation attempt is immutable'); END;
+
+-- Evaluation findings: the structured findings recorded atomically with a
+-- completed attempt's result (evaluation.Finding). Immutable once written.
 CREATE TABLE evaluation_finding (
   id TEXT PRIMARY KEY,
   attempt_id TEXT NOT NULL,
   sequence_number INTEGER NOT NULL CHECK (sequence_number >= 0),
-  severity TEXT NOT NULL,
-  file TEXT NOT NULL,
-  line INTEGER NOT NULL,
-  summary TEXT NOT NULL,
-  context TEXT,
+  finding_id TEXT NOT NULL CHECK (length(finding_id) > 0),
+  severity TEXT NOT NULL CHECK (severity IN ('material', 'minor', 'note')),
+  claim TEXT,
+  summary TEXT NOT NULL CHECK (length(summary) > 0),
+  evidence TEXT,
   UNIQUE (attempt_id, sequence_number),
+  UNIQUE (attempt_id, finding_id),
   FOREIGN KEY (attempt_id) REFERENCES evaluation_attempt(id)
 );
 
 CREATE INDEX idx_evaluation_finding_attempt ON evaluation_finding(attempt_id);
+
+CREATE TRIGGER evaluation_finding_frozen BEFORE UPDATE ON evaluation_finding
+BEGIN SELECT RAISE(ABORT, 'evaluation finding is immutable'); END;
+CREATE TRIGGER evaluation_finding_no_delete BEFORE DELETE ON evaluation_finding
+BEGIN SELECT RAISE(ABORT, 'evaluation finding is immutable'); END;

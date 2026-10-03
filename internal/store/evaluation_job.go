@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -27,23 +28,36 @@ var (
 	ErrEvaluationAttemptFinalized  = errors.New("evaluation attempt already finalized")
 	ErrEvaluationAttemptLive       = errors.New("previous evaluation attempt is still live")
 	ErrEvaluationCapacityExhausted = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
-	ErrEvaluationDuplicateJob      = errors.New("evaluation job already exists for this sample and candidate")
+	ErrEvaluationCandidateCorrupt  = errors.New("stored evaluation candidate does not match its recorded digest")
+	ErrEvaluationProjectNotAllowed = errors.New("project is not allowed for this evaluation campaign")
 	ErrEvaluationInvalidInput      = errors.New("invalid evaluation input")
 )
 
-// Exit classes for a finalized attempt.
+// EvaluationExitClass is the distinct terminal outcome of one attempt.
+type EvaluationExitClass string
+
 const (
-	EvalExitCompleted           = "completed"
-	EvalExitFailed              = "failed"
-	EvalExitCancelled           = "cancelled"
-	EvalExitUnknown             = "unknown"
-	EvalExitLeaseExpired        = "lease_expired"
-	EvalExitTimeout             = "timeout"
-	EvalExitUnavailableSnapshot = "unavailable_snapshot"
-	EvalExitUnavailableSource   = "unavailable_source"
-	EvalExitInvalidOutput       = "invalid_output"
-	EvalExitIncompleteOutput    = "incomplete_output"
+	EvalExitCompleted           EvaluationExitClass = "completed"
+	EvalExitFailed              EvaluationExitClass = "failed"
+	EvalExitCancelled           EvaluationExitClass = "cancelled"
+	EvalExitUnknown             EvaluationExitClass = "unknown"
+	EvalExitLeaseExpired        EvaluationExitClass = "lease_expired"
+	EvalExitTimeout             EvaluationExitClass = "timeout"
+	EvalExitUnavailableSnapshot EvaluationExitClass = "unavailable_snapshot"
+	EvalExitUnavailableSource   EvaluationExitClass = "unavailable_source"
+	EvalExitInvalidOutput       EvaluationExitClass = "invalid_output"
+	EvalExitIncompleteOutput    EvaluationExitClass = "incomplete_output"
 )
+
+func (c EvaluationExitClass) valid() bool {
+	switch c {
+	case EvalExitCompleted, EvalExitFailed, EvalExitCancelled, EvalExitUnknown, EvalExitLeaseExpired,
+		EvalExitTimeout, EvalExitUnavailableSnapshot, EvalExitUnavailableSource,
+		EvalExitInvalidOutput, EvalExitIncompleteOutput:
+		return true
+	}
+	return false
+}
 
 // Attempt states.
 const (
@@ -52,43 +66,43 @@ const (
 	EvalAttemptExpired   = "expired"
 )
 
-// EvaluationCampaign represents a finite evaluation experiment.
+// EvaluationCampaign represents a finite evaluation experiment. Samples may
+// only come from AllowedProjectIDs. Account pools belong to candidates.
 type EvaluationCampaign struct {
-	ID             string
-	Name           string
-	Description    *string
-	ProjectID      string
-	AllowedModelID string
-	CohortManifest string
-	AttemptCap     int
-	AccountPoolID  string
-	CreatedAt      string
-	UpdatedAt      string
+	ID                string
+	Name              string
+	Description       *string
+	AllowedProjectIDs []string
+	AllowedModelID    string
+	CohortManifest    string
+	AttemptCap        int
+	CreatedAt         string
+	UpdatedAt         string
 }
 
-// EvaluationCandidate represents an immutable model version for evaluation.
+// EvaluationCandidate is an immutable candidate version. Its identity is the
+// M1 evaluation.CandidateConfig; the store derives and verifies the digest from
+// it, so a candidate can never be stored or read under a digest that is not its
+// own. PerCandidateCap is this candidate's finite share of the campaign cap.
 type EvaluationCandidate struct {
-	ID                    string
-	CampaignID            string
-	AdapterName           string
-	ModelIdentity         string
-	ModelRevision         *string
-	RuntimeVersion        string
-	ReasoningConfig       *string
-	GenerationConfig      *string
-	PromptVersion         string
-	ToolAccessConfig      *string
-	SourceAccessConfig    *string
-	AccountPoolID         string
-	PerCandidateCap       int
-	CandidateConfigDigest string
-	CreatedAt             string
+	ID              string
+	CampaignID      string
+	Config          evaluation.CandidateConfig
+	PerCandidateCap int
+	CreatedAt       string
 }
+
+// Digest is the M1 identity digest of the candidate version.
+func (c EvaluationCandidate) Digest() string { return c.Config.Digest() }
+
+// AccountPoolID is the evaluation pool this candidate draws every start from.
+func (c EvaluationCandidate) AccountPoolID() string { return c.Config.Identity().AccountPool }
 
 // EvaluationSample represents an original task/review bound for evaluation.
 type EvaluationSample struct {
 	ID                  string
 	CampaignID          string
+	ProjectID           string
 	OriginalTaskID      string
 	OriginalReviewRound int
 	SubmittedSHA        string
@@ -121,7 +135,7 @@ type EvaluationAttempt struct {
 	StartedAt         string
 	ExpiresAt         string
 	EndedAt           *string
-	ExitClass         *string
+	ExitClass         *EvaluationExitClass
 	Status            *string
 	ErrorClass        *string
 	ErrorMessage      *string
@@ -146,84 +160,137 @@ type EvaluationJobClaimResult struct {
 	Attempt EvaluationAttempt
 }
 
-// CreateEvaluationCampaign persists a new campaign.
+// CreateEvaluationCampaign persists a new campaign and its allowed projects.
 func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign EvaluationCampaign) (EvaluationCampaign, error) {
-	if campaign.ID == "" || campaign.Name == "" || campaign.ProjectID == "" ||
-		campaign.AllowedModelID == "" || campaign.CohortManifest == "" ||
-		campaign.AttemptCap < 1 || campaign.AccountPoolID == "" {
+	if campaign.ID == "" || campaign.Name == "" || len(campaign.AllowedProjectIDs) == 0 ||
+		campaign.AllowedModelID == "" || campaign.CohortManifest == "" || campaign.AttemptCap < 1 {
 		return EvaluationCampaign{}, ErrEvaluationInvalidInput
+	}
+	seen := map[string]bool{}
+	for _, p := range campaign.AllowedProjectIDs {
+		if p == "" || seen[p] {
+			return EvaluationCampaign{}, ErrEvaluationInvalidInput
+		}
+		seen[p] = true
 	}
 
 	now := s.Now().UTC().Format(timestampLayout)
 	campaign.CreatedAt = now
 	campaign.UpdatedAt = now
+	campaign.AllowedProjectIDs = append([]string(nil), campaign.AllowedProjectIDs...)
 
-	_, err := s.conn.ExecContext(ctx,
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return EvaluationCampaign{}, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO evaluation_campaign
-		 (id, name, description, project_id, allowed_model_id, cohort_manifest, attempt_cap, account_pool_id, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		campaign.ID, campaign.Name, campaign.Description, campaign.ProjectID,
-		campaign.AllowedModelID, campaign.CohortManifest, campaign.AttemptCap,
-		campaign.AccountPoolID, now, now,
+		 (id, name, description, allowed_model_id, cohort_manifest, attempt_cap, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		campaign.ID, campaign.Name, campaign.Description,
+		campaign.AllowedModelID, campaign.CohortManifest, campaign.AttemptCap, now, now,
 	)
-
 	if err != nil {
 		return EvaluationCampaign{}, fmt.Errorf("create evaluation campaign: %w", err)
 	}
-
+	for _, p := range campaign.AllowedProjectIDs {
+		if _, err = tx.ExecContext(ctx,
+			`INSERT INTO evaluation_campaign_project (campaign_id, project_id) VALUES (?, ?)`, campaign.ID, p); err != nil {
+			return EvaluationCampaign{}, fmt.Errorf("create evaluation campaign project: %w", err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return EvaluationCampaign{}, fmt.Errorf("commit transaction: %w", err)
+	}
 	return campaign, nil
 }
 
-// CreateEvaluationCandidate persists a new immutable candidate.
+// CreateEvaluationCandidate persists a new immutable candidate version. The
+// digest is taken from the M1 config, never from the caller, and the canonical
+// identity is stored so the digest can be re-verified on every read. The
+// campaign must exist.
 func (s *sqliteStore) CreateEvaluationCandidate(ctx context.Context, candidate EvaluationCandidate) (EvaluationCandidate, error) {
-	if candidate.ID == "" || candidate.CampaignID == "" || candidate.AdapterName == "" ||
-		candidate.ModelIdentity == "" || candidate.RuntimeVersion == "" ||
-		candidate.PromptVersion == "" || candidate.AccountPoolID == "" || candidate.PerCandidateCap < 1 ||
-		candidate.CandidateConfigDigest == "" {
+	if candidate.ID == "" || candidate.CampaignID == "" || candidate.PerCandidateCap < 1 || candidate.Config.Digest() == "" {
 		return EvaluationCandidate{}, ErrEvaluationInvalidInput
 	}
+	identity := candidate.Config.Identity()
+	// Revalidate the identity so a zero or hand-built config cannot slip through.
+	if _, err := evaluation.NewCandidateConfig(identity); err != nil {
+		return EvaluationCandidate{}, fmt.Errorf("%w: %v", ErrEvaluationInvalidInput, err)
+	}
+	identityJSON, err := json.Marshal(identity)
+	if err != nil {
+		return EvaluationCandidate{}, fmt.Errorf("marshal candidate identity: %w", err)
+	}
 
-	now := s.Now().UTC().Format(timestampLayout)
-	candidate.CreatedAt = now
+	var campaignExists int
+	if err := s.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM evaluation_campaign WHERE id = ?`, candidate.CampaignID).Scan(&campaignExists); err != nil {
+		return EvaluationCandidate{}, fmt.Errorf("check campaign: %w", err)
+	}
+	if campaignExists == 0 {
+		return EvaluationCandidate{}, ErrEvaluationCampaignNotFound
+	}
 
-	_, err := s.conn.ExecContext(ctx,
+	candidate.CreatedAt = s.Now().UTC().Format(timestampLayout)
+	_, err = s.conn.ExecContext(ctx,
 		`INSERT INTO evaluation_candidate
-		 (id, campaign_id, adapter_name, model_identity, model_revision, runtime_version,
-		  reasoning_config, generation_config, prompt_version, tool_access_config,
-		  source_access_config, account_pool_id, per_candidate_cap, candidate_config_digest, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		candidate.ID, candidate.CampaignID, candidate.AdapterName, candidate.ModelIdentity,
-		candidate.ModelRevision, candidate.RuntimeVersion, candidate.ReasoningConfig,
-		candidate.GenerationConfig, candidate.PromptVersion, candidate.ToolAccessConfig,
-		candidate.SourceAccessConfig, candidate.AccountPoolID, candidate.PerCandidateCap,
-		candidate.CandidateConfigDigest, now,
+		 (id, campaign_id, identity_json, candidate_config_digest, account_pool_id, per_candidate_cap, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		candidate.ID, candidate.CampaignID, string(identityJSON), candidate.Config.Digest(),
+		identity.AccountPool, candidate.PerCandidateCap, candidate.CreatedAt,
 	)
-
 	if err != nil {
 		return EvaluationCandidate{}, fmt.Errorf("create evaluation candidate: %w", err)
 	}
-
 	return candidate, nil
 }
 
-// CreateEvaluationSample persists a new sample.
+// CreateEvaluationSample persists a new sample. Its project must be one of the
+// campaign's allowed projects and, if the original task exists, must be that
+// task's project.
 func (s *sqliteStore) CreateEvaluationSample(ctx context.Context, sample EvaluationSample) (EvaluationSample, error) {
-	if sample.ID == "" || sample.CampaignID == "" || sample.OriginalTaskID == "" ||
+	if sample.ID == "" || sample.CampaignID == "" || sample.ProjectID == "" || sample.OriginalTaskID == "" ||
 		sample.SubmittedSHA == "" || sample.PromptVersion == "" ||
 		sample.ModelVersion == "" || sample.RuntimeVersion == "" {
 		return EvaluationSample{}, ErrEvaluationInvalidInput
 	}
 
+	var campaignExists, allowed int
+	if err := s.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM evaluation_campaign WHERE id = ?`, sample.CampaignID).Scan(&campaignExists); err != nil {
+		return EvaluationSample{}, fmt.Errorf("check campaign: %w", err)
+	}
+	if campaignExists == 0 {
+		return EvaluationSample{}, ErrEvaluationCampaignNotFound
+	}
+	if err := s.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM evaluation_campaign_project WHERE campaign_id = ? AND project_id = ?`,
+		sample.CampaignID, sample.ProjectID).Scan(&allowed); err != nil {
+		return EvaluationSample{}, fmt.Errorf("check allowed project: %w", err)
+	}
+	if allowed == 0 {
+		return EvaluationSample{}, ErrEvaluationProjectNotAllowed
+	}
+	var taskProject string
+	err := s.conn.QueryRowContext(ctx, `SELECT project_id FROM task WHERE id = ?`, sample.OriginalTaskID).Scan(&taskProject)
+	switch {
+	case err == nil && taskProject != sample.ProjectID:
+		return EvaluationSample{}, fmt.Errorf("%w: original task belongs to project %s", ErrEvaluationInvalidInput, taskProject)
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return EvaluationSample{}, fmt.Errorf("check original task: %w", err)
+	}
+
 	now := s.Now().UTC().Format(timestampLayout)
 	sample.CreatedAt = now
 
-	_, err := s.conn.ExecContext(ctx,
+	_, err = s.conn.ExecContext(ctx,
 		`INSERT INTO evaluation_sample
-		 (id, campaign_id, original_task_id, original_review_round, submitted_sha,
+		 (id, campaign_id, project_id, original_task_id, original_review_round, submitted_sha,
 		  snapshot_digest, source_digest, manifest_digest, prompt_version, model_version,
 		  runtime_version, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sample.ID, sample.CampaignID, sample.OriginalTaskID, sample.OriginalReviewRound,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sample.ID, sample.CampaignID, sample.ProjectID, sample.OriginalTaskID, sample.OriginalReviewRound,
 		sample.SubmittedSHA, sample.SnapshotDigest, sample.SourceDigest, sample.ManifestDigest,
 		sample.PromptVersion, sample.ModelVersion, sample.RuntimeVersion,
 		now,
@@ -236,6 +303,39 @@ func (s *sqliteStore) CreateEvaluationSample(ctx context.Context, sample Evaluat
 	return sample, nil
 }
 
+// leaseExpired is the one boundary rule for a lease: an attempt is overdue at
+// the instant its expires_at is reached. Sweep, renew, finalize and pool
+// occupancy all agree on it.
+func leaseExpired(now, expiresAt time.Time) bool { return !now.Before(expiresAt) }
+
+// expireEvaluationAttempt records an overdue active attempt as expired with the
+// distinct lease_expired outcome, ending it at its lease deadline. It is the
+// single path by which a lease becomes an expired attempt, whether found by the
+// sweep or by a late result.
+func expireEvaluationAttempt(ctx context.Context, tx *sql.Tx, attemptID, startedAtStr, expiresAtStr string) error {
+	started, err := time.Parse(timestampLayout, startedAtStr)
+	if err != nil {
+		return fmt.Errorf("parse started_at: %w", err)
+	}
+	expires, err := time.Parse(timestampLayout, expiresAtStr)
+	if err != nil {
+		return fmt.Errorf("parse expires_at: %w", err)
+	}
+	dur := expires.Sub(started).Milliseconds()
+	if dur < 0 {
+		dur = 0
+	}
+	_, err = tx.ExecContext(ctx,
+		`UPDATE evaluation_attempt SET state = ?, ended_at = ?, exit_class = ?, duration_ms = ?
+		 WHERE id = ? AND state = ?`,
+		EvalAttemptExpired, expires.Format(timestampLayout), string(EvalExitLeaseExpired), dur,
+		attemptID, EvalAttemptActive)
+	if err != nil {
+		return fmt.Errorf("expire attempt: %w", err)
+	}
+	return nil
+}
+
 // ExpireEvaluationAttempts marks all overdue active attempts as expired.
 func (s *sqliteStore) ExpireEvaluationAttempts(ctx context.Context, now time.Time) (int, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
@@ -244,72 +344,37 @@ func (s *sqliteStore) ExpireEvaluationAttempts(ctx context.Context, now time.Tim
 	}
 	defer tx.Rollback()
 
-	var overdue []EvaluationAttempt
+	type overdue struct{ id, started, expires string }
+	var found []overdue
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, job_id, request_id, previous_attempt_id, sequence_number, state, started_at, expires_at, ended_at, exit_class, status, error_class, error_message, duration_ms, usage_tokens
-		 FROM evaluation_attempt WHERE state = ? AND expires_at <= ?`,
+		`SELECT id, started_at, expires_at FROM evaluation_attempt WHERE state = ? AND expires_at <= ?`,
 		EvalAttemptActive, now.UTC().Format(timestampLayout))
 	if err != nil {
 		return 0, fmt.Errorf("find overdue attempts: %w", err)
 	}
-	defer rows.Close()
-
 	for rows.Next() {
-		a := EvaluationAttempt{}
-		var reqID string
-		var endedAtStr *string
-		var exitClass, status, errorClass, errorMsg *string
-		var durationMs, usageTokens *int
-		if err := rows.Scan(&a.ID, &a.JobID, &reqID, &a.PreviousAttemptID, &a.SequenceNumber, &a.State,
-			&a.StartedAt, &a.ExpiresAt, &endedAtStr, &exitClass, &status, &errorClass, &errorMsg, &durationMs, &usageTokens); err != nil {
+		var o overdue
+		if err := rows.Scan(&o.id, &o.started, &o.expires); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("scan attempt: %w", err)
 		}
-		a.RequestID = reqID
-		a.EndedAt = endedAtStr
-		a.ExitClass = exitClass
-		a.Status = status
-		a.ErrorClass = errorClass
-		a.ErrorMessage = errorMsg
-		a.DurationMs = durationMs
-		a.UsageTokens = usageTokens
-		overdue = append(overdue, a)
+		found = append(found, o)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return 0, err
 	}
+	rows.Close()
 
-	count := 0
-	for _, a := range overdue {
-		started, err := time.Parse(timestampLayout, a.StartedAt)
-		if err != nil {
-			return 0, fmt.Errorf("parse started_at: %w", err)
+	for _, o := range found {
+		if err := expireEvaluationAttempt(ctx, tx, o.id, o.started, o.expires); err != nil {
+			return 0, err
 		}
-		expires, err := time.Parse(timestampLayout, a.ExpiresAt)
-		if err != nil {
-			return 0, fmt.Errorf("parse expires_at: %w", err)
-		}
-		dur := expires.Sub(started).Milliseconds()
-		if dur < 0 {
-			dur = 0
-		}
-
-		_, err = tx.ExecContext(ctx,
-			`UPDATE evaluation_attempt SET state = ?, ended_at = ?, exit_class = ?, duration_ms = ?
-			 WHERE id = ? AND state = ?`,
-			EvalAttemptExpired, expires.Format(timestampLayout), EvalExitLeaseExpired, dur,
-			a.ID, EvalAttemptActive)
-		if err != nil {
-			return 0, fmt.Errorf("expire attempt: %w", err)
-		}
-		count++
 	}
-
 	if err = tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit transaction: %w", err)
 	}
-
-	return count, nil
+	return len(found), nil
 }
 
 // ClaimEvaluationJob atomically claims a job, checking capacity and creating a new attempt for retries.
@@ -424,7 +489,7 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 			if err != nil {
 				return EvaluationJobClaimResult{}, fmt.Errorf("parse expires_at: %w", err)
 			}
-			if now.Before(prevExpires) {
+			if !leaseExpired(now, prevExpires) {
 				return EvaluationJobClaimResult{}, ErrEvaluationAttemptLive
 			}
 		}
@@ -617,7 +682,7 @@ func (s *sqliteStore) RenewEvaluationAttempt(ctx context.Context, attemptID stri
 	}
 
 	// Reject if lease has already passed
-	if now.After(currentExpires) {
+	if leaseExpired(now, currentExpires) {
 		return ErrEvaluationAttemptExpired
 	}
 
@@ -642,57 +707,85 @@ func (s *sqliteStore) RenewEvaluationAttempt(ctx context.Context, attemptID stri
 	return nil
 }
 
-// FinalizeEvaluationAttempt marks an attempt as finalized with result metadata.
-// It enforces fencing: the attempt must be the job's current_attempt_id and its lease must not have expired.
-func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, attemptID, fenceAttemptID string, exitClass string, status *evaluation.Status, errorClass *evaluation.ErrorClass, errorMsg *string, durationMs, usageTokens *int) error {
-	if attemptID != fenceAttemptID {
-		return ErrEvaluationFenceMismatch
-	}
+// EvaluationAttemptResult is the recorded outcome of one attempt. Findings are
+// part of the result: they are validated and written atomically with it and
+// never change afterwards. Nil DurationMs/UsageTokens mean unknown, not zero.
+type EvaluationAttemptResult struct {
+	AttemptID      string
+	FenceAttemptID string
+	ExitClass      EvaluationExitClass
+	Status         *evaluation.Status
+	ErrorClass     *evaluation.ErrorClass
+	ErrorMessage   *string
+	DurationMs     *int
+	UsageTokens    *int
+	Findings       []evaluation.Finding
+}
 
-	// Validate exitClass
-	switch exitClass {
-	case EvalExitCompleted, EvalExitFailed, EvalExitCancelled, EvalExitUnknown, EvalExitLeaseExpired,
-		EvalExitTimeout, EvalExitUnavailableSnapshot, EvalExitUnavailableSource,
-		EvalExitInvalidOutput, EvalExitIncompleteOutput:
-		// Valid
-	default:
-		return fmt.Errorf("invalid exit_class: %s", exitClass)
+func (r EvaluationAttemptResult) validate() error {
+	if r.AttemptID == "" {
+		return ErrEvaluationInvalidInput
 	}
-
-	// Validate status if provided
-	if status != nil {
-		switch *status {
+	if !r.ExitClass.valid() {
+		return fmt.Errorf("%w: exit_class %q", ErrEvaluationInvalidInput, r.ExitClass)
+	}
+	if r.ExitClass == EvalExitLeaseExpired {
+		return fmt.Errorf("%w: lease_expired is recorded by the store, not by a result", ErrEvaluationInvalidInput)
+	}
+	if r.Status != nil {
+		switch *r.Status {
 		case evaluation.StatusCompleted, evaluation.StatusIncomplete, evaluation.StatusUnsupported, evaluation.StatusInterrupted, evaluation.StatusFailed:
-			// Valid
 		default:
-			return fmt.Errorf("invalid status: %s", *status)
+			return fmt.Errorf("%w: status %q", ErrEvaluationInvalidInput, *r.Status)
 		}
 	}
-
-	// Validate error_class if provided
-	if errorClass != nil {
-		switch *errorClass {
+	if r.ErrorClass != nil {
+		switch *r.ErrorClass {
 		case evaluation.ErrClassCapabilityMissing, evaluation.ErrClassOutputTruncated, evaluation.ErrClassSourceUnavailable,
 			evaluation.ErrClassBudgetExhausted, evaluation.ErrClassInterrupted, evaluation.ErrClassTimeout,
 			evaluation.ErrClassRuntimeError, evaluation.ErrClassOutputMalformed, evaluation.ErrClassOutputMissing,
 			evaluation.ErrClassAuthMissing, evaluation.ErrClassLaunchError:
-			// Valid
 		default:
-			return fmt.Errorf("invalid error_class: %s", *errorClass)
+			return fmt.Errorf("%w: error_class %q", ErrEvaluationInvalidInput, *r.ErrorClass)
 		}
+	}
+	if r.ErrorMessage != nil && len(*r.ErrorMessage) > 1024 {
+		return fmt.Errorf("%w: error_message exceeds 1024 bytes", ErrEvaluationInvalidInput)
+	}
+	if (r.DurationMs != nil && *r.DurationMs < 0) || (r.UsageTokens != nil && *r.UsageTokens < 0) {
+		return fmt.Errorf("%w: negative duration or usage", ErrEvaluationInvalidInput)
+	}
+	if len(r.Findings) > 0 && r.ExitClass != EvalExitCompleted {
+		return fmt.Errorf("%w: findings are only valid on a completed attempt", ErrEvaluationInvalidInput)
+	}
+	if err := evaluation.ValidateFindings(r.Findings); err != nil {
+		return fmt.Errorf("%w: %v", ErrEvaluationInvalidInput, err)
+	}
+	return nil
+}
+
+// FinalizeEvaluationAttempt records an attempt's result and findings atomically.
+// It fences: the attempt must be the job's current attempt, still active, and
+// its lease must not have been reached. A late result instead records the
+// attempt as expired (lease_expired) and returns ErrEvaluationAttemptExpired; a
+// stale result for a superseded attempt returns ErrEvaluationFenceMismatch.
+func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, res EvaluationAttemptResult) error {
+	if res.AttemptID != res.FenceAttemptID {
+		return ErrEvaluationFenceMismatch
+	}
+	if err := res.validate(); err != nil {
+		return err
 	}
 
 	now := s.Now().UTC()
-	nowStr := now.UTC().Format(timestampLayout)
+	nowStr := now.Format(timestampLayout)
 
-	var statusVal interface{} = nil
-	if status != nil {
-		statusVal = string(*status)
+	var statusVal, errorClassVal any
+	if res.Status != nil {
+		statusVal = string(*res.Status)
 	}
-
-	var errorClassVal interface{} = nil
-	if errorClass != nil {
-		errorClassVal = string(*errorClass)
+	if res.ErrorClass != nil {
+		errorClassVal = string(*res.ErrorClass)
 	}
 
 	tx, err := s.conn.BeginTx(ctx, nil)
@@ -701,53 +794,42 @@ func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, attemptID, 
 	}
 	defer tx.Rollback()
 
-	// Fetch the attempt to check fencing conditions
-	var jobID, attemptState, expiresAtStr string
+	var jobID, attemptState, startedAtStr, expiresAtStr string
 	err = tx.QueryRowContext(ctx,
-		`SELECT job_id, state, expires_at FROM evaluation_attempt WHERE id = ?`,
-		attemptID,
-	).Scan(&jobID, &attemptState, &expiresAtStr)
+		`SELECT job_id, state, started_at, expires_at FROM evaluation_attempt WHERE id = ?`,
+		res.AttemptID,
+	).Scan(&jobID, &attemptState, &startedAtStr, &expiresAtStr)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return ErrEvaluationAttemptNotFound
 		}
 		return fmt.Errorf("fetch attempt: %w", err)
 	}
 
-	// Check if attempt is already in a terminal state
+	if attemptState == EvalAttemptFinalized {
+		return ErrEvaluationAttemptFinalized
+	}
 	if attemptState != EvalAttemptActive {
-		if attemptState == EvalAttemptFinalized {
-			return ErrEvaluationAttemptFinalized
-		}
 		return ErrEvaluationAttemptExpired
 	}
 
-	// Check if this attempt is still the job's current attempt
 	var jobCurrentAttemptID string
-	err = tx.QueryRowContext(ctx,
-		`SELECT current_attempt_id FROM evaluation_job WHERE id = ?`,
-		jobID,
-	).Scan(&jobCurrentAttemptID)
-	if err != nil {
+	if err = tx.QueryRowContext(ctx,
+		`SELECT current_attempt_id FROM evaluation_job WHERE id = ?`, jobID,
+	).Scan(&jobCurrentAttemptID); err != nil {
 		return fmt.Errorf("fetch job: %w", err)
 	}
-	if jobCurrentAttemptID != attemptID {
+	if jobCurrentAttemptID != res.AttemptID {
 		return ErrEvaluationFenceMismatch
 	}
 
-	// Check if the lease has expired
 	expiresAt, err := time.Parse(timestampLayout, expiresAtStr)
 	if err != nil {
 		return fmt.Errorf("parse expires_at: %w", err)
 	}
-	if now.After(expiresAt) {
-		// Lease has expired; mark the attempt as expired and return error
-		_, err := tx.ExecContext(ctx,
-			`UPDATE evaluation_attempt SET state = ? WHERE id = ?`,
-			EvalAttemptExpired, attemptID,
-		)
-		if err != nil {
-			return fmt.Errorf("mark attempt expired: %w", err)
+	if leaseExpired(now, expiresAt) {
+		if err := expireEvaluationAttempt(ctx, tx, res.AttemptID, startedAtStr, expiresAtStr); err != nil {
+			return err
 		}
 		if err = tx.Commit(); err != nil {
 			return fmt.Errorf("commit transaction: %w", err)
@@ -755,93 +837,63 @@ func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, attemptID, 
 		return ErrEvaluationAttemptExpired
 	}
 
-	// Now safe to finalize
-	result, err := tx.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`UPDATE evaluation_attempt
 		 SET state = ?, ended_at = ?, exit_class = ?, status = ?, error_class = ?, error_message = ?, duration_ms = ?, usage_tokens = ?
-		 WHERE id = ?`,
-		EvalAttemptFinalized, nowStr, exitClass, statusVal, errorClassVal, errorMsg, durationMs, usageTokens,
-		attemptID,
+		 WHERE id = ? AND state = ?`,
+		EvalAttemptFinalized, nowStr, string(res.ExitClass), statusVal, errorClassVal, res.ErrorMessage, res.DurationMs, res.UsageTokens,
+		res.AttemptID, EvalAttemptActive,
 	)
 	if err != nil {
 		return fmt.Errorf("finalize attempt: %w", err)
 	}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("rows affected: %w", err)
-	}
-
-	if rows == 0 {
-		return ErrEvaluationAttemptNotFound
+	for i, f := range res.Findings {
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO evaluation_finding (id, attempt_id, sequence_number, finding_id, severity, claim, summary, evidence)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			GenerateID(), res.AttemptID, i, f.ID, string(f.Severity), nullableString(f.Claim), f.Summary, nullableString(f.Evidence))
+		if err != nil {
+			return fmt.Errorf("store finding: %w", err)
+		}
 	}
 
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
-
 	return nil
 }
 
-// StoreEvaluationFinding persists a finding from a completed evaluation attempt.
-// Findings can only be stored on finalized attempts with completed status and are immutable.
-func (s *sqliteStore) StoreEvaluationFinding(ctx context.Context, attemptID string, sequenceNumber int, severity evaluation.Severity, file string, line int, summary, context *string) (string, error) {
-	if attemptID == "" || severity == "" || file == "" || line < 0 || summary == nil {
-		return "", ErrEvaluationInvalidInput
+func nullableString(v string) any {
+	if v == "" {
+		return nil
 	}
+	return v
+}
 
-	// Validate severity using evaluation package constants
-	switch severity {
-	case evaluation.SeverityMaterial, evaluation.SeverityMinor, evaluation.SeverityNote:
-		// Valid severity
-	default:
-		return "", fmt.Errorf("invalid severity: %s", severity)
+// ListEvaluationFindings returns an attempt's findings in recorded order.
+func (s *sqliteStore) ListEvaluationFindings(ctx context.Context, attemptID string) ([]evaluation.Finding, error) {
+	if _, err := s.fetchEvaluationAttempt(ctx, s.conn, attemptID); err != nil {
+		return nil, err
 	}
-
-	tx, err := s.conn.BeginTx(ctx, nil)
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT finding_id, severity, COALESCE(claim, ''), summary, COALESCE(evidence, '')
+		 FROM evaluation_finding WHERE attempt_id = ? ORDER BY sequence_number`, attemptID)
 	if err != nil {
-		return "", fmt.Errorf("begin transaction: %w", err)
+		return nil, fmt.Errorf("list findings: %w", err)
 	}
-	defer tx.Rollback()
-
-	// Verify that the attempt exists and is finalized with completed exit_class
-	var attemptState, exitClass string
-	err = tx.QueryRowContext(ctx,
-		`SELECT state, COALESCE(exit_class, '')
-		 FROM evaluation_attempt WHERE id = ?`,
-		attemptID,
-	).Scan(&attemptState, &exitClass)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return "", ErrEvaluationAttemptNotFound
+	defer rows.Close()
+	var out []evaluation.Finding
+	for rows.Next() {
+		var f evaluation.Finding
+		var sev string
+		if err := rows.Scan(&f.ID, &sev, &f.Claim, &f.Summary, &f.Evidence); err != nil {
+			return nil, fmt.Errorf("scan finding: %w", err)
 		}
-		return "", fmt.Errorf("fetch attempt: %w", err)
+		f.Severity = evaluation.Severity(sev)
+		out = append(out, f)
 	}
-
-	if attemptState != EvalAttemptFinalized {
-		return "", fmt.Errorf("findings can only be stored on finalized attempts, got state: %s", attemptState)
-	}
-
-	// Findings can only be stored if the exit_class is 'completed'
-	if exitClass != EvalExitCompleted {
-		return "", fmt.Errorf("findings can only be stored on completed attempts, got exit_class: %s", exitClass)
-	}
-
-	findingID := GenerateID()
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO evaluation_finding (id, attempt_id, sequence_number, severity, file, line, summary, context)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		findingID, attemptID, sequenceNumber, string(severity), file, line, summary, context,
-	)
-	if err != nil {
-		return "", fmt.Errorf("store finding: %w", err)
-	}
-
-	if err = tx.Commit(); err != nil {
-		return "", fmt.Errorf("commit transaction: %w", err)
-	}
-
-	return findingID, nil
+	return out, rows.Err()
 }
 
 // queryEvaluationJob is a helper to fetch a job by ID from either connection or transaction.
@@ -900,7 +952,10 @@ func (s *sqliteStore) fetchEvaluationAttempt(ctx context.Context, querier interf
 	attempt.StartedAt = startedAtStr
 	attempt.ExpiresAt = expiresAtStr
 	attempt.EndedAt = endedAtStr
-	attempt.ExitClass = exitClass
+	if exitClass != nil {
+		ec := EvaluationExitClass(*exitClass)
+		attempt.ExitClass = &ec
+	}
 	attempt.Status = status
 	attempt.ErrorClass = errorClass
 	attempt.ErrorMessage = errorMsg
@@ -925,11 +980,11 @@ func (s *sqliteStore) GetEvaluationSample(ctx context.Context, sampleID string) 
 	sample := EvaluationSample{}
 
 	err := s.conn.QueryRowContext(ctx,
-		`SELECT id, campaign_id, original_task_id, original_review_round, submitted_sha,
+		`SELECT id, campaign_id, project_id, original_task_id, original_review_round, submitted_sha,
 		        snapshot_digest, source_digest, manifest_digest, prompt_version, model_version,
 		        runtime_version, created_at FROM evaluation_sample WHERE id = ?`,
 		sampleID,
-	).Scan(&sample.ID, &sample.CampaignID, &sample.OriginalTaskID, &sample.OriginalReviewRound,
+	).Scan(&sample.ID, &sample.CampaignID, &sample.ProjectID, &sample.OriginalTaskID, &sample.OriginalReviewRound,
 		&sample.SubmittedSHA, &sample.SnapshotDigest, &sample.SourceDigest, &sample.ManifestDigest,
 		&sample.PromptVersion, &sample.ModelVersion, &sample.RuntimeVersion, &sample.CreatedAt)
 
@@ -943,29 +998,36 @@ func (s *sqliteStore) GetEvaluationSample(ctx context.Context, sampleID string) 
 	return sample, nil
 }
 
-// GetEvaluationCandidate fetches a candidate by ID.
+// GetEvaluationCandidate fetches a candidate by ID, rebuilding its M1 config
+// from the stored canonical identity and verifying it against the stored digest.
 func (s *sqliteStore) GetEvaluationCandidate(ctx context.Context, candidateID string) (EvaluationCandidate, error) {
 	candidate := EvaluationCandidate{}
+	var identityJSON, digest, pool string
 
 	err := s.conn.QueryRowContext(ctx,
-		`SELECT id, campaign_id, adapter_name, model_identity, model_revision, runtime_version,
-		        reasoning_config, generation_config, prompt_version, tool_access_config,
-		        source_access_config, account_pool_id, per_candidate_cap, candidate_config_digest, created_at
+		`SELECT id, campaign_id, identity_json, candidate_config_digest, account_pool_id, per_candidate_cap, created_at
 		 FROM evaluation_candidate WHERE id = ?`,
 		candidateID,
-	).Scan(&candidate.ID, &candidate.CampaignID, &candidate.AdapterName, &candidate.ModelIdentity,
-		&candidate.ModelRevision, &candidate.RuntimeVersion, &candidate.ReasoningConfig,
-		&candidate.GenerationConfig, &candidate.PromptVersion, &candidate.ToolAccessConfig,
-		&candidate.SourceAccessConfig, &candidate.AccountPoolID, &candidate.PerCandidateCap,
-		&candidate.CandidateConfigDigest, &candidate.CreatedAt)
-
+	).Scan(&candidate.ID, &candidate.CampaignID, &identityJSON, &digest, &pool, &candidate.PerCandidateCap, &candidate.CreatedAt)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return EvaluationCandidate{}, ErrEvaluationCandidateNotFound
 		}
 		return EvaluationCandidate{}, fmt.Errorf("get candidate: %w", err)
 	}
 
+	var identity evaluation.CandidateIdentity
+	if err := json.Unmarshal([]byte(identityJSON), &identity); err != nil {
+		return EvaluationCandidate{}, fmt.Errorf("%w: %v", ErrEvaluationCandidateCorrupt, err)
+	}
+	config, err := evaluation.NewCandidateConfig(identity)
+	if err != nil {
+		return EvaluationCandidate{}, fmt.Errorf("%w: %v", ErrEvaluationCandidateCorrupt, err)
+	}
+	if config.Digest() != digest || identity.AccountPool != pool {
+		return EvaluationCandidate{}, ErrEvaluationCandidateCorrupt
+	}
+	candidate.Config = config
 	return candidate, nil
 }
 
@@ -974,19 +1036,34 @@ func (s *sqliteStore) GetEvaluationCampaign(ctx context.Context, campaignID stri
 	campaign := EvaluationCampaign{}
 
 	err := s.conn.QueryRowContext(ctx,
-		`SELECT id, name, description, project_id, allowed_model_id, cohort_manifest, attempt_cap, account_pool_id, created_at, updated_at
+		`SELECT id, name, description, allowed_model_id, cohort_manifest, attempt_cap, created_at, updated_at
 		 FROM evaluation_campaign WHERE id = ?`,
 		campaignID,
-	).Scan(&campaign.ID, &campaign.Name, &campaign.Description, &campaign.ProjectID,
+	).Scan(&campaign.ID, &campaign.Name, &campaign.Description,
 		&campaign.AllowedModelID, &campaign.CohortManifest, &campaign.AttemptCap,
-		&campaign.AccountPoolID, &campaign.CreatedAt, &campaign.UpdatedAt)
-
+		&campaign.CreatedAt, &campaign.UpdatedAt)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return EvaluationCampaign{}, ErrEvaluationCampaignNotFound
 		}
 		return EvaluationCampaign{}, fmt.Errorf("get campaign: %w", err)
 	}
 
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT project_id FROM evaluation_campaign_project WHERE campaign_id = ? ORDER BY project_id`, campaignID)
+	if err != nil {
+		return EvaluationCampaign{}, fmt.Errorf("get campaign projects: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return EvaluationCampaign{}, fmt.Errorf("scan campaign project: %w", err)
+		}
+		campaign.AllowedProjectIDs = append(campaign.AllowedProjectIDs, p)
+	}
+	if err := rows.Err(); err != nil {
+		return EvaluationCampaign{}, err
+	}
 	return campaign, nil
 }

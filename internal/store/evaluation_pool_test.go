@@ -61,25 +61,21 @@ func newPoolTestCandidate(campaignID, adapter, promptVersion, pool string, cap i
 		Observers:          evaluation.UnknownNames(),
 		AccountPool:        pool,
 	}
-	config, _ := evaluation.NewCandidateConfig(identity)
-	return EvaluationCandidate{
-		ID:                    GenerateID(),
-		CampaignID:            campaignID,
-		AdapterName:           adapter,
-		ModelIdentity:         adapter + "-model",
-		RuntimeVersion:        "v1",
-		PromptVersion:         promptVersion,
-		AccountPoolID:         pool,
-		PerCandidateCap:       cap,
-		CandidateConfigDigest: config.Digest(),
+	config, err := evaluation.NewCandidateConfig(identity)
+	if err != nil {
+		panic(err)
 	}
+	return EvaluationCandidate{ID: GenerateID(), CampaignID: campaignID, Config: config, PerCandidateCap: cap}
 }
 
-func newPoolTestCampaign(t *testing.T, st Store, attemptCap int) EvaluationCampaign {
+func newPoolTestCampaign(t *testing.T, st Store, attemptCap int, projects ...string) EvaluationCampaign {
 	t.Helper()
+	if len(projects) == 0 {
+		projects = []string{"proj1"}
+	}
 	c, err := st.CreateEvaluationCampaign(context.Background(), EvaluationCampaign{
-		ID: GenerateID(), Name: "pool-campaign", ProjectID: "proj1", AllowedModelID: "m",
-		CohortManifest: `{"samples": []}`, AttemptCap: attemptCap, AccountPoolID: "campaign-pool",
+		ID: GenerateID(), Name: "pool-campaign", AllowedProjectIDs: projects, AllowedModelID: "m",
+		CohortManifest: `{"samples": []}`, AttemptCap: attemptCap,
 	})
 	if err != nil {
 		t.Fatalf("CreateEvaluationCampaign: %v", err)
@@ -102,7 +98,7 @@ func newPoolTestSamples(t *testing.T, st Store, c EvaluationCampaign, n int) []E
 	for i := 0; i < n; i++ {
 		sha := fmt.Sprintf("sha%d", i)
 		sm, err := st.CreateEvaluationSample(context.Background(), EvaluationSample{
-			ID: GenerateID(), CampaignID: c.ID, OriginalTaskID: fmt.Sprintf("task%d", i), OriginalReviewRound: 1,
+			ID: GenerateID(), CampaignID: c.ID, ProjectID: "proj1", OriginalTaskID: fmt.Sprintf("task%d", i), OriginalReviewRound: 1,
 			SubmittedSHA: sha, SnapshotDigest: &sha, PromptVersion: "v1", ModelVersion: "v1", RuntimeVersion: "v1",
 		})
 		if err != nil {
@@ -277,7 +273,7 @@ func TestEvaluationConcurrencyOnlyPool(t *testing.T) {
 		t.Fatalf("second concurrent claim = %v, want a concurrency retry", err)
 	}
 	// Finalizing releases the slot; there is no rate bucket to run out of.
-	if err := st.FinalizeEvaluationAttempt(ctx, a.Attempt.ID, a.Attempt.ID, EvalExitCompleted, nil, nil, nil, nil, nil); err != nil {
+	if err := st.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{AttemptID: a.Attempt.ID, FenceAttemptID: a.Attempt.ID, ExitClass: EvalExitCompleted}); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 	b, err := claimEval(st, samples[1], cand, time.Minute)
@@ -289,7 +285,7 @@ func TestEvaluationConcurrencyOnlyPool(t *testing.T) {
 	if _, err := claimEval(st, samples[2], cand, time.Minute); err != nil {
 		t.Fatalf("claim after lease lapse: %v", err)
 	}
-	if err := st.FinalizeEvaluationAttempt(ctx, b.Attempt.ID, b.Attempt.ID, EvalExitCompleted, nil, nil, nil, nil, nil); !errors.Is(err, ErrEvaluationAttemptExpired) {
+	if err := st.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{AttemptID: b.Attempt.ID, FenceAttemptID: b.Attempt.ID, ExitClass: EvalExitCompleted}); !errors.Is(err, ErrEvaluationAttemptExpired) {
 		t.Fatalf("late finalize = %v, want ErrEvaluationAttemptExpired", err)
 	}
 
@@ -359,7 +355,7 @@ func TestEvaluationTwoProvidersAreIsolated(t *testing.T) {
 	}
 	failed := evaluation.StatusFailed
 	errClass := evaluation.ErrClassRuntimeError
-	if err := st.FinalizeEvaluationAttempt(ctx, a1.Attempt.ID, a1.Attempt.ID, EvalExitFailed, &failed, &errClass, nil, nil, nil); err != nil {
+	if err := st.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{AttemptID: a1.Attempt.ID, FenceAttemptID: a1.Attempt.ID, ExitClass: EvalExitFailed, Status: &failed, ErrorClass: &errClass}); err != nil {
 		t.Fatalf("A finalize: %v", err)
 	}
 	// A is out of quota.
@@ -414,7 +410,7 @@ func TestEvaluationCandidateVersionsRoundTripAndStayIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v1.CandidateConfigDigest == v2.CandidateConfigDigest {
+	if v1.Digest() == v2.Digest() {
 		t.Fatal("a changed prompt version must change the candidate digest")
 	}
 	for _, want := range []EvaluationCandidate{v1, v2} {
@@ -422,11 +418,11 @@ func TestEvaluationCandidateVersionsRoundTripAndStayIsolated(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.CandidateConfigDigest != want.CandidateConfigDigest || got.CandidateConfigDigest == "" {
-			t.Errorf("digest round-trip = %q, want %q", got.CandidateConfigDigest, want.CandidateConfigDigest)
+		if got.Digest() != want.Digest() || got.Digest() == "" {
+			t.Errorf("digest round-trip = %q, want %q", got.Digest(), want.Digest())
 		}
-		if got.PromptVersion != want.PromptVersion {
-			t.Errorf("prompt version = %q, want %q", got.PromptVersion, want.PromptVersion)
+		if !reflect.DeepEqual(got.Config.Identity(), want.Config.Identity()) {
+			t.Errorf("identity did not round-trip: %+v vs %+v", got.Config.Identity(), want.Config.Identity())
 		}
 	}
 	sm := newPoolTestSamples(t, st, c, 1)[0]
@@ -544,10 +540,10 @@ func TestEvaluationResultsNeverTouchProductionReview(t *testing.T) {
 	snapBefore := productionSnapshot(t, st)
 
 	configureTestEvaluationPool(t, st, "iso-pool")
-	campaign := newPoolTestCampaign(t, st, 5)
+	campaign := newPoolTestCampaign(t, st, 5, projID)
 	cand := newPoolTestCandidateStored(t, st, campaign, "fakeA", "iso-pool", 5)
 	sample, err := st.CreateEvaluationSample(ctx, EvaluationSample{
-		ID: GenerateID(), CampaignID: campaign.ID, OriginalTaskID: parentID, OriginalReviewRound: parentBefore.ReviewRound,
+		ID: GenerateID(), CampaignID: campaign.ID, ProjectID: projID, OriginalTaskID: parentID, OriginalReviewRound: parentBefore.ReviewRound,
 		SubmittedSHA: "deadbeef", PromptVersion: "v1", ModelVersion: "v1", RuntimeVersion: "v1",
 	})
 	if err != nil {
@@ -562,7 +558,7 @@ func TestEvaluationResultsNeverTouchProductionReview(t *testing.T) {
 	}
 	failed := evaluation.StatusFailed
 	cls := evaluation.ErrClassRuntimeError
-	if err := st.FinalizeEvaluationAttempt(ctx, r1.Attempt.ID, r1.Attempt.ID, EvalExitFailed, &failed, &cls, nil, nil, nil); err != nil {
+	if err := st.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{AttemptID: r1.Attempt.ID, FenceAttemptID: r1.Attempt.ID, ExitClass: EvalExitFailed, Status: &failed, ErrorClass: &cls}); err != nil {
 		t.Fatal(err)
 	}
 	r2, err := claimEval(st, sample, cand, time.Minute)
@@ -570,12 +566,9 @@ func TestEvaluationResultsNeverTouchProductionReview(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := evaluation.StatusCompleted
-	if err := st.FinalizeEvaluationAttempt(ctx, r2.Attempt.ID, r2.Attempt.ID, EvalExitCompleted, &done, nil, nil, nil, nil); err != nil {
+	if err := st.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{AttemptID: r2.Attempt.ID, FenceAttemptID: r2.Attempt.ID, ExitClass: EvalExitCompleted, Status: &done,
+		Findings: []evaluation.Finding{{ID: "f1", Severity: evaluation.SeverityMaterial, Summary: "evaluator disagrees"}}}); err != nil {
 		t.Fatal(err)
-	}
-	summary := "evaluator disagrees"
-	if _, err := st.StoreEvaluationFinding(ctx, r2.Attempt.ID, 0, evaluation.SeverityMaterial, "a.md", 1, &summary, nil); err != nil {
-		t.Fatalf("StoreEvaluationFinding: %v", err)
 	}
 	if _, err := st.ExpireEvaluationAttempts(ctx, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)

@@ -95,8 +95,8 @@ type Store interface {
 	GetEvaluationPool(ctx context.Context, id string) (EvaluationPoolState, error)
 	ClaimEvaluationJob(ctx context.Context, req EvaluationJobClaim) (EvaluationJobClaimResult, error)
 	RenewEvaluationAttempt(ctx context.Context, attemptID string, expiresAt time.Time) error
-	FinalizeEvaluationAttempt(ctx context.Context, attemptID, fenceAttemptID string, exitClass string, status *evaluation.Status, errorClass *evaluation.ErrorClass, errorMsg *string, durationMs, usageTokens *int) error
-	StoreEvaluationFinding(ctx context.Context, attemptID string, sequenceNumber int, severity evaluation.Severity, file string, line int, summary, context *string) (string, error)
+	FinalizeEvaluationAttempt(ctx context.Context, res EvaluationAttemptResult) error
+	ListEvaluationFindings(ctx context.Context, attemptID string) ([]evaluation.Finding, error)
 	ExpireEvaluationAttempts(ctx context.Context, now time.Time) (int, error)
 	GetEvaluationJob(ctx context.Context, jobID string) (EvaluationJob, error)
 	GetEvaluationAttempt(ctx context.Context, attemptID string) (EvaluationAttempt, error)
