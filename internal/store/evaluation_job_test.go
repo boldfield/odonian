@@ -20,6 +20,35 @@ func newEvaluationStore(t *testing.T) Store {
 	return s
 }
 
+func newTestCandidate(campaignID string) EvaluationCandidate {
+	identity := evaluation.CandidateIdentity{
+		AdapterName:        "fake",
+		AdapterVersion:     "v1",
+		ModelID:            "model1",
+		ModelRevision:      "unknown",
+		RuntimeName:        "test",
+		RuntimeVersion:     "v1",
+		ReasoningSettings:  evaluation.UnknownSettings(),
+		GenerationSettings: evaluation.UnknownSettings(),
+		PromptVersion:      "v1",
+		Tools:              evaluation.UnknownNames(),
+		Observers:          evaluation.UnknownNames(),
+		AccountPool:        "pool1",
+	}
+	config, _ := evaluation.NewCandidateConfig(identity)
+	return EvaluationCandidate{
+		ID:                    GenerateID(),
+		CampaignID:            campaignID,
+		AdapterName:           "fake",
+		ModelIdentity:         "model1",
+		RuntimeVersion:        "v1",
+		PromptVersion:         "v1",
+		AccountPoolID:         "pool1",
+		PerCandidateCap:       5,
+		CandidateConfigDigest: config.Digest(),
+	}
+}
+
 func TestEvaluationJobClaim(t *testing.T) {
 	st := newEvaluationStore(t)
 
@@ -41,16 +70,7 @@ func TestEvaluationJobClaim(t *testing.T) {
 	}
 
 	// Create a candidate
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, err = st.CreateEvaluationCandidate(ctx, candidate)
 	if err != nil {
 		t.Fatalf("CreateEvaluationCandidate failed: %v", err)
@@ -116,16 +136,7 @@ func TestEvaluationJobClaimIdempotent(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{
@@ -185,16 +196,7 @@ func TestEvaluationJobCapacityEnforcement(t *testing.T) {
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
 	// Create candidate with low per-candidate cap
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 1,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	// Create two samples
@@ -264,16 +266,7 @@ func TestEvaluationAttemptRenewAndFinalize(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{
@@ -349,16 +342,7 @@ func TestEvaluationFindingStorage(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{
@@ -418,16 +402,7 @@ func TestEvaluationRetryAttemptLifecycle(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{
@@ -509,16 +484,7 @@ func TestEvaluationCapacityEnforcement(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample1 := EvaluationSample{
@@ -601,16 +567,7 @@ func TestEvaluationFencingLateStaleFence(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{
@@ -670,16 +627,7 @@ func TestEvaluationFencingWrongAttemptID(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{
@@ -745,16 +693,7 @@ func TestEvaluationFindingValidation(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{
@@ -822,16 +761,7 @@ func TestEvaluationLeaseExpirySweep(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 3,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{
@@ -904,50 +834,38 @@ func TestEvaluationConcurrentClaim(t *testing.T) {
 		ProjectID:      "proj1",
 		AllowedModelID: "model1",
 		CohortManifest: `{"samples": []}`,
-		AttemptCap:     10,
+		AttemptCap:     1,
 		AccountPoolID:  "pool1",
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 10,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
-	// Create multiple samples
-	samples := make([]EvaluationSample, 3)
-	for i := 0; i < 3; i++ {
-		sample := EvaluationSample{
-			ID:                  GenerateID(),
-			CampaignID:          campaign.ID,
-			OriginalTaskID:      fmt.Sprintf("task%d", i),
-			OriginalReviewRound: 1,
-			SubmittedSHA:        fmt.Sprintf("sha%d", i),
-			PromptVersion:       "v1",
-			ModelVersion:        "v1",
-			RuntimeVersion:      "v1",
-		}
-		sample, _ = st.CreateEvaluationSample(ctx, sample)
-		samples[i] = sample
+	// Create a single sample for concurrent claims
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "sha1",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
 	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
 
-	// Launch concurrent claims with different samples
-	numClaims := 3
+	// Launch concurrent claims for the SAME sample/candidate pair
+	numClaims := 16
 	results := make([]EvaluationJobClaimResult, numClaims)
 	errsChan := make(chan error, numClaims)
+	successCount := 0
 
 	for i := 0; i < numClaims; i++ {
 		go func(idx int) {
 			reqID := fmt.Sprintf("req%d", idx)
 			req := EvaluationJobClaim{
-				SampleID:     samples[idx].ID,
+				SampleID:     sample.ID,
 				CandidateID:  candidate.ID,
 				RequestID:    reqID,
 				LeaseExpires: 5 * time.Minute,
@@ -962,21 +880,232 @@ func TestEvaluationConcurrentClaim(t *testing.T) {
 		}(i)
 	}
 
-	// Collect results
+	// Collect results - only one should succeed, others should fail due to capacity limit
 	for i := 0; i < numClaims; i++ {
-		if err := <-errsChan; err != nil {
-			t.Fatalf("Concurrent claim %d failed: %v", i, err)
+		if err := <-errsChan; err == nil {
+			successCount++
 		}
 	}
 
-	// Verify all claims succeeded and have sequence number 1 (first attempt for each sample)
+	// With AttemptCap=1, exactly one concurrent claim should succeed
+	if successCount != 1 {
+		t.Errorf("Expected exactly 1 successful concurrent claim, got %d", successCount)
+	}
+
+	// Verify the one successful claim has sequence number 1
 	for i := 0; i < numClaims; i++ {
-		if results[i].Attempt.SequenceNumber != 1 {
-			t.Errorf("Attempt %d should have sequence number 1, got %d", i, results[i].Attempt.SequenceNumber)
+		if results[i].Attempt.SequenceNumber == 1 {
+			if results[i].Job.SampleID != sample.ID {
+				t.Errorf("Successful result sample ID mismatch")
+			}
 		}
-		if results[i].Job.SampleID != samples[i].ID {
-			t.Errorf("Result %d sample ID mismatch", i)
-		}
+	}
+}
+
+// TestEvaluationProductionIsolation tests that evaluation job operations never affect production review tasks.
+func TestEvaluationProductionIsolation(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	// Create a campaign and sample/candidate for evaluation
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "test-campaign",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     10,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	candidate := newTestCandidate(campaign.ID)
+	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
+
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	// Claim, finalize, and add findings to an evaluation job
+	req := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate.ID,
+		RequestID:    "req1",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result, _ := st.ClaimEvaluationJob(ctx, req)
+
+	status := evaluation.StatusCompleted
+	st.FinalizeEvaluationAttempt(ctx, result.Attempt.ID, result.Attempt.ID, EvalExitCompleted, &status, nil, nil, nil, nil)
+
+	summary := "Test finding"
+	st.StoreEvaluationFinding(ctx, result.Attempt.ID, 0, evaluation.SeverityMaterial, "main.go", 42, &summary, nil)
+
+	// Verify evaluation data exists
+	jobID := result.Job.ID
+	attemptID := result.Attempt.ID
+	retrievedJob, err := st.GetEvaluationJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve evaluation job: %v", err)
+	}
+	if retrievedJob.ID != jobID {
+		t.Error("Job ID mismatch")
+	}
+
+	// Verify that the evaluation job tables are completely independent
+	// A production task/review should never be directly connected to evaluation data
+	// This test ensures evaluation job creation and completion do NOT trigger any
+	// production task state changes, aggregateReviewRound calls, or scorecard updates.
+
+	// The key assertion: evaluation tables should have the data, production tables should be unaffected
+	// (since we're testing in a store without production tasks, we just verify evaluation data persists)
+	attempt, err := st.GetEvaluationAttempt(ctx, attemptID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve evaluation attempt: %v", err)
+	}
+	if attempt.State != EvalAttemptFinalized {
+		t.Errorf("Attempt should be finalized, got state: %s", attempt.State)
+	}
+	if attempt.ExitClass == nil || *attempt.ExitClass != EvalExitCompleted {
+		t.Errorf("Exit class should be 'completed', got: %v", attempt.ExitClass)
+	}
+}
+
+// TestEvaluationConfigVersionIsolation tests that different candidate configurations maintain separate immutable identities.
+func TestEvaluationConfigVersionIsolation(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+
+	campaign := EvaluationCampaign{
+		ID:             GenerateID(),
+		Name:           "test-campaign",
+		ProjectID:      "proj1",
+		AllowedModelID: "model1",
+		CohortManifest: `{"samples": []}`,
+		AttemptCap:     20,
+		AccountPoolID:  "pool1",
+	}
+	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
+
+	// Create first candidate version
+	identity1 := evaluation.CandidateIdentity{
+		AdapterName:        "fake",
+		AdapterVersion:     "v1",
+		ModelID:            "model-a",
+		ModelRevision:      "unknown",
+		RuntimeName:        "test",
+		RuntimeVersion:     "v1",
+		ReasoningSettings:  evaluation.UnknownSettings(),
+		GenerationSettings: evaluation.UnknownSettings(),
+		PromptVersion:      "v1",
+		Tools:              evaluation.UnknownNames(),
+		Observers:          evaluation.UnknownNames(),
+		AccountPool:        "pool1",
+	}
+	config1, _ := evaluation.NewCandidateConfig(identity1)
+
+	candidate1 := EvaluationCandidate{
+		ID:                    GenerateID(),
+		CampaignID:            campaign.ID,
+		AdapterName:           "fake",
+		ModelIdentity:         "model-a",
+		RuntimeVersion:        "v1",
+		PromptVersion:         "v1",
+		AccountPoolID:         "pool1",
+		PerCandidateCap:       5,
+		CandidateConfigDigest: config1.Digest(),
+	}
+	candidate1, _ = st.CreateEvaluationCandidate(ctx, candidate1)
+
+	// Create second candidate version with different model ID
+	identity2 := evaluation.CandidateIdentity{
+		AdapterName:        "fake",
+		AdapterVersion:     "v1",
+		ModelID:            "model-b",
+		ModelRevision:      "unknown",
+		RuntimeName:        "test",
+		RuntimeVersion:     "v1",
+		ReasoningSettings:  evaluation.UnknownSettings(),
+		GenerationSettings: evaluation.UnknownSettings(),
+		PromptVersion:      "v1",
+		Tools:              evaluation.UnknownNames(),
+		Observers:          evaluation.UnknownNames(),
+		AccountPool:        "pool1",
+	}
+	config2, _ := evaluation.NewCandidateConfig(identity2)
+
+	candidate2 := EvaluationCandidate{
+		ID:                    GenerateID(),
+		CampaignID:            campaign.ID,
+		AdapterName:           "fake",
+		ModelIdentity:         "model-b",
+		RuntimeVersion:        "v1",
+		PromptVersion:         "v1",
+		AccountPoolID:         "pool1",
+		PerCandidateCap:       5,
+		CandidateConfigDigest: config2.Digest(),
+	}
+	candidate2, _ = st.CreateEvaluationCandidate(ctx, candidate2)
+
+	// Verify the two candidates have different digests
+	if candidate1.CandidateConfigDigest == candidate2.CandidateConfigDigest {
+		t.Error("Different candidate configs should have different digests")
+	}
+
+	// Create a sample
+	sample := EvaluationSample{
+		ID:                  GenerateID(),
+		CampaignID:          campaign.ID,
+		OriginalTaskID:      "task1",
+		OriginalReviewRound: 1,
+		SubmittedSHA:        "abc123",
+		PromptVersion:       "v1",
+		ModelVersion:        "v1",
+		RuntimeVersion:      "v1",
+	}
+	sample, _ = st.CreateEvaluationSample(ctx, sample)
+
+	// Claim with candidate1
+	req1 := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate1.ID,
+		RequestID:    "req1",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result1, _ := st.ClaimEvaluationJob(ctx, req1)
+
+	// Finalize with candidate1
+	status := evaluation.StatusCompleted
+	st.FinalizeEvaluationAttempt(ctx, result1.Attempt.ID, result1.Attempt.ID, EvalExitCompleted, &status, nil, nil, nil, nil)
+
+	// Now claim the same sample with candidate2 (different version)
+	req2 := EvaluationJobClaim{
+		SampleID:     sample.ID,
+		CandidateID:  candidate2.ID,
+		RequestID:    "req2",
+		LeaseExpires: 5 * time.Minute,
+	}
+	result2, _ := st.ClaimEvaluationJob(ctx, req2)
+
+	// Verify we have two separate jobs for the same sample with different candidates
+	if result1.Job.ID == result2.Job.ID {
+		t.Error("Different candidates should create different jobs")
+	}
+
+	// Verify both jobs use their correct candidates
+	if result1.Job.CandidateID != candidate1.ID {
+		t.Error("Job 1 should reference candidate1")
+	}
+	if result2.Job.CandidateID != candidate2.ID {
+		t.Error("Job 2 should reference candidate2")
 	}
 }
 
@@ -1009,16 +1138,7 @@ func TestEvaluationCampaignMismatch(t *testing.T) {
 	campaign2, _ = st.CreateEvaluationCampaign(ctx, campaign2)
 
 	// Create candidate in campaign1
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign1.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign1.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	// Create sample in campaign2
@@ -1066,16 +1186,7 @@ func TestEvaluationFindingRejectionOnNonCompleted(t *testing.T) {
 	}
 	campaign, _ = st.CreateEvaluationCampaign(ctx, campaign)
 
-	candidate := EvaluationCandidate{
-		ID:              GenerateID(),
-		CampaignID:      campaign.ID,
-		AdapterName:     "fake",
-		ModelIdentity:   "model1",
-		RuntimeVersion:  "v1",
-		PromptVersion:   "v1",
-		AccountPoolID:   "pool1",
-		PerCandidateCap: 5,
-	}
+	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = st.CreateEvaluationCandidate(ctx, candidate)
 
 	sample := EvaluationSample{

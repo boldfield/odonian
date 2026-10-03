@@ -33,11 +33,16 @@ var (
 
 // Exit classes for a finalized attempt.
 const (
-	EvalExitCompleted    = "completed"
-	EvalExitFailed       = "failed"
-	EvalExitCancelled    = "cancelled"
-	EvalExitUnknown      = "unknown"
-	EvalExitLeaseExpired = "lease_expired"
+	EvalExitCompleted           = "completed"
+	EvalExitFailed              = "failed"
+	EvalExitCancelled           = "cancelled"
+	EvalExitUnknown             = "unknown"
+	EvalExitLeaseExpired        = "lease_expired"
+	EvalExitTimeout             = "timeout"
+	EvalExitUnavailableSnapshot = "unavailable_snapshot"
+	EvalExitUnavailableSource   = "unavailable_source"
+	EvalExitInvalidOutput       = "invalid_output"
+	EvalExitIncompleteOutput    = "incomplete_output"
 )
 
 // Attempt states.
@@ -63,20 +68,21 @@ type EvaluationCampaign struct {
 
 // EvaluationCandidate represents an immutable model version for evaluation.
 type EvaluationCandidate struct {
-	ID                 string
-	CampaignID         string
-	AdapterName        string
-	ModelIdentity      string
-	ModelRevision      *string
-	RuntimeVersion     string
-	ReasoningConfig    *string
-	GenerationConfig   *string
-	PromptVersion      string
-	ToolAccessConfig   *string
-	SourceAccessConfig *string
-	AccountPoolID      string
-	PerCandidateCap    int
-	CreatedAt          string
+	ID                    string
+	CampaignID            string
+	AdapterName           string
+	ModelIdentity         string
+	ModelRevision         *string
+	RuntimeVersion        string
+	ReasoningConfig       *string
+	GenerationConfig      *string
+	PromptVersion         string
+	ToolAccessConfig      *string
+	SourceAccessConfig    *string
+	AccountPoolID         string
+	PerCandidateCap       int
+	CandidateConfigDigest string
+	CreatedAt             string
 }
 
 // EvaluationSample represents an original task/review bound for evaluation.
@@ -169,7 +175,8 @@ func (s *sqliteStore) CreateEvaluationCampaign(ctx context.Context, campaign Eva
 func (s *sqliteStore) CreateEvaluationCandidate(ctx context.Context, candidate EvaluationCandidate) (EvaluationCandidate, error) {
 	if candidate.ID == "" || candidate.CampaignID == "" || candidate.AdapterName == "" ||
 		candidate.ModelIdentity == "" || candidate.RuntimeVersion == "" ||
-		candidate.PromptVersion == "" || candidate.AccountPoolID == "" || candidate.PerCandidateCap < 1 {
+		candidate.PromptVersion == "" || candidate.AccountPoolID == "" || candidate.PerCandidateCap < 1 ||
+		candidate.CandidateConfigDigest == "" {
 		return EvaluationCandidate{}, ErrEvaluationInvalidInput
 	}
 
@@ -180,13 +187,13 @@ func (s *sqliteStore) CreateEvaluationCandidate(ctx context.Context, candidate E
 		`INSERT INTO evaluation_candidate
 		 (id, campaign_id, adapter_name, model_identity, model_revision, runtime_version,
 		  reasoning_config, generation_config, prompt_version, tool_access_config,
-		  source_access_config, account_pool_id, per_candidate_cap, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  source_access_config, account_pool_id, per_candidate_cap, candidate_config_digest, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		candidate.ID, candidate.CampaignID, candidate.AdapterName, candidate.ModelIdentity,
 		candidate.ModelRevision, candidate.RuntimeVersion, candidate.ReasoningConfig,
 		candidate.GenerationConfig, candidate.PromptVersion, candidate.ToolAccessConfig,
 		candidate.SourceAccessConfig, candidate.AccountPoolID, candidate.PerCandidateCap,
-		now,
+		candidate.CandidateConfigDigest, now,
 	)
 
 	if err != nil {
@@ -634,7 +641,9 @@ func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, attemptID, 
 
 	// Validate exitClass
 	switch exitClass {
-	case EvalExitCompleted, EvalExitFailed, EvalExitCancelled, EvalExitUnknown, EvalExitLeaseExpired:
+	case EvalExitCompleted, EvalExitFailed, EvalExitCancelled, EvalExitUnknown, EvalExitLeaseExpired,
+		EvalExitTimeout, EvalExitUnavailableSnapshot, EvalExitUnavailableSource,
+		EvalExitInvalidOutput, EvalExitIncompleteOutput:
 		// Valid
 	default:
 		return fmt.Errorf("invalid exit_class: %s", exitClass)
@@ -666,14 +675,14 @@ func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, attemptID, 
 	now := s.Now()
 	nowStr := now.Format(timestampLayout)
 
-	statusStr := ""
+	var statusVal interface{} = nil
 	if status != nil {
-		statusStr = string(*status)
+		statusVal = string(*status)
 	}
 
-	errorClassStr := ""
+	var errorClassVal interface{} = nil
 	if errorClass != nil {
-		errorClassStr = string(*errorClass)
+		errorClassVal = string(*errorClass)
 	}
 
 	tx, err := s.conn.BeginTx(ctx, nil)
@@ -741,7 +750,7 @@ func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, attemptID, 
 		`UPDATE evaluation_attempt
 		 SET state = ?, ended_at = ?, exit_class = ?, status = ?, error_class = ?, error_message = ?, duration_ms = ?, usage_tokens = ?
 		 WHERE id = ?`,
-		EvalAttemptFinalized, nowStr, exitClass, statusStr, errorClassStr, errorMsg, durationMs, usageTokens,
+		EvalAttemptFinalized, nowStr, exitClass, statusVal, errorClassVal, errorMsg, durationMs, usageTokens,
 		attemptID,
 	)
 	if err != nil {

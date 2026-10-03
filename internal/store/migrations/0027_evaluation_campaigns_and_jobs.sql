@@ -57,6 +57,7 @@ CREATE TABLE evaluation_candidate (
   source_access_config TEXT,
   account_pool_id TEXT NOT NULL,
   per_candidate_cap INTEGER NOT NULL CHECK (per_candidate_cap >= 1),
+  candidate_config_digest TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY (campaign_id) REFERENCES evaluation_campaign(id)
 );
@@ -93,11 +94,11 @@ CREATE TABLE evaluation_attempt (
     'timeout', 'unavailable_snapshot', 'unavailable_source',
     'invalid_output', 'incomplete_output'
   )),
-  status TEXT CHECK (status IN ('completed', 'incomplete', 'unsupported', 'interrupted', 'failed', NULL)),
-  error_class TEXT CHECK (error_class IN (
+  status TEXT CHECK (status IS NULL OR status IN ('completed', 'incomplete', 'unsupported', 'interrupted', 'failed')),
+  error_class TEXT CHECK (error_class IS NULL OR error_class IN (
     'capability_missing', 'output_truncated', 'source_unavailable', 'budget_exhausted',
     'interrupted', 'timeout', 'runtime_error', 'output_malformed', 'output_missing',
-    'auth_missing', 'launch_error', NULL
+    'auth_missing', 'launch_error'
   )),
   error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 1024),
   duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
