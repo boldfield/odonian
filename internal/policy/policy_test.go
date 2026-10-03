@@ -810,3 +810,145 @@ func TestWorkClassesCovered(t *testing.T) {
 		t.Errorf("build/design should always be admitted, even at capacity")
 	}
 }
+
+func TestObserveModeReportsRateLimitDecisions(t *testing.T) {
+	now := time.Unix(1000, 0)
+	pe := New(ModeObserve, []*Pool{
+		{
+			Name:                    "main",
+			Models:                  map[string]bool{"haiku": true},
+			AccountID:               "acct1",
+			StartRate:               1.0,
+			BurstCapacity:           1,
+			ConcurrentDispatchLimit: 10,
+		},
+	}, now)
+	pe.SetClock(func() time.Time { return now })
+
+	// Consume the burst token (in observe mode, still admits)
+	result := pe.CheckAdmission("haiku", ResearchWrite)
+	if !result.Admitted {
+		t.Fatal("observe mode should admit during burst")
+	}
+	// Simulate an admission happening externally
+	pe.RecordAdmission("haiku", ResearchWrite)
+
+	// Move forward by 100ms - not enough for a full token at 1/sec
+	now = now.Add(100 * time.Millisecond)
+	result = pe.CheckAdmission("haiku", ResearchWrite)
+	if !result.Admitted {
+		t.Errorf("observe mode should admit even if rate-limited")
+	}
+	if result.Reason != ReasonRateLimit {
+		t.Errorf("observe mode should report rate limit reason, got %s", result.Reason)
+	}
+
+	// Move forward by 1 second total - should have 1 new token
+	now = now.Add(900 * time.Millisecond)
+	result = pe.CheckAdmission("haiku", ResearchWrite)
+	if !result.Admitted {
+		t.Errorf("observe mode should admit after refill")
+	}
+	if result.Reason != "" && result.Reason != "admit" {
+		t.Errorf("observe mode should not report a limit reason when tokens available, got %s", result.Reason)
+	}
+}
+
+func TestReconfigurePoolRemovalAndReadding(t *testing.T) {
+	now := time.Unix(1000, 0)
+	pe := New(ModeEnforce, []*Pool{
+		{
+			Name:                    "main",
+			Models:                  map[string]bool{"haiku": true},
+			AccountID:               "acct1",
+			StartRate:               1.0,
+			BurstCapacity:           10,
+			ConcurrentDispatchLimit: 10,
+		},
+	}, now)
+	pe.SetClock(func() time.Time { return now })
+
+	// Reconfigure to remove the pool
+	err := pe.Reconfigure([]*Pool{})
+	if err != nil {
+		t.Fatalf("reconfigure to remove pool failed: %v", err)
+	}
+
+	// Re-add the pool with lower burst (should start fresh, not keep old burst)
+	err = pe.Reconfigure([]*Pool{
+		{
+			Name:                    "main",
+			Models:                  map[string]bool{"haiku": true},
+			AccountID:               "acct1",
+			StartRate:               1.0,
+			BurstCapacity:           1, // Lower than before
+			ConcurrentDispatchLimit: 10,
+		},
+	})
+	if err != nil {
+		t.Fatalf("reconfigure to re-add pool failed: %v", err)
+	}
+
+	// Should only have 1 token (new burst), not the old 10
+	result := pe.CheckAdmission("haiku", ResearchWrite)
+	if !result.Admitted {
+		t.Errorf("should admit with new burst capacity")
+	}
+	pe.RecordAdmission("haiku", ResearchWrite)
+
+	// Next should fail (no more tokens)
+	result = pe.CheckAdmission("haiku", ResearchWrite)
+	if result.Admitted {
+		t.Errorf("should be at capacity after using the 1 token")
+	}
+}
+
+func TestReconfigureAddsNewModelsToPool(t *testing.T) {
+	now := time.Unix(1000, 0)
+	pe := New(ModeEnforce, []*Pool{
+		{
+			Name:                    "pool_a",
+			Models:                  map[string]bool{"haiku": true},
+			AccountID:               "acct1",
+			StartRate:               100.0,
+			BurstCapacity:           10,
+			ConcurrentDispatchLimit: 2,
+		},
+	}, now)
+	pe.SetClock(func() time.Time { return now })
+
+	// Admit haiku
+	result := pe.CheckAdmission("haiku", ResearchWrite)
+	if !result.Admitted {
+		t.Fatal("haiku should be admitted")
+	}
+	pe.RecordAdmission("haiku", ResearchWrite)
+
+	// Reconfigure: add opus to pool_a
+	err := pe.Reconfigure([]*Pool{
+		{
+			Name:                    "pool_a",
+			Models:                  map[string]bool{"haiku": true, "opus": true},
+			AccountID:               "acct1",
+			StartRate:               100.0,
+			BurstCapacity:           10,
+			ConcurrentDispatchLimit: 2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("reconfigure failed: %v", err)
+	}
+
+	// opus should now be mapped to pool_a and should be able to be admitted
+	result = pe.CheckAdmission("opus", ResearchWrite)
+	if !result.Admitted {
+		t.Errorf("opus should be admitted to pool_a after reconfigure")
+	}
+	pe.RecordAdmission("opus", ResearchWrite)
+
+	// Both haiku and opus are active at limit 2, so next should fail
+	result = pe.CheckAdmission("haiku", ResearchWrite)
+	if result.Admitted {
+		t.Errorf("should be at capacity with both models active")
+	}
+}

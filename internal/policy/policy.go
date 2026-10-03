@@ -138,6 +138,7 @@ func (pe *PolicyEvaluator) SetClock(clock func() time.Time) {
 
 // Reconfigure updates the policy configuration while preserving token bucket and concurrency state.
 // Carries over tokens (clamped to the new burst capacity), the high-water mark, and active counts.
+// Removed pools reset their bucket state, and re-added pools start fresh.
 func (pe *PolicyEvaluator) Reconfigure(newPools []*Pool) error {
 	now := pe.clock()
 
@@ -166,9 +167,13 @@ func (pe *PolicyEvaluator) Reconfigure(newPools []*Pool) error {
 				tokens:         newTokens,
 				capacity:       float64(newPool.BurstCapacity),
 				refillRate:     newPool.StartRate,
-				lastRefill:     now,
 				lastRefillMono: oldBucket.lastRefillMono, // Keep the high-water mark
 			}
+		} else {
+			// Pool is being removed - reset its bucket state
+			delete(pe.buckets, poolName)
+			delete(pe.concurrency, poolName)
+			delete(pe.completionActive, poolName)
 		}
 	}
 
@@ -179,7 +184,6 @@ func (pe *PolicyEvaluator) Reconfigure(newPools []*Pool) error {
 				tokens:         float64(newPool.BurstCapacity),
 				capacity:       float64(newPool.BurstCapacity),
 				refillRate:     newPool.StartRate,
-				lastRefill:     now,
 				lastRefillMono: now,
 			}
 			// Initialize concurrency tracking for new pool
@@ -236,26 +240,42 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, workClass WorkClass) Adm
 			firstPassLimit := pool.ConcurrentDispatchLimit - reserved
 			activeFirstPass := pe.concurrency[poolName] - pe.completionActive[poolName]
 
-			if activeFirstPass >= firstPassLimit {
+			// Check both reserved-aware limit and total ceiling
+			if activeFirstPass >= firstPassLimit || pe.concurrency[poolName] >= pool.ConcurrentDispatchLimit {
 				// Would be denied, but observe mode admits anyway
 				return AdmissionResult{Admitted: true, Reason: ReasonConcurrency}
 			}
 		}
-		// Check rate limit in observe mode
+		// Check rate limit in observe mode using a shadow bucket
+		// to report accurate decisions while keeping real buckets unchanged
 		bucket := pe.buckets[poolName]
-		bucket.refill(now)
-		if bucket.tokens < 1.0 {
-			timeToNextToken := (1.0 - bucket.tokens) / bucket.refillRate
-			if timeToNextToken < 0 {
-				timeToNextToken = 0
-			}
-			return AdmissionResult{
-				Admitted:  true,
-				Reason:    ReasonRateLimit,
-				NotBefore: now.Add(time.Duration(timeToNextToken * float64(time.Second))),
-			}
+		// Create a shadow bucket copy to check what would happen
+		shadowBucket := &tokenBucket{
+			tokens:         bucket.tokens,
+			capacity:       bucket.capacity,
+			refillRate:     bucket.refillRate,
+			lastRefillMono: bucket.lastRefillMono,
 		}
-		return AdmissionResult{Admitted: true}
+		shadowBucket.refill(now)
+		if shadowBucket.tokens >= 1.0 {
+			// Would be admitted - deduct from shadow for next check
+			// but don't modify the real bucket
+			bucket.tokens = shadowBucket.tokens - 1.0
+			bucket.lastRefillMono = now
+			return AdmissionResult{Admitted: true}
+		}
+		// Would be rate-limited
+		bucket.tokens = shadowBucket.tokens
+		bucket.lastRefillMono = now
+		timeToNextToken := (1.0 - shadowBucket.tokens) / shadowBucket.refillRate
+		if timeToNextToken < 0 {
+			timeToNextToken = 0
+		}
+		return AdmissionResult{
+			Admitted:  true,
+			Reason:    ReasonRateLimit,
+			NotBefore: now.Add(time.Duration(timeToNextToken * float64(time.Second))),
+		}
 	}
 
 	// Enforce mode: check concurrency limit
@@ -267,7 +287,7 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, workClass WorkClass) Adm
 			return AdmissionResult{
 				Admitted:     false,
 				Reason:       ReasonConcurrency,
-				RetryAfterMs: 1000,
+				RetryAfterMs: defaultRetryAfterMs,
 			}
 		}
 	} else {
@@ -281,7 +301,7 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, workClass WorkClass) Adm
 			return AdmissionResult{
 				Admitted:     false,
 				Reason:       ReasonConcurrency,
-				RetryAfterMs: 1000,
+				RetryAfterMs: defaultRetryAfterMs,
 			}
 		}
 	}
@@ -309,6 +329,8 @@ func (pe *PolicyEvaluator) CheckAdmission(model string, workClass WorkClass) Adm
 		NotBefore: now.Add(time.Duration(timeToNextToken * float64(time.Second))),
 	}
 }
+
+const defaultRetryAfterMs = 1000
 
 // RecordAdmission records that an attempt was admitted (for concurrency tracking).
 func (pe *PolicyEvaluator) RecordAdmission(model string, workClass WorkClass) {
@@ -364,11 +386,4 @@ func (b *tokenBucket) refill(now time.Time) {
 		b.tokens = newTokens
 		b.lastRefillMono = now
 	}
-}
-
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
 }
