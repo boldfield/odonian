@@ -475,6 +475,10 @@ func (r CandidateResponse) Validate() error {
 	}
 }
 
+// ValidateFindings applies the same finding rules a candidate response is held
+// to: bounded count, unique non-empty ids, a known severity and a summary.
+func ValidateFindings(fs []Finding) error { return validateFindings(fs) }
+
 func validateFindings(fs []Finding) error {
 	if len(fs) > maxFindings {
 		return invalid("more than %d findings", maxFindings)

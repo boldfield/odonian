@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 
+	"github.com/boldfield/odonian/internal/evaluation"
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/manifest"
 	"github.com/boldfield/odonian/internal/policy"
@@ -87,6 +88,21 @@ type Store interface {
 	UnarchiveProject(ctx context.Context, projectID string) (Project, error)
 	GetResearchReviewerScorecards(ctx context.Context, projectID string) (ReviewerScorecards, error)
 	TombstoneLink(ctx context.Context, taskID, linkID string) error
+	CreateEvaluationCampaign(ctx context.Context, campaign EvaluationCampaign) (EvaluationCampaign, error)
+	CreateEvaluationCandidate(ctx context.Context, candidate EvaluationCandidate) (EvaluationCandidate, error)
+	CreateEvaluationSample(ctx context.Context, sample EvaluationSample) (EvaluationSample, error)
+	ConfigureEvaluationPool(ctx context.Context, cfg EvaluationPoolConfig) (EvaluationPoolState, error)
+	GetEvaluationPool(ctx context.Context, id string) (EvaluationPoolState, error)
+	ClaimEvaluationJob(ctx context.Context, req EvaluationJobClaim) (EvaluationJobClaimResult, error)
+	RenewEvaluationAttempt(ctx context.Context, attemptID string, expiresAt time.Time) error
+	FinalizeEvaluationAttempt(ctx context.Context, res EvaluationAttemptResult) error
+	ListEvaluationFindings(ctx context.Context, attemptID string) ([]evaluation.Finding, error)
+	ExpireEvaluationAttempts(ctx context.Context, now time.Time) (int, error)
+	GetEvaluationJob(ctx context.Context, jobID string) (EvaluationJob, error)
+	GetEvaluationAttempt(ctx context.Context, attemptID string) (EvaluationAttempt, error)
+	GetEvaluationSample(ctx context.Context, sampleID string) (EvaluationSample, error)
+	GetEvaluationCandidate(ctx context.Context, candidateID string) (EvaluationCandidate, error)
+	GetEvaluationCampaign(ctx context.Context, campaignID string) (EvaluationCampaign, error)
 }
 
 // sqliteStore wraps a SQLite database connection and provides migration functionality.
