@@ -24,7 +24,7 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_PPROF` | unset | Enable Go runtime profiling on `/debug/pprof/` when set to exactly `true`. All pprof endpoints require the same bearer-token auth as every other protected route. When unset or any other value, `/debug/pprof/` returns 404. See [Runtime profiling with pprof](#runtime-profiling-with-pprof). |
 | `ODONIAN_SLOW_REQUEST_MS` | `500` | Per-request latency logging threshold in milliseconds. Requests at or above this threshold log at INFO level; below it log at DEBUG. `/healthz` is never logged. A non-integer or negative value logs one warning at startup and falls back to the default. |
 | `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by PR-watch, supersession PR cleanup, and `odonian merge`. See [Forge tokens](#forge-tokens). |
-| `ODONIAN_RESEARCH_POLICY_MODE` | `disabled` | Research admission policy mode: `disabled`, `observe` or `enforce`. Validated at startup; an invalid value or pool configuration stops the server. This release only defines and validates the policy — it does not yet gate claims or dispatch. See [Research pacing pools](#research-pacing-pools). |
+| `ODONIAN_RESEARCH_POLICY_MODE` | `disabled` | Research admission policy mode: `disabled`, `observe` or `enforce`. Validated at startup; an invalid value or pool configuration stops the server. Read once at start, so changing it means a server restart (pool allowance and active attempts persist across it). Under `enforce`, research claims (`odonian claim`, `next --claim`) are gated by the pool and a denied task stays `ready`; `observe` admits everything and records what `enforce` would have decided; `disabled` writes nothing. Roll out with [the rollout runbook](runbooks/research-pacing-rollout.md). See [Research pacing pools](#research-pacing-pools). |
 | `ODONIAN_RESEARCH_POOLS` | unset | JSON object mapping pool names to account pools for research LLM work; ignored when the mode is `disabled`. See [Research pacing pools](#research-pacing-pools). |
 
 ### Research tasks and escalation
@@ -57,18 +57,24 @@ Research tasks use a dedicated escalation ladder and thresholds, separate from t
 ### Research pacing pools
 
 The research pacing policy (`internal/policy`) decides, for one research LLM start, whether to admit it,
-defer it until a time, or ask the caller to retry after an active dispatch finishes. It is a pure
-module: the server parses and validates its configuration at startup, but nothing evaluates it yet, so
-setting these variables launches no model and changes no task, claim or dispatch. No production rate is
-assumed; with the defaults the policy is `disabled`.
+defer it until a time, or ask the caller to retry after an active dispatch finishes. The server applies it
+atomically inside the claim of a research task: under `enforce` a denied claim leaves the task `ready`
+(exit code 10 from `odonian claim`) and the fleet launcher starts no model for it, then retries when the
+server's hint says so. Admitted attempts are durable (`research_pool`, `research_permit`, `research_attempt`),
+so state survives a restart. Build, design and merge work is never gated. No production rate is assumed; with
+the defaults the policy is `disabled`, which admits everything and records nothing.
+
+Operating it, including choosing values from observed data, shared-account headroom, a safe rollout order and
+rollback, is in [`docs/runbooks/research-pacing-rollout.md`](runbooks/research-pacing-rollout.md).
 
 **Modes** (`ODONIAN_RESEARCH_POLICY_MODE`):
 
 - `disabled` (default): everything is admitted and nothing is tracked. `ODONIAN_RESEARCH_POOLS` is ignored.
 - `observe`: everything is admitted; each decision also reports what `enforce` would have decided, so
   hypothetical denials can be counted. Observe does not limit spending.
-- `enforce`: decisions are applied. Every model in `ODONIAN_MODELS` must be mapped to a pool, otherwise
-  startup fails.
+- `enforce`: decisions are applied to every research claim. Every model in `ODONIAN_MODELS` must be mapped
+  to a pool, otherwise startup fails. Launchers older than research admission start the model before it
+  claims, so drain them before enforcing; see the runbook.
 
 **Pools** (`ODONIAN_RESEARCH_POOLS`) is a JSON object keyed by pool name. Unknown fields are rejected.
 
@@ -158,9 +164,12 @@ export ODONIAN_RESEARCH_POOLS='
 '
 ```
 
-The numbers above are illustrative only, not recommendations.
+The numbers above are illustrative only, not recommendations for any deployment. The runbook has further
+illustrative shapes and the queries for calibrating real values.
 
-See `docs/features/research-pacing-and-reviewer-evaluation.md` for the full design.
+See `docs/features/research-pacing-and-reviewer-evaluation.md` for the full design and
+`docs/runbooks/research-pacing-rollout.md` for the operator runbook and its smoke test
+(`bash harness/research_pacing_smoke_test.sh`).
 
 ### Runtime profiling with pprof
 
