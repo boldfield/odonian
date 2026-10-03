@@ -397,7 +397,7 @@ Fields:
 #### `POST /research/permits/{permit_id}/renew`
 
 Extend the lease on an active research attempt. The attempt must be live (not finalized or
-expired). Caller must provide the attempt's task, model, and agent identities; mismatches
+expired). Caller must provide the attempt's task, model, agent, and request identities; mismatches
 are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
 
 **Request:**
@@ -406,6 +406,7 @@ are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
   "task_id": "task-uuid",
   "model": "haiku",
   "agent_id": "agent-uuid",
+  "request_id": "request-uuid",
   "attempt_id": "attempt-uuid"
 }
 ```
@@ -414,6 +415,7 @@ are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
 - `task_id` (required): ID of the task associated with this permit
 - `model` (required): Model that claimed this permit
 - `agent_id` (required): ID of the agent claiming this permit
+- `request_id` (required): ID of the request associated with this permit
 - `attempt_id` (required): ID of the current attempt to renew
 
 **Response (200 OK):**
@@ -434,10 +436,11 @@ are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
 - `400 MISSING_TASK_ID`: task_id is required
 - `400 MISSING_MODEL`: model is required
 - `400 MISSING_AGENT_ID`: agent_id is required
+- `400 MISSING_REQUEST_ID`: request_id is required
 - `400 MISSING_ATTEMPT_ID`: attempt_id is required
 - `401`: Missing or invalid bearer token (see [Authentication](#authentication))
 - `404 PERMIT_NOT_FOUND`: Permit does not exist
-- `409 PERMIT_IDENTITY_MISMATCH`: Provided task_id, model, or agent_id does not match the permit
+- `409 PERMIT_IDENTITY_MISMATCH`: Provided task_id, model, agent_id, or request_id does not match the permit
 - `409 ATTEMPT_FENCED`: Attempt ID does not match the permit's current attempt
 - `409 ATTEMPT_EXPIRED`: Attempt lease has expired
 - `409 ATTEMPT_FINALIZED`: Attempt is already finalized
@@ -448,7 +451,7 @@ are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
 #### `POST /research/permits/{permit_id}/finalize`
 
 End an active research attempt and record the outcome. The attempt must be live.
-Caller must provide the attempt's task, model, and agent identities; mismatches
+Caller must provide the attempt's task, model, agent, and request identities; mismatches
 are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
 
 **Request:**
@@ -457,6 +460,7 @@ are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
   "task_id": "task-uuid",
   "model": "haiku",
   "agent_id": "agent-uuid",
+  "request_id": "request-uuid",
   "attempt_id": "attempt-uuid",
   "exit_class": "completed",
   "usage_tokens": 1500
@@ -467,6 +471,7 @@ are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
 - `task_id` (required): ID of the task associated with this permit
 - `model` (required): Model that claimed this permit
 - `agent_id` (required): ID of the agent claiming this permit
+- `request_id` (required): ID of the request associated with this permit
 - `attempt_id` (required): ID of the current attempt to finalize
 - `exit_class` (required): Outcome class: `completed`, `failed`, `cancelled`, or `unknown`
 - `usage_tokens` (optional): Tokens consumed by this attempt; must be non-negative
@@ -489,13 +494,14 @@ are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
 - `400 MISSING_TASK_ID`: task_id is required
 - `400 MISSING_MODEL`: model is required
 - `400 MISSING_AGENT_ID`: agent_id is required
+- `400 MISSING_REQUEST_ID`: request_id is required
 - `400 MISSING_ATTEMPT_ID`: attempt_id is required
 - `400 MISSING_EXIT_CLASS`: exit_class is required
 - `400 INVALID_EXIT_CLASS`: exit_class must be one of: completed, failed, cancelled, unknown
 - `400 INVALID_USAGE_TOKENS`: usage_tokens must be non-negative
 - `401`: Missing or invalid bearer token (see [Authentication](#authentication))
 - `404 PERMIT_NOT_FOUND`: Permit does not exist
-- `409 PERMIT_IDENTITY_MISMATCH`: Provided task_id, model, or agent_id does not match the permit
+- `409 PERMIT_IDENTITY_MISMATCH`: Provided task_id, model, agent_id, or request_id does not match the permit
 - `409 ATTEMPT_FENCED`: Attempt ID does not match the permit's current attempt
 - `409 ATTEMPT_EXPIRED`: Attempt lease has expired
 - `500 FINALIZE_ERROR`: Server error finalizing attempt

@@ -1455,7 +1455,7 @@ func (s *Server) handleGetResearchPolicy(w http.ResponseWriter, r *http.Request)
 
 // handleGetResearchStatus handles GET /research/status to read pool status without credentials.
 func (s *Server) handleGetResearchStatus(w http.ResponseWriter, r *http.Request) {
-	now := time.Now()
+	now := s.store.Now()
 	pools, err := s.store.ListResearchPoolStates(r.Context(), now)
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, "STATUS_ERROR", "Failed to read status")
@@ -1498,6 +1498,7 @@ func (s *Server) handleRenewResearchPermit(w http.ResponseWriter, r *http.Reques
 		TaskID    string `json:"task_id"`
 		Model     string `json:"model"`
 		AgentID   string `json:"agent_id"`
+		RequestID string `json:"request_id"`
 		AttemptID string `json:"attempt_id"`
 	}
 
@@ -1518,12 +1519,16 @@ func (s *Server) handleRenewResearchPermit(w http.ResponseWriter, r *http.Reques
 		s.errorResponse(w, http.StatusBadRequest, "MISSING_AGENT_ID", "agent_id is required")
 		return
 	}
+	if payload.RequestID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_REQUEST_ID", "request_id is required")
+		return
+	}
 	if payload.AttemptID == "" {
 		s.errorResponse(w, http.StatusBadRequest, "MISSING_ATTEMPT_ID", "attempt_id is required")
 		return
 	}
 
-	now := time.Now()
+	now := s.store.Now()
 
 	// Load permit to validate identities
 	permit, _, err := s.store.GetResearchPermit(r.Context(), permitID)
@@ -1537,8 +1542,8 @@ func (s *Server) handleRenewResearchPermit(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Validate identities
-	if permit.TaskID != payload.TaskID || permit.Model != payload.Model || permit.AgentID != payload.AgentID {
-		s.errorResponse(w, http.StatusConflict, "PERMIT_IDENTITY_MISMATCH", "Permit identity does not match the provided task, model, or agent")
+	if permit.TaskID != payload.TaskID || permit.Model != payload.Model || permit.AgentID != payload.AgentID || permit.RequestID != payload.RequestID {
+		s.errorResponse(w, http.StatusConflict, "PERMIT_IDENTITY_MISMATCH", "Permit identity does not match the provided task, model, agent, or request")
 		return
 	}
 
@@ -1587,6 +1592,7 @@ func (s *Server) handleFinalizeResearchPermit(w http.ResponseWriter, r *http.Req
 		TaskID      string `json:"task_id"`
 		Model       string `json:"model"`
 		AgentID     string `json:"agent_id"`
+		RequestID   string `json:"request_id"`
 		AttemptID   string `json:"attempt_id"`
 		ExitClass   string `json:"exit_class"`
 		UsageTokens *int64 `json:"usage_tokens"`
@@ -1607,6 +1613,10 @@ func (s *Server) handleFinalizeResearchPermit(w http.ResponseWriter, r *http.Req
 	}
 	if payload.AgentID == "" {
 		s.errorResponse(w, http.StatusBadRequest, "MISSING_AGENT_ID", "agent_id is required")
+		return
+	}
+	if payload.RequestID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_REQUEST_ID", "request_id is required")
 		return
 	}
 	if payload.AttemptID == "" {
@@ -1633,7 +1643,7 @@ func (s *Server) handleFinalizeResearchPermit(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	now := time.Now()
+	now := s.store.Now()
 
 	// Load permit to validate identities
 	permit, _, err := s.store.GetResearchPermit(r.Context(), permitID)
@@ -1647,8 +1657,8 @@ func (s *Server) handleFinalizeResearchPermit(w http.ResponseWriter, r *http.Req
 	}
 
 	// Validate identities
-	if permit.TaskID != payload.TaskID || permit.Model != payload.Model || permit.AgentID != payload.AgentID {
-		s.errorResponse(w, http.StatusConflict, "PERMIT_IDENTITY_MISMATCH", "Permit identity does not match the provided task, model, or agent")
+	if permit.TaskID != payload.TaskID || permit.Model != payload.Model || permit.AgentID != payload.AgentID || permit.RequestID != payload.RequestID {
+		s.errorResponse(w, http.StatusConflict, "PERMIT_IDENTITY_MISMATCH", "Permit identity does not match the provided task, model, agent, or request")
 		return
 	}
 

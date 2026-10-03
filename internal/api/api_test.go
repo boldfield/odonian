@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/boldfield/odonian/internal/policy"
 	"github.com/boldfield/odonian/internal/store"
 )
 
@@ -9640,22 +9641,27 @@ func TestRenewResearchPermitWithMissingFields(t *testing.T) {
 	}{
 		{
 			name:        "missing task_id",
-			payload:     map[string]string{"model": "haiku", "agent_id": "agent", "attempt_id": "attempt"},
+			payload:     map[string]string{"model": "haiku", "agent_id": "agent", "request_id": "request", "attempt_id": "attempt"},
 			expectedErr: "MISSING_TASK_ID",
 		},
 		{
 			name:        "missing model",
-			payload:     map[string]string{"task_id": "task", "agent_id": "agent", "attempt_id": "attempt"},
+			payload:     map[string]string{"task_id": "task", "agent_id": "agent", "request_id": "request", "attempt_id": "attempt"},
 			expectedErr: "MISSING_MODEL",
 		},
 		{
 			name:        "missing agent_id",
-			payload:     map[string]string{"task_id": "task", "model": "haiku", "attempt_id": "attempt"},
+			payload:     map[string]string{"task_id": "task", "model": "haiku", "request_id": "request", "attempt_id": "attempt"},
 			expectedErr: "MISSING_AGENT_ID",
 		},
 		{
+			name:        "missing request_id",
+			payload:     map[string]string{"task_id": "task", "model": "haiku", "agent_id": "agent", "attempt_id": "attempt"},
+			expectedErr: "MISSING_REQUEST_ID",
+		},
+		{
 			name:        "missing attempt_id",
-			payload:     map[string]string{"task_id": "task", "model": "haiku", "agent_id": "agent"},
+			payload:     map[string]string{"task_id": "task", "model": "haiku", "agent_id": "agent", "request_id": "request"},
 			expectedErr: "MISSING_ATTEMPT_ID",
 		},
 	}
@@ -9696,6 +9702,7 @@ func TestRenewResearchPermitNotFound(t *testing.T) {
 		"task_id":    "test-task",
 		"model":      "haiku",
 		"agent_id":   "test-agent",
+		"request_id": "test-request",
 		"attempt_id": "test-attempt",
 	}
 	body, _ := json.Marshal(payload)
@@ -9758,28 +9765,42 @@ func TestFinalizeResearchPermitWithMissingFields(t *testing.T) {
 		{
 			name: "missing task_id",
 			payload: map[string]interface{}{
-				"model": "haiku", "agent_id": "agent", "attempt_id": "attempt", "exit_class": "completed",
+				"model": "haiku", "agent_id": "agent", "request_id": "request", "attempt_id": "attempt", "exit_class": "completed",
 			},
 			expectedErr: "MISSING_TASK_ID",
 		},
 		{
 			name: "missing model",
 			payload: map[string]interface{}{
-				"task_id": "task", "agent_id": "agent", "attempt_id": "attempt", "exit_class": "completed",
+				"task_id": "task", "agent_id": "agent", "request_id": "request", "attempt_id": "attempt", "exit_class": "completed",
 			},
 			expectedErr: "MISSING_MODEL",
 		},
 		{
+			name: "missing agent_id",
+			payload: map[string]interface{}{
+				"task_id": "task", "model": "haiku", "request_id": "request", "attempt_id": "attempt", "exit_class": "completed",
+			},
+			expectedErr: "MISSING_AGENT_ID",
+		},
+		{
+			name: "missing request_id",
+			payload: map[string]interface{}{
+				"task_id": "task", "model": "haiku", "agent_id": "agent", "attempt_id": "attempt", "exit_class": "completed",
+			},
+			expectedErr: "MISSING_REQUEST_ID",
+		},
+		{
 			name: "missing exit_class",
 			payload: map[string]interface{}{
-				"task_id": "task", "model": "haiku", "agent_id": "agent", "attempt_id": "attempt",
+				"task_id": "task", "model": "haiku", "agent_id": "agent", "request_id": "request", "attempt_id": "attempt",
 			},
 			expectedErr: "MISSING_EXIT_CLASS",
 		},
 		{
 			name: "invalid exit_class",
 			payload: map[string]interface{}{
-				"task_id": "task", "model": "haiku", "agent_id": "agent", "attempt_id": "attempt", "exit_class": "invalid",
+				"task_id": "task", "model": "haiku", "agent_id": "agent", "request_id": "request", "attempt_id": "attempt", "exit_class": "invalid",
 			},
 			expectedErr: "INVALID_EXIT_CLASS",
 		},
@@ -9821,6 +9842,7 @@ func TestFinalizeResearchPermitNotFound(t *testing.T) {
 		"task_id":    "test-task",
 		"model":      "haiku",
 		"agent_id":   "test-agent",
+		"request_id": "test-request",
 		"attempt_id": "test-attempt",
 		"exit_class": "completed",
 	}
@@ -9861,6 +9883,7 @@ func TestFinalizeResearchPermitWithValidExitClasses(t *testing.T) {
 				"task_id":    "test-task",
 				"model":      "haiku",
 				"agent_id":   "test-agent",
+				"request_id": "test-request",
 				"attempt_id": "test-attempt",
 				"exit_class": exitClass,
 			}
@@ -9919,6 +9942,71 @@ func TestRenewResearchPermitWithIdentityMismatch(t *testing.T) {
 		"task_id":    "different-task",
 		"model":      "haiku",
 		"agent_id":   "agent-1",
+		"request_id": "request-1",
+		"attempt_id": grant.Attempt.ID,
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/research/permits/"+grant.Permit.ID+"/renew", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("expected status 409, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if code, ok := resp["error"].(map[string]interface{})["code"]; !ok || code != "PERMIT_IDENTITY_MISMATCH" {
+		t.Errorf("expected PERMIT_IDENTITY_MISMATCH error code, got %v", code)
+	}
+}
+
+// TestRenewResearchPermitWithRequestIDMismatch verifies request_id identity validation on renew.
+func TestRenewResearchPermitWithRequestIDMismatch(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a research permit
+	permitReq := store.PermitRequest{
+		RequestID: "request-1",
+		TaskID:    "task-1",
+		ProjectID: "project-1",
+		AgentID:   "agent-1",
+		Model:     "haiku",
+		AccountID: "account-1",
+		Class:     "research_write",
+		LeaseTTL:  5 * time.Minute,
+	}
+
+	cfg := store.ResearchPoolConfig{
+		AccountID:          "account-1",
+		StartRate:          1.0,
+		BurstCapacity:      10,
+		ConcurrentLimit:    5,
+		CompletionReserved: 2,
+	}
+	_, err := server.store.ConfigureResearchPool(context.Background(), time.Now(), cfg)
+	if err != nil {
+		t.Fatalf("failed to configure pool: %v", err)
+	}
+
+	grant, err := server.store.RequestResearchPermit(context.Background(), time.Now(), permitReq)
+	if err != nil {
+		t.Fatalf("failed to request permit: %v", err)
+	}
+
+	// Try to renew with different request_id
+	payload := map[string]string{
+		"task_id":    "task-1",
+		"model":      "haiku",
+		"agent_id":   "agent-1",
+		"request_id": "different-request",
 		"attempt_id": grant.Attempt.ID,
 	}
 	body, _ := json.Marshal(payload)
@@ -9982,6 +10070,7 @@ func TestRenewResearchPermitSuccessfully(t *testing.T) {
 		"task_id":    "task-1",
 		"model":      "haiku",
 		"agent_id":   "agent-1",
+		"request_id": "request-1",
 		"attempt_id": grant.Attempt.ID,
 	}
 	body, _ := json.Marshal(payload)
@@ -10047,6 +10136,72 @@ func TestFinalizeResearchPermitWithIdentityMismatch(t *testing.T) {
 		"task_id":    "task-1",
 		"model":      "sonnet",
 		"agent_id":   "agent-1",
+		"request_id": "request-1",
+		"attempt_id": grant.Attempt.ID,
+		"exit_class": "completed",
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/research/permits/"+grant.Permit.ID+"/finalize", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("expected status 409, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if code, ok := resp["error"].(map[string]interface{})["code"]; !ok || code != "PERMIT_IDENTITY_MISMATCH" {
+		t.Errorf("expected PERMIT_IDENTITY_MISMATCH error code, got %v", code)
+	}
+}
+
+// TestFinalizeResearchPermitWithRequestIDMismatch verifies request_id identity validation on finalize.
+func TestFinalizeResearchPermitWithRequestIDMismatch(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a research permit
+	permitReq := store.PermitRequest{
+		RequestID: "request-1",
+		TaskID:    "task-1",
+		ProjectID: "project-1",
+		AgentID:   "agent-1",
+		Model:     "haiku",
+		AccountID: "account-1",
+		Class:     "research_write",
+		LeaseTTL:  5 * time.Minute,
+	}
+
+	cfg := store.ResearchPoolConfig{
+		AccountID:          "account-1",
+		StartRate:          1.0,
+		BurstCapacity:      10,
+		ConcurrentLimit:    5,
+		CompletionReserved: 2,
+	}
+	_, err := server.store.ConfigureResearchPool(context.Background(), time.Now(), cfg)
+	if err != nil {
+		t.Fatalf("failed to configure pool: %v", err)
+	}
+
+	grant, err := server.store.RequestResearchPermit(context.Background(), time.Now(), permitReq)
+	if err != nil {
+		t.Fatalf("failed to request permit: %v", err)
+	}
+
+	// Try to finalize with different request_id
+	payload := map[string]interface{}{
+		"task_id":    "task-1",
+		"model":      "haiku",
+		"agent_id":   "agent-1",
+		"request_id": "different-request",
 		"attempt_id": grant.Attempt.ID,
 		"exit_class": "completed",
 	}
@@ -10111,6 +10266,7 @@ func TestFinalizeResearchPermitSuccessfully(t *testing.T) {
 		"task_id":      "task-1",
 		"model":        "haiku",
 		"agent_id":     "agent-1",
+		"request_id":   "request-1",
 		"attempt_id":   grant.Attempt.ID,
 		"exit_class":   "completed",
 		"usage_tokens": 1500,
@@ -10178,6 +10334,7 @@ func TestFinalizeResearchPermitReplay(t *testing.T) {
 		"task_id":    "task-1",
 		"model":      "haiku",
 		"agent_id":   "agent-1",
+		"request_id": "request-1",
 		"attempt_id": grant.Attempt.ID,
 		"exit_class": "completed",
 	}
@@ -10256,6 +10413,7 @@ func TestFinalizeResearchPermitWithNegativeUsageTokens(t *testing.T) {
 		"task_id":      "task-1",
 		"model":        "haiku",
 		"agent_id":     "agent-1",
+		"request_id":   "request-1",
 		"attempt_id":   grant.Attempt.ID,
 		"exit_class":   "completed",
 		"usage_tokens": usageTokens,
@@ -10324,6 +10482,7 @@ func TestRenewResearchPermitAfterFinalize(t *testing.T) {
 		"task_id":    "task-1",
 		"model":      "haiku",
 		"agent_id":   "agent-1",
+		"request_id": "request-1",
 		"attempt_id": grant.Attempt.ID,
 		"exit_class": "completed",
 	}
@@ -10344,6 +10503,7 @@ func TestRenewResearchPermitAfterFinalize(t *testing.T) {
 		"task_id":    "task-1",
 		"model":      "haiku",
 		"agent_id":   "agent-1",
+		"request_id": "request-1",
 		"attempt_id": grant.Attempt.ID,
 	}
 	renewBody, _ := json.Marshal(renewPayload)
@@ -10410,6 +10570,7 @@ func TestFinalizeResearchPermitWithWrongAttemptID(t *testing.T) {
 		"task_id":    "task-1",
 		"model":      "haiku",
 		"agent_id":   "agent-1",
+		"request_id": "request-1",
 		"attempt_id": "wrong-attempt-id",
 		"exit_class": "completed",
 	}
@@ -10439,76 +10600,29 @@ func TestFinalizeResearchPermitWithWrongAttemptID(t *testing.T) {
 
 // TestFinalizeResearchPermitAfterTaskSubmission verifies finalize works after task submission.
 func TestFinalizeResearchPermitAfterTaskSubmission(t *testing.T) {
-	server := setupTestServer(t, "test-token")
+	r := newResearchAPI(t, policy.ModeEnforce, 5, 5)
 	authHeader := "Bearer test-token"
 
-	// Setup project and document
-	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+	// Create a task using the research API
+	taskID := r.task("research")
 
-	// Create a task
-	taskPayload := []store.TaskInput{
-		{
-			Title:      "Research Task",
-			Spec:       "Test research task",
-			DocumentID: docID,
-			Model:      "haiku",
-			Track:      "build", // Use build track for research tasks
-		},
-	}
-	taskBody, _ := json.Marshal(taskPayload)
-	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
-	createReq.Header.Set("Authorization", authHeader)
-	createReq.Header.Set("Content-Type", "application/json")
-	createW := httptest.NewRecorder()
-	server.mux.ServeHTTP(createW, createReq)
-
-	var createdTasks []store.Task
-	json.NewDecoder(createW.Body).Decode(&createdTasks)
-	taskID := createdTasks[0].ID
-
-	// Promote the task to ready
-	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
-	promoteReq.Header.Set("Authorization", authHeader)
-	promoteW := httptest.NewRecorder()
-	server.mux.ServeHTTP(promoteW, promoteReq)
-
-	// Claim the task
-	claimPayload := map[string]string{"agent_id": "agent-1", "model": "haiku"}
-	claimBody, _ := json.Marshal(claimPayload)
-	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
-	claimReq.Header.Set("Authorization", authHeader)
-	claimReq.Header.Set("Content-Type", "application/json")
-	claimW := httptest.NewRecorder()
-	server.mux.ServeHTTP(claimW, claimReq)
-
+	// Claim the task and get research admission
+	claimW := r.claim(taskID, nil)
 	if claimW.Code != http.StatusOK {
 		t.Fatalf("failed to claim task: got status %d", claimW.Code)
 	}
 
-	// Decode the claim response which includes research admission
-	var claimedResponse map[string]interface{}
-	json.NewDecoder(claimW.Body).Decode(&claimedResponse)
-
-	attemptID := ""
-	permitID := ""
-
-	if researchAdmission, ok := claimedResponse["research_admission"].(map[string]interface{}); ok {
-		if attempt, ok := researchAdmission["attempt_id"].(string); ok {
-			attemptID = attempt
-		}
-		if permit, ok := researchAdmission["permit_id"].(string); ok {
-			permitID = permit
-		}
+	adm := admission(t, claimW)
+	if adm == nil {
+		t.Fatal("Research admission not granted for this task")
 	}
 
-	// If no research admission, skip the test
-	if permitID == "" || attemptID == "" {
-		t.Skip("Research admission not granted for this task")
-	}
+	permitID := adm["permit_id"].(string)
+	attemptID := adm["attempt_id"].(string)
 
 	// Submit the task
 	submitPayload := map[string]interface{}{
-		"agent_id":   "agent-1",
+		"agent_id":   "agent",
 		"attempt_id": attemptID,
 	}
 	submitBody, _ := json.Marshal(submitPayload)
@@ -10517,7 +10631,7 @@ func TestFinalizeResearchPermitAfterTaskSubmission(t *testing.T) {
 	submitReq.Header.Set("Authorization", authHeader)
 	submitReq.Header.Set("Content-Type", "application/json")
 	submitW := httptest.NewRecorder()
-	server.mux.ServeHTTP(submitW, submitReq)
+	r.server.mux.ServeHTTP(submitW, submitReq)
 
 	if submitW.Code != http.StatusOK {
 		t.Fatalf("submit failed: %d, response: %s", submitW.Code, submitW.Body.String())
@@ -10526,8 +10640,9 @@ func TestFinalizeResearchPermitAfterTaskSubmission(t *testing.T) {
 	// Now finalize the permit after submission - should still work
 	finalizePayload := map[string]interface{}{
 		"task_id":    taskID,
-		"model":      "haiku",
-		"agent_id":   "agent-1",
+		"model":      "opus",
+		"agent_id":   "agent",
+		"request_id": adm["request_id"].(string),
 		"attempt_id": attemptID,
 		"exit_class": "completed",
 	}
@@ -10537,7 +10652,7 @@ func TestFinalizeResearchPermitAfterTaskSubmission(t *testing.T) {
 	finalizeReq.Header.Set("Authorization", authHeader)
 	finalizeReq.Header.Set("Content-Type", "application/json")
 	finalizeW := httptest.NewRecorder()
-	server.mux.ServeHTTP(finalizeW, finalizeReq)
+	r.server.mux.ServeHTTP(finalizeW, finalizeReq)
 
 	if finalizeW.Code != http.StatusOK {
 		t.Errorf("expected status 200 after task submission, got %d", finalizeW.Code)
@@ -10552,5 +10667,120 @@ func TestFinalizeResearchPermitAfterTaskSubmission(t *testing.T) {
 	attempt, ok := resp["attempt"].(map[string]interface{})
 	if !ok || attempt["state"] != "finalized" {
 		t.Errorf("expected finalized attempt after task submission, got %v", attempt)
+	}
+}
+
+// TestFinalizeResearchPermitWithExpiredLease verifies 409 ATTEMPT_EXPIRED for expired lease.
+func TestFinalizeResearchPermitWithExpiredLease(t *testing.T) {
+	r := newResearchAPI(t, policy.ModeEnforce, 5, 5)
+	authHeader := "Bearer test-token"
+
+	// Create a task and claim it to get a permit with research admission
+	taskID := r.task("research")
+	claimW := r.claim(taskID, nil)
+	if claimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim task: got status %d", claimW.Code)
+	}
+
+	adm := admission(t, claimW)
+	if adm == nil {
+		t.Fatal("Research admission not granted for this task")
+	}
+
+	permitID := adm["permit_id"].(string)
+	attemptID := adm["attempt_id"].(string)
+	requestID := adm["request_id"].(string)
+
+	// Advance the clock past the lease expiry (5 minute lease by default)
+	r.clock.Advance(6 * time.Minute)
+
+	// Try to finalize after lease expiry - should get 409 ATTEMPT_EXPIRED
+	finalizePayload := map[string]interface{}{
+		"task_id":    taskID,
+		"model":      "opus",
+		"agent_id":   "agent",
+		"request_id": requestID,
+		"attempt_id": attemptID,
+		"exit_class": "completed",
+	}
+	finalizeBody, _ := json.Marshal(finalizePayload)
+
+	finalizeReq := httptest.NewRequest("POST", "/research/permits/"+permitID+"/finalize", bytes.NewReader(finalizeBody))
+	finalizeReq.Header.Set("Authorization", authHeader)
+	finalizeReq.Header.Set("Content-Type", "application/json")
+	finalizeW := httptest.NewRecorder()
+	r.server.mux.ServeHTTP(finalizeW, finalizeReq)
+
+	if finalizeW.Code != http.StatusConflict {
+		t.Errorf("expected status 409, got %d", finalizeW.Code)
+		t.Errorf("response: %s", finalizeW.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(finalizeW.Body).Decode(&resp); err == nil {
+		errObj, ok := resp["error"].(map[string]interface{})
+		if ok {
+			code, _ := errObj["code"].(string)
+			if code != "ATTEMPT_EXPIRED" {
+				t.Errorf("expected error code ATTEMPT_EXPIRED, got %s", code)
+			}
+		}
+	}
+}
+
+// TestRenewResearchPermitWithExpiredLease verifies 409 ATTEMPT_EXPIRED for expired lease on renew.
+func TestRenewResearchPermitWithExpiredLease(t *testing.T) {
+	r := newResearchAPI(t, policy.ModeEnforce, 5, 5)
+	authHeader := "Bearer test-token"
+
+	// Create a task and claim it to get a permit with research admission
+	taskID := r.task("research")
+	claimW := r.claim(taskID, nil)
+	if claimW.Code != http.StatusOK {
+		t.Fatalf("failed to claim task: got status %d", claimW.Code)
+	}
+
+	adm := admission(t, claimW)
+	if adm == nil {
+		t.Fatal("Research admission not granted for this task")
+	}
+
+	permitID := adm["permit_id"].(string)
+	attemptID := adm["attempt_id"].(string)
+	requestID := adm["request_id"].(string)
+
+	// Advance the clock past the lease expiry (5 minute lease by default)
+	r.clock.Advance(6 * time.Minute)
+
+	// Try to renew after lease expiry - should get 409 ATTEMPT_EXPIRED
+	renewPayload := map[string]interface{}{
+		"task_id":    taskID,
+		"model":      "opus",
+		"agent_id":   "agent",
+		"request_id": requestID,
+		"attempt_id": attemptID,
+	}
+	renewBody, _ := json.Marshal(renewPayload)
+
+	renewReq := httptest.NewRequest("POST", "/research/permits/"+permitID+"/renew", bytes.NewReader(renewBody))
+	renewReq.Header.Set("Authorization", authHeader)
+	renewReq.Header.Set("Content-Type", "application/json")
+	renewW := httptest.NewRecorder()
+	r.server.mux.ServeHTTP(renewW, renewReq)
+
+	if renewW.Code != http.StatusConflict {
+		t.Errorf("expected status 409, got %d", renewW.Code)
+		t.Errorf("response: %s", renewW.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(renewW.Body).Decode(&resp); err == nil {
+		errObj, ok := resp["error"].(map[string]interface{})
+		if ok {
+			code, _ := errObj["code"].(string)
+			if code != "ATTEMPT_EXPIRED" {
+				t.Errorf("expected error code ATTEMPT_EXPIRED, got %s", code)
+			}
+		}
 	}
 }
