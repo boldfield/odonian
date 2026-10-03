@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -10709,5 +10710,81 @@ func TestRenewResearchPermitWithExpiredLease(t *testing.T) {
 				t.Errorf("expected error code ATTEMPT_EXPIRED, got %s", code)
 			}
 		}
+	}
+}
+
+// Evaluation endpoint tests
+
+func TestEvaluationCampaignPauseEndpoint(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+
+	// Create a test campaign
+	campaign, err := server.store.CreateEvaluationCampaign(context.Background(), store.EvaluationCampaign{
+		ID:                "camp-test-pause",
+		Name:              "Test Campaign",
+		AllowedProjectIDs: []string{"proj-test"},
+		AllowedModelIDs:   []string{"model-test"},
+		CohortManifest:    "{}",
+		AttemptCap:        100,
+		CreatedAt:         time.Now().Format("2006-01-02T15:04:05Z"),
+		UpdatedAt:         time.Now().Format("2006-01-02T15:04:05Z"),
+	})
+	if err != nil {
+		t.Fatalf("failed to create campaign: %v", err)
+	}
+
+	// Test pause endpoint
+	req := httptest.NewRequest("POST", fmt.Sprintf("/evaluation/campaigns/%s/pause", campaign.ID), nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("pause endpoint returned %d, want 200", w.Code)
+	}
+
+	// Verify pause was recorded
+	campaign2, err := server.store.GetEvaluationCampaign(context.Background(), campaign.ID)
+	if err != nil {
+		t.Fatalf("failed to get campaign: %v", err)
+	}
+	if campaign2.PausedAt == nil {
+		t.Errorf("campaign.PausedAt should be set after pause")
+	}
+}
+
+func TestEvaluationCampaignStatusEndpoint(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+
+	campaign, err := server.store.CreateEvaluationCampaign(context.Background(), store.EvaluationCampaign{
+		ID:                "camp-test-status",
+		Name:              "Test Campaign",
+		AllowedProjectIDs: []string{"proj-test"},
+		AllowedModelIDs:   []string{"model-test"},
+		CohortManifest:    "{}",
+		AttemptCap:        100,
+		CreatedAt:         time.Now().Format("2006-01-02T15:04:05Z"),
+		UpdatedAt:         time.Now().Format("2006-01-02T15:04:05Z"),
+	})
+	if err != nil {
+		t.Fatalf("failed to create campaign: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", fmt.Sprintf("/evaluation/campaigns/%s/status", campaign.ID), nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status endpoint returned %d, want 200", w.Code)
+	}
+
+	var status map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&status); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if status["id"] != campaign.ID {
+		t.Errorf("status id mismatch: got %v, want %s", status["id"], campaign.ID)
 	}
 }
