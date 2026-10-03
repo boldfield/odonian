@@ -466,8 +466,19 @@ func reserveAttempt(ctx context.Context, tx *sql.Tx, now time.Time, permit Resea
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM research_attempt WHERE task_id = ? AND state = 'active'`, permit.TaskID).Scan(&taskLive); err != nil {
 		return ResearchAttempt{}, nil, fmt.Errorf("failed to check task attempts: %w", err)
 	}
+	// In observe mode a live attempt on the task (typically a dispatch preserved
+	// past submit) must not change the claim outcome: record the hypothetical busy
+	// refusal and supersede the stale attempt so the claim proceeds as it would
+	// with the policy disabled.
+	var busy *AdmissionDeniedError
 	if taskLive > 0 {
-		return ResearchAttempt{}, nil, ErrTaskBusy
+		if !observe {
+			return ResearchAttempt{}, nil, ErrTaskBusy
+		}
+		if err := supersedeTaskAttempts(ctx, tx, permit.TaskID, at); err != nil {
+			return ResearchAttempt{}, nil, err
+		}
+		busy = &AdmissionDeniedError{Outcome: policy.OutcomeRetry, Reason: policy.ReasonConcurrency, RetryAfter: retryHint}
 	}
 
 	active, activeCompletion, err := occupancy(ctx, tx, permit.AccountID)
@@ -497,7 +508,45 @@ func reserveAttempt(ctx context.Context, tx *sql.Tx, now time.Time, permit Resea
 	if err != nil {
 		return ResearchAttempt{}, nil, fmt.Errorf("failed to insert research attempt: %w", err)
 	}
+	if denied == nil {
+		denied = busy
+	}
 	return a, denied, nil
+}
+
+// supersedeTaskAttempts ends every live attempt on a task at now.
+func supersedeTaskAttempts(ctx context.Context, tx *sql.Tx, taskID string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT `+attemptCols+` FROM research_attempt WHERE task_id = ? AND state = 'active'`, taskID)
+	if err != nil {
+		return fmt.Errorf("failed to find live research attempts: %w", err)
+	}
+	var live []ResearchAttempt
+	for rows.Next() {
+		a, err := scanAttempt(rows)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan research attempt: %w", err)
+		}
+		live = append(live, a)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, a := range live {
+		started, err := parseTS(a.StartedAt)
+		if err != nil {
+			return fmt.Errorf("invalid attempt timestamp: %w", err)
+		}
+		dur := max(now.Sub(started).Milliseconds(), 0)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE research_attempt SET state='expired', ended_at=?, exit_class=?, duration_ms=?
+			WHERE id = ? AND state = 'active'`, formatTS(now), ExitCancelled, dur, a.ID); err != nil {
+			return fmt.Errorf("failed to supersede research attempt: %w", err)
+		}
+	}
+	return nil
 }
 
 // RequestResearchPermit admits one start. A request ID already recorded returns

@@ -790,3 +790,77 @@ func TestResearchPolicyPersistsAcrossRestartWithoutRefill(t *testing.T) {
 		t.Fatalf("active attempts after restart = %d", n)
 	}
 }
+
+// reworkReady returns a submitted task to ready for a reworked round, as a
+// review rejection does, without touching its research attempt.
+func (f *claimFixture) reworkReady(id string) {
+	f.t.Helper()
+	if _, err := f.s.Conn().Exec(`UPDATE task SET state='ready', assignee=NULL, lease_expires_at=NULL, review_round=1 WHERE id = ?`, id); err != nil {
+		f.t.Fatalf("return task to ready: %v", err)
+	}
+}
+
+func TestClaimResearchReworkAfterSubmitByPolicyMode(t *testing.T) {
+	submit := func(f *claimFixture, id string, res ResearchClaimResult) {
+		t.Helper()
+		ctx := WithResearchAttempt(f.ctx, res.Grant.Attempt.ID)
+		if _, err := f.s.SubmitTask(ctx, id, "agent-a", "done", nil, []LinkInput{{Kind: "pr", Value: "#9"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		f.reworkReady(id)
+	}
+
+	t.Run("observe grants and records a hypothetical busy refusal", func(t *testing.T) {
+		f := newClaimFixture(t, claimPolicy(policy.ModeObserve, 5, 1, 0))
+		id := f.research()
+		first := f.mustClaim("r1", id, "agent-a")
+		submit(f, id, first)
+
+		second, err := f.claim("r2", id, "agent-a")
+		if err != nil {
+			t.Fatalf("observe mode refused ordinary eligible rework: %v", err)
+		}
+		if second.Grant == nil || second.Task.State != "in_progress" {
+			t.Fatalf("rework claim = %+v", second)
+		}
+		if second.Observed == nil || second.Observed.Outcome != policy.OutcomeRetry || second.Observed.Reason != policy.ReasonConcurrency {
+			t.Fatalf("observed = %+v, want a hypothetical retry/concurrency refusal", second.Observed)
+		}
+		d, err := f.s.GetResearchAdmissionDiagnostic(f.ctx, id)
+		if err != nil || !d.Hypothetical || d.Outcome != policy.OutcomeRetry || d.WorkClass != policy.ResearchRework {
+			t.Fatalf("diagnostic = %+v, %v", d, err)
+		}
+		_, old, err := f.s.GetResearchPermit(f.ctx, first.Grant.Permit.ID)
+		if err != nil || old.State == AttemptActive {
+			t.Fatalf("stale attempt still live after supersede: %+v, %v", old, err)
+		}
+		if second.Grant.Attempt.PreviousAttemptID == nil || *second.Grant.Attempt.PreviousAttemptID != first.Grant.Attempt.ID {
+			t.Fatalf("rework attempt not chained: %+v", second.Grant.Attempt)
+		}
+		if f.active() != 1 || f.count(`SELECT COUNT(*) FROM research_attempt WHERE state='active'`) != 1 {
+			t.Fatalf("expected exactly the new attempt live, active=%d", f.active())
+		}
+	})
+
+	t.Run("disabled grants the same claim", func(t *testing.T) {
+		f := newClaimFixture(t, claimPolicy(policy.ModeDisabled, 5, 1, 0))
+		id := f.research()
+		if _, err := f.s.ClaimTask(f.ctx, id, "agent-a", "opus", claimTTL); err != nil {
+			t.Fatal(err)
+		}
+		f.reworkReady(id)
+		if _, err := f.s.ClaimTask(f.ctx, id, "agent-a", "opus", claimTTL); err != nil {
+			t.Fatalf("disabled rework claim: %v", err)
+		}
+	})
+
+	t.Run("enforce still refuses while the dispatch is live", func(t *testing.T) {
+		f := newClaimFixture(t, claimPolicy(policy.ModeEnforce, 5, 1, 0))
+		id := f.research()
+		first := f.mustClaim("r1", id, "agent-a")
+		submit(f, id, first)
+		if _, err := f.claim("r2", id, "agent-a"); !errors.Is(err, ErrTaskBusy) {
+			t.Fatalf("got %v, want ErrTaskBusy", err)
+		}
+	})
+}

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/boldfield/odonian/internal/policy"
 	"github.com/boldfield/odonian/internal/store"
+	"github.com/boldfield/odonian/internal/tuiclient"
 )
 
 type apiClock struct {
@@ -293,5 +295,84 @@ func TestClaimNonResearchAPIUnaffectedByPolicy(t *testing.T) {
 		if _, ok := decodeBody(t, w)["research_admission"]; ok {
 			t.Fatalf("build claim returned an admission")
 		}
+	}
+}
+
+func TestResearchClientPathFencesStaleSameAgentAfterReplacement(t *testing.T) {
+	r := newResearchAPI(t, policy.ModeEnforce, 5, 5)
+	ts := httptest.NewServer(r.server.Handler())
+	t.Cleanup(ts.Close)
+	ctx := t.Context()
+	id := r.task("research")
+
+	// Two processes of the same agent identity, as after a lease expiry and reclaim.
+	oldWorker := tuiclient.NewHTTPClient(ts.URL, "test-token")
+	if err := oldWorker.ClaimTask(ctx, id, "agent", "opus"); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if oldWorker.AttemptID(id) == "" {
+		t.Fatalf("client did not keep the research attempt from the claim")
+	}
+	r.clock.Advance(6 * time.Minute)
+	newWorker := tuiclient.NewHTTPClient(ts.URL, "test-token")
+	if err := newWorker.ClaimTask(ctx, id, "agent", "opus"); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if newWorker.AttemptID(id) == oldWorker.AttemptID(id) {
+		t.Fatalf("reclaim reused the attempt")
+	}
+
+	var apiErr *tuiclient.APIError
+	err := oldWorker.HeartbeatTask(ctx, id, "agent")
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict || apiErr.Code != "ATTEMPT_FENCED" {
+		t.Fatalf("stale heartbeat = %v", err)
+	}
+	links := []tuiclient.LinkInput{{Kind: "pr", Value: "https://github.com/test/repo/pull/1"}}
+	err = oldWorker.SubmitTask(ctx, id, "agent", "stale", nil, links)
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict || apiErr.Code != "ATTEMPT_FENCED" {
+		t.Fatalf("stale submit = %v", err)
+	}
+	if got := apiGetTask(t, r.server, researchAuth, id); got.State != "in_progress" || got.Result != nil {
+		t.Fatalf("stale client changed the replacement: state=%s result=%v", got.State, got.Result)
+	}
+
+	if err := newWorker.HeartbeatTask(ctx, id, "agent"); err != nil {
+		t.Fatalf("current heartbeat: %v", err)
+	}
+	if err := newWorker.SubmitTask(ctx, id, "agent", "real", nil, links); err != nil {
+		t.Fatalf("current submit: %v", err)
+	}
+}
+
+func TestResearchClientAttemptSetExplicitly(t *testing.T) {
+	r := newResearchAPI(t, policy.ModeEnforce, 5, 5)
+	ts := httptest.NewServer(r.server.Handler())
+	t.Cleanup(ts.Close)
+	ctx := t.Context()
+	id := r.task("research")
+
+	claimer := tuiclient.NewHTTPClient(ts.URL, "test-token")
+	if err := claimer.ClaimTask(ctx, id, "agent", "opus"); err != nil {
+		t.Fatal(err)
+	}
+	// A later process (the CLI) is handed the attempt ID.
+	later := tuiclient.NewHTTPClient(ts.URL, "test-token")
+	later.SetAttemptID(id, claimer.AttemptID(id))
+	if err := later.HeartbeatTask(ctx, id, "agent"); err != nil {
+		t.Fatalf("heartbeat with set attempt: %v", err)
+	}
+	later.SetAttemptID(id, "not-the-attempt")
+	var apiErr *tuiclient.APIError
+	if err := later.HeartbeatTask(ctx, id, "agent"); !errors.As(err, &apiErr) || apiErr.Code != "ATTEMPT_FENCED" {
+		t.Fatalf("wrong attempt heartbeat = %v", err)
+	}
+
+	// A non-research claim carries no attempt.
+	plain := r.task("build")
+	if err := claimer.ClaimTask(ctx, plain, "agent", "opus"); err != nil {
+		t.Fatal(err)
+	}
+	if claimer.AttemptID(plain) != "" {
+		t.Fatalf("non-research claim recorded an attempt")
 	}
 }

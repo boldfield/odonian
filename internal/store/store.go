@@ -2242,7 +2242,9 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 
 	// Reject a submission from a research attempt that a replacement superseded.
 	// The attempt itself is left active: submitting ends task ownership, not the
-	// dispatch, which the harness finalizes when the process exits.
+	// dispatch. Only the store-level RenewResearchAttempt and FinalizeResearchAttempt
+	// drive that lifecycle; no API route exposes them yet, so until a harness
+	// integration calls them the preserved attempt lapses at its lease expiry.
 	if err := fenceResearchAttempt(ctx, tx, s.nowTime(), taskID, agentID, researchAttemptFromContext(ctx), 0); err != nil {
 		return TaskWithDepsAndLinks{}, err
 	}
