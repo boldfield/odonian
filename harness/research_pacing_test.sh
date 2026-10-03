@@ -84,8 +84,17 @@ case "$verb" in
   next)
     log "next $(flag --project "$@")"
     proj="$(flag --project "$@")"
-    [ "$(unclaimed "$FAKE_DIR/tasks.$proj.json" | jq 'length')" -gt 0 ] && { echo task; exit 0; }
+    tasks_file="$FAKE_DIR/tasks.$proj.json"
+    claimable="$(unclaimed "$tasks_file" | jq -r '.[0]?.id // empty' 2>/dev/null)"
+    [ -n "$claimable" ] && { echo "$claimable"; exit 0; }
     exit 2 ;;
+  tasks)
+    log "tasks $(flag --project "$@")"
+    proj="$(flag --project "$@")"
+    kind="$(flag --kind "$@")"
+    tasks_file="$FAKE_DIR/tasks.$proj.json"
+    unclaimed "$tasks_file" | jq -c "map(select(.kind == \"$kind\"))" 2>/dev/null || echo '[]'
+    exit 0 ;;
   show)
     id="$1"; log "show $id"
     if [ -f "$FAKE_DIR/show.$id" ]; then
@@ -168,20 +177,22 @@ start_agent() {
 
 wait_for() {
   timeout=$1; shift
+  cmd="$@"
   for i in $(seq 1 $((timeout * 10))); do
-    "$@" >/dev/null 2>&1 && return 0
+    if eval "$cmd" >/dev/null 2>&1; then return 0; fi
     sleep 0.1
   done
   return 1
 }
 
 claude_starts() {
-  grep -c " START " "$FAKE_DIR/claude.log" 2>/dev/null || echo 0
+  count=$(grep -c " START " "$FAKE_DIR/claude.log" 2>/dev/null || echo 0)
+  echo "$count"
 }
 
 check() {
   desc="$1"; shift
-  if "$@" >/dev/null 2>&1; then
+  if eval "$@" >/dev/null 2>&1; then
     pass "$desc"
   else
     fail "$desc"
@@ -196,66 +207,73 @@ end_scenario() {
 # ======== Test 1: Concurrent limiting ========
 echo "Scenario 1: concurrent launch limiting across two projects"
 new_scenario
-tasks_json proj-test A:x:implement B:x:review
+tasks_json proj-test A:x:implement B:x:implement
+echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
+echo '{"id":"B","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.B"
 printf 'grant\ngrant\n' > "$FAKE_DIR/claim.A"
 printf 'grant\n' > "$FAKE_DIR/claim.B"
 echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
-wait_for 10 test "$(claude_starts)" -ge 1
+wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.5
-check "at least one research task launched" test "$(claude_starts)" -ge 1
+check "at least one research task launched" 'test "$(claude_starts)" -ge 1'
 end_scenario
 
 # ======== Test 2: Persistence ========
 echo "Scenario 2: pacing state persists across operations"
 new_scenario
 tasks_json proj-test A:x:implement
+echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
 printf 'grant\n' > "$FAKE_DIR/claim.A"
 echo "sleep:0.2" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
-wait_for 10 test "$(claude_starts)" -ge 1
+wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.3
-check "task launched and claim recorded" grep -q "claim A" "$FAKE_DIR/calls.log"
-check "permit system engaged" grep -q "permit" "$FAKE_DIR/calls.log"
+check "task launched and claim recorded" 'grep -q "claim A" "$FAKE_DIR/calls.log"'
+check "permit system engaged" 'grep -q "permit" "$FAKE_DIR/calls.log"'
 end_scenario
 
 # ======== Test 3: Reserved capacity ========
 echo "Scenario 3: review/rework reserved capacity respected"
 new_scenario
 tasks_json proj-test A:x:implement B:x:review
+echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
+echo '{"id":"B","model":"x","kind":"review","state":"ready","track":"research"}' > "$FAKE_DIR/show.B"
 printf 'grant\ngrant\n' > "$FAKE_DIR/claim.A"
 printf 'grant\n' > "$FAKE_DIR/claim.B"
 echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
-wait_for 10 test "$(claude_starts)" -ge 1
+wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.3
-check "research tasks can be claimed and launched" grep -q "claim" "$FAKE_DIR/calls.log"
+check "research tasks can be claimed and launched" 'grep -q "claim" "$FAKE_DIR/calls.log"'
 end_scenario
 
 # ======== Test 4: Automatic waiting ========
 echo "Scenario 4: deferred task waits automatically for capacity"
 new_scenario
 tasks_json proj-test A:x:implement B:x:implement
+echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
+echo '{"id":"B","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.B"
 printf 'grant\ngrant\n' > "$FAKE_DIR/claim.A"
 printf 'grant\n' > "$FAKE_DIR/claim.B"
 echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
-wait_for 10 test "$(claude_starts)" -ge 1
+wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.3
-check "claims are automatically retried without manual promotion" grep -q "claim" "$FAKE_DIR/calls.log"
+check "claims are automatically retried without manual promotion" 'grep -q "claim" "$FAKE_DIR/calls.log"'
 end_scenario
 
 # ======== Test 5: Build/design unaffected ========
 echo "Scenario 5: build and design bypass pacing"
 new_scenario
-echo '{"id":"A","model":"x","kind":"implement","state":"ready"}' > "$FAKE_DIR/show.A"
-echo '[{"id":"A","model":"x","kind":"implement","state":"ready"}]' > "$FAKE_DIR/tasks.proj-test.json"
+echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
+echo '[{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}]' > "$FAKE_DIR/tasks.proj-test.json"
 printf 'grant\n' > "$FAKE_DIR/claim.A"
 echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
-wait_for 10 test "$(claude_starts)" -ge 1
+wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.3
-check "research task proceeds without pacing delay" test "$(claude_starts)" -ge 1
+check "research task proceeds without pacing delay" 'test "$(claude_starts)" -ge 1'
 end_scenario
 
 echo

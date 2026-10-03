@@ -40,6 +40,14 @@ Expose configured mode/pools and effective capacity without credentials, active 
 
 Required tests use fake clocks, concurrent requests, restarted stores, and fake model executables. Verify no model invocation on deferral; idempotent retries; continued polling of another project/model; research rework and review counting; completion reservations; non-research compatibility; no late permit release corrupting a newer attempt; task submission not prematurely releasing dispatch concurrency. Do not spend subscription usage for implementation tests.
 
+### Milestone 1 documentation
+
+Operator and configuration documentation:
+- **Rollout and operations:** `docs/runbooks/research-pacing-rollout.md` — covers baseline observation, drain legacy agents, enforcement, tuning, emergency rollback, and durable state across restarts
+- **Configuration examples:** `docs/research-pacing-config-examples.md` — illustrative pool configurations, pool sizing guidelines, and monitoring (note: all numeric examples are illustrative, not production recommendations; calibrate values from your own workload observations)
+- **Smoke test:** `docs/research-pacing-smoke-test.md` — end-to-end acceptance criteria demonstrations; also executable as `bash harness/research_pacing_test.sh`
+- **Design reference:** this document (features/research-pacing-and-reviewer-evaluation.md) — full policy, lifecycle, and implementation constraints
+
 ## Milestone 2: model-agnostic comparison reviews
 
 ### Candidate runtime adapter contract

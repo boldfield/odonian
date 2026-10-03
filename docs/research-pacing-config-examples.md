@@ -2,6 +2,15 @@
 
 This document provides concrete configuration examples for research pacing deployment, covering different quota scenarios, account pool strategies, and operational modes.
 
+**⚠️ Illustrative Examples Only:** The numeric values in all examples below (start_rate, burst_capacity, concurrent_dispatch_limit, completion_reserved) are illustrative examples designed to demonstrate the configuration structure and policy patterns. They are NOT production recommendations and should not be used directly in production deployments. Each deployment must determine appropriate values based on its own:
+- Subscription plan and quota limits
+- Expected workload characteristics and peak concurrency
+- Dispatch duration observations
+- Account capacity and headroom requirements
+- Team preferences for quality vs. throughput trade-offs
+
+See the "Pool Sizing Guidelines" section below for methods to calibrate your own values.
+
 ## Basic Configuration Structure
 
 All research pacing configuration uses environment variables:
@@ -47,10 +56,7 @@ export ODONIAN_RESEARCH_POOLS='
 - Reserved: 1 slot for reviews/rework, 1 for writers
 - Effect: Tight control, no starvation, slow steady flow
 
-**Suitable For:**
-- Quota-sensitive deployments
-- Small teams
-- Conservative budget approach
+**Illustrative scenario:** This pattern might suit deployments with very tight quota constraints, but actual values should be determined from your own quota limits and dispatch duration observations.
 
 ## Example 2: Single Account, Moderate Load (Balanced)
 
@@ -79,10 +85,7 @@ export ODONIAN_RESEARCH_POOLS='
 - Reserved: 2 slots for reviews/rework, 2 for writers
 - Effect: Moderate pacing, reviews protected, good throughput
 
-**Suitable For:**
-- Typical project workloads
-- Standard Anthropic subscription
-- Balanced quality and speed
+**Illustrative scenario:** This pattern demonstrates a mid-range configuration, but your deployment should calibrate start_rate and limits based on your actual subscription quota and dispatch durations.
 
 ## Example 3: Single Account, High Volume (Aggressive)
 
@@ -111,10 +114,7 @@ export ODONIAN_RESEARCH_POOLS='
 - Reserved: 3 slots for reviews/rework, 5 for writers
 - Effect: Aggressive pacing, high throughput, reviews still protected
 
-**Suitable For:**
-- High-volume research deployments
-- Enterprise-scale quotas
-- Speed-prioritized workflows
+**Illustrative scenario:** This pattern shows aggressive pacing, but only deployments with verified high quota capacity should use high start_rate values. Calibrate based on your subscription plan and monitoring.
 
 ## Example 4: Separate Providers (Meta Haiku vs. Anthropic Opus)
 
@@ -150,10 +150,7 @@ export ODONIAN_RESEARCH_POOLS='
 - Each account tracked independently
 - Model pool assignment is fixed; cannot move model between pools after config
 
-**Suitable For:**
-- Multi-provider cost optimization
-- Tiered deployment with price-based gating
-- Different quota levels per provider
+**Illustrative scenario:** This demonstrates the multi-provider pattern with different rates per provider. Your actual rates should reflect your subscription limits and cost priorities.
 
 ## Example 5: Evaluate Reviews Separately
 
@@ -189,10 +186,7 @@ export ODONIAN_RESEARCH_POOLS='
 - Writers and reviewers consume separate quotas
 - No cross-pool borrowing
 
-**Suitable For:**
-- Separate quota allocations per model
-- Isolated cost tracking
-- Protecting review capacity absolutely
+**Illustrative scenario:** This demonstrates separate capacity pools for writers and reviewers. Determine your own values based on quota availability and observed review/rework concurrency.
 
 ## Example 6: Review-Only Pool (No New Writers)
 
@@ -220,10 +214,7 @@ export ODONIAN_RESEARCH_POOLS='
 - No capacity available for new first-pass writers
 - New research tasks are deferred indefinitely
 
-**Suitable For:**
-- Temporary pause on new research
-- Processing review backlog
-- Budget freeze scenarios
+**Illustrative scenario:** This pattern demonstrates a review-only mode. Actual values should reflect your review queue depth and completion capacity.
 - (Note: Haiku and Sonnet must still be in ODONIAN_MODELS but are unmapped; this fails validation unless removed)
 
 ## Example 7: Observe Mode (No Enforcement)
@@ -253,11 +244,7 @@ export ODONIAN_RESEARCH_POOLS='
 - No impact on actual task flow
 - Operator can monitor what would be deferred
 
-**Suitable For:**
-- Pre-deployment validation
-- Measuring impact without risk
-- Tuning pool parameters safely
-- Collecting baseline data
+**Illustrative scenario:** Observe mode with the same pool configuration, allowing safe collection of hypothetical denial data before enforcement.
 
 ## Example 8: Disabled (Default, No Pacing)
 
@@ -275,10 +262,7 @@ export ODONIAN_RESEARCH_POLICY_MODE=disabled
 - No rate limiting
 - No pool configuration needed
 
-**Suitable For:**
-- Initial deployments
-- Emergency disable during incidents
-- Quota not available
+**Illustrative scenario:** No pacing configuration or enforcement; all research tasks admitted without concurrency limits.
 
 ## Transition Examples
 
@@ -351,10 +335,10 @@ export ODONIAN_RESEARCH_POOLS='
 3. Set start_rate = 1.0 / T_avg (one start per average dispatch duration)
 4. Add headroom: start_rate = (1.0 / T_avg) * 0.5 (50% headroom for variance)
 
-**Example:**
+**Example (illustrative):**
 - Average dispatch takes 5 seconds
 - Base rate = 1/5 = 0.2 starts/sec
-- With 50% headroom: 0.2 * 0.5 = 0.1 starts/sec (recommended)
+- With 50% headroom: 0.2 * 0.5 = 0.1 starts/sec (illustrative; use your own observations)
 
 ### Determining burst_capacity
 
@@ -363,9 +347,9 @@ export ODONIAN_RESEARCH_POOLS='
 2. Set burst_capacity = expected_peak_queue_size + 1
 3. Typical range: 1-10 (rarely higher)
 
-**Example:**
+**Example (illustrative):**
 - Peak queue observed: 3-5 tasks
-- Set burst_capacity = 5 (accommodate peak, allow one extra)
+- Set burst_capacity = 5 (illustrative; use your own peak observations)
 
 ### Determining concurrent_dispatch_limit
 
@@ -375,9 +359,9 @@ export ODONIAN_RESEARCH_POOLS='
 3. Consider subscription plan's concurrent request limit
 4. Typical range: 2-10
 
-**Example:**
+**Example (illustrative):**
 - Observed peak concurrent: 4 tasks
-- Subscription allows 10 concurrent: set limit = 6 (headroom)
+- Subscription allows 10 concurrent: set limit = 6 (illustrative; use your actual quota and headroom)
 
 ### Determining completion_reserved
 
@@ -386,9 +370,9 @@ export ODONIAN_RESEARCH_POOLS='
 2. Set completion_reserved ≥ peak_completion_count
 3. Typical: 1-3 slots per pool
 
-**Example:**
+**Example (illustrative):**
 - Peak concurrent reviews: 2
-- Set completion_reserved = 2 (ensure reviews never starve)
+- Set completion_reserved = 2 (illustrative; use your actual review concurrency)
 
 ## Validation Examples
 
