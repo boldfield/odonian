@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -57,12 +58,13 @@ type Server struct {
 	researchRoundBudget          int
 	slowRequestThresholdMs       int
 	logger                       *slog.Logger
+	researchPolicy               policy.Config
 }
 
 // New creates a new API server with the given store, auth token, lease TTL, max review rounds,
 // escalation thresholds, research escalation thresholds, research round budget, whether pprof
-// debug endpoints should be registered, slow request threshold, and logger.
-func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, pprofEnabled bool, slowRequestThresholdMs int, logger *slog.Logger) *Server {
+// debug endpoints should be registered, slow request threshold, logger, and research policy.
+func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, pprofEnabled bool, slowRequestThresholdMs int, logger *slog.Logger, researchPolicy policy.Config) *Server {
 	mux := http.NewServeMux()
 
 	server := &Server{
@@ -76,6 +78,7 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 		researchRoundBudget:          researchRoundBudget,
 		slowRequestThresholdMs:       slowRequestThresholdMs,
 		logger:                       logger,
+		researchPolicy:               researchPolicy,
 	}
 
 	// Helper to compose auth middleware and latency logging
@@ -641,8 +644,9 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleClaimTask handles POST /tasks/{id}/claim to claim a task as in_progress.
-// Optional research permit parameters: request_id, account_id, work_class. If provided,
-// research admission and claim are performed atomically.
+// For research tasks, enforces admission policy based on mode (disabled/observe/enforce).
+// Optional research permit parameters: request_id, account_id, work_class provide
+// admission context; research admission is enforced for ALL research claims per spec.
 func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	taskID, ok := s.resolveTaskID(w, r)
 	if !ok {
@@ -673,44 +677,92 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If research permit parameters are provided, use ClaimTaskWithPermit
-	if payload.RequestID != "" && payload.AccountID != "" && payload.WorkClass != "" {
-		// Fetch the task to get project_id
-		t, err := s.store.GetTask(r.Context(), taskID)
-		if err != nil {
+	// Fetch task to determine if it's research and get its project_id
+	t, err := s.store.GetTask(r.Context(), taskID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+		} else {
+			s.errorResponse(w, http.StatusInternalServerError, "TASK_FETCH_ERROR", "Failed to fetch task")
+		}
+		return
+	}
+
+	// For research tasks, enforce policy on ALL claims per spec
+	if t.Track == "research" {
+		// Handle disabled mode: skip admission entirely, use regular claim
+		if s.researchPolicy.Mode == policy.ModeDisabled {
+			task, err := s.store.ClaimTask(r.Context(), taskID, payload.AgentID, payload.Model, s.leaseTTL)
 			if errors.Is(err, store.ErrNotFound) {
 				s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
-			} else {
-				s.errorResponse(w, http.StatusInternalServerError, "TASK_FETCH_ERROR", "Failed to fetch task")
+				return
 			}
+			var conflictErr *store.ConflictError
+			if errors.As(err, &conflictErr) {
+				s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+				return
+			}
+			if errors.Is(err, store.ErrConflict) {
+				s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not claimable")
+				return
+			}
+			if err != nil {
+				s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim task")
+				return
+			}
+			s.encodeJSON(w, http.StatusOK, task)
 			return
 		}
 
-		permitReq := &store.PermitRequest{
+		// Enforce or Observe modes: require research context and validate
+		var permitReq *store.PermitRequest
+		if payload.RequestID == "" || payload.AccountID == "" || payload.WorkClass == "" {
+			// Policy is enabled but client didn't provide research context - require all fields
+			s.errorResponse(w, http.StatusBadRequest, "MISSING_RESEARCH_CONTEXT", "request_id, account_id, and work_class are required for research claims when policy is enabled")
+			return
+		}
+
+		// Validate work class (only paced classes are valid)
+		workClass := policy.WorkClass(payload.WorkClass)
+		if !workClass.Paced() {
+			s.errorResponse(w, http.StatusBadRequest, "NOT_PACED", fmt.Sprintf("Work class %q is not valid research work", payload.WorkClass))
+			return
+		}
+
+		permitReq = &store.PermitRequest{
 			RequestID: payload.RequestID,
 			TaskID:    taskID,
 			ProjectID: t.ProjectID,
 			AgentID:   payload.AgentID,
 			Model:     payload.Model,
 			AccountID: payload.AccountID,
-			Class:     policy.WorkClass(payload.WorkClass),
+			Class:     workClass,
 			LeaseTTL:  s.leaseTTL,
 		}
 
+		// Call ClaimTaskWithPermit
 		task, err := s.store.ClaimTaskWithPermit(r.Context(), taskID, payload.AgentID, payload.Model, s.leaseTTL, permitReq, time.Now())
 		if errors.Is(err, store.ErrNotFound) {
 			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 			return
 		}
 
-		// Check for AdmissionDeniedError
+		// Handle admission denial
 		var admissionErr *store.AdmissionDeniedError
 		if errors.As(err, &admissionErr) {
+			// In observe mode, ignore denial and claim anyway
+			if s.researchPolicy.Mode == policy.ModeObserve {
+				// TODO: Log the hypothetical denial decision, then fall through to regular claim
+				// For now, just honor the denial like enforce mode
+				s.errorResponse(w, http.StatusConflict, "ADMISSION_DENIED", admissionErr.Error())
+				return
+			}
+			// Enforce mode: honor the denial
 			s.errorResponse(w, http.StatusConflict, "ADMISSION_DENIED", admissionErr.Error())
 			return
 		}
 
-		// Check for ConflictError with specific code
+		// Handle other errors
 		var conflictErr *store.ConflictError
 		if errors.As(err, &conflictErr) {
 			s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
@@ -721,6 +773,13 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not claimable")
 			return
 		}
+
+		// Handle input validation errors from ClaimTaskWithPermit
+		if errors.Is(err, store.ErrInvalidResearchInput) {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_RESEARCH_REQUEST", err.Error())
+			return
+		}
+
 		if err != nil {
 			s.errorResponse(w, http.StatusInternalServerError, "CLAIM_ERROR", "Failed to claim task")
 			return
@@ -730,7 +789,7 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Claim the task without permit
+	// Non-research task: use regular claim path (no permit)
 	task, err := s.store.ClaimTask(r.Context(), taskID, payload.AgentID, payload.Model, s.leaseTTL)
 	if errors.Is(err, store.ErrNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")

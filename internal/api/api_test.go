@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/boldfield/odonian/internal/policy"
 	"github.com/boldfield/odonian/internal/store"
 )
 
@@ -29,7 +30,7 @@ func setupTestServer(t *testing.T, authToken string) *Server {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, nil, 999999, false, 500, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, nil, 999999, false, 500, nil, policy.Config{Mode: policy.ModeDisabled})
 }
 
 func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds map[string]int) *Server {
@@ -38,7 +39,7 @@ func setupTestServerWithThresholds(t *testing.T, authToken string, thresholds ma
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, thresholds, nil, 999999, false, 500, nil)
+	return New(s, authToken, 5*time.Minute, 5, thresholds, nil, 999999, false, 500, nil, policy.Config{Mode: policy.ModeDisabled})
 }
 
 func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool) *Server {
@@ -47,7 +48,7 @@ func setupTestServerWithPprof(t *testing.T, authToken string, pprofEnabled bool)
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	return New(s, authToken, 5*time.Minute, 5, nil, nil, 999999, pprofEnabled, 500, nil)
+	return New(s, authToken, 5*time.Minute, 5, nil, nil, 999999, pprofEnabled, 500, nil, policy.Config{Mode: policy.ModeDisabled})
 }
 
 // TestHealthzWithoutAuth verifies GET /healthz returns 200 without auth.
@@ -3644,7 +3645,7 @@ func TestListProjectsReturnsEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil, policy.Config{Mode: policy.ModeDisabled})
 	authHeader := "Bearer test-token"
 
 	// List projects without creating any
@@ -3678,7 +3679,7 @@ func TestListProjectsWithClaimableFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil, policy.Config{Mode: policy.ModeDisabled})
 	authHeader := "Bearer test-token"
 
 	// Create project 1 with a claimable haiku implement task
@@ -3784,7 +3785,7 @@ func TestListProjectsClaimableWithMultipleFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil, policy.Config{Mode: policy.ModeDisabled})
 	authHeader := "Bearer test-token"
 
 	// Create a project with two tasks: one haiku, one sonnet
@@ -3890,7 +3891,7 @@ func TestListProjectsClaimableUnchangedWithoutFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil, policy.Config{Mode: policy.ModeDisabled})
 	authHeader := "Bearer test-token"
 
 	// Create two projects
@@ -6798,7 +6799,7 @@ func TestLatencyLoggingSlowRequest(t *testing.T) {
 		t.Fatalf("failed to open test store: %v", err)
 	}
 	// Use threshold 0ms so all requests are considered slow
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 0, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 0, logger, policy.Config{Mode: policy.ModeDisabled})
 
 	// Create a project first
 	ctx := context.Background()
@@ -6878,7 +6879,7 @@ func TestLatencyLoggingFastRequest(t *testing.T) {
 		t.Fatalf("failed to open test store: %v", err)
 	}
 	// Use very high threshold (10 seconds) so normal requests are fast
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 10000, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 10000, logger, policy.Config{Mode: policy.ModeDisabled})
 
 	// Create a project first
 	ctx := context.Background()
@@ -6916,7 +6917,7 @@ func TestLatencyLoggingHealthzExcluded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, logger, policy.Config{Mode: policy.ModeDisabled})
 
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -6954,7 +6955,7 @@ func TestLatencyLoggingQueryParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 0, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 0, logger, policy.Config{Mode: policy.ModeDisabled})
 
 	// Create a project first
 	ctx := context.Background()
@@ -7479,7 +7480,7 @@ func TestLatencyLoggingAuthNotLogged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 0, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 0, logger, policy.Config{Mode: policy.ModeDisabled})
 
 	// Create a project first
 	ctx := context.Background()
@@ -7537,7 +7538,7 @@ func TestLatencyLoggingResponseSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test store: %v", err)
 	}
-	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 0, logger)
+	server := New(s, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 0, logger, policy.Config{Mode: policy.ModeDisabled})
 
 	req := httptest.NewRequest("GET", "/projects", nil)
 	req.Header.Set("Authorization", "Bearer test-token")

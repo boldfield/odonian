@@ -1929,74 +1929,137 @@ func (s *sqliteStore) ClaimTask(ctx context.Context, taskID, agentID, model stri
 	return Task{}, ErrConflict
 }
 
-// ClaimTaskWithPermit atomically claims a task and optionally requests a research permit
-// for research tasks. Permit request, debit, insertion and claim all happen in the same
-// transaction to ensure atomicity. If permit admission is denied, the task is not claimed
-// and an AdmissionDeniedError is returned. The permitReq parameter can be nil for
-// non-research tasks or when no permit-based admission is needed; this preserves backward
-// compatibility with disabled/observe modes.
+// ClaimTaskWithPermit atomically claims a task and requests a research permit for
+// research tasks. Permit validation, claimability check, admission, debit, attempt
+// insertion, and claim all happen in the same transaction to ensure atomicity.
+// Follows spec order: check claimability first, then admission/debit/attempt/claim.
+// If permit admission is denied, the task is not claimed and an AdmissionDeniedError
+// is returned with bounded diagnostics (state/lease/history unchanged except for
+// diagnostics). The permitReq parameter can be nil only for non-research tasks.
 func (s *sqliteStore) ClaimTaskWithPermit(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration, permitReq *PermitRequest, now time.Time) (Task, error) {
+	// Input validation (before any side effects)
+	if permitReq != nil {
+		switch {
+		case permitReq.RequestID == "" || permitReq.TaskID == "" || permitReq.ProjectID == "" || permitReq.AgentID == "" || permitReq.Model == "" || permitReq.AccountID == "":
+			return Task{}, invalidResearch("request ID, task, project, agent, model and account are required")
+		case !permitReq.Class.Paced():
+			return Task{}, invalidResearch("work class %q is not paced research work", permitReq.Class)
+		case leaseTTL <= 0:
+			return Task{}, invalidResearch("lease TTL must be positive")
+		}
+	}
+
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// First, fetch the task to check if it's a research task and get its state
-	var taskTrack string
-	var taskExists bool
-	var taskModel string
-	var isOtherwiseClaimable bool
 	now_ts := nowTimestamp()
-	err = tx.QueryRowContext(ctx, `
-		SELECT track, COUNT(*) > 0, COALESCE(model, ''), EXISTS(SELECT 1 FROM task WHERE id = ? AND `+claimableSQL+`)
-		FROM task WHERE id = ?
-	`, taskID, now_ts, taskID).Scan(&taskTrack, &taskExists, &taskModel, &isOtherwiseClaimable)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return Task{}, fmt.Errorf("failed to fetch task track: %w", err)
-	}
 
-	if !taskExists {
+	// Step 1: Fetch task and verify existence (proper error handling for unknown task)
+	var t Task
+	var reviewModelsJSON *string
+	var taskTrack string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if errors.Is(err, sql.ErrNoRows) {
 		return Task{}, ErrNotFound
 	}
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch task: %w", err)
+	}
 
-	// If task is research and permitReq is provided, request admission within the transaction
-	if taskTrack == "research" && permitReq != nil {
-		permit := ResearchPermit{
-			ID:         GenerateID(),
-			RequestID:  permitReq.RequestID,
-			TaskID:     permitReq.TaskID,
-			ProjectID:  permitReq.ProjectID,
-			AgentID:    permitReq.AgentID,
-			Model:      permitReq.Model,
-			AccountID:  permitReq.AccountID,
-			Completion: permitReq.Class.Completion(),
-			CreatedAt:  formatTS(now),
-		}
-		a, denied, err := startAttempt(ctx, tx, now, permit, 1, nil, permitReq.LeaseTTL, permitReq.RetryHint)
-		if err != nil {
-			return Task{}, err
-		}
-		if denied != nil {
-			// Permit denied - don't claim the task, just return the denial
-			// Return the denial as a conflict error to indicate the task could not be claimed
-			return Task{}, denied
-		}
-		// Permit granted - insert it into the database within the transaction
-		permit.CurrentAttemptID = a.ID
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO research_permit (id, request_id, task_id, project_id, agent_id, model, account_id, completion, current_attempt_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			permit.ID, permit.RequestID, permit.TaskID, permit.ProjectID, permit.AgentID, permit.Model, permit.AccountID, permit.Completion, permit.CurrentAttemptID, permit.CreatedAt)
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to insert research permit: %w", err)
+	// Unmarshal review_models
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
 		}
 	}
 
-	// Now proceed with the normal claim logic
-	leaseExpiry := leaseExpiryTimestamp(leaseTTL)
+	taskTrack = t.Track
 
-	// Single conditional UPDATE reusing claimableSQL with additional model check
+	// Step 2: Check claimability BEFORE admission/debit (spec order requirement)
+	// Verify dependencies, holds, state, and model match
+	var isClaimable bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM task WHERE id = ? AND `+claimableSQL+`)`,
+		taskID, now_ts).Scan(&isClaimable)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to check claimability: %w", err)
+	}
+
+	if !isClaimable {
+		// Task exists but is not claimable (wrong state, unfinished deps, live lease, held, etc.)
+		if t.Model != model {
+			return Task{}, conflict("MODEL_MISMATCH", fmt.Sprintf("Task model '%s' does not match declared model '%s'", t.Model, model))
+		}
+		return Task{}, ErrConflict
+	}
+
+	// Step 3: Request admission for research tasks (after claimability verified)
+	if taskTrack == "research" && permitReq != nil {
+		// Look up existing request_id for idempotent replay (no double-debit on retry)
+		existing, err := getPermit(ctx, tx, "request_id", permitReq.RequestID)
+		if err == nil {
+			// Permit already exists - verify binding matches
+			if existing.TaskID != permitReq.TaskID || existing.ProjectID != permitReq.ProjectID ||
+				existing.AgentID != permitReq.AgentID || existing.Model != permitReq.Model ||
+				existing.AccountID != permitReq.AccountID || existing.Completion != permitReq.Class.Completion() {
+				return Task{}, ErrBindingMismatch
+			}
+			// Replay: use existing permit and its current attempt
+			// Verify attempt is in a valid state for replay
+			a, err := getAttempt(ctx, tx, existing.CurrentAttemptID)
+			if err != nil {
+				return Task{}, err
+			}
+			// If attempt is already failed or finalized, this is a stale replay - deny it
+			if a.State != AttemptActive {
+				// Attempt already completed or expired - this is a stale retry
+				// Return the original denial or final state
+				return Task{}, ErrConflict
+			}
+		} else if !errors.Is(err, ErrPermitNotFound) {
+			return Task{}, err
+		} else {
+			// New permit: request admission within transaction
+			permit := ResearchPermit{
+				ID:         GenerateID(),
+				RequestID:  permitReq.RequestID,
+				TaskID:     permitReq.TaskID,
+				ProjectID:  permitReq.ProjectID,
+				AgentID:    permitReq.AgentID,
+				Model:      permitReq.Model,
+				AccountID:  permitReq.AccountID,
+				Completion: permitReq.Class.Completion(),
+				CreatedAt:  formatTS(now),
+			}
+			a, denied, err := startAttempt(ctx, tx, now, permit, 1, nil, leaseTTL, permitReq.RetryHint)
+			if err != nil {
+				return Task{}, err
+			}
+			if denied != nil {
+				// Admission denied - preserve bounded diagnostics, don't claim task
+				// Denial error already contains retry information
+				return Task{}, denied
+			}
+			// Admission granted - insert permit in transaction
+			permit.CurrentAttemptID = a.ID
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO research_permit (id, request_id, task_id, project_id, agent_id, model, account_id, completion, current_attempt_id, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				permit.ID, permit.RequestID, permit.TaskID, permit.ProjectID, permit.AgentID, permit.Model, permit.AccountID, permit.Completion, permit.CurrentAttemptID, permit.CreatedAt)
+			if err != nil {
+				return Task{}, fmt.Errorf("failed to insert research permit: %w", err)
+			}
+		}
+	}
+
+	// Step 4: Claim the task (now that claimability and admission are verified)
+	leaseExpiry := leaseExpiryTimestamp(leaseTTL)
 	result, err := tx.ExecContext(ctx, `
 		UPDATE task
 		SET state='in_progress', assignee=?, lease_expires_at=?, updated_at=?
@@ -2011,46 +2074,39 @@ func (s *sqliteStore) ClaimTaskWithPermit(ctx context.Context, taskID, agentID, 
 		return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
 	}
 
-	if rowsAffected == 1 {
-		// Claim succeeded. Append event in the same transaction.
-		_, err := s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil)
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to append claim event: %w", err)
-		}
-
-		// SELECT the claimed task within the same transaction
-		var t Task
-		var reviewModelsJSON *string
-		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
-			FROM task WHERE id = ?
-		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to fetch claimed task: %w", err)
-		}
-
-		// Unmarshal review_models from JSON
-		t.ReviewModels = []string{}
-		if reviewModelsJSON != nil {
-			if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
-				return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
-		}
-
-		return t, nil
+	if rowsAffected != 1 {
+		// Task not claimed (state changed between steps 2 and 4, or lease expired)
+		// This is a race condition - return conflict
+		return Task{}, ErrConflict
 	}
 
-	// rowsAffected == 0: task was not claimed. Determine the cause for the right error.
-	if taskModel != model && isOtherwiseClaimable {
-		return Task{}, conflict("MODEL_MISMATCH", fmt.Sprintf("Task model '%s' does not match declared model '%s'", taskModel, model))
+	// Claim succeeded - append event
+	_, err = s.AppendEvent(ctx, tx, taskID, agentID, "claim", nil, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to append claim event: %w", err)
 	}
 
-	// Task exists but is not claimable for some reason
-	return Task{}, ErrConflict
+	// Fetch updated task
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch claimed task: %w", err)
+	}
+
+	// Unmarshal review_models
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return t, nil
 }
 
 // HeartbeatTask atomically extends the lease on an in_progress task.

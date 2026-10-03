@@ -295,7 +295,7 @@ func runServer() {
 	}
 
 	// Create API server
-	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, pprofEnabled, slowRequestThresholdMs, logger)
+	apiServer := api.New(s, authToken, leaseTTL, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, pprofEnabled, slowRequestThresholdMs, logger, researchPolicy)
 
 	// Set up graceful shutdown with signal handling
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
