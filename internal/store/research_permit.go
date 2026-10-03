@@ -23,16 +23,17 @@ import (
 // leaving in_progress. A start is never refunded.
 
 var (
-	ErrPoolNotFound         = errors.New("research pool not found")
-	ErrPermitNotFound       = errors.New("research permit not found")
-	ErrFenceMismatch        = errors.New("research attempt identity does not match the permit's current attempt")
-	ErrPermitExpired        = errors.New("research attempt lease expired")
-	ErrPermitFinalized      = errors.New("research attempt already finalized")
-	ErrBindingMismatch      = errors.New("request ID is already bound to a different task, agent, model or pool")
-	ErrTaskBusy             = errors.New("task already has a live research attempt")
-	ErrAttemptLive          = errors.New("previous research attempt is still live")
-	ErrInsufficientCapacity = errors.New("research pool has insufficient capacity")
-	ErrInvalidResearchInput = errors.New("invalid research permit input")
+	ErrPoolNotFound           = errors.New("research pool not found")
+	ErrPermitNotFound         = errors.New("research permit not found")
+	ErrFenceMismatch          = errors.New("research attempt identity does not match the permit's current attempt")
+	ErrPermitExpired          = errors.New("research attempt lease expired")
+	ErrPermitFinalized        = errors.New("research attempt already finalized")
+	ErrPermitIdentityMismatch = errors.New("permit identity does not match the provided task, model, or agent")
+	ErrBindingMismatch        = errors.New("request ID is already bound to a different task, agent, model or pool")
+	ErrTaskBusy               = errors.New("task already has a live research attempt")
+	ErrAttemptLive            = errors.New("previous research attempt is still live")
+	ErrInsufficientCapacity   = errors.New("research pool has insufficient capacity")
+	ErrInvalidResearchInput   = errors.New("invalid research permit input")
 )
 
 // Exit classes for a finalized attempt. ExitLeaseExpired is recorded by expiry
@@ -86,6 +87,7 @@ type ResearchPoolState struct {
 	SettledAt        string
 	Active           int
 	ActiveCompletion int
+	Deferred         int
 }
 
 // PermitRequest asks for one research start. Class must be a paced research
@@ -147,6 +149,8 @@ type PermitGrant struct {
 type ResearchPermitStore interface {
 	ConfigureResearchPool(ctx context.Context, now time.Time, cfg ResearchPoolConfig) (ResearchPoolState, error)
 	GetResearchPool(ctx context.Context, now time.Time, accountID string) (ResearchPoolState, error)
+	ListResearchPools(ctx context.Context) ([]ResearchPoolConfig, error)
+	ListResearchPoolStates(ctx context.Context, now time.Time) ([]ResearchPoolState, error)
 	RequestResearchPermit(ctx context.Context, now time.Time, req PermitRequest) (PermitGrant, error)
 	StartNextResearchAttempt(ctx context.Context, now time.Time, permitID, priorAttemptID string, leaseTTL, retryHint time.Duration) (PermitGrant, error)
 	RenewResearchAttempt(ctx context.Context, now time.Time, permitID, attemptID string, leaseTTL time.Duration) (ResearchAttempt, error)
@@ -410,6 +414,114 @@ func (s *sqliteStore) GetResearchPool(ctx context.Context, now time.Time, accoun
 		return ResearchPoolState{}, fmt.Errorf("failed to count research occupancy: %w", err)
 	}
 	return st, nil
+}
+
+// ListResearchPools reads all configured pools without changing them.
+func (s *sqliteStore) ListResearchPools(ctx context.Context) ([]ResearchPoolConfig, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT account_id, start_rate, burst_capacity, concurrent_limit, completion_reserved
+		FROM research_pool
+		ORDER BY account_id`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query research pools: %w", err)
+	}
+	defer rows.Close()
+
+	var pools []ResearchPoolConfig
+	for rows.Next() {
+		var cfg ResearchPoolConfig
+		if err := rows.Scan(&cfg.AccountID, &cfg.StartRate, &cfg.BurstCapacity, &cfg.ConcurrentLimit, &cfg.CompletionReserved); err != nil {
+			return nil, fmt.Errorf("failed to scan research pool: %w", err)
+		}
+		pools = append(pools, cfg)
+	}
+	return pools, rows.Err()
+}
+
+// ListResearchPoolStates reads all pools with their current state without changing them.
+func (s *sqliteStore) ListResearchPoolStates(ctx context.Context, now time.Time) ([]ResearchPoolState, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT account_id, start_rate, burst_capacity, concurrent_limit, completion_reserved, tokens, settled_at
+		FROM research_pool
+		ORDER BY account_id`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query research pools: %w", err)
+	}
+	defer rows.Close()
+
+	var states []ResearchPoolState
+	for rows.Next() {
+		var state ResearchPoolState
+		var settledAtStr string
+		if err := rows.Scan(&state.AccountID, &state.StartRate, &state.BurstCapacity, &state.ConcurrentLimit, &state.CompletionReserved, &state.Tokens, &settledAtStr); err != nil {
+			return nil, fmt.Errorf("failed to scan research pool: %w", err)
+		}
+
+		// Parse settled_at timestamp
+		settledAt, err := parseTS(settledAtStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse settled_at: %w", err)
+		}
+
+		// Settle the pool to the current time
+		at := settledAt
+		if now.After(settledAt) {
+			state.Tokens = math.Min(float64(state.BurstCapacity), state.Tokens+now.Sub(settledAt).Seconds()*state.StartRate)
+			at = now
+		}
+		state.SettledAt = formatTS(at)
+
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	// Counts run after the pool rows are drained so no query is nested inside an open cursor.
+	for i := range states {
+		state := &states[i]
+		at, err := parseTS(state.SettledAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse settled_at: %w", err)
+		}
+		// Count active attempts
+		var active, activeCompletion int
+		err = tx.QueryRowContext(ctx, `
+			SELECT COUNT(*), COALESCE(SUM(completion), 0) FROM research_attempt
+			WHERE account_id = ? AND state = 'active' AND expires_at > ?`, state.AccountID, formatTS(at)).Scan(&active, &activeCompletion)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count research occupancy: %w", err)
+		}
+		state.Active = active
+		state.ActiveCompletion = activeCompletion
+
+		// Count waiting tasks: non-hypothetical rate defers and concurrency retries whose task is still claimable (state='ready')
+		var deferred int
+		err = tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM research_admission_diagnostic
+			WHERE account_id = ? AND outcome IN ('defer', 'retry') AND hypothetical = 0 AND task_id IN (
+				SELECT id FROM task WHERE state = 'ready'
+			)`, state.AccountID).Scan(&deferred)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count deferred tasks: %w", err)
+		}
+		state.Deferred = deferred
+
+	}
+	return states, nil
 }
 
 const tokenEpsilon = 1e-9

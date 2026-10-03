@@ -376,3 +376,78 @@ func TestResearchClientAttemptSetExplicitly(t *testing.T) {
 		t.Fatalf("non-research claim recorded an attempt")
 	}
 }
+
+func (r *researchAPI) deferredCount() (int, int) {
+	r.t.Helper()
+	req := httptest.NewRequest("GET", "/research/status", nil)
+	req.Header.Set("Authorization", researchAuth)
+	w := httptest.NewRecorder()
+	r.server.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		r.t.Fatalf("status: %d: %s", w.Code, w.Body.String())
+	}
+	pools, _ := decodeBody(r.t, w)["pools"].([]any)
+	if len(pools) != 1 {
+		r.t.Fatalf("pools = %v", pools)
+	}
+	pool := pools[0].(map[string]any)
+	return int(pool["deferred"].(float64)), int(pool["active"].(float64))
+}
+
+func TestResearchStatusDeferredCountsRateAndConcurrencyDenials(t *testing.T) {
+	t.Run("concurrency retry", func(t *testing.T) {
+		r := newResearchAPI(t, policy.ModeEnforce, 5, 1)
+		admission(t, r.claim(r.task("research"), nil))
+		if w := r.claim(r.task("research"), nil); w.Code != http.StatusTooManyRequests {
+			t.Fatalf("claim: %d %s", w.Code, w.Body.String())
+		}
+		if d, a := r.deferredCount(); d != 1 || a != 1 {
+			t.Fatalf("deferred=%d active=%d, want 1/1", d, a)
+		}
+	})
+	t.Run("rate defer", func(t *testing.T) {
+		r := newResearchAPI(t, policy.ModeEnforce, 1, 5)
+		admission(t, r.claim(r.task("research"), nil))
+		if w := r.claim(r.task("research"), nil); w.Code != http.StatusTooManyRequests {
+			t.Fatalf("claim: %d %s", w.Code, w.Body.String())
+		}
+		if d, _ := r.deferredCount(); d != 1 {
+			t.Fatalf("deferred=%d, want 1", d)
+		}
+	})
+}
+
+func TestResearchStatusDeferredIgnoresObserveModeHypotheticalDenials(t *testing.T) {
+	r := newResearchAPI(t, policy.ModeObserve, 1, 1)
+	admission(t, r.claim(r.task("research"), nil))
+	b := r.task("research")
+	admission(t, r.claim(b, nil))
+	if got := apiGetTask(t, r.server, researchAuth, b); got.State != "in_progress" {
+		t.Fatalf("observe mode must grant the claim, state = %s", got.State)
+	}
+	d, err := r.server.store.GetResearchAdmissionDiagnostic(t.Context(), b)
+	if err != nil || !d.Hypothetical || (d.Outcome != policy.OutcomeRetry && d.Outcome != policy.OutcomeDefer) {
+		t.Fatalf("expected a hypothetical denial diagnostic, got %+v err=%v", d, err)
+	}
+	if got, _ := r.deferredCount(); got != 0 {
+		t.Fatalf("deferred=%d, want 0 for hypothetical denials", got)
+	}
+}
+
+func TestResearchStatusDeferredDropsTasksThatLeaveReady(t *testing.T) {
+	r := newResearchAPI(t, policy.ModeEnforce, 5, 1)
+	admission(t, r.claim(r.task("research"), nil))
+	b := r.task("research")
+	if w := r.claim(b, nil); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("claim: %d %s", w.Code, w.Body.String())
+	}
+	if got, _ := r.deferredCount(); got != 1 {
+		t.Fatalf("deferred=%d, want 1 while ready", got)
+	}
+	if _, err := r.server.store.TransitionTask(t.Context(), b, "blocked", nil); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	if got, _ := r.deferredCount(); got != 0 {
+		t.Fatalf("deferred=%d, want 0 after task left ready", got)
+	}
+}

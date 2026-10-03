@@ -47,6 +47,7 @@ type Store interface {
 	ResearchPermitStore
 	Close() error
 	Conn() *sql.DB
+	Now() time.Time
 	AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string, findings ...json.RawMessage) (Event, error)
 	ListEvents(ctx context.Context, taskID string) ([]Event, error)
 	PruneEvents(ctx context.Context, terminalRetentionDays int) (int64, error)
@@ -64,6 +65,7 @@ type Store interface {
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	ClaimResearchTask(ctx context.Context, req ResearchClaim) (ResearchClaimResult, error)
 	SetResearchPolicy(ctx context.Context, now time.Time, cfg policy.Config) error
+	GetResearchPolicyMode(ctx context.Context) (policy.Mode, error)
 	GetResearchAdmissionDiagnostic(ctx context.Context, taskID string) (ResearchAdmissionDiagnostic, error)
 	HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error)
 	PromoteTask(ctx context.Context, taskID string) (Task, error)
@@ -399,6 +401,14 @@ func (s *sqliteStore) Close() error {
 // Conn returns the underlying database connection for direct access.
 func (s *sqliteStore) Conn() *sql.DB {
 	return s.conn
+}
+
+// Now returns the current time using the store's clock (which may be mocked in tests).
+func (s *sqliteStore) Now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
 }
 
 // AppendEvent inserts a new event into the event table within an existing transaction.

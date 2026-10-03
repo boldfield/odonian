@@ -100,6 +100,10 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 
 	// Research endpoints (protected)
 	mux.HandleFunc("GET /projects/{id}/research/reviewers", wrapProtected("GET /projects/{id}/research/reviewers", server.handleGetResearchReviewerScorecards))
+	mux.HandleFunc("GET /research/policy", wrapProtected("GET /research/policy", server.handleGetResearchPolicy))
+	mux.HandleFunc("GET /research/status", wrapProtected("GET /research/status", server.handleGetResearchStatus))
+	mux.HandleFunc("POST /research/permits/{permit_id}/renew", wrapProtected("POST /research/permits/{permit_id}/renew", server.handleRenewResearchPermit))
+	mux.HandleFunc("POST /research/permits/{permit_id}/finalize", wrapProtected("POST /research/permits/{permit_id}/finalize", server.handleFinalizeResearchPermit))
 
 	// Task endpoints (protected)
 	mux.HandleFunc("POST /projects/{id}/tasks", wrapProtected("POST /projects/{id}/tasks", server.handleCreateTasks))
@@ -1416,4 +1420,277 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.encodeJSON(w, http.StatusOK, task)
+}
+
+// handleGetResearchPolicy handles GET /research/policy to read safe policy configuration.
+func (s *Server) handleGetResearchPolicy(w http.ResponseWriter, r *http.Request) {
+	pools, err := s.store.ListResearchPools(r.Context())
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "POLICY_ERROR", "Failed to read policy")
+		return
+	}
+
+	poolConfigs := make([]map[string]interface{}, 0, len(pools))
+	for _, p := range pools {
+		poolConfigs = append(poolConfigs, map[string]interface{}{
+			"account_id":          p.AccountID,
+			"start_rate":          p.StartRate,
+			"burst_capacity":      p.BurstCapacity,
+			"concurrent_limit":    p.ConcurrentLimit,
+			"completion_reserved": p.CompletionReserved,
+		})
+	}
+
+	mode, err := s.store.GetResearchPolicyMode(r.Context())
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "POLICY_ERROR", "Failed to read policy mode")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"mode":  string(mode),
+		"pools": poolConfigs,
+	})
+}
+
+// handleGetResearchStatus handles GET /research/status to read pool status without credentials.
+func (s *Server) handleGetResearchStatus(w http.ResponseWriter, r *http.Request) {
+	now := s.store.Now()
+	pools, err := s.store.ListResearchPoolStates(r.Context(), now)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "STATUS_ERROR", "Failed to read status")
+		return
+	}
+
+	poolStates := make([]map[string]interface{}, 0, len(pools))
+	for _, p := range pools {
+		poolStates = append(poolStates, map[string]interface{}{
+			"account_id":        p.AccountID,
+			"active":            p.Active,
+			"active_completion": p.ActiveCompletion,
+			"deferred":          p.Deferred,
+			"tokens":            p.Tokens,
+			"settled_at":        p.SettledAt,
+		})
+	}
+
+	mode, err := s.store.GetResearchPolicyMode(r.Context())
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "STATUS_ERROR", "Failed to read policy mode")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"mode":  string(mode),
+		"pools": poolStates,
+	})
+}
+
+// handleRenewResearchPermit handles POST /research/permits/{permit_id}/renew to extend a research attempt's lease.
+func (s *Server) handleRenewResearchPermit(w http.ResponseWriter, r *http.Request) {
+	permitID := r.PathValue("permit_id")
+	if permitID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_PERMIT_ID", "permit_id path parameter is required")
+		return
+	}
+
+	var payload struct {
+		TaskID    string `json:"task_id"`
+		Model     string `json:"model"`
+		AgentID   string `json:"agent_id"`
+		RequestID string `json:"request_id"`
+		AttemptID string `json:"attempt_id"`
+	}
+
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return
+	}
+
+	// Validate required fields
+	if payload.TaskID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_TASK_ID", "task_id is required")
+		return
+	}
+	if payload.Model == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_MODEL", "model is required")
+		return
+	}
+	if payload.AgentID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_AGENT_ID", "agent_id is required")
+		return
+	}
+	if payload.RequestID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_REQUEST_ID", "request_id is required")
+		return
+	}
+	if payload.AttemptID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_ATTEMPT_ID", "attempt_id is required")
+		return
+	}
+
+	now := s.store.Now()
+
+	// Load permit to validate identities
+	permit, _, err := s.store.GetResearchPermit(r.Context(), permitID)
+	if errors.Is(err, store.ErrPermitNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "PERMIT_NOT_FOUND", "Research permit not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "RENEW_ERROR", "Failed to load research permit")
+		return
+	}
+
+	// Validate identities
+	if permit.TaskID != payload.TaskID || permit.Model != payload.Model || permit.AgentID != payload.AgentID || permit.RequestID != payload.RequestID {
+		s.errorResponse(w, http.StatusConflict, "PERMIT_IDENTITY_MISMATCH", "Permit identity does not match the provided task, model, agent, or request")
+		return
+	}
+
+	attempt, err := s.store.RenewResearchAttempt(r.Context(), now, permitID, payload.AttemptID, s.leaseTTL)
+	if errors.Is(err, store.ErrPermitNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "PERMIT_NOT_FOUND", "Research permit not found")
+		return
+	}
+	if errors.Is(err, store.ErrFenceMismatch) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_FENCED", "Attempt ID does not match the permit's current attempt")
+		return
+	}
+	if errors.Is(err, store.ErrPermitExpired) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_EXPIRED", "Research attempt lease has expired")
+		return
+	}
+	if errors.Is(err, store.ErrPermitFinalized) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_FINALIZED", "Research attempt is already finalized")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "RENEW_ERROR", "Failed to renew research attempt")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"attempt": map[string]interface{}{
+			"id":         attempt.ID,
+			"permit_id":  attempt.PermitID,
+			"task_id":    attempt.TaskID,
+			"expires_at": attempt.ExpiresAt,
+			"state":      attempt.State,
+		},
+	})
+}
+
+// handleFinalizeResearchPermit handles POST /research/permits/{permit_id}/finalize to end a research attempt.
+func (s *Server) handleFinalizeResearchPermit(w http.ResponseWriter, r *http.Request) {
+	permitID := r.PathValue("permit_id")
+	if permitID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_PERMIT_ID", "permit_id path parameter is required")
+		return
+	}
+
+	var payload struct {
+		TaskID      string `json:"task_id"`
+		Model       string `json:"model"`
+		AgentID     string `json:"agent_id"`
+		RequestID   string `json:"request_id"`
+		AttemptID   string `json:"attempt_id"`
+		ExitClass   string `json:"exit_class"`
+		UsageTokens *int64 `json:"usage_tokens"`
+	}
+
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return
+	}
+
+	// Validate required fields
+	if payload.TaskID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_TASK_ID", "task_id is required")
+		return
+	}
+	if payload.Model == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_MODEL", "model is required")
+		return
+	}
+	if payload.AgentID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_AGENT_ID", "agent_id is required")
+		return
+	}
+	if payload.RequestID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_REQUEST_ID", "request_id is required")
+		return
+	}
+	if payload.AttemptID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_ATTEMPT_ID", "attempt_id is required")
+		return
+	}
+	if payload.ExitClass == "" {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_EXIT_CLASS", "exit_class is required")
+		return
+	}
+
+	// Validate exit_class
+	switch payload.ExitClass {
+	case store.ExitCompleted, store.ExitFailed, store.ExitCancelled, store.ExitUnknown:
+		// valid
+	default:
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_EXIT_CLASS", "exit_class must be one of: completed, failed, cancelled, unknown")
+		return
+	}
+
+	// Validate usage_tokens if provided
+	if payload.UsageTokens != nil && *payload.UsageTokens < 0 {
+		s.errorResponse(w, http.StatusBadRequest, "INVALID_USAGE_TOKENS", "usage_tokens must be non-negative")
+		return
+	}
+
+	now := s.store.Now()
+
+	// Load permit to validate identities
+	permit, _, err := s.store.GetResearchPermit(r.Context(), permitID)
+	if errors.Is(err, store.ErrPermitNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "PERMIT_NOT_FOUND", "Research permit not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FINALIZE_ERROR", "Failed to load research permit")
+		return
+	}
+
+	// Validate identities
+	if permit.TaskID != payload.TaskID || permit.Model != payload.Model || permit.AgentID != payload.AgentID || permit.RequestID != payload.RequestID {
+		s.errorResponse(w, http.StatusConflict, "PERMIT_IDENTITY_MISMATCH", "Permit identity does not match the provided task, model, agent, or request")
+		return
+	}
+
+	attempt, err := s.store.FinalizeResearchAttempt(r.Context(), now, permitID, payload.AttemptID, payload.ExitClass, payload.UsageTokens)
+	if errors.Is(err, store.ErrPermitNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "PERMIT_NOT_FOUND", "Research permit not found")
+		return
+	}
+	if errors.Is(err, store.ErrFenceMismatch) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_FENCED", "Attempt ID does not match the permit's current attempt")
+		return
+	}
+	if errors.Is(err, store.ErrPermitExpired) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_EXPIRED", "Research attempt lease has expired")
+		return
+	}
+	if errors.Is(err, store.ErrPermitFinalized) {
+		s.errorResponse(w, http.StatusConflict, "ATTEMPT_FINALIZED", "Research attempt is already finalized")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FINALIZE_ERROR", "Failed to finalize research attempt")
+		return
+	}
+
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{
+		"attempt": map[string]interface{}{
+			"id":         attempt.ID,
+			"permit_id":  attempt.PermitID,
+			"task_id":    attempt.TaskID,
+			"state":      attempt.State,
+			"exit_class": attempt.ExitClass,
+		},
+	})
 }
