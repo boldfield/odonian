@@ -470,13 +470,14 @@ dispatch() {
   fi
 
   CLAUDE_PID=$!   # tracked so request_stop()/cleanup() can tear down this claude's process group
-  local pid=$CLAUDE_PID rc=0 task_id="${ODONIAN_TASK_ID:-}" permit_id="${ODONIAN_PRECLAIMED_PERMIT_ID:-}" attempt_id="${ODONIAN_PRECLAIMED_ATTEMPT_ID:-}"
+  local pid=$CLAUDE_PID rc task_id="${ODONIAN_TASK_ID:-}" permit_id="${ODONIAN_PRECLAIMED_PERMIT_ID:-}" attempt_id="${ODONIAN_PRECLAIMED_ATTEMPT_ID:-}"
   local last_renew=$(date +%s)
 
+  # Poll for child completion while running permit renewal. Use a polling loop instead of blocking
+  # wait so renewal can execute while the child is alive. When the child exits, wait will return
+  # its exit code.
   while kill -0 "$pid" 2>/dev/null; do
     sleep 1
-    wait "$pid" 2>/dev/null && break
-
     if [ -n "$permit_id" ] && [ -n "$attempt_id" ] && [ -n "$task_id" ]; then
       local now=$(date +%s)
       if [ $((now - last_renew)) -ge 30 ]; then
@@ -485,6 +486,9 @@ dispatch() {
       fi
     fi
   done
+
+  # Child has exited; capture its exit code
+  wait "$pid" 2>/dev/null
   rc=$?
 
   CLAUDE_PID=""
@@ -596,7 +600,7 @@ if [ "$MULTI" = 0 ]; then
           echo "[$AGENT_ID] $(date '+%H:%M:%S') research admission failed for $task_id; skipping"; nap 10; continue
         fi
 
-        ODONIAN_PRECLAIMED_TASK_ID=$(extract_admission_field "$admission_output" "task_id")
+        ODONIAN_PRECLAIMED_TASK_ID="$task_id"
         ODONIAN_PRECLAIMED_ATTEMPT_ID=$(extract_admission_field "$admission_output" "attempt_id")
         ODONIAN_PRECLAIMED_PERMIT_ID=$(extract_admission_field "$admission_output" "permit_id")
         ODONIAN_TASK_ID="$task_id"
@@ -691,7 +695,7 @@ while true; do
         continue
       fi
 
-      ODONIAN_PRECLAIMED_TASK_ID=$(extract_admission_field "$admission_output" "task_id")
+      ODONIAN_PRECLAIMED_TASK_ID="$task_id"
       ODONIAN_PRECLAIMED_ATTEMPT_ID=$(extract_admission_field "$admission_output" "attempt_id")
       ODONIAN_PRECLAIMED_PERMIT_ID=$(extract_admission_field "$admission_output" "permit_id")
       ODONIAN_TASK_ID="$task_id"
