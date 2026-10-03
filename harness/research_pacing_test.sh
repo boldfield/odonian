@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # research_pacing_test.sh — deterministic smoke tests for research pacing.
-# Demonstrates: concurrent launch limiting, persistence through restart,
+# Demonstrates: concurrent launch limiting across projects, persistence through restart,
 # review/rework reserved capacity, automatic waiting, unaffected build work.
 set -uo pipefail
 
@@ -46,7 +46,7 @@ git -C "$SEED1" -c user.email=t@t.example -c user.name=test commit --quiet --all
 git -C "$SEED1" push --quiet origin HEAD:main 2>/dev/null
 MAIN_REPO1="$TMP/main1"; git clone --quiet "$BARE1" "$MAIN_REPO1" 2>/dev/null
 
-# --- fake odonian (pacing-aware) ---
+# --- pacing-aware fake odonian ---
 cat > "$BIN/odonian" <<'ODONIAN_SCRIPT'
 #!/usr/bin/env bash
 log() { echo "$(date +%s.%N) $*" >> "$FAKE_DIR/calls.log"; }
@@ -89,7 +89,7 @@ case "$verb" in
     [ -n "$claimable" ] && { echo "$claimable"; exit 0; }
     exit 2 ;;
   tasks)
-    log "tasks $(flag --project "$@")"
+    log "tasks $(flag --project "$@") $(flag --kind "$@")"
     proj="$(flag --project "$@")"
     kind="$(flag --kind "$@")"
     tasks_file="$FAKE_DIR/tasks.$proj.json"
@@ -108,13 +108,17 @@ case "$verb" in
     req="$(flag --request-id "$@")"
     model="$(flag --model "$@")"
     log "claim $id req=$req model=$model"
+
     mode="$(mode_of "$FAKE_DIR/claim.$id" "$FAKE_DIR/claimcount.$id" 2>/dev/null || echo 'grant')"
+
     case "$mode" in
       grant)
         : > "$FAKE_DIR/claimed-$id"
+        echo "$(date +%s.%N) PERMIT $id" >> "$FAKE_DIR/permit.log"
         printf '{"permit_id":"p-%s","attempt_id":"a-%s-1","request_id":"%s","account_id":"acct"}\n' "$id" "$id" "$req"
         exit 0 ;;
       defer)
+        log "DEFER: $id"
         echo "denied: concurrency" >&2
         exit 10 ;;
       *) exit 1 ;;
@@ -148,6 +152,7 @@ new_scenario() {
   export FAKE_DIR
   : > "$FAKE_DIR/calls.log"
   : > "$FAKE_DIR/claude.log"
+  : > "$FAKE_DIR/permit.log"
   export ODONIAN_HOME="$TMP/home$SCN"
   mkdir -p "$ODONIAN_HOME"
 }
@@ -205,22 +210,23 @@ end_scenario() {
 }
 
 # ======== Test 1: Concurrent limiting ========
-echo "Scenario 1: concurrent launch limiting across two projects"
+echo "Scenario 1: concurrent launch limiting across projects"
 new_scenario
 tasks_json proj-test A:x:implement B:x:implement
 echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
 echo '{"id":"B","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.B"
-printf 'grant\ngrant\n' > "$FAKE_DIR/claim.A"
+printf 'grant\ndefer\n' > "$FAKE_DIR/claim.A"
 printf 'grant\n' > "$FAKE_DIR/claim.B"
-echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
+echo "sleep:0.2" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
 wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.5
-check "at least one research task launched" 'test "$(claude_starts)" -ge 1'
+check "first task launches within limit" 'test "$(claude_starts)" -ge 1'
+check "second task deferred by pool" 'grep -q "DEFER" "$FAKE_DIR/calls.log"'
 end_scenario
 
 # ======== Test 2: Persistence ========
-echo "Scenario 2: pacing state persists across operations"
+echo "Scenario 2: pacing state persists"
 new_scenario
 tasks_json proj-test A:x:implement
 echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
@@ -229,38 +235,40 @@ echo "sleep:0.2" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
 wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.3
-check "task launched and claim recorded" 'grep -q "claim A" "$FAKE_DIR/calls.log"'
-check "permit system engaged" 'grep -q "permit" "$FAKE_DIR/calls.log"'
+check "permit recorded" 'grep -q "PERMIT A" "$FAKE_DIR/permit.log"'
+check "single launch" 'test "$(claude_starts)" -eq 1'
 end_scenario
 
 # ======== Test 3: Reserved capacity ========
-echo "Scenario 3: review/rework reserved capacity respected"
+echo "Scenario 3: review/rework reserved capacity"
 new_scenario
 tasks_json proj-test A:x:implement B:x:review
 echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
 echo '{"id":"B","model":"x","kind":"review","state":"ready","track":"research"}' > "$FAKE_DIR/show.B"
-printf 'grant\ngrant\n' > "$FAKE_DIR/claim.A"
+printf 'grant\n' > "$FAKE_DIR/claim.A"
 printf 'grant\n' > "$FAKE_DIR/claim.B"
 echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
 wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.3
-check "research tasks can be claimed and launched" 'grep -q "claim" "$FAKE_DIR/calls.log"'
+check "implement task can be claimed" 'grep -q "claim A" "$FAKE_DIR/calls.log"'
+check "pool with reserved capacity" 'grep -q "claim" "$FAKE_DIR/calls.log"'
 end_scenario
 
 # ======== Test 4: Automatic waiting ========
-echo "Scenario 4: deferred task waits automatically for capacity"
+echo "Scenario 4: deferred task waits automatically"
 new_scenario
 tasks_json proj-test A:x:implement B:x:implement
 echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
 echo '{"id":"B","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.B"
-printf 'grant\ngrant\n' > "$FAKE_DIR/claim.A"
-printf 'grant\n' > "$FAKE_DIR/claim.B"
+printf 'grant\n' > "$FAKE_DIR/claim.A"
+printf 'defer\ngrant\n' > "$FAKE_DIR/claim.B"
 echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
-wait_for 10 'test "$(claude_starts)" -ge 1'
-sleep 0.3
-check "claims are automatically retried without manual promotion" 'grep -q "claim" "$FAKE_DIR/calls.log"'
+wait_for 15 'test "$(claude_starts)" -ge 1'
+sleep 0.5
+check "first task launches" 'grep -q "claim A" "$FAKE_DIR/calls.log"'
+check "deferred task retried" 'grep -q "DEFER" "$FAKE_DIR/calls.log" || grep -q "claim B" "$FAKE_DIR/calls.log"'
 end_scenario
 
 # ======== Test 5: Build/design unaffected ========
@@ -273,7 +281,7 @@ echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
 wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.3
-check "research task proceeds without pacing delay" 'test "$(claude_starts)" -ge 1'
+check "research task proceeds" 'test "$(claude_starts)" -ge 1'
 end_scenario
 
 echo

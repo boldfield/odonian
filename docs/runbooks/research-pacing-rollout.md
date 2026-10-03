@@ -45,53 +45,54 @@ systemctl restart odonian
 
 Dispatch duration is the time from task launch to completion. This determines sustainable start_rate.
 
-**Method 1: Log-based observation (simplest)**
+**Method 1: Permit-based observation (simplest)**
 
 ```bash
-# Extract dispatch durations from server logs
+# Extract dispatch durations from research_attempt
 sqlite3 $ODONIAN_DB <<'SQL'
 SELECT 
   task_id,
-  model,
   datetime(started_at) as start_time,
-  datetime(completed_at) as end_time,
-  CAST((julianday(completed_at) - julianday(started_at)) * 86400 AS INTEGER) as duration_seconds
-FROM research_attempts
-WHERE completed_at IS NOT NULL
+  datetime(ended_at) as end_time,
+  duration_ms / 1000.0 as duration_seconds,
+  state
+FROM research_attempt
+WHERE state IN ('finalized', 'expired')
   AND started_at > datetime('now', '-1 day')
-ORDER BY completed_at DESC;
+ORDER BY ended_at DESC;
 SQL
 
-# Calculate statistics
+# Calculate statistics by completion type
 sqlite3 $ODONIAN_DB <<'SQL'
 SELECT 
-  model,
-  COUNT(*) as completed_tasks,
-  ROUND(AVG(CAST((julianday(completed_at) - julianday(started_at)) * 86400 AS INTEGER)), 1) as avg_duration_sec,
-  ROUND(MAX(CAST((julianday(completed_at) - julianday(started_at)) * 86400 AS INTEGER)), 1) as max_duration_sec,
-  ROUND(MIN(CAST((julianday(completed_at) - julianday(started_at)) * 86400 AS INTEGER)), 1) as min_duration_sec
-FROM research_attempts
-WHERE completed_at IS NOT NULL
+  completion,
+  COUNT(*) as completed_attempts,
+  ROUND(AVG(duration_ms) / 1000.0, 1) as avg_duration_sec,
+  ROUND(MAX(duration_ms) / 1000.0, 1) as max_duration_sec,
+  ROUND(MIN(duration_ms) / 1000.0, 1) as min_duration_sec
+FROM research_attempt
+WHERE state IN ('finalized', 'expired')
   AND started_at > datetime('now', '-1 day')
-GROUP BY model;
+GROUP BY completion;
 SQL
 ```
 
-### Observing Hypothetical Deferrals
+### Observing Active Permits
 
-In observe mode, the server evaluates policy but admits all tasks. Check what would have been deferred.
+In observe mode, the server evaluates policy but admits all tasks. Track active permits to understand load.
 
 ```bash
-# Count hypothetical deferrals by reason
+# Count active permits by account and completion type
 sqlite3 $ODONIAN_DB <<'SQL'
 SELECT 
   account_id,
-  denial_reason,
-  COUNT(*) as hypothetical_denials
-FROM research_hypothetical_denials
-WHERE evaluated_at > datetime('now', '-1 day')
-GROUP BY account_id, denial_reason
-ORDER BY hypothetical_denials DESC;
+  SUM(CASE WHEN completion = 0 THEN 1 ELSE 0 END) as active_writer_attempts,
+  SUM(CASE WHEN completion = 1 THEN 1 ELSE 0 END) as active_completion_attempts,
+  COUNT(*) as total_active_attempts
+FROM research_attempt
+WHERE state = 'active'
+GROUP BY account_id
+ORDER BY total_active_attempts DESC;
 SQL
 ```
 
@@ -100,51 +101,54 @@ SQL
 Headroom is the difference between your subscription's concurrent limit and your actual peak concurrent usage.
 
 ```bash
-# Current active permits (running dispatches)
+# Current active attempts (running dispatches)
 sqlite3 $ODONIAN_DB <<'SQL'
-SELECT account_id, COUNT(*) as active_permits
-FROM research_permits
-WHERE finalized_at IS NULL
+SELECT account_id, COUNT(*) as active_attempts
+FROM research_attempt
+WHERE state = 'active'
 GROUP BY account_id;
 SQL
 
-# Peak concurrent observed in the last 24 hours
+# Peak concurrent observed in the last 24 hours (by completion type)
 sqlite3 $ODONIAN_DB <<'SQL'
 SELECT 
   account_id,
-  MAX(active_at_time) as peak_concurrent,
-  datetime(sample_time) as when_peak_occurred
+  MAX(CASE WHEN completion = 0 THEN active_writers ELSE 0 END) as peak_writers,
+  MAX(CASE WHEN completion = 1 THEN active_completion ELSE 0 END) as peak_completion
 FROM (
   SELECT 
     account_id,
-    strftime('%Y-%m-%d %H:00:00', started_at) as sample_time,
-    COUNT(*) as active_at_time
-  FROM research_attempts
-  WHERE started_at > datetime('now', '-1 day')
-  GROUP BY account_id, sample_time
+    strftime('%Y-%m-%d %H:00:00', started_at) as hour,
+    SUM(CASE WHEN completion = 0 THEN 1 ELSE 0 END) as active_writers,
+    SUM(CASE WHEN completion = 1 THEN 1 ELSE 0 END) as active_completion
+  FROM research_attempt
+  WHERE state = 'active' AND started_at > datetime('now', '-1 day')
+  GROUP BY account_id, hour
 )
 GROUP BY account_id;
 SQL
 ```
 
 **Interpreting headroom:**
-- If your subscription allows 10 concurrent and peak observed is 4, headroom = 60%
+- Your pool's concurrent_dispatch_limit defines the allowed concurrent slot count
+- Peak concurrent usage is the maximum active_attempts observed
+- Headroom = (limit - peak) / limit
 - Rule of thumb: keep 30-50% headroom for variance and future growth
 - Headroom of less than 20% indicates you're running tight
 
 ### Checking Durable State Across Restarts
 
-Verify that research permits persist across server restarts.
+Verify that research attempts persist across server restarts.
 
 ```bash
-# Before restart: record active permits
-sqlite3 $ODONIAN_DB "SELECT task_id, permit_id FROM research_permits WHERE finalized_at IS NULL LIMIT 5;"
+# Before restart: record active attempts
+sqlite3 $ODONIAN_DB "SELECT task_id, permit_id FROM research_attempt WHERE state = 'active' LIMIT 5;"
 
 # Restart server
 systemctl restart odonian
 
-# After restart: verify permits still exist
-sqlite3 $ODONIAN_DB "SELECT task_id, permit_id FROM research_permits WHERE finalized_at IS NULL LIMIT 5;"
+# After restart: verify attempts still exist
+sqlite3 $ODONIAN_DB "SELECT task_id, permit_id FROM research_attempt WHERE state = 'active' LIMIT 5;"
 
 # Compare: same permit_ids should exist, no duplicates
 ```
@@ -181,8 +185,8 @@ ps aux | grep -E 'agent\.sh.*--kind (implement|review)' | head -20
 export ODONIAN_PROJECT=""
 
 # Step 2: Wait for in-flight tasks to complete
-# Monitor active_permits count
-watch -n 10 'sqlite3 $ODONIAN_DB "SELECT COUNT(*) FROM research_permits WHERE finalized_at IS NULL;"'
+# Monitor active attempts count
+watch -n 10 'sqlite3 $ODONIAN_DB "SELECT COUNT(*) FROM research_attempt WHERE state = '\''active'\'';"'
 
 # When count reaches 0: all permits have been finalized
 
@@ -197,7 +201,7 @@ tail -f /var/log/odonian/agent.log | grep PRECLAIMED
 
 **During drain:**
 - Users can continue submitting research tasks; they'll queue in `backlog`
-- In-flight tasks complete normally; their permits release
+- In-flight tasks complete normally; their attempts release
 - Review and rework tasks (if any) continue to launch
 - No user-visible disruption
 
@@ -249,34 +253,36 @@ tail -20 /var/log/odonian/server.log | grep -i "policy\|pool\|research"
 
 ### Monitor First 24 Hours
 
-After enabling enforce mode:
+After enabling enforce mode, observe attempt completion patterns to validate your pool configuration:
 
 ```bash
-# Check deferral distribution by reason
+# Check completions by exit class (success vs failure modes)
 sqlite3 $ODONIAN_DB <<'SQL'
 SELECT 
-  denial_reason,
-  COUNT(*) as deferrals
-FROM research_deferrals
-WHERE deferred_at > datetime('now', '-24 hours')
-GROUP BY denial_reason
-ORDER BY deferrals DESC;
+  exit_class,
+  completion,
+  COUNT(*) as count
+FROM research_attempt
+WHERE ended_at > datetime('now', '-24 hours')
+GROUP BY exit_class, completion
+ORDER BY count DESC;
 SQL
 
-# Check active dispatch count trend
+# Check attempt duration distribution (retries and waiting times)
 sqlite3 $ODONIAN_DB <<'SQL'
 SELECT 
-  strftime('%Y-%m-%d %H:00', finalized_at) as hour,
-  COUNT(*) as completions
-FROM research_permits
-WHERE finalized_at > datetime('now', '-24 hours')
-GROUP BY hour
-ORDER BY hour DESC;
+  sequence_number,
+  COUNT(*) as attempts,
+  ROUND(AVG(duration_ms) / 1000.0, 1) as avg_duration_sec
+FROM research_attempt
+WHERE started_at > datetime('now', '-24 hours')
+GROUP BY sequence_number
+ORDER BY sequence_number;
 SQL
 
-# If 'concurrency' is the top deferral reason → your concurrent_dispatch_limit is too low
-# If 'rate' is the top reason → your start_rate is too conservative
-# Adjust and restart as needed
+# If many multi-sequence attempts → deferral is happening; may need higher concurrent_dispatch_limit
+# If completion attempts are slow → may need higher completion_reserved
+# Monitor server logs for "denied: concurrency" messages to understand deferral patterns
 ```
 
 ## Phase 4: Inspection and Tuning
@@ -351,17 +357,17 @@ tail -10 /var/log/odonian/server.log
 ### Verification After Rollback
 
 ```bash
-# Check that no new deferrals are recorded
-sqlite3 $ODONIAN_DB <<'SQL'
-SELECT COUNT(*) FROM research_deferrals
-WHERE deferred_at > datetime('now', '-5 minutes');
-SQL
-
-# Should return 0
-
-# Check server logs for mode
-grep "policy mode" /var/log/odonian/server.log | tail -1
+# Confirm policy mode is disabled
+grep "policy mode\|research.*mode" /var/log/odonian/server.log | tail -3
 # Should show: "policy mode: disabled"
+
+# Check that active attempts continue to completion (no stuck attempts)
+sqlite3 $ODONIAN_DB <<'SQL'
+SELECT COUNT(*) as stuck_active
+FROM research_attempt
+WHERE state = 'active' AND started_at < datetime('now', '-30 minutes');
+SQL
+# Should return 0 (old active attempts should have finalized)
 ```
 
 ## Phase 6: Re-enable After Root Cause Fix
@@ -440,43 +446,41 @@ All research pacing state is stored in SQLite database (WAL-enabled).
 ### What Persists
 
 ```sql
--- Active permits (in-flight tasks)
-SELECT task_id, permit_id, started_at FROM research_permits 
-WHERE finalized_at IS NULL;
+-- Active attempts (in-flight tasks)
+SELECT task_id, permit_id, state, started_at FROM research_attempt 
+WHERE state = 'active';
 
--- Permit accounting (how many starts used this hour)
-SELECT account_id, starts_used_this_window FROM research_accounts;
+-- Pool accounting (start_rate token bucket state)
+SELECT account_id, tokens, settled_at FROM research_pool;
 
--- Task assignment to agent (prevents duplicate claims)
-SELECT task_id, agent_id, claimed_at FROM research_claims;
+-- Permit records (no duplicate claims)
+SELECT task_id, permit_id, current_attempt_id FROM research_permit;
 ```
 
 ### Restart Guarantees
 
 - **No duplicate permits:** A task with a permit will not be re-admitted after restart
-- **State preserved:** Permit leases are not reset; they continue their original timeline
-- **No lost starts:** Rate window accounting is exact across restarts
+- **Permit attempts resume:** Active attempts continue with their original timeline
+- **Pool state exact:** Rate window accounting is preserved across restarts
 
 ### Crash Safety
 
-If the server crashes during a permit operation:
+If the server crashes during an attempt operation:
 
 ```bash
-# Permit is in one of three states:
-# 1. Fully committed (record in research_permits table) → survives crash
-# 2. In-flight (not yet committed) → lost, but agent will retry and get new permit
-# 3. Finalized → persisted, won't be reused
+# Attempt is in one of three states:
+# 1. Fully committed (in research_attempt table with state='active') → survives crash
+# 2. In-flight (not yet committed) → lost, but agent will retry and get new attempt
+# 3. Finalized/expired → persisted, won't be reused
 
-# Verify no orphaned permits:
+# Verify no orphaned attempts (attempts that expired during downtime):
 sqlite3 $ODONIAN_DB <<'SQL'
-SELECT COUNT(*) as orphaned
-FROM research_permits
-WHERE finalized_at IS NULL
-  AND started_at < datetime('now', '-1 hour')
-  AND lease_expires_at < datetime('now');
+SELECT COUNT(*) as expired_during_downtime
+FROM research_attempt
+WHERE state = 'expired' AND ended_at > datetime('now', '-30 minutes');
 SQL
 
-# If orphaned > 0: permits have expired and are no longer active
+# These are expected after restart if the server was down
 ```
 
 ## Troubleshooting
@@ -488,25 +492,25 @@ SQL
 **Diagnosis:**
 ```bash
 # Check policy mode
-systemctl status odonian | grep policy
+grep "policy mode" /var/log/odonian/server.log | tail -1
 
-# Check pool configuration for errors
-systemctl status odonian | grep -i "pool\|error\|invalid"
+# Check pool configuration loaded
+grep "pool" /var/log/odonian/server.log | grep -i "load\|error"
 
 # Check start_rate value
-sqlite3 $ODONIAN_DB "SELECT account_id, start_rate FROM research_pool_config;"
+sqlite3 $ODONIAN_DB "SELECT account_id, start_rate FROM research_pool;"
 ```
 
 **Fix:**
 - If start_rate = 0: increase it
 - If mode = disabled/observe: change to enforce
-- If no permit finalization: check why completion_reserved is too high
+- If no attempt finalization: check why completion_reserved is too high
 
-### Permit leak (active_permits growing)
+### Attempt leak (active_attempts growing indefinitely)
 
-**Symptom:** `SELECT COUNT(*) FROM research_permits WHERE finalized_at IS NULL;` keeps increasing.
+**Symptom:** `SELECT COUNT(*) FROM research_attempt WHERE state = 'active';` keeps growing.
 
-**Diagnosis:** Permits are not being finalized (tasks not completing or agent not calling permit-finalize).
+**Diagnosis:** Attempts are not finalizing (tasks not completing or agent not calling permit-finalize).
 
 **Fix:**
 ```bash
@@ -516,32 +520,31 @@ ps aux | grep agent.sh
 # Check agent logs for errors
 tail -100 /var/log/odonian/agent.log | grep -i "permit\|error\|finalize"
 
-# Force finalize old permits (⚠️ only if > 1 hour old and no agent touching them)
+# Identify old attempts that should have finalized
 sqlite3 $ODONIAN_DB <<'SQL'
-UPDATE research_permits
-SET finalized_at = datetime('now'),
-    exit_class = 'unknown'
-WHERE finalized_at IS NULL
-  AND started_at < datetime('now', '-1 hour')
-  AND lease_expires_at < datetime('now');
+SELECT task_id, permit_id, started_at
+FROM research_attempt
+WHERE state = 'active' AND started_at < datetime('now', '-1 hour');
 SQL
+# If many: task execution is stalled or agent isn't calling permit-finalize
 ```
 
-### Clock skew issues
+### Expires_at timing issues
 
-**Symptom:** Permits expire prematurely or never expire; lease_expires_at is in the past.
+**Symptom:** Attempts show expires_at in the past but state is still active.
 
 **Diagnosis:** Server clock has jumped or is out of sync.
 
 **Fix:**
 - Use gradual NTP slew correction (not step): `ntpd`, `chrony`
 - Avoid `date -s` (manual step setting)
-- On restart: database will recompute lease times based on current clock
+- Monitor: `ntpq -p` to check sync status
+- On restart: database will recompute expiry times based on current clock
 
 ## Contacts and Escalation
 
 - **Policy questions:** Check `docs/features/research-pacing-and-reviewer-evaluation.md`
-- **Operational issues:** Check server logs and `research_permits` table state
+- **Operational issues:** Check server logs and `research_attempt`/`research_permit` table state
 - **Emergency disable:** Set `ODONIAN_RESEARCH_POLICY_MODE=disabled` and restart
 
 ---
