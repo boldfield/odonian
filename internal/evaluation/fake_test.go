@@ -144,8 +144,13 @@ func TestFakeAdapterUnsupportedMode(t *testing.T) {
 		ResultPath: resultPath,
 	}
 
-	reqData, _ := json.Marshal(req)
-	os.WriteFile(requestPath, reqData, 0644)
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
 
 	cfg := FakeAdapterConfig{
 		Mode:           FakeModeUnsupported,
@@ -160,9 +165,14 @@ func TestFakeAdapterUnsupportedMode(t *testing.T) {
 		t.Fatalf("execution failed: %v", err)
 	}
 
-	resultData, _ := os.ReadFile(resultPath)
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result failed: %v", err)
+	}
 	var response CandidateResponse
-	json.Unmarshal(resultData, &response)
+	if err := json.Unmarshal(resultData, &response); err != nil {
+		t.Fatalf("unmarshal result failed: %v", err)
+	}
 
 	if response.Status != "unsupported" {
 		t.Errorf("expected unsupported status, got %s", response.Status)
@@ -189,8 +199,13 @@ func TestFakeAdapterInterruptedMode(t *testing.T) {
 		ResultPath:   resultPath,
 	}
 
-	reqData, _ := json.Marshal(req)
-	os.WriteFile(requestPath, reqData, 0644)
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
 
 	cfg := FakeAdapterConfig{
 		Mode:           FakeModeInterrupted,
@@ -204,9 +219,14 @@ func TestFakeAdapterInterruptedMode(t *testing.T) {
 		t.Fatalf("execution failed: %v", err)
 	}
 
-	resultData, _ := os.ReadFile(resultPath)
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result failed: %v", err)
+	}
 	var response CandidateResponse
-	json.Unmarshal(resultData, &response)
+	if err := json.Unmarshal(resultData, &response); err != nil {
+		t.Fatalf("unmarshal result failed: %v", err)
+	}
 
 	if response.Status != "incomplete" {
 		t.Errorf("expected incomplete status, got %s", response.Status)
@@ -230,8 +250,13 @@ func TestFakeAdapterFailedMode(t *testing.T) {
 		ResultPath:   resultPath,
 	}
 
-	reqData, _ := json.Marshal(req)
-	os.WriteFile(requestPath, reqData, 0644)
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
 
 	cfg := FakeAdapterConfig{
 		Mode:           FakeModeExecutionFail,
@@ -246,9 +271,14 @@ func TestFakeAdapterFailedMode(t *testing.T) {
 		t.Fatalf("execution failed: %v", err)
 	}
 
-	resultData, _ := os.ReadFile(resultPath)
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result failed: %v", err)
+	}
 	var response CandidateResponse
-	json.Unmarshal(resultData, &response)
+	if err := json.Unmarshal(resultData, &response); err != nil {
+		t.Fatalf("unmarshal result failed: %v", err)
+	}
 
 	if response.Status != "failed" {
 		t.Errorf("expected failed status, got %s", response.Status)
@@ -283,35 +313,58 @@ func TestFakeAdapterDeterministicExecution(t *testing.T) {
 	}
 
 	// Run 1
-	req1Data, _ := json.Marshal(req)
+	req1Data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request 1 failed: %v", err)
+	}
 	req1Path := filepath.Join(tmpDir, "request1.json")
 	result1Path := filepath.Join(tmpDir, "result1.json")
-	os.WriteFile(req1Path, req1Data, 0644)
+	if err := os.WriteFile(req1Path, req1Data, 0644); err != nil {
+		t.Fatalf("write request 1 failed: %v", err)
+	}
 
 	if err := ExecuteFakeAdapter(req1Path, result1Path, cfg); err != nil {
 		t.Fatalf("first execution failed: %v", err)
 	}
 
-	result1Data, _ := os.ReadFile(result1Path)
+	result1Data, err := os.ReadFile(result1Path)
+	if err != nil {
+		t.Fatalf("read result 1 failed: %v", err)
+	}
 	var response1 CandidateResponse
-	json.Unmarshal(result1Data, &response1)
+	if err := json.Unmarshal(result1Data, &response1); err != nil {
+		t.Fatalf("unmarshal result 1 failed: %v", err)
+	}
 
 	// Run 2 with same config
 	req.RunID = "test-deterministic-1" // Same RunID
-	req2Data, _ := json.Marshal(req)
+	req2Data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request 2 failed: %v", err)
+	}
 	req2Path := filepath.Join(tmpDir, "request2.json")
 	result2Path := filepath.Join(tmpDir, "result2.json")
 	req.ResultPath = result2Path
-	req2Data, _ = json.Marshal(req)
-	os.WriteFile(req2Path, req2Data, 0644)
+	req2Data, err = json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request 2 (updated) failed: %v", err)
+	}
+	if err := os.WriteFile(req2Path, req2Data, 0644); err != nil {
+		t.Fatalf("write request 2 failed: %v", err)
+	}
 
 	if err := ExecuteFakeAdapter(req2Path, result2Path, cfg); err != nil {
 		t.Fatalf("second execution failed: %v", err)
 	}
 
-	result2Data, _ := os.ReadFile(result2Path)
+	result2Data, err := os.ReadFile(result2Path)
+	if err != nil {
+		t.Fatalf("read result 2 failed: %v", err)
+	}
 	var response2 CandidateResponse
-	json.Unmarshal(result2Data, &response2)
+	if err := json.Unmarshal(result2Data, &response2); err != nil {
+		t.Fatalf("unmarshal result 2 failed: %v", err)
+	}
 
 	// Verify determinism: same findings count, status, etc.
 	if response1.Status != response2.Status {
@@ -365,10 +418,17 @@ func TestTwoCandidateConfigurationsSameRequestPipeline(t *testing.T) {
 	}
 
 	// Use the shared host pipeline for candidate 1
+	adapter1 := &FakeAdapter{Config: candidate1Config}
+	runtime1 := &AdapterRuntime{
+		Name:                 "muse_code",
+		Version:              "1.0.0",
+		DeclaredCapabilities: []string{"source_retrieval", "tool_execution"},
+	}
 	pipeline1 := &HostRequestPipeline{
 		RequestPath: req1Path,
 		ResultPath:  result1Path,
-		Config:      candidate1Config,
+		Adapter:     adapter1,
+		Runtime:     runtime1,
 	}
 	response1, err := pipeline1.Execute()
 	if err != nil {
@@ -397,10 +457,17 @@ func TestTwoCandidateConfigurationsSameRequestPipeline(t *testing.T) {
 	}
 
 	// Use the shared host pipeline for candidate 2
+	adapter2 := &FakeAdapter{Config: candidate2Config}
+	runtime2 := &AdapterRuntime{
+		Name:                 "pi_spark",
+		Version:              "2.0.0",
+		DeclaredCapabilities: []string{"source_retrieval", "tool_execution"},
+	}
 	pipeline2 := &HostRequestPipeline{
 		RequestPath: req2Path,
 		ResultPath:  result2Path,
-		Config:      candidate2Config,
+		Adapter:     adapter2,
+		Runtime:     runtime2,
 	}
 	response2, err := pipeline2.Execute()
 	if err != nil {
@@ -459,8 +526,13 @@ func TestFakeAdapterResponseDelay(t *testing.T) {
 		ResultPath:   resultPath,
 	}
 
-	reqData, _ := json.Marshal(req)
-	os.WriteFile(requestPath, reqData, 0644)
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
 
 	cfg := FakeAdapterConfig{
 		Mode:           FakeModeSuccess,
@@ -481,13 +553,238 @@ func TestFakeAdapterResponseDelay(t *testing.T) {
 		t.Errorf("expected at least %v delay, got %v", cfg.ResponseDelay, duration)
 	}
 
-	resultData, _ := os.ReadFile(resultPath)
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result failed: %v", err)
+	}
 	var response CandidateResponse
-	json.Unmarshal(resultData, &response)
+	if err := json.Unmarshal(resultData, &response); err != nil {
+		t.Fatalf("unmarshal result failed: %v", err)
+	}
 
 	// Verify timing was recorded
 	if response.Timing.Duration <= 0 {
 		t.Error("response timing should be positive")
+	}
+}
+
+func TestFakeAdapterUnknownMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	requestPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:      AdapterVersion,
+		RunID:        "test-unknown-mode-1",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   resultPath,
+	}
+
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
+
+	cfg := FakeAdapterConfig{
+		Mode:           FakeAdapterMode("unknown_mode"),
+		CandidateName:  "test_adapter",
+		ModelID:        "test-model-1.0",
+		RuntimeVersion: "1.0",
+		PromptVersion:  "v1",
+	}
+
+	if err := ExecuteFakeAdapter(requestPath, resultPath, cfg); err == nil {
+		t.Error("execution with unknown mode should fail")
+	}
+}
+
+func TestHostPipelinePreflightUnsupported(t *testing.T) {
+	tmpDir := t.TempDir()
+	requestPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:      AdapterVersion,
+		RunID:        "test-preflight-unsupported",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ToolAccess: ToolAccessRequirements{
+			RequirePDFSupport: true,
+		},
+		ResultPath: resultPath,
+	}
+
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
+
+	cfg := FakeAdapterConfig{
+		Mode:           FakeModeSuccess,
+		CandidateName:  "limited_adapter",
+		ModelID:        "model-v1",
+		RuntimeVersion: "1.0",
+		PromptVersion:  "v1",
+	}
+
+	adapter := &FakeAdapter{Config: cfg}
+
+	runtime := &AdapterRuntime{
+		Name:                 "limited_adapter",
+		Version:              "1.0",
+		DeclaredCapabilities: []string{"source_retrieval", "tool_execution"},
+	}
+
+	pipeline := &HostRequestPipeline{
+		RequestPath: requestPath,
+		ResultPath:  resultPath,
+		Adapter:     adapter,
+		Runtime:     runtime,
+	}
+
+	response, err := pipeline.Execute()
+	if err != nil {
+		t.Fatalf("pipeline failed: %v", err)
+	}
+
+	if response.Status != StatusUnsupported {
+		t.Errorf("expected unsupported status, got %s", response.Status)
+	}
+	if response.ReviewCompleted {
+		t.Error("unsupported response should not have ReviewCompleted=true")
+	}
+	if response.ErrorClass == nil || *response.ErrorClass != "capability_unsupported" {
+		t.Errorf("expected capability_unsupported error class, got %v", response.ErrorClass)
+	}
+}
+
+func TestHostPipelineMalformedOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	requestPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:      AdapterVersion,
+		RunID:        "test-malformed-pipeline",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   resultPath,
+	}
+
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
+
+	cfg := FakeAdapterConfig{
+		Mode:           FakeModeMalformed,
+		CandidateName:  "test_adapter",
+		ModelID:        "test-model-1.0",
+		RuntimeVersion: "1.0",
+		PromptVersion:  "v1",
+	}
+
+	adapter := &FakeAdapter{Config: cfg}
+	pipeline := &HostRequestPipeline{
+		RequestPath: requestPath,
+		ResultPath:  resultPath,
+		Adapter:     adapter,
+		Runtime:     nil,
+	}
+
+	response, err := pipeline.Execute()
+	if err != nil {
+		t.Fatalf("pipeline should handle malformed gracefully: %v", err)
+	}
+
+	if response.Status != StatusFailed {
+		t.Errorf("malformed output should produce failed status, got %s", response.Status)
+	}
+	if response.ErrorClass == nil || *response.ErrorClass != "output_malformed" {
+		t.Errorf("expected output_malformed error class, got %v", response.ErrorClass)
+	}
+	if response.RawOutput == nil {
+		t.Error("malformed output should preserve RawOutput")
+	}
+}
+
+func TestFakeAdapterWithConfigurableSettings(t *testing.T) {
+	tmpDir := t.TempDir()
+	requestPath := filepath.Join(tmpDir, "request.json")
+	resultPath := filepath.Join(tmpDir, "result.json")
+
+	req := CandidateRequest{
+		Version:      AdapterVersion,
+		RunID:        "test-settings-1",
+		TaskID:       "task-123",
+		ReviewRound:  1,
+		SnapshotPath: "/tmp/snapshot",
+		ResultPath:   resultPath,
+	}
+
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
+
+	cfg := FakeAdapterConfig{
+		Mode:           FakeModeSuccess,
+		CandidateName:  "test_adapter",
+		ModelID:        "test-model-1.0",
+		RuntimeVersion: "1.0",
+		PromptVersion:  "v1",
+		FindingCount:   1,
+		ReasoningSettings: map[string]interface{}{
+			"temperature": 0.7,
+		},
+		GenerationSettings: map[string]interface{}{
+			"max_tokens": 2048,
+		},
+		ToolConfiguration: []ToolConfig{
+			{Name: "bash", Version: "5.1"},
+		},
+	}
+
+	if err := ExecuteFakeAdapter(requestPath, resultPath, cfg); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result failed: %v", err)
+	}
+	var response CandidateResponse
+	if err := json.Unmarshal(resultData, &response); err != nil {
+		t.Fatalf("unmarshal result failed: %v", err)
+	}
+
+	if response.EffectiveCandidate.ReasoningSettings == nil {
+		t.Error("reasoning settings should be preserved")
+	}
+	if response.EffectiveCandidate.GenerationSettings == nil {
+		t.Error("generation settings should be preserved")
+	}
+	if len(response.EffectiveCandidate.ToolConfiguration) != 1 {
+		t.Error("tool configuration should be preserved")
+	}
+	if response.EffectiveCandidate.ToolConfiguration[0].Name != "bash" {
+		t.Error("tool name should be preserved")
 	}
 }
 
@@ -505,8 +802,13 @@ func TestFakeAdapterFindingDetails(t *testing.T) {
 		ResultPath:   resultPath,
 	}
 
-	reqData, _ := json.Marshal(req)
-	os.WriteFile(requestPath, reqData, 0644)
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+	if err := os.WriteFile(requestPath, reqData, 0644); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
 
 	cfg := FakeAdapterConfig{
 		Mode:           FakeModeSuccess,
@@ -521,9 +823,14 @@ func TestFakeAdapterFindingDetails(t *testing.T) {
 		t.Fatalf("execution failed: %v", err)
 	}
 
-	resultData, _ := os.ReadFile(resultPath)
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result failed: %v", err)
+	}
 	var response CandidateResponse
-	json.Unmarshal(resultData, &response)
+	if err := json.Unmarshal(resultData, &response); err != nil {
+		t.Fatalf("unmarshal result failed: %v", err)
+	}
 
 	for i, finding := range response.Findings {
 		if finding.Severity == "" {

@@ -167,9 +167,13 @@ type ResponseUsage struct {
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
+// Unknown is a marker value for explicitly unknown candidate identity fields.
+const Unknown = "unknown"
+
 // CandidateIdentity uniquely identifies a reviewer configuration for reproducibility.
 // Changing any field creates a new candidate version.
-// Use Unknown() to mark a field as explicitly unknown rather than empty.
+// To represent unknown values explicitly, use the Unknown constant for string fields
+// or a special map/slice that serializes differently from empty.
 type CandidateIdentity struct {
 	// AdapterName is the registered adapter identifier (e.g., "muse_code", "pi_spark").
 	AdapterName string `json:"adapter_name"`
@@ -180,8 +184,8 @@ type CandidateIdentity struct {
 	// ModelID is the immutable model identifier (e.g., "muse-spark-1.3", "pi-2024-q4").
 	ModelID string `json:"model_id"`
 
-	// ModelRevision is the model version if the provider reports one; may be empty.
-	// Empty string means unknown.
+	// ModelRevision is the model version if the provider reports one.
+	// Empty string or Unknown means unknown.
 	ModelRevision string `json:"model_revision,omitempty"`
 
 	// RuntimeName is the runtime environment (e.g., "muse_code_cli", "pi_api").
@@ -191,22 +195,27 @@ type CandidateIdentity struct {
 	RuntimeVersion string `json:"runtime_version"`
 
 	// ReasoningSettings are the configured reasoning parameters (if applicable).
-	// Nil means unknown/not applicable; empty map means no settings.
+	// Use Unknown() helper to explicitly mark as unknown vs empty.
 	ReasoningSettings map[string]interface{} `json:"reasoning_settings,omitempty"`
 
 	// GenerationSettings are the configured generation parameters.
-	// Nil means unknown/not applicable; empty map means no settings.
+	// Use Unknown() helper to explicitly mark as unknown vs empty.
 	GenerationSettings map[string]interface{} `json:"generation_settings,omitempty"`
 
 	// PromptVersion is the exact prompt version used.
 	PromptVersion string `json:"prompt_version"`
 
 	// ToolConfiguration describes what tools are available.
-	// Nil means unknown/not applicable; empty slice means no tools.
+	// Use Unknown() helper to explicitly mark as unknown vs empty.
 	ToolConfiguration []ToolConfig `json:"tool_configuration,omitempty"`
 
 	// AccountOrPool identifies the subscription/compute pool used.
 	AccountOrPool string `json:"account_or_pool"`
+}
+
+// IsUnknown checks if a string field is explicitly unknown.
+func IsUnknown(s string) bool {
+	return s == Unknown
 }
 
 // ToolConfig describes a tool available to the reviewer.

@@ -108,13 +108,29 @@ func TestCandidateIdentityDigestWithSettingsChange(t *testing.T) {
 		},
 	}
 
-	digest1, _ := baseIdentity.Digest()
+	digest1, err := baseIdentity.Digest()
+	if err != nil {
+		t.Fatalf("digest failed: %v", err)
+	}
 
-	// Change reasoning settings
-	modifiedIdentity := baseIdentity
-	modifiedIdentity.ReasoningSettings["temperature"] = 0.9
+	// Change reasoning settings by creating a new map
+	modifiedIdentity := CandidateIdentity{
+		AdapterName:    "test_adapter",
+		AdapterVersion: "1.0",
+		ModelID:        "model-v1",
+		RuntimeName:    "runtime",
+		RuntimeVersion: "1.0",
+		PromptVersion:  "v1",
+		AccountOrPool:  "pool",
+		ReasoningSettings: map[string]interface{}{
+			"temperature": 0.9,
+		},
+	}
 
-	digest2, _ := modifiedIdentity.Digest()
+	digest2, err := modifiedIdentity.Digest()
+	if err != nil {
+		t.Fatalf("digest failed: %v", err)
+	}
 
 	if digest1 == digest2 {
 		t.Error("digest should change when reasoning settings change")
@@ -173,12 +189,12 @@ func TestCandidateRequestStructure(t *testing.T) {
 		t.Fatalf("marshal failed: %v", err)
 	}
 
-	var unmarshed CandidateRequest
-	if err := json.Unmarshal(data, &unmarshed); err != nil {
+	var unmarshaled CandidateRequest
+	if err := json.Unmarshal(data, &unmarshaled); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
 
-	if unmarshed.RunID != req.RunID {
+	if unmarshaled.RunID != req.RunID {
 		t.Error("roundtrip failed")
 	}
 }

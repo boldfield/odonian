@@ -21,15 +21,18 @@ const (
 
 // FakeAdapterConfig configures the fake adapter's behavior.
 type FakeAdapterConfig struct {
-	Mode            FakeAdapterMode
-	CandidateName   string
-	ModelID         string
-	RuntimeVersion  string
-	PromptVersion   string
-	FindingCount    int
-	ErrorMessage    string
-	ResponseDelay   time.Duration
-	MalformedReason string
+	Mode               FakeAdapterMode
+	CandidateName      string
+	ModelID            string
+	RuntimeVersion     string
+	PromptVersion      string
+	FindingCount       int
+	ErrorMessage       string
+	ResponseDelay      time.Duration
+	MalformedReason    string
+	ReasoningSettings  map[string]interface{}
+	GenerationSettings map[string]interface{}
+	ToolConfiguration  []ToolConfig
 }
 
 // ExecuteFakeAdapter runs the fake adapter with the given mode.
@@ -96,11 +99,7 @@ func ExecuteFakeAdapter(requestPath, resultPath string, cfg FakeAdapterConfig) e
 		}
 		responseData, err2 = json.MarshalIndent(response, "", "  ")
 	default:
-		response := generateSuccessResponse(req, startTime, cfg)
-		if err := response.Validate(); err != nil {
-			return fmt.Errorf("invalid success response: %w", err)
-		}
-		responseData, err2 = json.MarshalIndent(response, "", "  ")
+		return fmt.Errorf("unknown fake adapter mode: %s", cfg.Mode)
 	}
 
 	if err2 != nil {
@@ -138,20 +137,25 @@ func generateSuccessResponse(req CandidateRequest, startTime time.Time, cfg Fake
 		})
 	}
 
+	identity := CandidateIdentity{
+		AdapterName:        cfg.CandidateName,
+		AdapterVersion:     "1.0",
+		ModelID:            cfg.ModelID,
+		RuntimeName:        "fake_runtime",
+		RuntimeVersion:     cfg.RuntimeVersion,
+		PromptVersion:      cfg.PromptVersion,
+		AccountOrPool:      "fake_pool",
+		ReasoningSettings:  cfg.ReasoningSettings,
+		GenerationSettings: cfg.GenerationSettings,
+		ToolConfiguration:  cfg.ToolConfiguration,
+	}
+
 	return CandidateResponse{
-		Version:         AdapterVersion,
-		Status:          StatusCompleted,
-		Findings:        findings,
-		ReviewCompleted: true,
-		EffectiveCandidate: CandidateIdentity{
-			AdapterName:    cfg.CandidateName,
-			AdapterVersion: "1.0",
-			ModelID:        cfg.ModelID,
-			RuntimeName:    "fake_runtime",
-			RuntimeVersion: cfg.RuntimeVersion,
-			PromptVersion:  cfg.PromptVersion,
-			AccountOrPool:  "fake_pool",
-		},
+		Version:            AdapterVersion,
+		Status:             StatusCompleted,
+		Findings:           findings,
+		ReviewCompleted:    true,
+		EffectiveCandidate: identity,
 		Timing: ResponseTiming{
 			StartedAt:   startTime,
 			CompletedAt: endTime,
@@ -159,36 +163,6 @@ func generateSuccessResponse(req CandidateRequest, startTime time.Time, cfg Fake
 		},
 		Usage: &ResponseUsage{
 			Units: "fake_units",
-		},
-	}
-}
-
-func generateMalformedResponse(req CandidateRequest, startTime time.Time, cfg FakeAdapterConfig) CandidateResponse {
-	endTime := time.Now()
-	reason := cfg.MalformedReason
-	if reason == "" {
-		reason = "Adapter output was malformed"
-	}
-
-	return CandidateResponse{
-		Version:         AdapterVersion,
-		Status:          StatusFailed,
-		ReviewCompleted: false,
-		ErrorClass:      ptrString("output_malformed"),
-		ErrorMessage:    ptrString(reason),
-		EffectiveCandidate: CandidateIdentity{
-			AdapterName:    cfg.CandidateName,
-			AdapterVersion: "1.0",
-			ModelID:        cfg.ModelID,
-			RuntimeName:    "fake_runtime",
-			RuntimeVersion: cfg.RuntimeVersion,
-			PromptVersion:  cfg.PromptVersion,
-			AccountOrPool:  "fake_pool",
-		},
-		Timing: ResponseTiming{
-			StartedAt:   startTime,
-			CompletedAt: endTime,
-			Duration:    endTime.Sub(startTime),
 		},
 	}
 }
@@ -201,21 +175,26 @@ func generateUnsupportedResponse(req CandidateRequest, startTime time.Time, cfg 
 		reason = "Required capability not supported"
 	}
 
+	identity := CandidateIdentity{
+		AdapterName:        cfg.CandidateName,
+		AdapterVersion:     "1.0",
+		ModelID:            cfg.ModelID,
+		RuntimeName:        "fake_runtime",
+		RuntimeVersion:     cfg.RuntimeVersion,
+		PromptVersion:      cfg.PromptVersion,
+		AccountOrPool:      "fake_pool",
+		ReasoningSettings:  cfg.ReasoningSettings,
+		GenerationSettings: cfg.GenerationSettings,
+		ToolConfiguration:  cfg.ToolConfiguration,
+	}
+
 	return CandidateResponse{
-		Version:         AdapterVersion,
-		Status:          StatusUnsupported,
-		ReviewCompleted: false,
-		ErrorClass:      ptrString("capability_unsupported"),
-		ErrorMessage:    ptrString(reason),
-		EffectiveCandidate: CandidateIdentity{
-			AdapterName:    cfg.CandidateName,
-			AdapterVersion: "1.0",
-			ModelID:        cfg.ModelID,
-			RuntimeName:    "fake_runtime",
-			RuntimeVersion: cfg.RuntimeVersion,
-			PromptVersion:  cfg.PromptVersion,
-			AccountOrPool:  "fake_pool",
-		},
+		Version:            AdapterVersion,
+		Status:             StatusUnsupported,
+		ReviewCompleted:    false,
+		ErrorClass:         ptrString("capability_unsupported"),
+		ErrorMessage:       ptrString(reason),
+		EffectiveCandidate: identity,
 		Timing: ResponseTiming{
 			StartedAt:   startTime,
 			CompletedAt: endTime,
@@ -227,21 +206,26 @@ func generateUnsupportedResponse(req CandidateRequest, startTime time.Time, cfg 
 func generateInterruptedResponse(req CandidateRequest, startTime time.Time, cfg FakeAdapterConfig) CandidateResponse {
 	endTime := time.Now()
 
+	identity := CandidateIdentity{
+		AdapterName:        cfg.CandidateName,
+		AdapterVersion:     "1.0",
+		ModelID:            cfg.ModelID,
+		RuntimeName:        "fake_runtime",
+		RuntimeVersion:     cfg.RuntimeVersion,
+		PromptVersion:      cfg.PromptVersion,
+		AccountOrPool:      "fake_pool",
+		ReasoningSettings:  cfg.ReasoningSettings,
+		GenerationSettings: cfg.GenerationSettings,
+		ToolConfiguration:  cfg.ToolConfiguration,
+	}
+
 	return CandidateResponse{
-		Version:         AdapterVersion,
-		Status:          StatusIncomplete,
-		ReviewCompleted: false,
-		ErrorClass:      ptrString("timeout"),
-		ErrorMessage:    ptrString("Review interrupted before completion"),
-		EffectiveCandidate: CandidateIdentity{
-			AdapterName:    cfg.CandidateName,
-			AdapterVersion: "1.0",
-			ModelID:        cfg.ModelID,
-			RuntimeName:    "fake_runtime",
-			RuntimeVersion: cfg.RuntimeVersion,
-			PromptVersion:  cfg.PromptVersion,
-			AccountOrPool:  "fake_pool",
-		},
+		Version:            AdapterVersion,
+		Status:             StatusIncomplete,
+		ReviewCompleted:    false,
+		ErrorClass:         ptrString("timeout"),
+		ErrorMessage:       ptrString("Review interrupted before completion"),
+		EffectiveCandidate: identity,
 		Timing: ResponseTiming{
 			StartedAt:   startTime,
 			CompletedAt: endTime,
@@ -258,21 +242,26 @@ func generateFailedResponse(req CandidateRequest, startTime time.Time, cfg FakeA
 		reason = "Adapter execution failed"
 	}
 
+	identity := CandidateIdentity{
+		AdapterName:        cfg.CandidateName,
+		AdapterVersion:     "1.0",
+		ModelID:            cfg.ModelID,
+		RuntimeName:        "fake_runtime",
+		RuntimeVersion:     cfg.RuntimeVersion,
+		PromptVersion:      cfg.PromptVersion,
+		AccountOrPool:      "fake_pool",
+		ReasoningSettings:  cfg.ReasoningSettings,
+		GenerationSettings: cfg.GenerationSettings,
+		ToolConfiguration:  cfg.ToolConfiguration,
+	}
+
 	return CandidateResponse{
-		Version:         AdapterVersion,
-		Status:          StatusFailed,
-		ReviewCompleted: false,
-		ErrorClass:      ptrString("execution_error"),
-		ErrorMessage:    ptrString(reason),
-		EffectiveCandidate: CandidateIdentity{
-			AdapterName:    cfg.CandidateName,
-			AdapterVersion: "1.0",
-			ModelID:        cfg.ModelID,
-			RuntimeName:    "fake_runtime",
-			RuntimeVersion: cfg.RuntimeVersion,
-			PromptVersion:  cfg.PromptVersion,
-			AccountOrPool:  "fake_pool",
-		},
+		Version:            AdapterVersion,
+		Status:             StatusFailed,
+		ReviewCompleted:    false,
+		ErrorClass:         ptrString("execution_error"),
+		ErrorMessage:       ptrString(reason),
+		EffectiveCandidate: identity,
 		Timing: ResponseTiming{
 			StartedAt:   startTime,
 			CompletedAt: endTime,
@@ -289,53 +278,150 @@ func ptrInt(i int) *int {
 	return &i
 }
 
-// HostRequestPipeline is the unified pipeline that processes requests through adapters.
-// All adapters (including multiple candidate configurations) use this same pipeline:
+// Adapter is the interface that all adapters (fake, Muse, Pi, CLI, etc.) must implement.
+type Adapter interface {
+	// Execute runs the adapter with the given request path and result path.
+	// The adapter must write a response to the result path.
+	Execute(requestPath, resultPath string) error
+
+	// DeclaredCapabilities returns the list of capabilities this adapter has.
+	DeclaredCapabilities() []string
+}
+
+// FakeAdapter implements the Adapter interface using FakeAdapterConfig.
+type FakeAdapter struct {
+	Config FakeAdapterConfig
+}
+
+// Execute runs the fake adapter.
+func (fa *FakeAdapter) Execute(requestPath, resultPath string) error {
+	return ExecuteFakeAdapter(requestPath, resultPath, fa.Config)
+}
+
+// DeclaredCapabilities returns capabilities based on the config.
+func (fa *FakeAdapter) DeclaredCapabilities() []string {
+	// Fake adapter claims to support all capabilities by default
+	return []string{"source_retrieval", "pdf_support", "tool_execution"}
+}
+
+// HostRequestPipeline is the unified adapter-agnostic pipeline that processes requests.
+// All adapters (fake, Muse, Pi, CLI, etc.) use this same pipeline:
 // 1. Validate the request
 // 2. Check preflight capabilities
 // 3. Execute the adapter
-// 4. Validate and normalize the result
+// 4. Read and validate the result
 type HostRequestPipeline struct {
 	RequestPath string
 	ResultPath  string
-	Config      FakeAdapterConfig
+	Adapter     Adapter
+	Runtime     *AdapterRuntime
 }
 
 // Execute runs the full request/result pipeline for this candidate.
 // It returns the parsed response and any errors encountered.
 func (p *HostRequestPipeline) Execute() (*CandidateResponse, error) {
-	// Step 1: Execute the adapter (which validates request internally)
-	if err := ExecuteFakeAdapter(p.RequestPath, p.ResultPath, p.Config); err != nil {
+	// Step 1: Read and validate the request
+	requestData, err := os.ReadFile(p.RequestPath)
+	if err != nil {
+		return nil, fmt.Errorf("read request: %w", err)
+	}
+
+	var req CandidateRequest
+	if err := json.Unmarshal(requestData, &req); err != nil {
+		return nil, fmt.Errorf("unmarshal request: %w", err)
+	}
+
+	if err := req.Validate(); err != nil {
+		return nil, fmt.Errorf("validate request: %w", err)
+	}
+
+	// Step 2: Check preflight capabilities without making a paid call
+	if p.Runtime != nil {
+		preflight := &CapabilityPreflight{}
+		preflight.CheckCapabilities(&req, p.Runtime.DeclaredCapabilities)
+		if !preflight.Supported {
+			// Return an unsupported response without invoking the adapter
+			return &CandidateResponse{
+				Version:         AdapterVersion,
+				Status:          StatusUnsupported,
+				ReviewCompleted: false,
+				ErrorClass:      ptrString("capability_unsupported"),
+				ErrorMessage:    preflight.Error,
+				EffectiveCandidate: CandidateIdentity{
+					AdapterName:   p.Runtime.Name,
+					ModelID:       Unknown,
+					PromptVersion: req.BlindedPrompt[:min(len(req.BlindedPrompt), 50)],
+				},
+				Timing: ResponseTiming{
+					StartedAt:   time.Now(),
+					CompletedAt: time.Now(),
+					Duration:    0,
+				},
+			}, nil
+		}
+	}
+
+	// Step 3: Execute the adapter
+	if err := p.Adapter.Execute(p.RequestPath, p.ResultPath); err != nil {
 		return nil, fmt.Errorf("adapter execution failed: %w", err)
 	}
 
-	// Step 2: Read and parse the result
+	// Step 4: Read and validate the result
 	resultData, err := os.ReadFile(p.ResultPath)
 	if err != nil {
 		return nil, fmt.Errorf("read result: %w", err)
 	}
 
-	// For malformed mode, we expect invalid JSON
-	if p.Config.Mode == FakeModeMalformed {
-		// Try to parse but expect failure
-		var resp CandidateResponse
-		if err := json.Unmarshal(resultData, &resp); err == nil {
-			return nil, fmt.Errorf("expected malformed output, but got valid JSON")
-		}
-		// Malformed output detected as expected
-		return nil, fmt.Errorf("adapter produced malformed output (expected for testing)")
-	}
-
-	// Step 3: Unmarshal and validate the response
+	// Try to unmarshal the result; if it fails, it's malformed output
 	var resp CandidateResponse
 	if err := json.Unmarshal(resultData, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal result: %w", err)
+		// Adapter produced malformed output; normalize to a failed response
+		return &CandidateResponse{
+			Version:         AdapterVersion,
+			Status:          StatusFailed,
+			ReviewCompleted: false,
+			ErrorClass:      ptrString("output_malformed"),
+			ErrorMessage:    ptrString(fmt.Sprintf("adapter produced invalid JSON: %v", err)),
+			RawOutput:       ptrString(string(resultData)),
+			EffectiveCandidate: CandidateIdentity{
+				AdapterName: Unknown,
+				ModelID:     Unknown,
+			},
+			Timing: ResponseTiming{
+				StartedAt:   time.Now(),
+				CompletedAt: time.Now(),
+				Duration:    0,
+			},
+		}, nil
 	}
 
-	// Step 4: Validate the response against the protocol
+	// Validate the response against the protocol
 	if err := resp.Validate(); err != nil {
-		return nil, fmt.Errorf("response validation failed: %w", err)
+		return &CandidateResponse{
+			Version:         AdapterVersion,
+			Status:          StatusFailed,
+			ReviewCompleted: false,
+			ErrorClass:      ptrString("output_malformed"),
+			ErrorMessage:    ptrString(fmt.Sprintf("response validation failed: %v", err)),
+			RawOutput:       ptrString(string(resultData)),
+			EffectiveCandidate: CandidateIdentity{
+				AdapterName: Unknown,
+				ModelID:     Unknown,
+			},
+			Timing: ResponseTiming{
+				StartedAt:   time.Now(),
+				CompletedAt: time.Now(),
+				Duration:    0,
+			},
+		}, nil
 	}
 
 	return &resp, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
