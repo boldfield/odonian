@@ -30,9 +30,9 @@ type FakeAdapterConfig struct {
 	ErrorMessage       string
 	ResponseDelay      time.Duration
 	MalformedReason    string
-	ReasoningSettings  map[string]interface{}
-	GenerationSettings map[string]interface{}
-	ToolConfiguration  []ToolConfig
+	ReasoningSettings  UnknownSettingsMap
+	GenerationSettings UnknownSettingsMap
+	ToolConfiguration  UnknownTools
 }
 
 // ExecuteFakeAdapter runs the fake adapter with the given mode.
@@ -301,7 +301,7 @@ func (fa *FakeAdapter) Execute(requestPath, resultPath string) error {
 // DeclaredCapabilities returns capabilities based on the config.
 func (fa *FakeAdapter) DeclaredCapabilities() []string {
 	// Fake adapter claims to support all capabilities by default
-	return []string{"source_retrieval", "pdf_support", "tool_execution"}
+	return []string{"source_retrieval", "pdf_parsing", "tool_execution", "structured_output"}
 }
 
 // HostRequestPipeline is the unified adapter-agnostic pipeline that processes requests.

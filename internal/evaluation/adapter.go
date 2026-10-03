@@ -1,11 +1,15 @@
 package evaluation
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -70,9 +74,10 @@ func (r *CandidateRequest) Validate() error {
 
 // ToolAccessRequirements declares what tools and source access the review needs.
 type ToolAccessRequirements struct {
-	RequireSourceRetrieval bool     `json:"require_source_retrieval"`
-	RequirePDFSupport      bool     `json:"require_pdf_support"`
-	DeclaredTools          []string `json:"declared_tools"` // e.g., ["bash", "python", "curl"]
+	RequireSourceRetrieval  bool     `json:"require_source_retrieval"`
+	RequirePDFSupport       bool     `json:"require_pdf_support"`
+	RequireStructuredOutput bool     `json:"require_structured_output"`
+	DeclaredTools           []string `json:"declared_tools"` // e.g., ["bash", "python", "curl"]
 }
 
 // CandidateResponse is the normalized result returned by a comparison reviewer adapter.
@@ -170,10 +175,63 @@ type ResponseUsage struct {
 // Unknown is a marker value for explicitly unknown candidate identity fields.
 const Unknown = "unknown"
 
+// UnknownSettingsMap explicitly represents unknown settings.
+// It distinguishes between nil (unknown), empty map (no settings), and populated map.
+type UnknownSettingsMap map[string]interface{}
+
+// MarshalJSON ensures nil, empty, and populated maps serialize distinctly.
+func (u UnknownSettingsMap) MarshalJSON() ([]byte, error) {
+	if u == nil {
+		return []byte(`"` + Unknown + `"`), nil
+	}
+	return json.Marshal(map[string]interface{}(u))
+}
+
+// UnmarshalJSON reconstructs the map from JSON, handling the unknown marker.
+func (u *UnknownSettingsMap) UnmarshalJSON(data []byte) error {
+	if string(data) == `"`+Unknown+`"` {
+		*u = nil
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	*u = UnknownSettingsMap(m)
+	return nil
+}
+
+// UnknownTools explicitly represents unknown tool configuration.
+// It distinguishes between nil (unknown), empty slice (no tools), and populated slice.
+type UnknownTools []ToolConfig
+
+// MarshalJSON ensures nil, empty, and populated slices serialize distinctly.
+func (u UnknownTools) MarshalJSON() ([]byte, error) {
+	if u == nil {
+		return []byte(`"` + Unknown + `"`), nil
+	}
+	return json.Marshal([]ToolConfig(u))
+}
+
+// UnmarshalJSON reconstructs the slice from JSON, handling the unknown marker.
+func (u *UnknownTools) UnmarshalJSON(data []byte) error {
+	if string(data) == `"`+Unknown+`"` {
+		*u = nil
+		return nil
+	}
+	var t []ToolConfig
+	if err := json.Unmarshal(data, &t); err != nil {
+		return err
+	}
+	*u = UnknownTools(t)
+	return nil
+}
+
 // CandidateIdentity uniquely identifies a reviewer configuration for reproducibility.
 // Changing any field creates a new candidate version.
-// To represent unknown values explicitly, use the Unknown constant for string fields
-// or a special map/slice that serializes differently from empty.
+// String fields use the Unknown constant to represent unknown values.
+// Settings and tool configuration use UnknownSettingsMap and UnknownTools to explicitly
+// distinguish unknown from empty.
 type CandidateIdentity struct {
 	// AdapterName is the registered adapter identifier (e.g., "muse_code", "pi_spark").
 	AdapterName string `json:"adapter_name"`
@@ -185,8 +243,8 @@ type CandidateIdentity struct {
 	ModelID string `json:"model_id"`
 
 	// ModelRevision is the model version if the provider reports one.
-	// Empty string or Unknown means unknown.
-	ModelRevision string `json:"model_revision,omitempty"`
+	// Use Unknown constant to represent unknown value.
+	ModelRevision string `json:"model_revision"`
 
 	// RuntimeName is the runtime environment (e.g., "muse_code_cli", "pi_api").
 	RuntimeName string `json:"runtime_name"`
@@ -195,19 +253,19 @@ type CandidateIdentity struct {
 	RuntimeVersion string `json:"runtime_version"`
 
 	// ReasoningSettings are the configured reasoning parameters (if applicable).
-	// Use Unknown() helper to explicitly mark as unknown vs empty.
-	ReasoningSettings map[string]interface{} `json:"reasoning_settings,omitempty"`
+	// nil = unknown, empty map = no settings, populated map = actual settings.
+	ReasoningSettings UnknownSettingsMap `json:"reasoning_settings"`
 
 	// GenerationSettings are the configured generation parameters.
-	// Use Unknown() helper to explicitly mark as unknown vs empty.
-	GenerationSettings map[string]interface{} `json:"generation_settings,omitempty"`
+	// nil = unknown, empty map = no settings, populated map = actual settings.
+	GenerationSettings UnknownSettingsMap `json:"generation_settings"`
 
 	// PromptVersion is the exact prompt version used.
 	PromptVersion string `json:"prompt_version"`
 
 	// ToolConfiguration describes what tools are available.
-	// Use Unknown() helper to explicitly mark as unknown vs empty.
-	ToolConfiguration []ToolConfig `json:"tool_configuration,omitempty"`
+	// nil = unknown, empty slice = no tools, populated slice = actual tools.
+	ToolConfiguration UnknownTools `json:"tool_configuration"`
 
 	// AccountOrPool identifies the subscription/compute pool used.
 	AccountOrPool string `json:"account_or_pool"`
@@ -253,9 +311,14 @@ type CapabilityPreflight struct {
 }
 
 // CheckCapabilities validates whether the adapter can fulfill a request's tool access needs.
+// Capability names: "source_retrieval", "pdf_parsing", "tool_execution", "structured_output".
 func (cp *CapabilityPreflight) CheckCapabilities(req *CandidateRequest, adapterCaps []string) {
 	cp.DeclaredCapabilities = make(map[string]bool)
 	for _, cap := range adapterCaps {
+		// Normalize pdf_support to pdf_parsing for consistency
+		if cap == "pdf_support" {
+			cap = "pdf_parsing"
+		}
 		cp.DeclaredCapabilities[cap] = true
 	}
 
@@ -266,14 +329,19 @@ func (cp *CapabilityPreflight) CheckCapabilities(req *CandidateRequest, adapterC
 		cp.Supported = false
 		missing = append(missing, "source_retrieval")
 	}
-	if req.ToolAccess.RequirePDFSupport && !cp.DeclaredCapabilities["pdf_support"] {
+	if req.ToolAccess.RequirePDFSupport && !cp.DeclaredCapabilities["pdf_parsing"] {
 		cp.Supported = false
-		missing = append(missing, "pdf_support")
+		missing = append(missing, "pdf_parsing")
 	}
 
 	if len(req.ToolAccess.DeclaredTools) > 0 && !cp.DeclaredCapabilities["tool_execution"] {
 		cp.Supported = false
 		missing = append(missing, "tool_execution")
+	}
+
+	if req.ToolAccess.RequireStructuredOutput && !cp.DeclaredCapabilities["structured_output"] {
+		cp.Supported = false
+		missing = append(missing, "structured_output")
 	}
 
 	if !cp.Supported {
@@ -316,9 +384,121 @@ type AdapterRuntime struct {
 	Executable RegistrationExecutable `json:"executable"`
 
 	// DeclaredCapabilities lists what this adapter can do.
-	// Examples: "source_retrieval", "pdf_parsing", "tool_execution".
+	// Standard capabilities: "source_retrieval", "pdf_parsing", "tool_execution", "structured_output".
 	DeclaredCapabilities []string `json:"declared_capabilities"`
 
 	// RequiredCredentials lists credentials this adapter needs.
 	RequiredCredentials []string `json:"required_credentials"`
+}
+
+// AdapterRegistry holds registered adapters and provides resolution.
+type AdapterRegistry struct {
+	adapters map[string]*AdapterRuntime
+}
+
+// NewAdapterRegistry creates an empty registry.
+func NewAdapterRegistry() *AdapterRegistry {
+	return &AdapterRegistry{
+		adapters: make(map[string]*AdapterRuntime),
+	}
+}
+
+// Register adds a new adapter runtime to the registry.
+// It returns an error if an adapter with the same name is already registered.
+func (r *AdapterRegistry) Register(runtime *AdapterRuntime) error {
+	if runtime.Name == "" {
+		return fmt.Errorf("runtime name is required")
+	}
+	if _, exists := r.adapters[runtime.Name]; exists {
+		return fmt.Errorf("adapter %q already registered", runtime.Name)
+	}
+	r.adapters[runtime.Name] = runtime
+	return nil
+}
+
+// Resolve retrieves a registered adapter runtime by name.
+// It returns nil if the adapter is not found.
+func (r *AdapterRegistry) Resolve(name string) *AdapterRuntime {
+	return r.adapters[name]
+}
+
+// RegisteredAdapters returns a list of all registered adapter names.
+func (r *AdapterRegistry) RegisteredAdapters() []string {
+	names := make([]string, 0, len(r.adapters))
+	for name := range r.adapters {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// ExecuteRegisteredAdapter runs a registered adapter with argv substitution and timeout.
+// It replaces {request_path} and {result_path} placeholders in the Args list,
+// sets up the working directory and environment, and runs the executable.
+// No shell text execution is allowed; only the registered argv is used.
+// Credentials are provided by the caller and never stored in the executable configuration.
+func ExecuteRegisteredAdapter(ctx context.Context, registry *AdapterRegistry, adapterName string, requestPath string, resultPath string, credentials map[string]string) error {
+	if registry == nil {
+		return fmt.Errorf("registry is required")
+	}
+
+	runtime := registry.Resolve(adapterName)
+	if runtime == nil {
+		return fmt.Errorf("adapter %q not found in registry", adapterName)
+	}
+
+	exe := runtime.Executable
+	if exe.Path == "" {
+		return fmt.Errorf("executable path is required for adapter %q", adapterName)
+	}
+
+	// Substitute placeholders in args
+	substitutedArgs := make([]string, len(exe.Args))
+	for i, arg := range exe.Args {
+		substituted := strings.ReplaceAll(arg, "{request_path}", requestPath)
+		substituted = strings.ReplaceAll(substituted, "{result_path}", resultPath)
+		substitutedArgs[i] = substituted
+	}
+
+	// Build the command with argv only (no shell)
+	if exe.Timeout > 0 {
+		// Create a new context with timeout if one wasn't provided or if we need a shorter timeout
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, exe.Timeout)
+		defer cancel()
+	}
+
+	cmd := exec.CommandContext(ctx, exe.Path, substitutedArgs...)
+
+	// Set working directory if specified
+	if exe.WorkingDirectory != "" {
+		cmd.Dir = exe.WorkingDirectory
+	}
+
+	// Set up environment
+	// Start with the current process environment
+	cmd.Env = os.Environ()
+
+	// Add credential environment variables (credentials are provided by the caller,
+	// not stored in the RegistrationExecutable to ensure secret isolation)
+	for _, credName := range exe.CredentialReferences {
+		if credValue, ok := credentials[credName]; ok {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", credName, credValue))
+		}
+	}
+
+	// Add other environment variables (non-credential ones only)
+	for key, value := range exe.Environment {
+		// Skip credential environment variables from the config; they must come from the credentials map
+		if !slices.Contains(exe.CredentialReferences, key) {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, value))
+		}
+	}
+
+	// Execute the adapter
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("adapter execution failed: %w", err)
+	}
+
+	return nil
 }

@@ -2,6 +2,7 @@ package evaluation
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -558,12 +559,145 @@ func TestCapabilityPreflightCheck(t *testing.T) {
 		t.Error("preflight error should be set")
 	}
 
-	// Request requiring PDF support
+	// Request requiring PDF support (pdf_parsing is the standard name)
 	req.ToolAccess.RequireSourceRetrieval = false
 	req.ToolAccess.RequirePDFSupport = true
 	preflight = &CapabilityPreflight{}
 	preflight.CheckCapabilities(&req, []string{"other_capability"})
 	if preflight.Supported {
-		t.Error("preflight should not support request without pdf_support")
+		t.Error("preflight should not support request without pdf_parsing")
+	}
+}
+
+func TestCapabilityPreflightStructuredOutput(t *testing.T) {
+	req := CandidateRequest{
+		Version: AdapterVersion,
+		ToolAccess: ToolAccessRequirements{
+			RequireStructuredOutput: true,
+		},
+	}
+
+	// Adapter with structured output support
+	preflight := &CapabilityPreflight{}
+	preflight.CheckCapabilities(&req, []string{"structured_output"})
+	if !preflight.Supported {
+		t.Error("preflight should support structured_output")
+	}
+
+	// Adapter without structured output support
+	preflight = &CapabilityPreflight{}
+	preflight.CheckCapabilities(&req, []string{"source_retrieval"})
+	if preflight.Supported {
+		t.Error("preflight should not support request without structured_output")
+	}
+}
+
+func TestAdapterRegistry(t *testing.T) {
+	registry := NewAdapterRegistry()
+
+	// Register an adapter
+	runtime := &AdapterRuntime{
+		Name:    "test_adapter",
+		Version: "1.0",
+		Executable: RegistrationExecutable{
+			Path: "/usr/bin/test",
+			Args: []string{"--request", "{request_path}"},
+		},
+		DeclaredCapabilities: []string{"source_retrieval"},
+	}
+
+	if err := registry.Register(runtime); err != nil {
+		t.Fatalf("registration failed: %v", err)
+	}
+
+	// Resolve the adapter
+	resolved := registry.Resolve("test_adapter")
+	if resolved == nil {
+		t.Error("adapter not found")
+	}
+	if resolved.Name != "test_adapter" {
+		t.Error("adapter name mismatch")
+	}
+
+	// Try to register duplicate
+	if err := registry.Register(runtime); err == nil {
+		t.Error("should not allow duplicate registration")
+	}
+
+	// List registered adapters
+	adapters := registry.RegisteredAdapters()
+	if len(adapters) != 1 || adapters[0] != "test_adapter" {
+		t.Error("adapter list incorrect")
+	}
+}
+
+func TestUnknownSettingsMapSerialization(t *testing.T) {
+	// nil = unknown
+	var nilSettings UnknownSettingsMap
+	nilData, err := json.Marshal(nilSettings)
+	if err != nil {
+		t.Fatalf("marshal nil settings failed: %v", err)
+	}
+
+	// empty map = no settings
+	emptySettings := UnknownSettingsMap{}
+	emptyData, err := json.Marshal(emptySettings)
+	if err != nil {
+		t.Fatalf("marshal empty settings failed: %v", err)
+	}
+
+	// Verify they serialize differently
+	if string(nilData) == string(emptyData) {
+		t.Error("nil and empty settings should serialize differently")
+	}
+
+	// nil should be the string "unknown"
+	if !strings.Contains(string(nilData), "unknown") {
+		t.Errorf("nil settings should contain 'unknown', got: %s", string(nilData))
+	}
+
+	// empty should be an empty object
+	if !strings.Contains(string(emptyData), "{}") {
+		t.Errorf("empty settings should contain '{{}}', got: %s", string(emptyData))
+	}
+}
+
+func TestCandidateIdentityUnknownVsEmpty(t *testing.T) {
+	// Identity with unknown reasoning settings
+	identity1 := CandidateIdentity{
+		AdapterName:       "test",
+		AdapterVersion:    "1.0",
+		ModelID:           "model1",
+		RuntimeName:       "runtime",
+		RuntimeVersion:    "1.0",
+		PromptVersion:     "v1",
+		AccountOrPool:     "pool",
+		ReasoningSettings: nil, // unknown
+	}
+
+	// Identity with empty reasoning settings
+	identity2 := CandidateIdentity{
+		AdapterName:       "test",
+		AdapterVersion:    "1.0",
+		ModelID:           "model1",
+		RuntimeName:       "runtime",
+		RuntimeVersion:    "1.0",
+		PromptVersion:     "v1",
+		AccountOrPool:     "pool",
+		ReasoningSettings: UnknownSettingsMap{}, // empty
+	}
+
+	digest1, err := identity1.Digest()
+	if err != nil {
+		t.Fatalf("digest 1 failed: %v", err)
+	}
+
+	digest2, err := identity2.Digest()
+	if err != nil {
+		t.Fatalf("digest 2 failed: %v", err)
+	}
+
+	if digest1 == digest2 {
+		t.Error("unknown and empty settings should produce different digests")
 	}
 }
