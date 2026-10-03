@@ -1958,7 +1958,11 @@ func (m *BoardModel) renderColumnTasks() string {
 			taskIDDisplay = task.ID[:8]
 		}
 		modelBadge := fmt.Sprintf("[%s]", task.Model)
-		b.WriteString(fmt.Sprintf("%s %s %s  %s\n", prefix, taskIDDisplay, modelBadge, task.Title))
+		held := ""
+		if task.Held {
+			held = " [HELD]"
+		}
+		b.WriteString(fmt.Sprintf("%s %s %s%s  %s\n", prefix, taskIDDisplay, modelBadge, held, task.Title))
 
 		// Show assignee for in_progress, review, approved, and done states
 		shouldShowAssignee := task.State == stateInProgress || task.State == stateReview ||

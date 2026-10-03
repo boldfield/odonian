@@ -4778,3 +4778,66 @@ func TestBoardModel_ApproveRefusedInLocalCommitMode(t *testing.T) {
 		t.Errorf("expected the message to point at odonian approve, got %q", msg.err)
 	}
 }
+
+// TestBoardModel_HeldMarkerRendering verifies that [HELD] marker is rendered on board rows.
+func TestBoardModel_HeldMarkerRendering(t *testing.T) {
+	mockClient := &tuiclient.MockClient{
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{
+				{ID: "ready-task-1", Title: "Held Task", State: "ready", Model: "haiku", Held: true},
+				{ID: "ready-task-2", Title: "Normal Task", State: "ready", Model: "haiku", Held: false},
+			}, nil
+		},
+	}
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "testuser",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
+
+	model := NewBoardModel(mockClient, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	bucketed := make(map[string][]tuiclient.Task)
+	bucketed["backlog"] = []tuiclient.Task{}
+	bucketed["ready"] = []tuiclient.Task{
+		{ID: "ready-task-1", Title: "Held Task", State: "ready", Model: "haiku", Held: true},
+		{ID: "ready-task-2", Title: "Normal Task", State: "ready", Model: "haiku", Held: false},
+	}
+	bucketed["in_progress"] = []tuiclient.Task{}
+	bucketed["review"] = []tuiclient.Task{}
+	bucketed["approved"] = []tuiclient.Task{}
+	bucketed["done"] = []tuiclient.Task{}
+	bucketed["blocked"] = []tuiclient.Task{}
+
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+
+	// Select the ready column to view the tasks
+	model.selectedColumn = 1 // ready column
+
+	output := model.View()
+
+	// Verify that [HELD] marker appears (held task should show it)
+	if !strings.Contains(output, "[HELD]") {
+		t.Errorf("Expected held task to show [HELD] marker in board view.\nOutput:\n%s", output)
+	}
+
+	// Verify both tasks are visible (check by their truncated IDs or titles)
+	if !strings.Contains(output, "Held Task") {
+		t.Errorf("Expected held task to be in board view.\nOutput:\n%s", output)
+	}
+	if !strings.Contains(output, "Normal Task") {
+		t.Errorf("Expected normal task to be in board view.\nOutput:\n%s", output)
+	}
+
+	// Verify normal task does not show [HELD] marker (by checking that [HELD] appears once, not twice)
+	heldCount := strings.Count(output, "[HELD]")
+	if heldCount != 1 {
+		t.Errorf("Expected exactly one [HELD] marker, got %d.\nOutput:\n%s", heldCount, output)
+	}
+}
