@@ -5961,3 +5961,37 @@ func TestResearchStatusFloatTokens(t *testing.T) {
 		t.Errorf("expected tokens 1234.5, got %v", status.Pools[0].Tokens)
 	}
 }
+
+
+func TestPermitRenewOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":         "attempt-456",
+			"permit_id":  "permit-123",
+			"task_id":    "task-1",
+			"state":      "active",
+			"expires_at": "2026-10-10T12:00:00Z",
+		})
+	}))
+	defer server.Close()
+
+	var buf bytes.Buffer
+	err := executePermitRenew(context.Background(), server.URL, "testtoken",
+		[]string{"permit-1", "--task-id", "task-1", "--model", "haiku", "--agent-id", "agent-1",
+			"--request-id", "req-1", "--attempt-id", "att-1"}, &buf)
+
+	if err != nil {
+		t.Fatalf("executePermitRenew failed: %v", err)
+	}
+
+	var attempt map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &attempt); err != nil {
+		t.Fatalf("failed to decode permit renew response: %v", err)
+	}
+	if attempt["expires_at"] == nil {
+		t.Errorf("expected expires_at in response, got nil")
+	}
+}
+
