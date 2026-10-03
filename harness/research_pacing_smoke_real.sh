@@ -101,11 +101,13 @@ new_scenario() {
   DB="$FAKE_DIR/odonian.db"
   export ODONIAN_DB="$DB"
   export ODONIAN_TOKEN="test-token-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' ')"
-  export ODONIAN_ADDR="127.0.0.1:0"
+  # Use a specific high port to avoid conflicts
+  TEST_PORT=$((8080 + SCN))
+  export ODONIAN_ADDR="127.0.0.1:$TEST_PORT"
   export ODONIAN_RESEARCH_POLICY_MODE="enforce"
 
   # Pool configuration for this scenario
-  POOL_DEFAULT='{"default": {"account_id": "test-acct", "models": ["x"], "start_rate": 0.5, "burst_capacity": 2, "concurrent_dispatch_limit": 2, "completion_reserved": 1}}'
+  POOL_DEFAULT='{"default": {"account_id": "test-acct", "models": ["haiku"], "start_rate": 0.5, "burst_capacity": 2, "concurrent_dispatch_limit": 2, "completion_reserved": 1}}'
   export ODONIAN_RESEARCH_POOLS="${POOL_CONFIG:-$POOL_DEFAULT}"
 }
 
@@ -116,37 +118,31 @@ start_server() {
 
   export ODONIAN_HOME="$FAKE_DIR/home"
   mkdir -p "$ODONIAN_HOME"
+  # Set allowed models to match the pool configuration
+  export ODONIAN_MODELS="haiku"
 
   SERVER_LOG="$FAKE_DIR/server.log"
   "$ODONIAN_BIN" server > "$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
 
-  # Wait for server to start and extract the port
-  for _ in $(seq 1 100); do
-    if [ -f "$SERVER_LOG" ] && grep -q "listening\|Listening\|started" "$SERVER_LOG" 2>/dev/null; then
-      sleep 0.2
-      # Try to connect
-      for port in $(seq 8080 8100); do
-        if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
-          export ODONIAN_URL="http://127.0.0.1:$port"
-          sleep 0.3
-          return 0
-        fi
-      done
+  # Wait for server to start
+  for i in $(seq 1 100); do
+    if [ -f "$SERVER_LOG" ] && grep -q "listening" "$SERVER_LOG" 2>/dev/null; then
+      # Extract the port from ODONIAN_ADDR which is already set in the environment
+      PORT=$(echo "$ODONIAN_ADDR" | sed -n 's/.*:\([0-9]\+\)$/\1/p')
+      if [ -n "$PORT" ]; then
+        export ODONIAN_URL="http://127.0.0.1:$PORT"
+        # Give it a moment to fully start listening
+        sleep 0.5
+        return 0
+      fi
     fi
     sleep 0.1
   done
 
-  # Fallback - check log
-  ACTUAL_URL=$(grep -o "http://[^[:space:]]*" "$SERVER_LOG" 2>/dev/null | head -1)
-  if [ -n "$ACTUAL_URL" ]; then
-    export ODONIAN_URL="$ACTUAL_URL"
-    sleep 0.3
-    return 0
-  fi
-
-  echo "ERROR: Failed to start server" >&2
-  cat "$SERVER_LOG" >&2
+  echo "ERROR: Failed to start server after 10 seconds" >&2
+  echo "Server log:" >&2
+  tail -20 "$SERVER_LOG" >&2
   return 1
 }
 
@@ -234,10 +230,10 @@ create_project proj-test "$MAIN_REPO1"
 create_project proj-other "$MAIN_REPO2"
 
 # Two tasks, one can launch, one should defer (limit=2, reserved=1 = 1 available)
-create_task proj-test task-a x implement research
-create_task proj-test task-b x implement research
+create_task proj-test task-a haiku implement research
+create_task proj-test task-b haiku implement research
 
-start_agent "$MAIN_REPO1" proj-test
+start_agent "$MAIN_REPO1" proj-test haiku
 wait_for 15 'test "$(claude_starts)" -ge 1'
 sleep 0.5
 
@@ -252,13 +248,17 @@ new_scenario
 start_server || exit 1
 
 create_project proj-test "$MAIN_REPO1"
-create_task proj-test task-persist x implement research
+create_task proj-test task-persist haiku implement research
 
-start_agent "$MAIN_REPO1" proj-test
+start_agent "$MAIN_REPO1" proj-test haiku
 wait_for 15 'test "$(claude_starts)" -ge 1'
 
 sleep 0.5
 CLAUDE_COUNT_BEFORE=$(claude_starts)
+PERMITS_BEFORE=0
+if command -v sqlite3 >/dev/null 2>&1; then
+  PERMITS_BEFORE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM research_permit WHERE state != 'finalized';" 2>/dev/null || echo 0)
+fi
 
 # Restart server
 stop_server
@@ -266,9 +266,16 @@ sleep 0.5
 start_server || exit 1
 
 CLAUDE_COUNT_AFTER=$(claude_starts)
+PERMITS_AFTER=0
+if command -v sqlite3 >/dev/null 2>&1; then
+  PERMITS_AFTER=$(sqlite3 "$DB" "SELECT COUNT(*) FROM research_permit WHERE state != 'finalized';" 2>/dev/null || echo 0)
+fi
 
 # If permit state survives, same number of claude starts after restart
 check "no duplicate launches after restart" "[ '$CLAUDE_COUNT_BEFORE' -eq '$CLAUDE_COUNT_AFTER' ]"
+if [ "$PERMITS_BEFORE" -gt 0 ]; then
+  check "permits survive restart" "[ '$PERMITS_BEFORE' -eq '$PERMITS_AFTER' ]"
+fi
 
 end_scenario
 
@@ -276,15 +283,15 @@ end_scenario
 echo "Scenario 3: completion reservation"
 new_scenario
 
-export POOL_CONFIG='{"default": {"account_id": "test-acct", "models": ["x"], "start_rate": 1.0, "burst_capacity": 3, "concurrent_dispatch_limit": 3, "completion_reserved": 1}}'
+export POOL_CONFIG='{"default": {"account_id": "test-acct", "models": ["haiku"], "start_rate": 1.0, "burst_capacity": 3, "concurrent_dispatch_limit": 3, "completion_reserved": 1}}'
 
 start_server || exit 1
 
 create_project proj-test "$MAIN_REPO1"
-create_task proj-test impl-1 x implement research
-create_task proj-test review-1 x review research
+create_task proj-test impl-1 haiku implement research
+create_task proj-test review-1 haiku review research
 
-start_agent "$MAIN_REPO1" proj-test
+start_agent "$MAIN_REPO1" proj-test haiku
 wait_for 15 'test "$(claude_starts)" -ge 1'
 sleep 0.5
 
@@ -300,12 +307,12 @@ start_server || exit 1
 create_project proj-a "$MAIN_REPO1"
 create_project proj-b "$MAIN_REPO2"
 
-create_task proj-a task-a1 x implement research
-create_task proj-a task-a2 x implement research
-create_task proj-b task-b1 x implement research
+create_task proj-a task-a1 haiku implement research
+create_task proj-a task-a2 haiku implement research
+create_task proj-b task-b1 haiku implement research
 
 # Start agent on first project
-start_agent "$MAIN_REPO1" proj-a
+start_agent "$MAIN_REPO1" proj-a haiku
 wait_for 15 'test "$(claude_starts)" -ge 1'
 sleep 0.5
 

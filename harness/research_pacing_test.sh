@@ -215,9 +215,9 @@ new_scenario
 tasks_json proj-test A:x:implement B:x:implement
 echo '{"id":"A","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.A"
 echo '{"id":"B","model":"x","kind":"implement","state":"ready","track":"research"}' > "$FAKE_DIR/show.B"
-printf 'grant\ndefer\n' > "$FAKE_DIR/claim.A"
-printf 'grant\n' > "$FAKE_DIR/claim.B"
-echo "sleep:0.2" > "$FAKE_DIR/claude.mode"
+printf 'grant\n' > "$FAKE_DIR/claim.A"
+printf 'defer\n' > "$FAKE_DIR/claim.B"
+echo "sleep:0.1" > "$FAKE_DIR/claude.mode"
 start_agent "$MAIN_REPO1" proj-test
 wait_for 10 'test "$(claude_starts)" -ge 1'
 sleep 0.5
