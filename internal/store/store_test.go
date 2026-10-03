@@ -194,8 +194,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 25 {
-		t.Errorf("expected 25 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 26 {
+		t.Errorf("expected 26 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -205,13 +205,13 @@ func TestMigrations(t *testing.T) {
 	}
 	defer store2.Close()
 
-	// Verify that we still have exactly 25 migrations recorded (idempotency)
+	// Verify that we still have exactly 26 migrations recorded (idempotency)
 	err = store2.Conn().QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount)
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 25 {
-		t.Errorf("expected 25 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 26 {
+		t.Errorf("expected 26 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -307,8 +307,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 25 {
-		t.Errorf("expected 25 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 26 {
+		t.Errorf("expected 26 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -19064,11 +19064,13 @@ func TestFinalizePermitIdempotent(t *testing.T) {
 		t.Fatalf("first FinalizePermit failed: %v", err)
 	}
 
-	// Second finalize should fail with fence mismatch (already finalized)
-	usage2 := "2000"
-	_, err = store.FinalizePermit(ctx, permit1.ID, permit1.AttemptID, &exitClass, &usage2)
-	if err != ErrFenceMismatch {
-		t.Errorf("expected ErrFenceMismatch on second finalize, got %v", err)
+	// Second finalize with same attempt should succeed (idempotent) and return same state
+	finalizedPermit2, err := store.FinalizePermit(ctx, permit1.ID, permit1.AttemptID, &exitClass, &usage)
+	if err != nil {
+		t.Errorf("second same-identity FinalizePermit should succeed, got %v", err)
+	}
+	if finalizedPermit2.State != "finalized" {
+		t.Errorf("expected finalized state, got %s", finalizedPermit2.State)
 	}
 
 	// Verify usage is still the first value

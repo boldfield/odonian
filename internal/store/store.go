@@ -6187,7 +6187,7 @@ func (s *sqliteStore) canonicalizeManifest(raw json.RawMessage, taskID string) (
 // RequestPermit requests or retrieves a permit by request ID, atomically.
 // Stable retries with same request ID return the original permit if it matches the binding.
 // Replayed requests with mismatched task/project/agent/model/pool return ErrReplayMismatch.
-// New requests create a fresh permit with attempt sequence 1 and debits a start from the pool.
+// New requests apply refill, then create a fresh permit with attempt sequence 1 and debit a start from the pool.
 func (s *sqliteStore) RequestPermit(ctx context.Context, requestID, taskID, projectID, agentID, model, accountPool string) (ResearchPermit, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -6216,20 +6216,44 @@ func (s *sqliteStore) RequestPermit(ctx context.Context, requestID, taskID, proj
 		return ResearchPermit{}, fmt.Errorf("query existing permit failed: %w", err)
 	}
 
-	// New permit: check pool capacity and debit
-	// Get or create pool
+	// New permit: apply refill, check pool capacity and debit
+	now := s.timeProvider.NowTimestamp()
+
 	var poolTokens int64
 	var poolConcurrencyLimit, poolConcurrencyUsed int64
+	var lastRefillStr string
+	var refillRate float64
+	var capacityTokens *int64
+
 	err = tx.QueryRowContext(ctx,
-		`SELECT tokens_available, concurrency_limit, concurrency_used FROM research_account_pool WHERE account_pool = ?`,
+		`SELECT tokens_available, concurrency_limit, concurrency_used, last_refill_at, refill_rate, capacity_tokens FROM research_account_pool WHERE account_pool = ?`,
 		accountPool,
-	).Scan(&poolTokens, &poolConcurrencyLimit, &poolConcurrencyUsed)
+	).Scan(&poolTokens, &poolConcurrencyLimit, &poolConcurrencyUsed, &lastRefillStr, &refillRate, &capacityTokens)
 
 	if err == sql.ErrNoRows {
 		return ResearchPermit{}, ErrPoolNotFound
 	}
 	if err != nil {
 		return ResearchPermit{}, fmt.Errorf("query pool failed: %w", err)
+	}
+
+	// Apply refill if configured
+	if capacityTokens != nil && *capacityTokens > 0 && refillRate > 0 {
+		lastRefill, _ := time.Parse(timestampLayout, lastRefillStr)
+		nowTime, _ := time.Parse(timestampLayout, now)
+		elapsed := nowTime.Sub(lastRefill).Seconds()
+		if elapsed > 0 {
+			refilled := int64(math.Ceil(elapsed * refillRate))
+			poolTokens = int64(math.Min(float64(*capacityTokens), float64(poolTokens+refilled)))
+			// Update last_refill_at to now
+			_, err = tx.ExecContext(ctx,
+				`UPDATE research_account_pool SET last_refill_at = ?, tokens_available = ?, updated_at = ? WHERE account_pool = ?`,
+				now, poolTokens, now, accountPool,
+			)
+			if err != nil {
+				return ResearchPermit{}, fmt.Errorf("update refill failed: %w", err)
+			}
+		}
 	}
 
 	// Check capacity: need at least 1 token and room for 1 concurrent permit
@@ -6243,7 +6267,6 @@ func (s *sqliteStore) RequestPermit(ctx context.Context, requestID, taskID, proj
 	// Debit one token and increment concurrency_used
 	permitID := GenerateID()
 	attemptID := GenerateID()
-	now := s.timeProvider.NowTimestamp()
 	expiresAt := s.timeProvider.LeaseExpiryTimestamp(time.Hour)
 
 	// Update pool: debit token and increment concurrency
@@ -6372,7 +6395,15 @@ func (s *sqliteStore) FinalizePermit(ctx context.Context, permitID, attemptID st
 
 	poolID = permit.AccountPool
 
-	// If not active (already finalized or expired), return fence mismatch
+	// If already finalized with same attempt, return the recorded outcome (idempotent)
+	if permit.State == "finalized" {
+		if err := tx.Commit(); err != nil {
+			return ResearchPermit{}, fmt.Errorf("commit failed: %w", err)
+		}
+		return permit, nil
+	}
+
+	// If expired or unknown state, return fence mismatch
 	if permit.State != "active" {
 		return ResearchPermit{}, ErrFenceMismatch
 	}
@@ -6391,7 +6422,7 @@ func (s *sqliteStore) FinalizePermit(ctx context.Context, permitID, attemptID st
 		return ResearchPermit{}, fmt.Errorf("rows affected failed: %w", err)
 	}
 	if affected == 0 {
-		return ResearchPermit{}, fmt.Errorf("permit already finalized")
+		return ResearchPermit{}, ErrPermitFinalized
 	}
 
 	// Update the attempt with exit info
@@ -6496,6 +6527,7 @@ func (s *sqliteStore) ExpirePermit(ctx context.Context, now time.Time) (int64, e
 
 // CreateNextAttempt creates a new attempt for a permit with incremented sequence_number.
 // Fenced by currentAttemptID to prevent concurrent rotation.
+// Charges a token from the pool (new attempts debit a new start).
 // Updates the permit's attempt_id to reference the new attempt for proper fencing.
 // Returns the new attempt and permit.
 func (s *sqliteStore) CreateNextAttempt(ctx context.Context, permitID, currentAttemptID string) (ResearchAttempt, ResearchPermit, error) {
@@ -6518,9 +6550,53 @@ func (s *sqliteStore) CreateNextAttempt(ctx context.Context, permitID, currentAt
 		return ResearchAttempt{}, ResearchPermit{}, fmt.Errorf("query permit failed: %w", err)
 	}
 
-	// Verify the caller owns the current attempt
+	// Verify the caller owns the current attempt and permit is still active
 	if p.AttemptID != currentAttemptID {
 		return ResearchAttempt{}, ResearchPermit{}, ErrFenceMismatch
+	}
+	if p.State != "active" {
+		return ResearchAttempt{}, ResearchPermit{}, ErrFenceMismatch
+	}
+
+	// Apply refill and check capacity before creating new attempt
+	now := s.timeProvider.NowTimestamp()
+
+	var poolTokens int64
+	var lastRefillStr string
+	var refillRate float64
+	var capacityTokens *int64
+
+	err = tx.QueryRowContext(ctx,
+		`SELECT tokens_available, last_refill_at, refill_rate, capacity_tokens FROM research_account_pool WHERE account_pool = ?`,
+		p.AccountPool,
+	).Scan(&poolTokens, &lastRefillStr, &refillRate, &capacityTokens)
+
+	if err != nil {
+		return ResearchAttempt{}, ResearchPermit{}, fmt.Errorf("query pool failed: %w", err)
+	}
+
+	// Apply refill if configured
+	if capacityTokens != nil && *capacityTokens > 0 && refillRate > 0 {
+		lastRefill, _ := time.Parse(timestampLayout, lastRefillStr)
+		nowTime, _ := time.Parse(timestampLayout, now)
+		elapsed := nowTime.Sub(lastRefill).Seconds()
+		if elapsed > 0 {
+			refilled := int64(math.Ceil(elapsed * refillRate))
+			poolTokens = int64(math.Min(float64(*capacityTokens), float64(poolTokens+refilled)))
+			// Update last_refill_at to now
+			_, err = tx.ExecContext(ctx,
+				`UPDATE research_account_pool SET last_refill_at = ?, tokens_available = ?, updated_at = ? WHERE account_pool = ?`,
+				now, poolTokens, now, p.AccountPool,
+			)
+			if err != nil {
+				return ResearchAttempt{}, ResearchPermit{}, fmt.Errorf("update refill failed: %w", err)
+			}
+		}
+	}
+
+	// Check capacity: need at least 1 token
+	if poolTokens < 1 {
+		return ResearchAttempt{}, ResearchPermit{}, ErrInsufficientCapacity
 	}
 
 	// Get latest sequence number
@@ -6535,7 +6611,15 @@ func (s *sqliteStore) CreateNextAttempt(ctx context.Context, permitID, currentAt
 
 	newSeqNum := seqNum + 1
 	newAttemptID := GenerateID()
-	now := s.timeProvider.NowTimestamp()
+
+	// Debit one token
+	_, err = tx.ExecContext(ctx,
+		`UPDATE research_account_pool SET tokens_available = tokens_available - 1, updated_at = ? WHERE account_pool = ?`,
+		now, p.AccountPool,
+	)
+	if err != nil {
+		return ResearchAttempt{}, ResearchPermit{}, fmt.Errorf("update pool failed: %w", err)
+	}
 
 	// Create new attempt
 	_, err = tx.ExecContext(ctx,
@@ -6601,16 +6685,48 @@ func (s *sqliteStore) ListActivePermits(ctx context.Context, state string) ([]Re
 }
 
 // InitializePool creates or updates a research account pool with initial configuration.
-// Idempotent: calling multiple times with the same pool name and config is safe.
+// On creation: initializes tokens, refill state, and concurrency limit.
+// On update: preserves existing tokens, occupancy, and refill state; only updates concurrency limit.
+// This prevents restart from resetting allowances or occupancy while permits are active.
 func (s *sqliteStore) InitializePool(ctx context.Context, accountPool string, tokensAvailable int64, concurrencyLimit int64) error {
 	now := s.timeProvider.NowTimestamp()
 
-	_, err := s.conn.ExecContext(ctx,
-		`INSERT OR REPLACE INTO research_account_pool (account_pool, tokens_available, last_refill_at, concurrency_limit, concurrency_used, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, 0, COALESCE((SELECT created_at FROM research_account_pool WHERE account_pool = ?), ?), ?)`,
-		accountPool, tokensAvailable, now, concurrencyLimit, accountPool, now, now,
-	)
-	return err
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Check if pool exists
+	var exists bool
+	err = tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM research_account_pool WHERE account_pool = ?)`,
+		accountPool,
+	).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("query pool existence failed: %w", err)
+	}
+
+	if !exists {
+		// Create new pool
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO research_account_pool (account_pool, tokens_available, last_refill_at, concurrency_limit, concurrency_used, refill_rate, capacity_tokens, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 0, 0.0, ?, ?, ?)`,
+			accountPool, tokensAvailable, now, concurrencyLimit, tokensAvailable, now, now,
+		)
+	} else {
+		// Update: only change concurrency_limit, preserve everything else
+		_, err = tx.ExecContext(ctx,
+			`UPDATE research_account_pool SET concurrency_limit = ?, updated_at = ? WHERE account_pool = ?`,
+			concurrencyLimit, now, accountPool,
+		)
+	}
+
+	if err != nil {
+		return fmt.Errorf("initialize/update pool failed: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // ListPermitsByProject lists permits for a specific project.
