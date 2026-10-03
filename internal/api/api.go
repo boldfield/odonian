@@ -1468,6 +1468,7 @@ func (s *Server) handleGetResearchStatus(w http.ResponseWriter, r *http.Request)
 			"account_id":        p.AccountID,
 			"active":            p.Active,
 			"active_completion": p.ActiveCompletion,
+			"deferred":          p.Deferred,
 			"tokens":            p.Tokens,
 			"settled_at":        p.SettledAt,
 		})
@@ -1523,6 +1524,24 @@ func (s *Server) handleRenewResearchPermit(w http.ResponseWriter, r *http.Reques
 	}
 
 	now := time.Now()
+
+	// Load permit to validate identities
+	permit, _, err := s.store.GetResearchPermit(r.Context(), permitID)
+	if errors.Is(err, store.ErrPermitNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "PERMIT_NOT_FOUND", "Research permit not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "RENEW_ERROR", "Failed to load research permit")
+		return
+	}
+
+	// Validate identities
+	if permit.TaskID != payload.TaskID || permit.Model != payload.Model || permit.AgentID != payload.AgentID {
+		s.errorResponse(w, http.StatusConflict, "PERMIT_IDENTITY_MISMATCH", "Permit identity does not match the provided task, model, or agent")
+		return
+	}
+
 	attempt, err := s.store.RenewResearchAttempt(r.Context(), now, permitID, payload.AttemptID, s.leaseTTL)
 	if errors.Is(err, store.ErrPermitNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "PERMIT_NOT_FOUND", "Research permit not found")
@@ -1609,6 +1628,24 @@ func (s *Server) handleFinalizeResearchPermit(w http.ResponseWriter, r *http.Req
 	}
 
 	now := time.Now()
+
+	// Load permit to validate identities
+	permit, _, err := s.store.GetResearchPermit(r.Context(), permitID)
+	if errors.Is(err, store.ErrPermitNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "PERMIT_NOT_FOUND", "Research permit not found")
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "FINALIZE_ERROR", "Failed to load research permit")
+		return
+	}
+
+	// Validate identities
+	if permit.TaskID != payload.TaskID || permit.Model != payload.Model || permit.AgentID != payload.AgentID {
+		s.errorResponse(w, http.StatusConflict, "PERMIT_IDENTITY_MISMATCH", "Permit identity does not match the provided task, model, or agent")
+		return
+	}
+
 	attempt, err := s.store.FinalizeResearchAttempt(r.Context(), now, permitID, payload.AttemptID, payload.ExitClass, payload.UsageTokens)
 	if errors.Is(err, store.ErrPermitNotFound) {
 		s.errorResponse(w, http.StatusNotFound, "PERMIT_NOT_FOUND", "Research permit not found")

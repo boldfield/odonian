@@ -315,6 +315,193 @@ returns `200` with an empty `reviewer_scorecards` array rather than `404`.
 
 ---
 
+### Research Admission
+
+#### `GET /research/policy`
+
+Read the current research pacing policy (admission mode). Returns the configured pool mode
+(`enforce`, `observe`, or `disabled`) and safe pool configuration without credentials.
+
+**Request:**
+```bash
+curl -H "Authorization: Bearer token" \
+  https://api.example.com/research/policy
+```
+
+**Response (200 OK):**
+```json
+{
+  "mode": "enforce",
+  "pools": [
+    {
+      "account_id": "account-1",
+      "start_rate": 1.0,
+      "burst_capacity": 10,
+      "concurrent_limit": 5,
+      "completion_reserved": 2
+    }
+  ]
+}
+```
+
+**Status Codes:**
+- `200 OK`: Policy retrieved
+- `401`: Missing or invalid bearer token (see [Authentication](#authentication))
+- `500 POLICY_ERROR`: Server error retrieving policy
+
+---
+
+#### `GET /research/status`
+
+Read the current research pool status: configured limits, allowance tokens, active and deferred
+task counts. Safe to expose publicly (no credentials, no task details).
+
+**Request:**
+```bash
+curl -H "Authorization: Bearer token" \
+  https://api.example.com/research/status
+```
+
+**Response (200 OK):**
+```json
+{
+  "mode": "enforce",
+  "pools": [
+    {
+      "account_id": "account-1",
+      "active": 3,
+      "active_completion": 1,
+      "deferred": 2,
+      "tokens": 7.5,
+      "settled_at": "2026-10-03T12:00:00Z"
+    }
+  ]
+}
+```
+
+Fields:
+- `mode`: Current admission mode (`enforce`, `observe`, or `disabled`)
+- `active`: Number of active research attempts
+- `active_completion`: Number of active completion-class attempts
+- `deferred`: Number of currently deferred tasks waiting for capacity/rate limit
+- `tokens`: Current token bucket level (capped at `burst_capacity`)
+- `settled_at`: Timestamp when tokens were last settled
+
+**Status Codes:**
+- `200 OK`: Status retrieved
+- `401`: Missing or invalid bearer token (see [Authentication](#authentication))
+- `500 STATUS_ERROR`: Server error retrieving status
+
+---
+
+#### `POST /research/permits/{permit_id}/renew`
+
+Extend the lease on an active research attempt. The attempt must be live (not finalized or
+expired). Caller must provide the attempt's task, model, and agent identities; mismatches
+are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
+
+**Request:**
+```json
+{
+  "task_id": "task-uuid",
+  "model": "haiku",
+  "agent_id": "agent-uuid",
+  "attempt_id": "attempt-uuid"
+}
+```
+
+**Parameters:**
+- `task_id` (required): ID of the task associated with this permit
+- `model` (required): Model that claimed this permit
+- `agent_id` (required): ID of the agent claiming this permit
+- `attempt_id` (required): ID of the current attempt to renew
+
+**Response (200 OK):**
+```json
+{
+  "attempt": {
+    "id": "attempt-uuid",
+    "permit_id": "permit-uuid",
+    "task_id": "task-uuid",
+    "expires_at": "2026-10-03T12:30:00Z",
+    "state": "active"
+  }
+}
+```
+
+**Status Codes:**
+- `200 OK`: Lease renewed
+- `400 MISSING_TASK_ID`: task_id is required
+- `400 MISSING_MODEL`: model is required
+- `400 MISSING_AGENT_ID`: agent_id is required
+- `400 MISSING_ATTEMPT_ID`: attempt_id is required
+- `401`: Missing or invalid bearer token (see [Authentication](#authentication))
+- `404 PERMIT_NOT_FOUND`: Permit does not exist
+- `409 PERMIT_IDENTITY_MISMATCH`: Provided task_id, model, or agent_id does not match the permit
+- `409 ATTEMPT_FENCED`: Attempt ID does not match the permit's current attempt
+- `409 ATTEMPT_EXPIRED`: Attempt lease has expired
+- `409 ATTEMPT_FINALIZED`: Attempt is already finalized
+- `500 RENEW_ERROR`: Server error renewing attempt
+
+---
+
+#### `POST /research/permits/{permit_id}/finalize`
+
+End an active research attempt and record the outcome. The attempt must be live.
+Caller must provide the attempt's task, model, and agent identities; mismatches
+are rejected with `409 PERMIT_IDENTITY_MISMATCH`.
+
+**Request:**
+```json
+{
+  "task_id": "task-uuid",
+  "model": "haiku",
+  "agent_id": "agent-uuid",
+  "attempt_id": "attempt-uuid",
+  "exit_class": "completed",
+  "usage_tokens": 1500
+}
+```
+
+**Parameters:**
+- `task_id` (required): ID of the task associated with this permit
+- `model` (required): Model that claimed this permit
+- `agent_id` (required): ID of the agent claiming this permit
+- `attempt_id` (required): ID of the current attempt to finalize
+- `exit_class` (required): Outcome class: `completed`, `failed`, `cancelled`, or `unknown`
+- `usage_tokens` (optional): Tokens consumed by this attempt; must be non-negative
+
+**Response (200 OK):**
+```json
+{
+  "attempt": {
+    "id": "attempt-uuid",
+    "permit_id": "permit-uuid",
+    "task_id": "task-uuid",
+    "state": "finalized",
+    "exit_class": "completed"
+  }
+}
+```
+
+**Status Codes:**
+- `200 OK`: Attempt finalized
+- `400 MISSING_TASK_ID`: task_id is required
+- `400 MISSING_MODEL`: model is required
+- `400 MISSING_AGENT_ID`: agent_id is required
+- `400 MISSING_ATTEMPT_ID`: attempt_id is required
+- `400 MISSING_EXIT_CLASS`: exit_class is required
+- `400 INVALID_EXIT_CLASS`: exit_class must be one of: completed, failed, cancelled, unknown
+- `401`: Missing or invalid bearer token (see [Authentication](#authentication))
+- `404 PERMIT_NOT_FOUND`: Permit does not exist
+- `409 PERMIT_IDENTITY_MISMATCH`: Provided task_id, model, or agent_id does not match the permit
+- `409 ATTEMPT_FENCED`: Attempt ID does not match the permit's current attempt
+- `409 ATTEMPT_EXPIRED`: Attempt lease has expired
+- `409 ATTEMPT_FINALIZED`: Attempt is already finalized
+- `500 FINALIZE_ERROR`: Server error finalizing attempt
+
+---
+
 ### Tasks
 
 #### Task ID Conventions

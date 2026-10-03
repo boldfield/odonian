@@ -23,16 +23,17 @@ import (
 // leaving in_progress. A start is never refunded.
 
 var (
-	ErrPoolNotFound         = errors.New("research pool not found")
-	ErrPermitNotFound       = errors.New("research permit not found")
-	ErrFenceMismatch        = errors.New("research attempt identity does not match the permit's current attempt")
-	ErrPermitExpired        = errors.New("research attempt lease expired")
-	ErrPermitFinalized      = errors.New("research attempt already finalized")
-	ErrBindingMismatch      = errors.New("request ID is already bound to a different task, agent, model or pool")
-	ErrTaskBusy             = errors.New("task already has a live research attempt")
-	ErrAttemptLive          = errors.New("previous research attempt is still live")
-	ErrInsufficientCapacity = errors.New("research pool has insufficient capacity")
-	ErrInvalidResearchInput = errors.New("invalid research permit input")
+	ErrPoolNotFound           = errors.New("research pool not found")
+	ErrPermitNotFound         = errors.New("research permit not found")
+	ErrFenceMismatch          = errors.New("research attempt identity does not match the permit's current attempt")
+	ErrPermitExpired          = errors.New("research attempt lease expired")
+	ErrPermitFinalized        = errors.New("research attempt already finalized")
+	ErrPermitIdentityMismatch = errors.New("permit identity does not match the provided task, model, or agent")
+	ErrBindingMismatch        = errors.New("request ID is already bound to a different task, agent, model or pool")
+	ErrTaskBusy               = errors.New("task already has a live research attempt")
+	ErrAttemptLive            = errors.New("previous research attempt is still live")
+	ErrInsufficientCapacity   = errors.New("research pool has insufficient capacity")
+	ErrInvalidResearchInput   = errors.New("invalid research permit input")
 )
 
 // Exit classes for a finalized attempt. ExitLeaseExpired is recorded by expiry
@@ -86,6 +87,7 @@ type ResearchPoolState struct {
 	SettledAt        string
 	Active           int
 	ActiveCompletion int
+	Deferred         int
 }
 
 // PermitRequest asks for one research start. Class must be a paced research
@@ -491,6 +493,16 @@ func (s *sqliteStore) ListResearchPoolStates(ctx context.Context, now time.Time)
 		}
 		state.Active = active
 		state.ActiveCompletion = activeCompletion
+
+		// Count deferred tasks
+		var deferred int
+		err = tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM research_admission_diagnostic
+			WHERE account_id = ? AND outcome = 'defer'`, state.AccountID).Scan(&deferred)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count deferred tasks: %w", err)
+		}
+		state.Deferred = deferred
 
 		states = append(states, state)
 	}
