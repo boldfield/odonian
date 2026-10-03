@@ -282,18 +282,18 @@ type CandidateStats struct {
 
 // StoredFinding represents a finding with its attempt context.
 type StoredFinding struct {
-	FindingID      string
-	AttemptID      string
-	CandidateID    string
-	SampleID       string
-	Severity       string
-	Claim          string
-	Summary        string
-	Evidence       string
-	ExitClass      *EvaluationExitClass
-	Status         *string
-	Disposition    *string
-	DispositionEv  string
+	FindingID     string
+	AttemptID     string
+	CandidateID   string
+	SampleID      string
+	Severity      string
+	Claim         string
+	Summary       string
+	Evidence      string
+	ExitClass     *EvaluationExitClass
+	Status        *string
+	Disposition   *string
+	DispositionEv string
 }
 
 // ListCampaignAttempts returns all attempts for a campaign with findings grouped by sample and candidate.
@@ -437,9 +437,16 @@ func (s *sqliteStore) ListCampaignAttempts(ctx context.Context, campaignID strin
 	for findingRows.Next() {
 		var finding StoredFinding
 		var sampleID, candidateID string
+		var claim, evidence sql.NullString
 		if err := findingRows.Scan(&finding.FindingID, &finding.AttemptID, &finding.Severity,
-			&finding.Claim, &finding.Summary, &finding.Evidence, &sampleID, &candidateID); err != nil {
+			&claim, &finding.Summary, &evidence, &sampleID, &candidateID); err != nil {
 			return stats, fmt.Errorf("scan finding: %w", err)
+		}
+		if claim.Valid {
+			finding.Claim = claim.String
+		}
+		if evidence.Valid {
+			finding.Evidence = evidence.String
 		}
 		finding.SampleID = sampleID
 		finding.CandidateID = candidateID

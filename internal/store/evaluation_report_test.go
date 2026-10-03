@@ -3,6 +3,9 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
+
+	"github.com/boldfield/odonian/internal/evaluation"
 )
 
 func TestRecordAndGetFindingDisposition(t *testing.T) {
@@ -250,7 +253,7 @@ func TestListCampaignAttemptsWithUnequalCoverage(t *testing.T) {
 	cand2, _ = store.CreateEvaluationCandidate(ctx, cand2)
 
 	// Create jobs: candidate1 has both samples, candidate2 has only sample1
-	pool, _ := store.ConfigureEvaluationPool(ctx, EvaluationPoolConfig{ID: "pool1", ConcurrentLimit: 10})
+	_, _ = store.ConfigureEvaluationPool(ctx, EvaluationPoolConfig{ID: "pool1", ConcurrentLimit: 10})
 	store.ConfigureEvaluationPool(ctx, EvaluationPoolConfig{ID: cand1.AccountPoolID(), ConcurrentLimit: 10})
 	store.ConfigureEvaluationPool(ctx, EvaluationPoolConfig{ID: cand2.AccountPoolID(), ConcurrentLimit: 10})
 
@@ -354,8 +357,8 @@ func TestListCampaignAttemptsWithMissingUsage(t *testing.T) {
 	candidate := newTestCandidate(campaign.ID)
 	candidate, _ = store.CreateEvaluationCandidate(ctx, candidate)
 	store.ConfigureEvaluationPool(ctx, EvaluationPoolConfig{
-		ID:               candidate.AccountPoolID(),
-		ConcurrentLimit:  10,
+		ID:              candidate.AccountPoolID(),
+		ConcurrentLimit: 10,
 	})
 
 	// Create attempt with no usage tokens
@@ -393,4 +396,4 @@ func intPtr(i int) *int {
 	return &i
 }
 
-var completedStatus = "completed"
+var completedStatus = evaluation.StatusCompleted
