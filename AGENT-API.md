@@ -325,6 +325,8 @@ digest and therefore creates a separate set.
 ## Research admission CLI commands
 
 Research tasks are admitted against a research pacing policy that manages consumption automatically.
+Operators: the rollout runbook, calibration queries and smoke test are in
+[`docs/runbooks/research-pacing-rollout.md`](docs/runbooks/research-pacing-rollout.md).
 The following CLI commands expose research admission operations and status.
 
 ### Get research pacing policy configuration

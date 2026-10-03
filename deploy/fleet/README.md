@@ -149,6 +149,28 @@ room, not as a substitute for this bound), leaving headroom for worktrees and to
 also live under `$ODONIAN_HOME` but are not touched by this prune — only `$ODONIAN_HOME/repos`
 is in scope.
 
+### Research pacing and launcher rollout
+
+Research workers and reviewers request admission before launching a model: `harness/agent.sh` runs
+`odonian claim` for the chosen research task, starts `claude` only if the server admits it (passing
+`ODONIAN_PRECLAIMED_TASK_ID` and `ODONIAN_PRECLAIMED_ATTEMPT_ID`), renews the permit while the process
+lives, and finalizes it on exit. A denied task stays `ready` and the launcher moves on and retries on its
+own. Build, design and merge slots are unaffected.
+
+Rolling pacing out to the fleet is an ordering problem, and the image pins live in the manifests repository
+(not changed from here):
+
+1. Roll the new fleet image to every research worker and reviewer while the server's
+   `ODONIAN_RESEARCH_POLICY_MODE` is still unset or `disabled`; the new launcher works with the policy off.
+2. Drain any launcher still on an older image before the server enforces. An older launcher starts the model
+   first and lets the model claim, so under `enforce` it spends model usage on claims that are then denied.
+3. Only then set the mode (`observe`, then `enforce`) on the server.
+
+The server-side variables, the observe/calibrate queries, the rollback and the smoke test are in
+[`docs/runbooks/research-pacing-rollout.md`](../../docs/runbooks/research-pacing-rollout.md). Fleet timing is
+tunable with `ODONIAN_RENEW_INTERVAL_SECS` (permit/lease renewal period, default `20`, which must stay well
+under `ODONIAN_LEASE_TTL`), `ODONIAN_ADMISSION_TRIES` and `ODONIAN_ADMISSION_RETRY_NAP`.
+
 ### PDF rendering and source inspection
 
 The fleet image includes Poppler utilities (`pdfinfo`, `pdftoppm`, `pdftotext`) for PDF rendering
