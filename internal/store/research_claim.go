@@ -105,6 +105,12 @@ func (s *sqliteStore) SetResearchPolicy(ctx context.Context, now time.Time, cfg 
 	return nil
 }
 
+// GetResearchPolicyMode returns the current research admission policy mode.
+func (s *sqliteStore) GetResearchPolicyMode(ctx context.Context) (policy.Mode, error) {
+	snap := s.researchPolicy()
+	return snap.Mode, nil
+}
+
 // ResearchClaim is one claim of a specific task by one agent. RequestID is the
 // caller's stable idempotency key: a transport retry with the same ID recovers
 // the original admission instead of spending again. Empty means a legacy claim

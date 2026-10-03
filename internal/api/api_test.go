@@ -9419,3 +9419,390 @@ func testContinuationHeldLegacyTasks(t *testing.T) {
 		t.Fatalf("action items must list the held follow-up and the held dependent for manual handling, got %+v", done.Continuation.ActionItems)
 	}
 }
+
+// TestGetResearchPolicyRequiresAuth verifies GET /research/policy requires authentication.
+func TestGetResearchPolicyRequiresAuth(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+
+	req := httptest.NewRequest("GET", "/research/policy", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+}
+
+// TestGetResearchPolicyReturnsConfiguredPools verifies GET /research/policy returns configured pools.
+func TestGetResearchPolicyReturnsConfiguredPools(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Configure a research pool
+	cfg := store.ResearchPoolConfig{
+		AccountID:          "account-1",
+		StartRate:          1.0,
+		BurstCapacity:      10,
+		ConcurrentLimit:    5,
+		CompletionReserved: 2,
+	}
+	_, err := server.store.ConfigureResearchPool(context.Background(), time.Now(), cfg)
+	if err != nil {
+		t.Fatalf("failed to configure pool: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/research/policy", nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if mode, ok := resp["mode"].(string); !ok || mode == "" {
+		t.Errorf("expected mode in response, got %v", resp["mode"])
+	}
+
+	pools, ok := resp["pools"].([]interface{})
+	if !ok {
+		t.Errorf("expected pools array in response")
+	} else if len(pools) == 0 {
+		t.Errorf("expected at least one pool in response")
+	}
+}
+
+// TestGetResearchStatusRequiresAuth verifies GET /research/status requires authentication.
+func TestGetResearchStatusRequiresAuth(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+
+	req := httptest.NewRequest("GET", "/research/status", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+}
+
+// TestGetResearchStatusReturnsPoolStatus verifies GET /research/status returns pool status.
+func TestGetResearchStatusReturnsPoolStatus(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	cfg := store.ResearchPoolConfig{
+		AccountID:          "account-2",
+		StartRate:          1.0,
+		BurstCapacity:      10,
+		ConcurrentLimit:    5,
+		CompletionReserved: 2,
+	}
+	_, err := server.store.ConfigureResearchPool(context.Background(), time.Now(), cfg)
+	if err != nil {
+		t.Fatalf("failed to configure pool: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/research/status", nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if mode, ok := resp["mode"].(string); !ok || mode == "" {
+		t.Errorf("expected mode in response, got %v", resp["mode"])
+	}
+
+	pools, ok := resp["pools"].([]interface{})
+	if !ok {
+		t.Errorf("expected pools array in response")
+	} else if len(pools) == 0 {
+		t.Errorf("expected at least one pool in response")
+	}
+}
+
+// TestRenewResearchPermitRequiresAuth verifies POST /research/permits/{id}/renew requires authentication.
+func TestRenewResearchPermitRequiresAuth(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+
+	payload := map[string]string{
+		"task_id":    "test-task",
+		"model":      "haiku",
+		"agent_id":   "test-agent",
+		"attempt_id": "test-attempt",
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/research/permits/test-permit/renew", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+}
+
+// TestRenewResearchPermitWithMissingFields verifies validation of required fields.
+func TestRenewResearchPermitWithMissingFields(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	tests := []struct {
+		name        string
+		payload     map[string]string
+		expectedErr string
+	}{
+		{
+			name:        "missing task_id",
+			payload:     map[string]string{"model": "haiku", "agent_id": "agent", "attempt_id": "attempt"},
+			expectedErr: "MISSING_TASK_ID",
+		},
+		{
+			name:        "missing model",
+			payload:     map[string]string{"task_id": "task", "agent_id": "agent", "attempt_id": "attempt"},
+			expectedErr: "MISSING_MODEL",
+		},
+		{
+			name:        "missing agent_id",
+			payload:     map[string]string{"task_id": "task", "model": "haiku", "attempt_id": "attempt"},
+			expectedErr: "MISSING_AGENT_ID",
+		},
+		{
+			name:        "missing attempt_id",
+			payload:     map[string]string{"task_id": "task", "model": "haiku", "agent_id": "agent"},
+			expectedErr: "MISSING_ATTEMPT_ID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _ := json.Marshal(tt.payload)
+			req := httptest.NewRequest("POST", "/research/permits/test-permit/renew", bytes.NewReader(body))
+			req.Header.Set("Authorization", authHeader)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected status 400, got %d", w.Code)
+			}
+
+			var errResp map[string]interface{}
+			json.NewDecoder(w.Body).Decode(&errResp)
+			errObj, ok := errResp["error"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("expected error object in response")
+			}
+			code, ok := errObj["code"].(string)
+			if !ok || code != tt.expectedErr {
+				t.Errorf("expected error code %s, got %s", tt.expectedErr, code)
+			}
+		})
+	}
+}
+
+// TestRenewResearchPermitNotFound verifies 404 for non-existent permit.
+func TestRenewResearchPermitNotFound(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	payload := map[string]string{
+		"task_id":    "test-task",
+		"model":      "haiku",
+		"agent_id":   "test-agent",
+		"attempt_id": "test-attempt",
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/research/permits/nonexistent-permit/renew", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d", w.Code)
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&errResp)
+	errObj, ok := errResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object in response")
+	}
+	code, ok := errObj["code"].(string)
+	if !ok || code != "PERMIT_NOT_FOUND" {
+		t.Errorf("expected error code PERMIT_NOT_FOUND, got %s", code)
+	}
+}
+
+// TestFinalizeResearchPermitRequiresAuth verifies POST /research/permits/{id}/finalize requires authentication.
+func TestFinalizeResearchPermitRequiresAuth(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+
+	payload := map[string]interface{}{
+		"task_id":    "test-task",
+		"model":      "haiku",
+		"agent_id":   "test-agent",
+		"attempt_id": "test-attempt",
+		"exit_class": "completed",
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/research/permits/test-permit/finalize", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+}
+
+// TestFinalizeResearchPermitWithMissingFields verifies validation of required fields.
+func TestFinalizeResearchPermitWithMissingFields(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	tests := []struct {
+		name        string
+		payload     map[string]interface{}
+		expectedErr string
+	}{
+		{
+			name: "missing task_id",
+			payload: map[string]interface{}{
+				"model": "haiku", "agent_id": "agent", "attempt_id": "attempt", "exit_class": "completed",
+			},
+			expectedErr: "MISSING_TASK_ID",
+		},
+		{
+			name: "missing model",
+			payload: map[string]interface{}{
+				"task_id": "task", "agent_id": "agent", "attempt_id": "attempt", "exit_class": "completed",
+			},
+			expectedErr: "MISSING_MODEL",
+		},
+		{
+			name: "missing exit_class",
+			payload: map[string]interface{}{
+				"task_id": "task", "model": "haiku", "agent_id": "agent", "attempt_id": "attempt",
+			},
+			expectedErr: "MISSING_EXIT_CLASS",
+		},
+		{
+			name: "invalid exit_class",
+			payload: map[string]interface{}{
+				"task_id": "task", "model": "haiku", "agent_id": "agent", "attempt_id": "attempt", "exit_class": "invalid",
+			},
+			expectedErr: "INVALID_EXIT_CLASS",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _ := json.Marshal(tt.payload)
+			req := httptest.NewRequest("POST", "/research/permits/test-permit/finalize", bytes.NewReader(body))
+			req.Header.Set("Authorization", authHeader)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected status 400, got %d", w.Code)
+			}
+
+			var errResp map[string]interface{}
+			json.NewDecoder(w.Body).Decode(&errResp)
+			errObj, ok := errResp["error"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("expected error object in response")
+			}
+			code, ok := errObj["code"].(string)
+			if !ok || code != tt.expectedErr {
+				t.Errorf("expected error code %s, got %s", tt.expectedErr, code)
+			}
+		})
+	}
+}
+
+// TestFinalizeResearchPermitNotFound verifies 404 for non-existent permit.
+func TestFinalizeResearchPermitNotFound(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	payload := map[string]interface{}{
+		"task_id":    "test-task",
+		"model":      "haiku",
+		"agent_id":   "test-agent",
+		"attempt_id": "test-attempt",
+		"exit_class": "completed",
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/research/permits/nonexistent-permit/finalize", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d", w.Code)
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&errResp)
+	errObj, ok := errResp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object in response")
+	}
+	code, ok := errObj["code"].(string)
+	if !ok || code != "PERMIT_NOT_FOUND" {
+		t.Errorf("expected error code PERMIT_NOT_FOUND, got %s", code)
+	}
+}
+
+// TestFinalizeResearchPermitWithValidExitClasses verifies all valid exit classes are accepted.
+func TestFinalizeResearchPermitWithValidExitClasses(t *testing.T) {
+	validClasses := []string{"completed", "failed", "cancelled", "unknown"}
+
+	for _, exitClass := range validClasses {
+		t.Run(exitClass, func(t *testing.T) {
+			server := setupTestServer(t, "test-token")
+			authHeader := "Bearer test-token"
+
+			payload := map[string]interface{}{
+				"task_id":    "test-task",
+				"model":      "haiku",
+				"agent_id":   "test-agent",
+				"attempt_id": "test-attempt",
+				"exit_class": exitClass,
+			}
+			body, _ := json.Marshal(payload)
+
+			req := httptest.NewRequest("POST", "/research/permits/nonexistent-permit/finalize", bytes.NewReader(body))
+			req.Header.Set("Authorization", authHeader)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+
+			// We expect 404 (permit not found), not 400 (invalid exit_class)
+			if w.Code != http.StatusNotFound {
+				t.Errorf("expected status 404, got %d", w.Code)
+			}
+		})
+	}
+}

@@ -64,6 +64,7 @@ type Store interface {
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	ClaimResearchTask(ctx context.Context, req ResearchClaim) (ResearchClaimResult, error)
 	SetResearchPolicy(ctx context.Context, now time.Time, cfg policy.Config) error
+	GetResearchPolicyMode(ctx context.Context) (policy.Mode, error)
 	GetResearchAdmissionDiagnostic(ctx context.Context, taskID string) (ResearchAdmissionDiagnostic, error)
 	HeartbeatTask(ctx context.Context, taskID, agentID string, leaseTTL time.Duration) (Task, error)
 	PromoteTask(ctx context.Context, taskID string) (Task, error)

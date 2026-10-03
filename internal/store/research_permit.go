@@ -147,6 +147,8 @@ type PermitGrant struct {
 type ResearchPermitStore interface {
 	ConfigureResearchPool(ctx context.Context, now time.Time, cfg ResearchPoolConfig) (ResearchPoolState, error)
 	GetResearchPool(ctx context.Context, now time.Time, accountID string) (ResearchPoolState, error)
+	ListResearchPools(ctx context.Context) ([]ResearchPoolConfig, error)
+	ListResearchPoolStates(ctx context.Context, now time.Time) ([]ResearchPoolState, error)
 	RequestResearchPermit(ctx context.Context, now time.Time, req PermitRequest) (PermitGrant, error)
 	StartNextResearchAttempt(ctx context.Context, now time.Time, permitID, priorAttemptID string, leaseTTL, retryHint time.Duration) (PermitGrant, error)
 	RenewResearchAttempt(ctx context.Context, now time.Time, permitID, attemptID string, leaseTTL time.Duration) (ResearchAttempt, error)
@@ -410,6 +412,89 @@ func (s *sqliteStore) GetResearchPool(ctx context.Context, now time.Time, accoun
 		return ResearchPoolState{}, fmt.Errorf("failed to count research occupancy: %w", err)
 	}
 	return st, nil
+}
+
+// ListResearchPools reads all configured pools without changing them.
+func (s *sqliteStore) ListResearchPools(ctx context.Context) ([]ResearchPoolConfig, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT account_id, start_rate, burst_capacity, concurrent_limit, completion_reserved
+		FROM research_pool
+		ORDER BY account_id`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query research pools: %w", err)
+	}
+	defer rows.Close()
+
+	var pools []ResearchPoolConfig
+	for rows.Next() {
+		var cfg ResearchPoolConfig
+		if err := rows.Scan(&cfg.AccountID, &cfg.StartRate, &cfg.BurstCapacity, &cfg.ConcurrentLimit, &cfg.CompletionReserved); err != nil {
+			return nil, fmt.Errorf("failed to scan research pool: %w", err)
+		}
+		pools = append(pools, cfg)
+	}
+	return pools, rows.Err()
+}
+
+// ListResearchPoolStates reads all pools with their current state without changing them.
+func (s *sqliteStore) ListResearchPoolStates(ctx context.Context, now time.Time) ([]ResearchPoolState, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT account_id, start_rate, burst_capacity, concurrent_limit, completion_reserved, tokens, settled_at
+		FROM research_pool
+		ORDER BY account_id`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query research pools: %w", err)
+	}
+	defer rows.Close()
+
+	var states []ResearchPoolState
+	for rows.Next() {
+		var state ResearchPoolState
+		var settledAtStr string
+		if err := rows.Scan(&state.AccountID, &state.StartRate, &state.BurstCapacity, &state.ConcurrentLimit, &state.CompletionReserved, &state.Tokens, &settledAtStr); err != nil {
+			return nil, fmt.Errorf("failed to scan research pool: %w", err)
+		}
+
+		// Parse settled_at timestamp
+		settledAt, err := parseTS(settledAtStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse settled_at: %w", err)
+		}
+
+		// Settle the pool to the current time
+		at := settledAt
+		if now.After(settledAt) {
+			state.Tokens = math.Min(float64(state.BurstCapacity), state.Tokens+now.Sub(settledAt).Seconds()*state.StartRate)
+			at = now
+		}
+		state.SettledAt = formatTS(at)
+
+		// Count active attempts
+		var active, activeCompletion int
+		err = tx.QueryRowContext(ctx, `
+			SELECT COUNT(*), COALESCE(SUM(completion), 0) FROM research_attempt
+			WHERE account_id = ? AND state = 'active' AND expires_at > ?`, state.AccountID, formatTS(at)).Scan(&active, &activeCompletion)
+		if err != nil {
+			return nil, fmt.Errorf("failed to count research occupancy: %w", err)
+		}
+		state.Active = active
+		state.ActiveCompletion = activeCompletion
+
+		states = append(states, state)
+	}
+	return states, rows.Err()
 }
 
 const tokenEpsilon = 1e-9
