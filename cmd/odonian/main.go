@@ -1478,6 +1478,16 @@ func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			if errors.Is(err, tuiclient.ErrAlreadyClaimed) {
 				return &claimError{message: "raced, none claimed", code: 2}
 			}
+			var apiErr *tuiclient.APIError
+			if errors.As(err, &apiErr) {
+				if apiErr.StatusCode == 429 {
+					return &schedulingError{
+						message:           apiErr.Error(),
+						retryAfterSeconds: apiErr.RetryAfterSeconds,
+						code:              2,
+					}
+				}
+			}
 			return err
 		}
 		saveAttempt(client, task.ID)

@@ -5907,9 +5907,9 @@ func TestClaimSchedulingError(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"error": map[string]interface{}{
-				"code":                  "ADMISSION_DEFERRED",
-				"message":               "admission deferred",
-				"retry_after_seconds":   retryAfter,
+				"code":                "ADMISSION_DEFERRED",
+				"message":             "admission deferred",
+				"retry_after_seconds": retryAfter,
 			},
 		})
 	}))

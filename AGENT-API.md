@@ -395,6 +395,30 @@ This support allows the harness to pre-admit research tasks against the pacing p
 claiming and debiting a start in one call), then supply the admitted task ID to the worker/reviewer
 process so no additional claims or discovery calls are needed.
 
+## Exit codes
+
+Research admission commands (`claim`, `next --claim`, `permit-renew`, `permit-finalize`) use
+distinct exit codes to signal scheduling vs. error conditions, allowing callers to distinguish
+transient admission deferral (which may succeed on retry) from fatal conflicts:
+
+- **Exit 0:** Command succeeded.
+- **Exit 1:** Generic error (misconfiguration, network failure, server error, etc.). Retry strategy
+  depends on the nature of the error; inspect stderr for details.
+- **Exit 2:** Scheduling error — the task/permit encountered admission scheduling constraints
+  (e.g., 429 Too Many Requests due to quota exhaustion or deferral). The command prints
+  `scheduling: <reason>` to stderr. If available, `retry-after: <seconds>` is also printed,
+  indicating how long to wait before retrying. Callers should back off and retry after the
+  specified delay.
+- **Exit 3:** Already claimed (claim-specific) — the task was claimed by another agent or worker
+  between the `next` query and the claim attempt. A racing claim succeeded first. Retry by calling
+  `next` again.
+- **Exit 11:** Conflict error — the permit or attempt is in an invalid state for the requested
+  operation. The command prints `conflict: <reason>` to stderr. Possible reasons include
+  `ATTEMPT_FENCED` (the attempt ID doesn't match the permit's current attempt), `ATTEMPT_EXPIRED`
+  (the permit's lease has expired), `ATTEMPT_FINALIZED` (the attempt is already finalized), or
+  `PERMIT_IDENTITY_MISMATCH` (the supplied identity parameters don't match the permit's record).
+  These are fatal conditions and do not benefit from retry.
+
 ## Task creation
 
 ```json
