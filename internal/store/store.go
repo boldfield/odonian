@@ -97,6 +97,7 @@ type Store interface {
 	RenewEvaluationAttempt(ctx context.Context, attemptID string, expiresAt time.Time) error
 	FinalizeEvaluationAttempt(ctx context.Context, res EvaluationAttemptResult) error
 	ListEvaluationFindings(ctx context.Context, attemptID string) ([]evaluation.Finding, error)
+	GetEvaluationAttemptDetail(ctx context.Context, attemptID string) (*EvaluationAttemptDetail, error)
 	ExpireEvaluationAttempts(ctx context.Context, now time.Time) (int, error)
 	GetEvaluationJob(ctx context.Context, jobID string) (EvaluationJob, error)
 	GetEvaluationAttempt(ctx context.Context, attemptID string) (EvaluationAttempt, error)

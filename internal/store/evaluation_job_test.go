@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -955,4 +957,76 @@ func TestEvaluationCampaignMismatch(t *testing.T) {
 	if err != ErrEvaluationInvalidInput {
 		t.Errorf("Expected ErrEvaluationInvalidInput, got %v", err)
 	}
+}
+
+func TestEvaluationAttemptDetailIsRecordedWithTheResult(t *testing.T) {
+	st := newEvaluationStore(t)
+	ctx := context.Background()
+	c := newPoolTestCampaign(t, st, 10)
+	cand := newPoolTestCandidateStored(t, st, c, "fakeA", "pool1", 5)
+	samples := newPoolTestSamples(t, st, c, 3)
+	identity := cand.Config.Identity()
+	completed := evaluation.StatusCompleted
+	code := 0
+
+	claim := func(i int) EvaluationAttempt {
+		t.Helper()
+		res, err := claimEval(st, samples[i], cand, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Attempt
+	}
+
+	att := claim(0)
+	detail := &EvaluationAttemptDetail{
+		CandidateDigest: cand.Digest(), EffectiveIdentity: &identity, EffectiveDigest: identity.Digest(),
+		PromptDigest: "p", StandardDigest: "s", Launched: true, ExitCode: &code,
+		Usage: map[string]float64{"gpu_seconds": 4.5, "critic_calls": 2},
+	}
+	if err := st.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{
+		AttemptID: att.ID, FenceAttemptID: att.ID, ExitClass: EvalExitCompleted, Status: &completed, Detail: detail,
+	}); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	got, err := st.GetEvaluationAttemptDetail(ctx, att.ID)
+	if err != nil || got == nil || !reflect.DeepEqual(*got, *detail) {
+		t.Fatalf("detail = %+v, %v; want %+v", got, err, *detail)
+	}
+
+	none := claim(1)
+	if err := st.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{AttemptID: none.ID, FenceAttemptID: none.ID, ExitClass: EvalExitFailed}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.GetEvaluationAttemptDetail(ctx, none.ID); err != nil || got != nil {
+		t.Fatalf("no detail was offered, got %+v, %v", got, err)
+	}
+
+	t.Run("a rejected detail leaves the attempt live", func(t *testing.T) {
+		live := claim(2)
+		other := *detail
+		other.CandidateDigest = "not-this-candidate"
+		bad := map[string]EvaluationAttemptDetail{
+			"foreign candidate digest": other,
+			"identity without digest":  {CandidateDigest: cand.Digest(), EffectiveIdentity: &identity, Launched: true},
+			"digest of another identity": {
+				CandidateDigest: cand.Digest(), EffectiveIdentity: &identity, EffectiveDigest: "x", Launched: true,
+			},
+			"negative usage":        {CandidateDigest: cand.Digest(), Launched: true, Usage: map[string]float64{"u": -1}},
+			"usage with empty unit": {CandidateDigest: cand.Digest(), Launched: true, Usage: map[string]float64{"": 1}},
+			"usage without launch":  {CandidateDigest: cand.Digest(), Usage: map[string]float64{"u": 1}},
+		}
+		for name, d := range bad {
+			d := d
+			err := st.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{
+				AttemptID: live.ID, FenceAttemptID: live.ID, ExitClass: EvalExitFailed, Detail: &d,
+			})
+			if !errors.Is(err, ErrEvaluationInvalidInput) {
+				t.Errorf("%s: err = %v, want ErrEvaluationInvalidInput", name, err)
+			}
+		}
+		if a, err := st.GetEvaluationAttempt(ctx, live.ID); err != nil || a.State != EvalAttemptActive {
+			t.Fatalf("attempt after rejected results = %+v, %v", a, err)
+		}
+	})
 }

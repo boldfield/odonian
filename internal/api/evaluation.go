@@ -540,6 +540,8 @@ func (s *Server) handleFinalizeEvaluationAttempt(w http.ResponseWriter, r *http.
 		DurationMs     *int                   `json:"duration_ms"`
 		UsageTokens    *int                   `json:"usage_tokens"`
 		Findings       []evaluation.Finding   `json:"findings"`
+
+		Detail *store.EvaluationAttemptDetail `json:"detail"`
 	}
 	if !s.decodeEvaluationJSON(w, r, &payload) {
 		return
@@ -556,7 +558,7 @@ func (s *Server) handleFinalizeEvaluationAttempt(w http.ResponseWriter, r *http.
 		AttemptID: attempt.ID, FenceAttemptID: payload.FenceAttemptID,
 		ExitClass: store.EvaluationExitClass(payload.ExitClass), Status: payload.Status,
 		ErrorClass: payload.ErrorClass, ErrorMessage: payload.ErrorMessage,
-		DurationMs: payload.DurationMs, UsageTokens: payload.UsageTokens, Findings: payload.Findings,
+		DurationMs: payload.DurationMs, UsageTokens: payload.UsageTokens, Findings: payload.Findings, Detail: payload.Detail,
 	})
 	if err != nil {
 		s.writeEvaluationError(w, err)

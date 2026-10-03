@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -800,9 +801,58 @@ func (s *sqliteStore) RenewEvaluationAttempt(ctx context.Context, attemptID stri
 	return nil
 }
 
-// EvaluationAttemptResult is the recorded outcome of one attempt. Findings are
-// part of the result: they are validated and written atomically with it and
-// never change afterwards. Nil DurationMs/UsageTokens mean unknown, not zero.
+// maxDetailUsageUnits bounds the usage units one attempt may record.
+const maxDetailUsageUnits = 64
+
+// EvaluationAttemptDetail is the host's account of how one attempt ran. Usage
+// is kept in the provider's own units, one entry per unit as reported; it is
+// never summed across units or attempts. EffectiveIdentity is what the runtime
+// reported about itself and is nil when no valid result was read; it may differ
+// from the declared candidate, which CandidateDigest names.
+type EvaluationAttemptDetail struct {
+	CandidateDigest   string                        `json:"candidate_digest"`
+	EffectiveIdentity *evaluation.CandidateIdentity `json:"effective_identity,omitempty"`
+	EffectiveDigest   string                        `json:"effective_digest,omitempty"`
+	PromptDigest      string                        `json:"prompt_digest,omitempty"`
+	StandardDigest    string                        `json:"standard_digest,omitempty"`
+	Launched          bool                          `json:"launched"`
+	ExitCode          *int                          `json:"exit_code,omitempty"`
+	Usage             map[string]float64            `json:"usage,omitempty"`
+}
+
+func (d EvaluationAttemptDetail) validate() error {
+	if d.CandidateDigest == "" {
+		return fmt.Errorf("%w: detail candidate_digest is required", ErrEvaluationInvalidInput)
+	}
+	if (d.EffectiveIdentity == nil) != (d.EffectiveDigest == "") {
+		return fmt.Errorf("%w: detail effective_identity and effective_digest go together", ErrEvaluationInvalidInput)
+	}
+	if d.EffectiveIdentity != nil {
+		if err := d.EffectiveIdentity.Validate(); err != nil {
+			return fmt.Errorf("%w: detail effective identity: %v", ErrEvaluationInvalidInput, err)
+		}
+		if d.EffectiveIdentity.Digest() != d.EffectiveDigest {
+			return fmt.Errorf("%w: detail effective_digest does not match the effective identity", ErrEvaluationInvalidInput)
+		}
+	}
+	if len(d.Usage) > maxDetailUsageUnits {
+		return fmt.Errorf("%w: detail usage has more than %d units", ErrEvaluationInvalidInput, maxDetailUsageUnits)
+	}
+	for k, v := range d.Usage {
+		if k == "" || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			return fmt.Errorf("%w: detail usage %q=%v", ErrEvaluationInvalidInput, k, v)
+		}
+	}
+	if !d.Launched && (d.ExitCode != nil || d.EffectiveIdentity != nil || len(d.Usage) > 0) {
+		return fmt.Errorf("%w: a run that never launched has no exit code, identity or usage", ErrEvaluationInvalidInput)
+	}
+	return nil
+}
+
+// EvaluationAttemptResult is the recorded outcome of one attempt. Findings and
+// Detail are part of the result: they are validated and written atomically
+// with it and never change afterwards. Nil DurationMs/UsageTokens mean unknown,
+// not zero. A nil Detail records no detail.
 type EvaluationAttemptResult struct {
 	AttemptID      string
 	FenceAttemptID string
@@ -813,9 +863,15 @@ type EvaluationAttemptResult struct {
 	DurationMs     *int
 	UsageTokens    *int
 	Findings       []evaluation.Finding
+	Detail         *EvaluationAttemptDetail
 }
 
 func (r EvaluationAttemptResult) validate() error {
+	if r.Detail != nil {
+		if err := r.Detail.validate(); err != nil {
+			return err
+		}
+	}
 	if r.AttemptID == "" {
 		return ErrEvaluationInvalidInput
 	}
@@ -955,10 +1011,64 @@ func (s *sqliteStore) FinalizeEvaluationAttempt(ctx context.Context, res Evaluat
 		}
 	}
 
+	if res.Detail != nil {
+		if err = insertEvaluationAttemptDetail(ctx, tx, res.AttemptID, *res.Detail, nowStr); err != nil {
+			return err
+		}
+	}
+
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 	return nil
+}
+
+// insertEvaluationAttemptDetail writes the detail row, requiring the declared
+// candidate digest to be that of the candidate the attempt's job belongs to.
+func insertEvaluationAttemptDetail(ctx context.Context, tx *sql.Tx, attemptID string, d EvaluationAttemptDetail, now string) error {
+	var digest string
+	err := tx.QueryRowContext(ctx,
+		`SELECT ec.candidate_config_digest FROM evaluation_attempt ea
+		 JOIN evaluation_job ej ON ea.job_id = ej.id
+		 JOIN evaluation_candidate ec ON ej.candidate_id = ec.id WHERE ea.id = ?`, attemptID).Scan(&digest)
+	if err != nil {
+		return fmt.Errorf("fetch attempt candidate: %w", err)
+	}
+	if digest != d.CandidateDigest {
+		return fmt.Errorf("%w: detail candidate_digest is not the attempt's candidate", ErrEvaluationInvalidInput)
+	}
+	body, err := json.Marshal(d)
+	if err != nil {
+		return fmt.Errorf("encode attempt detail: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx,
+		`INSERT INTO evaluation_attempt_detail (attempt_id, detail_json, recorded_at) VALUES (?, ?, ?)`,
+		attemptID, string(body), now); err != nil {
+		return fmt.Errorf("store attempt detail: %w", err)
+	}
+	return nil
+}
+
+// GetEvaluationAttemptDetail returns the detail recorded with an attempt's
+// result, or nil when none was recorded.
+func (s *sqliteStore) GetEvaluationAttemptDetail(ctx context.Context, attemptID string) (*EvaluationAttemptDetail, error) {
+	if _, err := s.fetchEvaluationAttempt(ctx, s.conn, attemptID); err != nil {
+		return nil, err
+	}
+	var body string
+	err := s.conn.QueryRowContext(ctx,
+		`SELECT detail_json FROM evaluation_attempt_detail WHERE attempt_id = ?`, attemptID).Scan(&body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get attempt detail: %w", err)
+	}
+	var d EvaluationAttemptDetail
+	if err := json.Unmarshal([]byte(body), &d); err != nil {
+		return nil, fmt.Errorf("decode attempt detail: %w", err)
+	}
+	return &d, nil
 }
 
 func isUniqueViolation(err error) bool {

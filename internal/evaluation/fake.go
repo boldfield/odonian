@@ -59,6 +59,7 @@ func FakeMain(args []string, stderr io.Writer) int {
 	mode := fs.String("mode", "", "fixture mode")
 	reqPath := fs.String("request", "", "request file")
 	identityJSON := fs.String("identity", "", "effective identity as JSON")
+	usageJSON := fs.String("usage-json", "", "usage to report on success, as a JSON object of provider-native units")
 	secretEnv := fs.String("secret-env", "", "environment variable holding a credential to leak (leak fixtures)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -131,6 +132,13 @@ func FakeMain(args []string, stderr io.Writer) int {
 		base.Status, base.ReviewCompleted = StatusCompleted, true
 		base.Findings = fakeFindings(req)
 		base.Usage = map[string]float64{"fake_units": float64(len(req.BlindedPrompt))}
+		if *usageJSON != "" {
+			base.Usage = nil
+			if err := json.Unmarshal([]byte(*usageJSON), &base.Usage); err != nil {
+				fmt.Fprintln(stderr, "fake: decode usage:", err)
+				return 2
+			}
+		}
 		return writeResp(base)
 	case FakeModeWrongRun:
 		base.RunID = req.RunID + "-other"
