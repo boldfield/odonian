@@ -343,7 +343,7 @@ func TestBoundedComparisonExhaustedCampaignOutcome(t *testing.T) {
 
 	dir := t.TempDir()
 	fakeStore := NewFakeEvaluationStore()
-	fakeStore.ClaimErrorToReturn = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
+	fakeStore.ClaimErrorToReturn = ErrEvaluationCapacityExhausted
 
 	cfg := BoundedComparisonConfig{
 		Registry:             reg,

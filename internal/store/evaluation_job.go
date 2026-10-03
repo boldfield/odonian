@@ -27,15 +27,18 @@ var (
 	ErrEvaluationFenceMismatch         = errors.New("evaluation attempt identity does not match the job's current attempt")
 	ErrEvaluationAttemptExpired        = errors.New("evaluation attempt lease expired")
 	ErrEvaluationAttemptFinalized      = errors.New("evaluation attempt already finalized")
-	ErrEvaluationAttemptLive           = errors.New("previous evaluation attempt is still live")
-	ErrEvaluationCapacityExhausted     = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
 	ErrEvaluationCandidateCorrupt      = errors.New("stored evaluation candidate does not match its recorded digest")
 	ErrEvaluationProjectNotAllowed     = errors.New("project is not allowed for this evaluation campaign")
 	ErrEvaluationModelNotAllowed       = errors.New("model is not allowed for this evaluation campaign")
-	ErrEvaluationCampaignPaused        = errors.New("evaluation campaign is paused")
 	ErrEvaluationCampaignAlreadyPaused = errors.New("evaluation campaign is already paused")
 	ErrEvaluationInvalidInput          = errors.New("invalid evaluation input")
 	ErrEvaluationAlreadyExists         = errors.New("evaluation record already exists")
+
+	// Sentinel errors imported from evaluation package to support error checking
+	// with errors.Is in the bounded comparison runner.
+	ErrEvaluationAttemptLive       = evaluation.ErrEvaluationAttemptLive
+	ErrEvaluationCapacityExhausted = evaluation.ErrEvaluationCapacityExhausted
+	ErrEvaluationCampaignPaused    = evaluation.ErrEvaluationCampaignPaused
 )
 
 // EvaluationExitClass is the distinct terminal outcome of one attempt.

@@ -2,9 +2,10 @@ package evaluation
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,7 +28,7 @@ type BoundedComparisonConfig struct {
 	// Now is an injectable clock; time.Now is used if nil.
 	Now func() time.Time
 	// MaxRetries bounds the number of attempts to claim and retry after
-	// transient failures. Exhausted attempts record EvalExitExhaustedCampaign.
+	// transient failures. Exhausted attempts record ExitExhaustedCampaign.
 	MaxRetries int
 	// InitialLeaseExpiry sets the initial claim lease TTL.
 	InitialLeaseExpiry time.Duration
@@ -52,6 +53,9 @@ type EvaluationJobClaim struct {
 	CandidateID  string
 	RequestID    string
 	LeaseExpires time.Duration
+	// RetryHint is the RetryAfter returned for a concurrency denial; zero means
+	// use default backoff.
+	RetryHint time.Duration
 }
 
 // EvaluationJob represents a job binding sample and candidate.
@@ -88,6 +92,7 @@ type EvaluationAttemptResult struct {
 	ErrorClass     *ErrorClass
 	ErrorMessage   *string
 	DurationMs     *int
+	UsageTokens    *int
 	Findings       []Finding
 }
 
@@ -135,6 +140,13 @@ type BoundedComparisonResult struct {
 	// AttemptID identifies the finalized attempt.
 	AttemptID string
 }
+
+// Sentinel errors returned by evaluation store implementations.
+var (
+	ErrEvaluationCapacityExhausted = errors.New("evaluation campaign or candidate has exhausted attempt capacity")
+	ErrEvaluationAttemptLive       = errors.New("previous evaluation attempt is still live")
+	ErrEvaluationCampaignPaused    = errors.New("evaluation campaign is paused")
+)
 
 var validRunIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -214,33 +226,51 @@ func (c BoundedComparisonConfig) RunBoundedComparison(ctx context.Context, req B
 
 	var claimResult EvaluationJobClaimResult
 	var claimErr error
-	const capacityExhaustedErr = "evaluation campaign or candidate has exhausted attempt capacity"
-	const attemptLiveErr = "previous evaluation attempt is still live"
-	const pausedErr = "evaluation campaign is paused"
+	var retryAfter time.Duration
 
 	for attempt := 0; attempt < c.MaxRetries; attempt++ {
 		claimResult, claimErr = c.Store.ClaimEvaluationJob(ctx, claim)
 		if claimErr == nil {
 			break
 		}
+
 		// Distinct outcome for capacity exhaustion.
-		if claimErr.Error() == capacityExhaustedErr {
+		if errors.Is(claimErr, ErrEvaluationCapacityExhausted) {
 			return BoundedComparisonResult{
 				ExitClass: ExitExhaustedCampaign,
 			}, fmt.Errorf("evaluation campaign capacity exhausted")
 		}
-		// Retry on transient errors; other errors are fatal.
-		errMsg := claimErr.Error()
-		if errMsg != attemptLiveErr && errMsg != pausedErr {
-			return BoundedComparisonResult{}, fmt.Errorf("claim job: %w", claimErr)
+
+		// Retry on transient errors with backoff.
+		if errors.Is(claimErr, ErrEvaluationAttemptLive) ||
+			errors.Is(claimErr, ErrEvaluationCampaignPaused) {
+			// Use provided retry hint if available, or default backoff.
+			retryAfter = claim.RetryHint
+			if retryAfter == 0 {
+				retryAfter = time.Duration(100*attempt+50) * time.Millisecond
+			}
+			select {
+			case <-time.After(retryAfter):
+				continue
+			case <-ctx.Done():
+				return BoundedComparisonResult{ExitClass: ExitFailed}, ctx.Err()
+			}
 		}
+
+		// Other errors are fatal.
+		return BoundedComparisonResult{}, fmt.Errorf("claim job: %w", claimErr)
 	}
+
 	if claimErr != nil {
 		return BoundedComparisonResult{}, fmt.Errorf("claim job after retries: %w", claimErr)
 	}
 
 	attemptID := claimResult.Attempt.ID
-	resultPath := filepath.Join(c.StagingDir, req.RunID, "result.json")
+	runDir := filepath.Join(c.StagingDir, req.RunID)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return BoundedComparisonResult{}, fmt.Errorf("create run dir: %w", err)
+	}
+	resultPath := filepath.Join(runDir, "result.json")
 
 	candReq := CandidateRequest{
 		Version:       ProtocolVersion,
@@ -252,18 +282,18 @@ func (c BoundedComparisonConfig) RunBoundedComparison(ctx context.Context, req B
 	}
 
 	if err := candReq.Validate(); err != nil {
+		finErr := c.Store.FinalizeEvaluationAttempt(ctx, EvaluationAttemptResult{
+			AttemptID:      attemptID,
+			FenceAttemptID: attemptID,
+			ExitClass:      ExitFailed,
+		})
+		if finErr != nil {
+			return BoundedComparisonResult{}, fmt.Errorf("candidate request validation failed, finalize also failed: %w (original: %v)", finErr, err)
+		}
 		return BoundedComparisonResult{}, fmt.Errorf("candidate request: %w", err)
 	}
 
-	// Start tracking metadata.
 	startTime := now()
-	defer func() {
-		if attemptID == "" {
-			return
-		}
-		// Finalize runs even on error; record the outcome distinctly.
-		// This is deferred so lease renewals don't block the finalize flow.
-	}()
 
 	pipeline := &Pipeline{
 		Registry:    c.Registry,
@@ -292,15 +322,18 @@ func (c BoundedComparisonConfig) RunBoundedComparison(ctx context.Context, req B
 	for {
 		select {
 		case <-ctx.Done():
-			return BoundedComparisonResult{
-				ExitClass: ExitFailed,
-			}, ctx.Err()
+			// Context cancelled; finalize as failed.
+			finalizeErr := c.finializeAttempt(ctx, c.Store, now, startTime, attemptID, ExitFailed, nil, nil)
+			if finalizeErr != nil {
+				return BoundedComparisonResult{}, fmt.Errorf("context done and finalize failed: %w", finalizeErr)
+			}
+			return BoundedComparisonResult{ExitClass: ExitFailed}, ctx.Err()
+
 		case <-ticker.C:
 			// Renew the lease while waiting for execution.
-			if err := c.Store.RenewEvaluationAttempt(ctx, attemptID, now().Add(c.InitialLeaseExpiry)); err != nil {
-				// Log renewal failure but continue; the attempt might expire.
-				// Return it in finalize.
-			}
+			_ = c.Store.RenewEvaluationAttempt(ctx, attemptID, now().Add(c.InitialLeaseExpiry))
+			// Ignore renewal errors; finalization will handle expiration correctly.
+
 		case result := <-execDone:
 			pipelineRes = result.res
 			pipelineErr = result.err
@@ -314,43 +347,123 @@ finalize:
 
 	// Determine exit class from the outcome.
 	exitClass := ExitCompleted
-	if pipelineErr != nil {
-		exitClass = ExitFailed
-	} else if pipelineRes != nil {
-		switch pipelineRes.Response.Status {
-		case StatusCompleted:
-			exitClass = ExitCompleted
-		case StatusFailed:
-			exitClass = ExitFailed
-		case StatusIncomplete:
-			exitClass = ExitIncompleteOutput
-		case StatusUnsupported, StatusInterrupted:
-			exitClass = ExitFailed
-		}
-		if pipelineRes.Response.ErrorClass != "" && pipelineRes.Response.ErrorClass == ErrClassSourceUnavailable {
-			exitClass = ExitUnavailableSource
-		}
-	}
-
-	// Validate result before recording.
-	var findings []Finding
 	var status *Status
 	var errorClass *ErrorClass
 	var errorMsg *string
-	if pipelineRes != nil {
-		if len(pipelineRes.Response.Findings) > 0 {
-			findings = pipelineRes.Response.Findings
+	var findings []Finding
+
+	if pipelineErr != nil {
+		exitClass = ExitFailed
+	} else if pipelineRes != nil {
+		// Validate that result file exists and is complete.
+		resultBytes, readErr := os.ReadFile(resultPath)
+		if readErr != nil {
+			if errors.Is(readErr, fs.ErrNotExist) {
+				exitClass = ExitIncompleteOutput
+			} else {
+				exitClass = ExitFailed
+			}
+		} else if len(resultBytes) == 0 {
+			exitClass = ExitIncompleteOutput
+		} else {
+			// Validate result can be unmarshalled.
+			var resultData map[string]interface{}
+			if err := json.Unmarshal(resultBytes, &resultData); err != nil {
+				exitClass = ExitIncompleteOutput
+			} else {
+				// Result is valid and complete.
+				switch pipelineRes.Response.Status {
+				case StatusCompleted:
+					exitClass = ExitCompleted
+				case StatusFailed:
+					exitClass = ExitFailed
+				case StatusIncomplete:
+					exitClass = ExitIncompleteOutput
+				case StatusUnsupported, StatusInterrupted:
+					exitClass = ExitFailed
+				}
+				if pipelineRes.Response.ErrorClass == ErrClassSourceUnavailable {
+					exitClass = ExitUnavailableSource
+				}
+			}
 		}
-		status = (*Status)(&pipelineRes.Response.Status)
-		if pipelineRes.Response.ErrorClass != "" {
-			errorClass = (*ErrorClass)(&pipelineRes.Response.ErrorClass)
-		}
-		if pipelineRes.Response.ErrorMessage != "" {
-			errorMsg = &pipelineRes.Response.ErrorMessage
+
+		// Extract status, error class, and message from response.
+		if pipelineRes != nil {
+			if len(pipelineRes.Response.Findings) > 0 {
+				findings = pipelineRes.Response.Findings
+			}
+			status = (*Status)(&pipelineRes.Response.Status)
+			if pipelineRes.Response.ErrorClass != "" {
+				errorClass = (*ErrorClass)(&pipelineRes.Response.ErrorClass)
+			}
+			if pipelineRes.Response.ErrorMessage != "" {
+				errorMsg = &pipelineRes.Response.ErrorMessage
+			}
 		}
 	}
 
-	attemptResult := EvaluationAttemptResult{
+	// Only include findings if exit class is completed.
+	if exitClass != ExitCompleted {
+		findings = nil
+	}
+
+	// Extract usage metrics from the response.
+	var usageTokens *int
+	if pipelineRes != nil && len(pipelineRes.Response.Usage) > 0 {
+		total := 0
+		for _, v := range pipelineRes.Response.Usage {
+			total += int(v)
+		}
+		usageTokens = &total
+	}
+
+	finalizeErr := c.finializeAttemptWithMetadata(ctx, c.Store, attemptID,
+		exitClass, status, errorClass, errorMsg, durationMs, usageTokens, findings)
+	if finalizeErr != nil {
+		return BoundedComparisonResult{}, fmt.Errorf("finalize attempt: %w", finalizeErr)
+	}
+
+	result := BoundedComparisonResult{
+		ExitClass: exitClass,
+		AttemptID: attemptID,
+	}
+	if pipelineRes != nil {
+		result.Response = pipelineRes.Response
+		result.Runtime = pipelineRes.Runtime
+		result.CandidateDigest = pipelineRes.CandidateDigest
+		result.Launched = pipelineRes.Launched
+		result.ExitCode = pipelineRes.ExitCode
+		result.Stderr = pipelineRes.Stderr
+		result.RawOutput = pipelineRes.RawOutput
+	}
+	return result, nil
+}
+
+// finializeAttempt records a failed attempt without findings.
+func (c BoundedComparisonConfig) finializeAttempt(ctx context.Context, store EvaluationStore,
+	now func() time.Time, startTime time.Time, attemptID string,
+	exitClass EvaluationExitClass, status *Status, errorMsg *string) error {
+	duration := now().Sub(startTime)
+	durationMs := int(duration.Milliseconds())
+
+	result := EvaluationAttemptResult{
+		AttemptID:      attemptID,
+		FenceAttemptID: attemptID,
+		ExitClass:      exitClass,
+		Status:         status,
+		ErrorMessage:   errorMsg,
+		DurationMs:     &durationMs,
+		Findings:       []Finding{},
+	}
+	return store.FinalizeEvaluationAttempt(ctx, result)
+}
+
+// finializeAttemptWithMetadata records an attempt with metadata and findings.
+func (c BoundedComparisonConfig) finializeAttemptWithMetadata(ctx context.Context, store EvaluationStore,
+	attemptID string, exitClass EvaluationExitClass, status *Status, errorClass *ErrorClass, errorMsg *string,
+	durationMs int, usageTokens *int, findings []Finding) error {
+	result := EvaluationAttemptResult{
 		AttemptID:      attemptID,
 		FenceAttemptID: attemptID,
 		ExitClass:      exitClass,
@@ -358,38 +471,8 @@ finalize:
 		ErrorClass:     errorClass,
 		ErrorMessage:   errorMsg,
 		DurationMs:     &durationMs,
+		UsageTokens:    usageTokens,
 		Findings:       findings,
 	}
-
-	if err := c.Store.FinalizeEvaluationAttempt(ctx, attemptResult); err != nil {
-		return BoundedComparisonResult{
-			Response:        pipelineRes.Response,
-			Runtime:         pipelineRes.Runtime,
-			CandidateDigest: pipelineRes.CandidateDigest,
-			Launched:        pipelineRes.Launched,
-			ExitCode:        pipelineRes.ExitCode,
-			Stderr:          pipelineRes.Stderr,
-			RawOutput:       pipelineRes.RawOutput,
-			ExitClass:       exitClass,
-			AttemptID:       attemptID,
-		}, fmt.Errorf("finalize attempt: %w", err)
-	}
-
-	return BoundedComparisonResult{
-		Response:        pipelineRes.Response,
-		Runtime:         pipelineRes.Runtime,
-		CandidateDigest: pipelineRes.CandidateDigest,
-		Launched:        pipelineRes.Launched,
-		ExitCode:        pipelineRes.ExitCode,
-		Stderr:          pipelineRes.Stderr,
-		RawOutput:       pipelineRes.RawOutput,
-		ExitClass:       exitClass,
-		AttemptID:       attemptID,
-	}, nil
-}
-
-// hashDigest returns a SHA256 hex digest of the input.
-func hashDigest(data []byte) string {
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
+	return store.FinalizeEvaluationAttempt(ctx, result)
 }
