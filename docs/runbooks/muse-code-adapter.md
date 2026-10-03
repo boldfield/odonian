@@ -11,7 +11,8 @@ copies a credential, and never falls back to another provider or to pay-as-you-g
 
 ## What the official documentation does and does not say
 
-Sources: <https://dev.meta.ai/docs/muse-code>, `/extending`, `/auth`, `/subscriptions` (checked 2026-10-03).
+Sources: <https://dev.meta.ai/docs/muse-code>, `/extending`, `/auth`, `/subscriptions`, `/configuration` (checked
+2026-10-03).
 
 Documented, and relied on:
 
@@ -19,6 +20,9 @@ Documented, and relied on:
 - `muse exec` is the headless mode. Documented options: `--json` (JSONL events on stdout), `--prompt-file <path>`,
   `--disable-approval` (skips approval prompts, keeps the sandbox), `--max-model-steps`, `--session-id`,
   `--allow-workspace-switch`, `--yolo` (never used here).
+- `--model <id>` selects the model on both `muse` and `muse exec` (configuration page; the default model is
+  `muse-spark-1.2`). Preflight still confirms that the installed `muse exec --help` lists it, and reports
+  `capability_missing` (nothing runs) if it does not.
 - Exit codes: `0` turn completed, `1` failure or cancellation (including the step limit), `2` usage error,
   `130`/`143` SIGINT/SIGTERM.
 - Credential precedence: `META_API_KEY` if set, then a stored key (`muse auth set`), and only then a stored browser
@@ -27,11 +31,10 @@ Documented, and relied on:
 
 **Not documented**, so never assumed:
 
-- A model-selection flag (the default model is `muse-spark-1.2`). The adapter uses `--model` and confirms at preflight
-  that the installed `muse exec --help` lists it. If it does not, preflight reports `capability_missing` and nothing runs.
 - The JSONL event schema. The adapter requires every stdout line to be one JSON object, but takes results from its own
   marker protocol (below), not from event field names.
-- Any command that reports which credential is active, and where credentials are stored.
+- Any command that reports which credential is active, and where credentials (browser session or stored key) are
+  stored. Only `~/.config/muse/settings.json` is documented, and it holds settings, not credentials.
 
 ## Install and version
 
@@ -64,30 +67,51 @@ out:
    HOME=/home/eval/muse-home muse                 # sign in with the Power account's browser flow, then exit
    ```
    Never run `muse auth set` with that `HOME`.
-3. Preflight inspects the directory before muse is ever started, and reports:
+3. **Session manifest (`--session-manifest FILE`, required).** Because Muse does not document where it stores the
+   browser session, no file pattern can prove that a home holds one. The adapter therefore runs only against state the
+   owner verified. Right after the sign-in in step 2, still in that interactive session, the owner confirms the route:
+   Muse reports when an environment key hides a browser session, and `/upgrade` opens Accounts Center, where the Power
+   subscription must be shown. Then the owner records what the home looks like:
+   ```
+   ./muse-adapter --record-session --muse-home /home/eval/muse-home \
+     --session-manifest /home/eval/muse-session.json --auth-route browser-session
+   ```
+   Recording applies every check below except the manifest itself, never starts muse, and writes (mode `0600`) only the
+   names of the entries directly under `.config/muse`, never their contents. Preflight then requires that exact entry
+   set. A home that was never recorded fails `auth_route_unconfirmed`, and any later change fails `auth_ambiguous`:
+   an added stray file, a key stored with `muse auth set` in a new file, or a logout that removes the session. After
+   signing in again, verify the route again and re-record. The manifest must be an absolute path outside the
+   credential home, a regular file (not a symlink), private, and owned by the adapter's user. If Muse itself adds or
+   removes entries under `.config/muse` during normal runs, preflight fails closed after such a run until the owner
+   verifies and re-records. That is expected, not a reason to loosen the check.
+4. Preflight inspects the directory before muse is ever started, and reports:
 
    | `outcome` | Condition |
    |---|---|
-   | `auth_route_unconfirmed` | `--muse-home` not given or not absolute |
-   | `auth_missing` | directory missing or empty, or it holds no recognizable Muse session state: a non-empty file other than `settings.json` directly under `.config/muse` (Muse does not document its storage layout, so this is a heuristic that rejects unrelated or settings-only directories; it does not prove the session is valid or entitled) |
-   | `auth_ambiguous` | symlink or not a directory; mode allows group/other access; owned by another user; same directory as the adapter's own `HOME`; unreadable or too large to inspect (over 5000 entries); or any file name or file content (first 1 MiB, inspected in memory, never reported) matching `api key`-style names such as `api_key`, `apiKey`, `api-key` |
-4. `--auth-route browser-session` must also be passed. It is the owner's statement that step 2 was followed and
+   | `auth_route_unconfirmed` | `--muse-home` not given or not absolute; `--session-manifest` not given, not absolute or not recorded |
+   | `auth_missing` | directory missing or empty, or no candidate session state: no non-empty file other than `settings.json` directly under `.config/muse` (a necessary condition only; the manifest is what ties the state to a verified sign-in) |
+   | `auth_ambiguous` | symlink or not a directory; mode allows group/other access; owned by another user; same directory as the adapter's own `HOME`; **any symlink, FIFO, socket or device anywhere inside it** (the scan does not follow links, but muse would); unreadable or too large to inspect (over 5000 entries); any file name or file content (first 1 MiB, inspected in memory, never reported) matching `api key`-style names such as `api_key`, `apiKey`, `api-key`; manifest inside the home, a symlink, readable by others, malformed, recorded for another home, or listing different entries than the home now holds |
+5. `--auth-route browser-session` must also be passed. It is the owner's statement that step 2 was followed and
    `muse auth set` was never run against that home; without it, `auth_route_unconfirmed` and muse is never started.
-5. The muse child runs with an allowlisted environment only (`PATH`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`, `TZ`,
+6. The muse child runs with an allowlisted environment only (`PATH`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM`, `TZ`,
    `TMPDIR`, TLS certificate variables, proxy variables) plus `HOME=<muse-home>`. Every other variable, including any
    API key, `ODONIAN_*`, and cloud credentials, is dropped.
 
 Residual limits, stated plainly: the key-detection scan is a heuristic over file names and contents, because the
 storage format is undocumented, and a credential kept outside the home (for example an OS keychain, if muse used one)
-cannot be seen. A signed-in session also does not prove the Power subscription is what is billed. Before a paid pilot
-the owner validates in an interactive session using that home and in the Meta Accounts Center (`/upgrade` inside
-`muse`) that evaluation usage lands on the subscription. This adapter performs no paid probe to establish that.
+cannot be seen. The manifest records entry names, not contents, so a key written into an existing file is caught only
+by the content scan. The subscriptions page says the Power subscription is attached to "the Muse Code API key that is
+automatically connected in the Muse Code CLI onboarding process"; if Muse stores that credential under an
+`api key`-style name, a genuine session will fail `auth_ambiguous` (closed, not open), and the scan needs revisiting
+against a real install. A signed-in session also does not prove the Power subscription is what is billed: the owner's
+interactive verification in step 3 is what establishes that, before every record. This adapter performs no paid probe.
 
 ## Preflight (no model call)
 
 ```
 go build -o muse-adapter ./cmd/muse-adapter
-./muse-adapter --preflight --muse-home /home/eval/muse-home --auth-route browser-session [--muse-bin /abs/path/to/muse]
+./muse-adapter --preflight --muse-home /home/eval/muse-home --session-manifest /home/eval/muse-session.json \
+  --auth-route browser-session [--muse-bin /abs/path/to/muse]
 ```
 
 Preflight runs only `muse --version` and `muse exec --help`, each bounded to 20 seconds, and prints a JSON report to
@@ -95,14 +119,14 @@ stdout (exit `0` when ready, `1` otherwise). The report never contains credentia
 
 | `outcome` | Meaning | Contract response in run mode |
 |---|---|---|
-| `ready` | runtime found, version recorded, every required flag listed, credential home verified, route attested | runs |
+| `ready` | runtime found, version recorded, every required flag listed, credential home matches its manifest, route attested | runs |
 | `runtime_missing` | `muse` not found or not executable | `failed` / `launch_error` |
 | `runtime_error` | `--version` or `exec --help` failed, timed out or printed nothing | `failed` / `runtime_error` |
 | `capability_missing` | `exec --help` lacks one of `--json --prompt-file --model --disable-approval --max-model-steps` | `unsupported` / `capability_missing`, `missing_capabilities: ["cli_flag:--model", ...]` |
 | `auth_override_present` | `META_API_KEY` is set | `failed` / `auth_missing` |
-| `auth_route_unconfirmed` | `--auth-route browser-session` or a valid `--muse-home` not given | `failed` / `auth_missing` |
-| `auth_missing` | credential home missing, empty, or without recognizable Muse session state | `failed` / `auth_missing` |
-| `auth_ambiguous` | credential home shared, symlinked, the adapter's own `HOME`, or showing a stored key | `failed` / `auth_missing` |
+| `auth_route_unconfirmed` | `--auth-route browser-session`, a valid `--muse-home` or a recorded `--session-manifest` not given | `failed` / `auth_missing` |
+| `auth_missing` | credential home missing, empty, or without candidate session state | `failed` / `auth_missing` |
+| `auth_ambiguous` | credential home shared, symlinked or holding a symlink/special file, the adapter's own `HOME`, showing a stored key, or no longer matching its manifest | `failed` / `auth_missing` |
 
 The response `error_message` always starts with the specific outcome name.
 
@@ -112,8 +136,8 @@ The adapter is a trusted registration (`Runtime` in `internal/evaluation/registr
 Example argv (the host substitutes `{request_path}`):
 
 ```
---request {request_path} --muse-home /home/eval/muse-home --auth-route browser-session \
-  --muse-bin /home/eval/.local/bin/muse \
+--request {request_path} --muse-home /home/eval/muse-home --session-manifest /home/eval/muse-session.json \
+  --auth-route browser-session --muse-bin /home/eval/.local/bin/muse \
   --account-pool meta-eval --max-model-steps 100 --timeout 25m
 ```
 
@@ -123,7 +147,8 @@ claim source retrieval, PDF access or named tools, and returns `unsupported` / `
 needs them. Set the host runtime timeout longer than `--timeout`: the adapter's own timeout kills muse and its process
 group cleanly, whereas a host-side kill of the adapter cannot reach muse's descendants.
 
-Flags: `--muse-bin` (default `muse` on `PATH`), `--muse-home`, `--auth-route`, `--account-pool` (recorded as `account_pool`; `unknown`
+Flags: `--muse-bin` (default `muse` on `PATH`), `--muse-home`, `--session-manifest`, `--auth-route`, `--record-session`
+(record mode, above), `--account-pool` (recorded as `account_pool`; `unknown`
 when omitted), `--max-model-steps` (default 100), `--timeout` (default 30m).
 
 ## How a run works
@@ -171,5 +196,7 @@ Responses written before a preflight succeeds carry unknown effective values.
 ## Tests
 
 `go test ./internal/evaluation` exercises the adapter against fake `muse` shell scripts (missing runtime, incompatible
-flags, auth ambiguity (API-key override, missing/empty/shared/symlinked credential home, own-HOME home, stored-key hints), malformed and missing output, exit zero without completion, non-zero exits, timeout, SIGTERM
+flags, auth ambiguity (API-key override, missing/empty/shared/symlinked credential home, symlinks and special files inside
+it, own-HOME home, stored-key hints, missing/unsafe/malformed/foreign session manifests, unrelated or changed session
+entries), session recording, malformed and missing output, exit zero without completion, non-zero exits, timeout, SIGTERM
 with a surviving grandchild). No test installs Muse, reads a credential or makes a paid call.

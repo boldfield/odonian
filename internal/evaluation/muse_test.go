@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -166,15 +167,33 @@ func homeWith(t *testing.T, rel, content string) string {
 
 const operatorHome = "/tmp/operator-home"
 
+// pinnedHome signs in a credential home and records its session manifest, as
+// the owner does after verifying the subscription route.
+func pinnedHome(m fakeMuse) (home, manifest string) {
+	home, manifest = signedInHome(m), filepath.Join(m.dir, "session-manifest.json")
+	opts := MuseOptions{AuthRoute: MuseAuthRouteBrowserSession, MuseHome: home, SessionManifest: manifest, Environ: []string{"HOME=" + operatorHome}}
+	if _, o, msg := RecordMuseSession(opts); o != PreflightReady {
+		panic(fmt.Sprintf("record session: %s: %s", o, msg))
+	}
+	return home, manifest
+}
+
+func pinnedArgs(m fakeMuse) []string {
+	home, manifest := pinnedHome(m)
+	return []string{"--muse-bin", m.path, "--muse-home", home, "--session-manifest", manifest, "--auth-route", MuseAuthRouteBrowserSession}
+}
+
 func museOpts(m fakeMuse) MuseOptions {
+	home, manifest := pinnedHome(m)
 	return MuseOptions{
-		Executable:   m.path,
-		AuthRoute:    MuseAuthRouteBrowserSession,
-		MuseHome:     signedInHome(m),
-		AccountPool:  "meta-eval-pool",
-		Environ:      []string{"PATH=" + os.Getenv("PATH"), "HOME=" + operatorHome, "OTHER_API_KEY=other-secret-value"},
-		Timeout:      20 * time.Second,
-		ProbeTimeout: 5 * time.Second,
+		Executable:      m.path,
+		AuthRoute:       MuseAuthRouteBrowserSession,
+		MuseHome:        home,
+		SessionManifest: manifest,
+		AccountPool:     "meta-eval-pool",
+		Environ:         []string{"PATH=" + os.Getenv("PATH"), "HOME=" + operatorHome, "OTHER_API_KEY=other-secret-value"},
+		Timeout:         20 * time.Second,
+		ProbeTimeout:    5 * time.Second,
 	}
 }
 
@@ -317,6 +336,49 @@ func TestMusePreflightAuthRouting(t *testing.T) {
 		{"settings alone is not a session", func(o *MuseOptions) { o.MuseHome = homeWith(t, ".config/muse/settings.json", `{"theme":"dark"}`) }, PreflightAuthMissing},
 		{"empty session file is not a session", func(o *MuseOptions) { o.MuseHome = homeWith(t, ".config/muse/session.json", "") }, PreflightAuthMissing},
 		{"session file outside .config/muse", func(o *MuseOptions) { o.MuseHome = homeWith(t, "session.json", `{"session":"x"}`) }, PreflightAuthMissing},
+		{"symlinked subdirectory hiding a stored key", func(o *MuseOptions) {
+			outside := t.TempDir()
+			_ = os.MkdirAll(filepath.Join(outside, "share", "muse"), 0o700)
+			_ = os.WriteFile(filepath.Join(outside, "share", "muse", "creds.json"), []byte(`{"api_key":"`+keyValue+`"}`), 0o600)
+			_ = os.Symlink(outside, filepath.Join(o.MuseHome, ".local"))
+		}, PreflightAuthAmbiguous},
+		{"symlinked file", func(o *MuseOptions) {
+			_ = os.Symlink("/etc/hostname", filepath.Join(o.MuseHome, ".config", "muse", "session-link"))
+		}, PreflightAuthAmbiguous},
+		{"special file", func(o *MuseOptions) {
+			if err := syscall.Mkfifo(filepath.Join(o.MuseHome, "pipe"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, PreflightAuthAmbiguous},
+		{"unrelated file under .config/muse without a manifest", func(o *MuseOptions) {
+			o.MuseHome = homeWith(t, ".config/muse/random.txt", "not a session")
+			o.SessionManifest = ""
+		}, PreflightAuthUnconfirmed},
+		{"manifest recorded for another home", func(o *MuseOptions) {
+			o.MuseHome = homeWith(t, ".config/muse/session.json", `{"session":"x"}`)
+		}, PreflightAuthAmbiguous},
+		{"unrelated file added after verification", func(o *MuseOptions) {
+			_ = os.WriteFile(filepath.Join(o.MuseHome, ".config", "muse", "random.txt"), []byte("not a session"), 0o600)
+		}, PreflightAuthAmbiguous},
+		{"session entry replaced after verification", func(o *MuseOptions) {
+			dir := filepath.Join(o.MuseHome, ".config", "muse")
+			_ = os.Rename(filepath.Join(dir, "session.json"), filepath.Join(dir, "other.json"))
+		}, PreflightAuthAmbiguous},
+		{"no session manifest", func(o *MuseOptions) { o.SessionManifest = "" }, PreflightAuthUnconfirmed},
+		{"relative session manifest", func(o *MuseOptions) { o.SessionManifest = "manifest.json" }, PreflightAuthUnconfirmed},
+		{"session manifest missing", func(o *MuseOptions) { o.SessionManifest = filepath.Join(t.TempDir(), "nope.json") }, PreflightAuthUnconfirmed},
+		{"session manifest inside the credential home", func(o *MuseOptions) {
+			o.SessionManifest = filepath.Join(o.MuseHome, "manifest.json")
+		}, PreflightAuthAmbiguous},
+		{"session manifest readable by others", func(o *MuseOptions) { _ = os.Chmod(o.SessionManifest, 0o644) }, PreflightAuthAmbiguous},
+		{"session manifest is a symlink", func(o *MuseOptions) {
+			link := filepath.Join(t.TempDir(), "manifest.json")
+			_ = os.Symlink(o.SessionManifest, link)
+			o.SessionManifest = link
+		}, PreflightAuthAmbiguous},
+		{"session manifest malformed", func(o *MuseOptions) {
+			_ = os.WriteFile(o.SessionManifest, []byte(`{"version":1,"muse_home":"`+o.MuseHome+`","session_entries":["session.json"],"extra":1}`), 0o600)
+		}, PreflightAuthAmbiguous},
 		{"stored key file name", func(o *MuseOptions) {
 			_ = os.WriteFile(filepath.Join(o.MuseHome, "api_key"), []byte("sk-x"), 0o600)
 		}, PreflightAuthAmbiguous},
@@ -347,6 +409,96 @@ func TestMusePreflightAuthRouting(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRecordMuseSessionWritesNamesOnly(t *testing.T) {
+	m := writeFakeMuse(t, fakeMuseCfg{})
+	home := signedInHome(m)
+	manifest := filepath.Join(t.TempDir(), "manifest.json")
+	opts := MuseOptions{Executable: m.path, AuthRoute: MuseAuthRouteBrowserSession, MuseHome: home, SessionManifest: manifest, Environ: []string{"HOME=" + operatorHome}}
+	got, o, msg := RecordMuseSession(opts)
+	if o != PreflightReady {
+		t.Fatalf("%s: %s", o, msg)
+	}
+	if !reflect.DeepEqual(got.SessionEntries, []string{"session.json"}) || got.MuseHome != home {
+		t.Fatalf("manifest: %+v", got)
+	}
+	info, err := os.Stat(manifest)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("manifest file: %v %v", info, err)
+	}
+	if raw := string(must(os.ReadFile(manifest))); strings.Contains(raw, "browser-token") {
+		t.Fatalf("manifest must not hold credential content: %s", raw)
+	}
+	if m.exists("invoked") {
+		t.Fatal("recording must not start muse")
+	}
+
+	// Re-signing in with a different layout requires re-recording; the new
+	// record replaces the old one and preflight accepts it again.
+	if err := os.WriteFile(filepath.Join(home, ".config", "muse", "settings.json"), []byte(`{"schema_version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if rep := MusePreflight(context.Background(), opts); rep.Outcome != PreflightAuthAmbiguous {
+		t.Fatalf("changed home accepted: %+v", rep)
+	}
+	if _, o, msg := RecordMuseSession(opts); o != PreflightReady {
+		t.Fatalf("re-record: %s: %s", o, msg)
+	}
+	if rep := MusePreflight(context.Background(), opts); !rep.Ready() || rep.SessionManifest != manifest {
+		t.Fatalf("after re-record: %+v", rep)
+	}
+}
+
+func TestRecordMuseSessionRefusesUnsafeState(t *testing.T) {
+	m := writeFakeMuse(t, fakeMuseCfg{})
+	base := func() MuseOptions {
+		return MuseOptions{AuthRoute: MuseAuthRouteBrowserSession, MuseHome: signedInHome(fakeMuse{dir: t.TempDir()}),
+			SessionManifest: filepath.Join(t.TempDir(), "manifest.json"), Environ: []string{"HOME=" + operatorHome}}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*MuseOptions)
+		outcome PreflightOutcome
+	}{
+		{"api key override", func(o *MuseOptions) { o.Environ = append(o.Environ, "META_API_KEY=x") }, PreflightAuthOverride},
+		{"unattested", func(o *MuseOptions) { o.AuthRoute = "" }, PreflightAuthUnconfirmed},
+		{"no session state", func(o *MuseOptions) { o.MuseHome = homeWith(t, ".config/muse/settings.json", "{}") }, PreflightAuthMissing},
+		{"stored key", func(o *MuseOptions) {
+			_ = os.WriteFile(filepath.Join(o.MuseHome, ".config", "muse", "key.json"), []byte(`{"api_key":"x"}`), 0o600)
+		}, PreflightAuthAmbiguous},
+		{"symlink in home", func(o *MuseOptions) { _ = os.Symlink(t.TempDir(), filepath.Join(o.MuseHome, ".local")) }, PreflightAuthAmbiguous},
+		{"no manifest path", func(o *MuseOptions) { o.SessionManifest = "" }, PreflightAuthUnconfirmed},
+		{"relative manifest path", func(o *MuseOptions) { o.SessionManifest = "m.json" }, PreflightAuthUnconfirmed},
+		{"manifest inside home", func(o *MuseOptions) { o.SessionManifest = filepath.Join(o.MuseHome, "m.json") }, PreflightAuthAmbiguous},
+		{"manifest path is a symlink", func(o *MuseOptions) {
+			target := filepath.Join(t.TempDir(), "target.json")
+			_ = os.WriteFile(target, []byte("{}"), 0o600)
+			_ = os.Symlink(target, o.SessionManifest)
+		}, PreflightAuthAmbiguous},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := base()
+			opts.Executable = m.path
+			tc.mutate(&opts)
+			if _, o, msg := RecordMuseSession(opts); o != tc.outcome {
+				t.Fatalf("got %s (%s), want %s", o, msg, tc.outcome)
+			}
+			if tc.name != "manifest path is a symlink" && opts.SessionManifest != "" && filepath.IsAbs(opts.SessionManifest) {
+				if _, err := os.Lstat(opts.SessionManifest); err == nil {
+					t.Fatal("a refused record must not write a manifest")
+				}
+			}
+		})
+	}
+}
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
 
 func TestRunMuseCompleted(t *testing.T) {
@@ -632,7 +784,7 @@ func TestMuseMainSIGTERMWritesInterruptedResponse(t *testing.T) {
 
 	code := make(chan int, 1)
 	go func() {
-		code <- MuseMain([]string{"--request", reqPath, "--muse-bin", m.path, "--muse-home", signedInHome(m), "--auth-route", MuseAuthRouteBrowserSession}, os.Stdout, os.Stderr)
+		code <- MuseMain(append([]string{"--request", reqPath}, pinnedArgs(m)...), os.Stdout, os.Stderr)
 	}()
 	pid, err := strconv.Atoi(waitForFile(t, m.file("child.pid")))
 	if err != nil {
@@ -680,7 +832,7 @@ func TestMuseMainPreflightCommand(t *testing.T) {
 	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + operatorHome}
 	var out, errOut strings.Builder
 
-	code := museMain(context.Background(), []string{"--preflight", "--muse-bin", m.path, "--muse-home", signedInHome(m), "--auth-route", MuseAuthRouteBrowserSession}, env, &out, &errOut)
+	code := museMain(context.Background(), append([]string{"--preflight"}, pinnedArgs(m)...), env, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("exit %d: %s %s", code, out.String(), errOut.String())
 	}
@@ -696,6 +848,37 @@ func TestMuseMainPreflightCommand(t *testing.T) {
 	}
 }
 
+func TestMuseMainRecordSessionCommand(t *testing.T) {
+	m := writeFakeMuse(t, fakeMuseCfg{})
+	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + operatorHome}
+	home, manifest := signedInHome(m), filepath.Join(t.TempDir(), "manifest.json")
+	args := []string{"--muse-bin", m.path, "--muse-home", home, "--session-manifest", manifest, "--auth-route", MuseAuthRouteBrowserSession}
+	var out, errOut strings.Builder
+
+	if code := museMain(context.Background(), append([]string{"--preflight"}, args...), env, &out, &errOut); code != 1 || !strings.Contains(out.String(), string(PreflightAuthUnconfirmed)) {
+		t.Fatalf("unrecorded home: exit %d, report %s", code, out.String())
+	}
+	out.Reset()
+	if code := museMain(context.Background(), append([]string{"--record-session"}, args...), env, &out, &errOut); code != 0 {
+		t.Fatalf("record: exit %d: %s", code, errOut.String())
+	}
+	var rec MuseSessionManifest
+	if err := json.Unmarshal([]byte(out.String()), &rec); err != nil || len(rec.SessionEntries) != 1 {
+		t.Fatalf("record output %q: %v", out.String(), err)
+	}
+	out.Reset()
+	if code := museMain(context.Background(), append([]string{"--preflight"}, args...), env, &out, &errOut); code != 0 {
+		t.Fatalf("recorded home: exit %d, report %s", code, out.String())
+	}
+
+	errOut.Reset()
+	bad := append([]string{"--record-session"}, args...)
+	bad[len(bad)-1] = ""
+	if code := museMain(context.Background(), bad, env, &out, &errOut); code != 1 || !strings.Contains(errOut.String(), string(PreflightAuthUnconfirmed)) {
+		t.Fatalf("unattested record: exit %d: %s", code, errOut.String())
+	}
+}
+
 func TestMuseMainRunWritesContractValidResult(t *testing.T) {
 	m := writeFakeMuse(t, fakeMuseCfg{events: goodEvents(t)})
 	req := museRequest(t)
@@ -706,7 +889,7 @@ func TestMuseMainRunWritesContractValidResult(t *testing.T) {
 	}
 	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + operatorHome}
 	var out, errOut strings.Builder
-	code := museMain(context.Background(), []string{"--request", reqPath, "--muse-bin", m.path, "--muse-home", signedInHome(m), "--auth-route", MuseAuthRouteBrowserSession, "--account-pool", "p1"}, env, &out, &errOut)
+	code := museMain(context.Background(), append(append([]string{"--request", reqPath}, pinnedArgs(m)...), "--account-pool", "p1"), env, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
@@ -743,7 +926,7 @@ func TestMuseResponsesPassThroughHostPipeline(t *testing.T) {
 	reg := NewRegistry()
 	rt := Runtime{
 		Name: "muse", Executable: exe, Timeout: 30 * time.Second, Capabilities: []string{CapStructuredOutput}, Candidate: cfg,
-		Args:           []string{museAdapterArg, "--request", PlaceholderRequestPath, "--muse-bin", m.path, "--muse-home", signedInHome(m), "--auth-route", MuseAuthRouteBrowserSession},
+		Args:           append([]string{museAdapterArg, "--request", PlaceholderRequestPath}, pinnedArgs(m)...),
 		PassThroughEnv: []string{"HOME"},
 	}
 	if err := reg.Register(rt); err != nil {

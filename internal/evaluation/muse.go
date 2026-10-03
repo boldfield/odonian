@@ -8,17 +8,19 @@ package evaluation
 // documentation (https://dev.meta.ai/docs/muse-code and its /extending, /auth
 // and /subscriptions pages), which documents: `muse --version`; `muse exec`
 // with --json (JSONL events on stdout), --prompt-file, --disable-approval and
-// --max-model-steps; exit codes 0, 1, 2, 130 and 143; and the credential
+// --max-model-steps; --model <id> (configuration page, common to `muse` and
+// `muse exec`); exit codes 0, 1, 2, 130 and 143; and the credential
 // precedence META_API_KEY, then a stored key, then a stored browser session
 // (only the browser session is covered by a Power subscription; any API key is
-// billed pay-as-you-go). It does NOT document a model-selection flag, the JSONL
-// event schema, or any way to ask which credential is active. The adapter
-// therefore never assumes those: it probes `muse exec --help` for the flags it
-// needs, collects results through its own marker protocol that does not depend
-// on the event schema, and refuses to run unless the billing route is
-// constrained: muse runs with a dedicated credential home (HOME is replaced,
-// XDG_* dropped) that preflight checks, so an API key stored for some other
-// purpose in the operator's own HOME can never outrank the browser session.
+// billed pay-as-you-go). It does NOT document the JSONL event schema, where
+// credentials are stored, or any way to ask which credential is active. The
+// adapter therefore never assumes those: it probes `muse exec --help` for the
+// flags it needs, collects results through its own marker protocol that does
+// not depend on the event schema, and refuses to run unless the billing route
+// is constrained: muse runs with a dedicated credential home (HOME is
+// replaced, XDG_* dropped) that preflight checks against a manifest the owner
+// recorded after verifying the subscription route, so an API key stored for
+// some other purpose can never outrank the browser session unnoticed.
 
 import (
 	"bytes"
@@ -79,8 +81,8 @@ const (
 // museKeyHint matches file names and contents that suggest a stored API key.
 var museKeyHint = regexp.MustCompile(`(?i)api[_\-. ]?key`)
 
-// museRequiredFlags are the `muse exec` flags the adapter passes. --model is
-// not in the public documentation, so its presence is confirmed per install.
+// museRequiredFlags are the `muse exec` flags the adapter passes; each is
+// documented, and preflight confirms the installed CLI lists every one.
 var museRequiredFlags = []string{"--json", "--prompt-file", "--model", "--disable-approval", "--max-model-steps"}
 
 // museAllowedEnv is every variable (or prefix ending in *) the muse child
@@ -106,12 +108,14 @@ const (
 	// it over the subscription session and bill pay-as-you-go.
 	PreflightAuthOverride PreflightOutcome = "auth_override_present"
 	// PreflightAuthUnconfirmed means nothing proves the run uses the
-	// subscription session (a stored key cannot be detected from outside).
+	// subscription session (a stored key cannot be detected from outside):
+	// no attestation, no valid credential home path, or no session manifest.
 	PreflightAuthUnconfirmed PreflightOutcome = "auth_route_unconfirmed"
 	// PreflightAuthMissing means the credential home holds no session at all.
 	PreflightAuthMissing PreflightOutcome = "auth_missing"
 	// PreflightAuthAmbiguous means the credential home is unsafe to trust: it
-	// is shared, is the adapter's own HOME, or shows signs of a stored API key.
+	// is shared, is the adapter's own HOME, holds a symlink, shows signs of a
+	// stored API key, or no longer matches the recorded session manifest.
 	PreflightAuthAmbiguous PreflightOutcome = "auth_ambiguous"
 )
 
@@ -124,6 +128,7 @@ type PreflightReport struct {
 	Model            string           `json:"model"`
 	AuthRoute        string           `json:"auth_route"`
 	MuseHome         string           `json:"muse_home,omitempty"`
+	SessionManifest  string           `json:"session_manifest,omitempty"`
 	ExecFlagsFound   []string         `json:"exec_flags_found,omitempty"`
 	ExecFlagsMissing []string         `json:"exec_flags_missing,omitempty"`
 }
@@ -133,15 +138,18 @@ func (r PreflightReport) Ready() bool { return r.Outcome == PreflightReady }
 
 // MuseOptions configures one adapter invocation.
 type MuseOptions struct {
-	Executable    string        // path or name of the muse binary; default "muse"
-	AuthRoute     string        // operator attestation; see MuseAuthRouteBrowserSession
-	MuseHome      string        // absolute dedicated credential home; becomes the child's HOME
-	AccountPool   string        // recorded in the identity; Unknown when empty
-	MaxModelSteps int           // default 100
-	Timeout       time.Duration // whole exec run; default 30m
-	ProbeTimeout  time.Duration // each preflight probe; default 20s
-	Environ       []string      // the adapter's environment (KEY=VALUE)
-	Now           func() time.Time
+	Executable string // path or name of the muse binary; default "muse"
+	AuthRoute  string // operator attestation; see MuseAuthRouteBrowserSession
+	MuseHome   string // absolute dedicated credential home; becomes the child's HOME
+	// SessionManifest is the absolute path of the owner-recorded session
+	// manifest (see RecordMuseSession); it lives outside MuseHome.
+	SessionManifest string
+	AccountPool     string        // recorded in the identity; Unknown when empty
+	MaxModelSteps   int           // default 100
+	Timeout         time.Duration // whole exec run; default 30m
+	ProbeTimeout    time.Duration // each preflight probe; default 20s
+	Environ         []string      // the adapter's environment (KEY=VALUE)
+	Now             func() time.Time
 }
 
 func (o MuseOptions) withDefaults() MuseOptions {
@@ -243,8 +251,12 @@ func flagListed(help, flagName string) bool {
 // to route billing through the browser session. Muse documents no way to ask
 // which credential is active, so the adapter instead prevents the documented
 // bypass: the child only ever sees this directory as HOME, and the directory
-// must be private, separate from the adapter's own HOME, show Muse session
-// state (a non-empty file besides settings.json under .config/muse) and free of anything that looks like a stored API key.
+// must be private, separate from the adapter's own HOME, hold only plain files
+// and directories, show candidate Muse session state (a non-empty file besides
+// settings.json under .config/muse) and be free of anything that looks like a
+// stored API key. Because Muse does not document its storage layout, that is
+// necessary but not sufficient: checkSessionManifest additionally requires the
+// state to match what the owner verified and recorded.
 // File contents are inspected in memory only and never reported.
 func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 	home := opts.MuseHome
@@ -275,7 +287,7 @@ func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 			return PreflightAuthAmbiguous, "credential home is the adapter's own HOME, which may hold a stored API key that outranks the subscription session; use a dedicated directory"
 		}
 	}
-	files, hint, sessionFound := 0, "", false
+	files, hint, special, sessionFound := 0, "", "", false
 	sessionDir := filepath.Join(home, ".config", "muse")
 	walkErr := filepath.WalkDir(home, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -288,11 +300,18 @@ func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 			return errors.New("too many entries to inspect")
 		}
 		rel, _ := filepath.Rel(home, path)
+		// The walk does not follow symlinks but the muse child does, so a
+		// link (or any other special file) could hide a stored key from the
+		// scan. Nothing but plain files and directories is trusted.
+		if d.Type()&os.ModeSymlink != 0 || (!d.IsDir() && !d.Type().IsRegular()) {
+			special = rel
+			return filepath.SkipAll
+		}
 		if museKeyHint.MatchString(d.Name()) {
 			hint = rel
 			return filepath.SkipAll
 		}
-		if !d.Type().IsRegular() {
+		if d.IsDir() {
 			return nil
 		}
 		if filepath.Dir(path) == sessionDir && d.Name() != museSettingsFile {
@@ -316,6 +335,8 @@ func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 		return nil
 	})
 	switch {
+	case special != "":
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home contains a symlink or special file (%s) that the stored-key scan cannot inspect; keep only plain files and directories in it", special)
 	case hint != "":
 		return PreflightAuthAmbiguous, fmt.Sprintf("credential home contains what looks like a stored API key (%s); run HOME=%s muse logout and sign in again with the browser flow", hint, home)
 	case walkErr != nil:
@@ -326,6 +347,170 @@ func checkMuseHome(opts MuseOptions) (PreflightOutcome, string) {
 		return PreflightAuthMissing, fmt.Sprintf("credential home %s holds no recognizable Muse session state (expected a non-empty file other than %s under .config/muse); sign in with HOME=%s muse (Power browser flow) first", home, museSettingsFile, home)
 	}
 	return PreflightReady, ""
+}
+
+// museManifestVersion versions the session manifest format.
+const museManifestVersion = 1
+
+// MuseSessionManifest pins the session state the owner verified. Muse
+// documents neither where it stores the browser session nor any command that
+// reports the active credential, so no file pattern can prove a session
+// exists. Instead the owner signs in interactively with the dedicated home,
+// confirms there that the Power subscription is the billed route, and records
+// the names of the entries under .config/muse with RecordMuseSession.
+// Preflight then refuses to run unless the home still holds exactly those
+// entries: an unverified home has no manifest, and a later `muse auth set`,
+// logout or stray file changes the entry set. It holds names only, never
+// contents.
+type MuseSessionManifest struct {
+	Version  int    `json:"version"`
+	MuseHome string `json:"muse_home"`
+	// SessionEntries are the entry names directly under .config/muse,
+	// sorted; directories carry a trailing "/".
+	SessionEntries []string `json:"session_entries"`
+}
+
+func museSessionEntries(home string) ([]string, error) {
+	des, err := os.ReadDir(filepath.Join(home, ".config", "muse"))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(des))
+	for _, d := range des {
+		name := d.Name()
+		if d.IsDir() {
+			name += "/"
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// checkManifestPath validates where a manifest lives: an absolute path outside
+// the credential home (so the muse child cannot rewrite it), and when it
+// exists a private regular file owned by the adapter's user.
+func checkManifestPath(path, home string) (PreflightOutcome, string) {
+	if path == "" {
+		return PreflightAuthUnconfirmed, "no session manifest: after verifying the subscription route interactively, record one with --record-session and pass --session-manifest"
+	}
+	if !filepath.IsAbs(path) {
+		return PreflightAuthUnconfirmed, fmt.Sprintf("--session-manifest %q must be an absolute path", path)
+	}
+	if rel, err := filepath.Rel(filepath.Clean(home), filepath.Clean(path)); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s must live outside the credential home", path)
+	}
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return PreflightAuthUnconfirmed, fmt.Sprintf("session manifest %s does not exist; record it with --record-session after verifying the subscription route", path)
+	case err != nil:
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s unreadable: %v", path, err)
+	case !info.Mode().IsRegular():
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s must be a regular file, not a symlink", path)
+	case info.Mode().Perm()&0o077 != 0:
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s is accessible to other users (mode %o); chmod 600", path, info.Mode().Perm())
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s is not owned by the adapter's user", path)
+	}
+	return PreflightReady, ""
+}
+
+// checkSessionManifest requires the credential home to match the recorded
+// manifest exactly. Call it only after checkMuseHome passed.
+func checkSessionManifest(opts MuseOptions) (PreflightOutcome, string) {
+	if o, msg := checkManifestPath(opts.SessionManifest, opts.MuseHome); o != PreflightReady {
+		return o, msg
+	}
+	data, err := os.ReadFile(opts.SessionManifest)
+	if err != nil {
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest unreadable: %v", err)
+	}
+	var m MuseSessionManifest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&m); err != nil || m.Version != museManifestVersion || len(m.SessionEntries) == 0 {
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest %s is not a valid version %d manifest; record it again", opts.SessionManifest, museManifestVersion)
+	}
+	if m.MuseHome != filepath.Clean(opts.MuseHome) {
+		return PreflightAuthAmbiguous, fmt.Sprintf("session manifest was recorded for credential home %s, not %s", m.MuseHome, opts.MuseHome)
+	}
+	have, err := museSessionEntries(opts.MuseHome)
+	if err != nil {
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home session state unreadable: %v", err)
+	}
+	if added, removed := diffSorted(m.SessionEntries, have); len(added)+len(removed) > 0 {
+		return PreflightAuthAmbiguous, fmt.Sprintf("credential home session state changed since it was verified (added %v, removed %v); verify the subscription route again and re-record with --record-session",
+			added, removed)
+	}
+	return PreflightReady, ""
+}
+
+// diffSorted returns the entries only in have (added) and only in want
+// (removed). Both inputs are sorted.
+func diffSorted(want, have []string) (added, removed []string) {
+	i, j := 0, 0
+	for i < len(want) || j < len(have) {
+		switch {
+		case j == len(have) || (i < len(want) && want[i] < have[j]):
+			removed = append(removed, want[i])
+			i++
+		case i == len(want) || have[j] < want[i]:
+			added = append(added, have[j])
+			j++
+		default:
+			i, j = i+1, j+1
+		}
+	}
+	return added, removed
+}
+
+// RecordMuseSession writes the session manifest for a credential home the
+// owner has just verified. It applies every preflight billing-route check
+// except the manifest itself, never starts muse, and writes only entry names.
+func RecordMuseSession(opts MuseOptions) (MuseSessionManifest, PreflightOutcome, string) {
+	if _, set := envLookup(opts.Environ, museAPIKeyEnv); set {
+		return MuseSessionManifest{}, PreflightAuthOverride, museAPIKeyEnv + " is set; unset it before recording a subscription session"
+	}
+	if opts.AuthRoute != MuseAuthRouteBrowserSession {
+		return MuseSessionManifest{}, PreflightAuthUnconfirmed, "pass --auth-route " + MuseAuthRouteBrowserSession + " to attest that the home was signed in with the Power browser session"
+	}
+	if o, msg := checkMuseHome(opts); o != PreflightReady {
+		return MuseSessionManifest{}, o, msg
+	}
+	if opts.SessionManifest == "" || !filepath.IsAbs(opts.SessionManifest) {
+		return MuseSessionManifest{}, PreflightAuthUnconfirmed, "--session-manifest must be an absolute path outside the credential home"
+	}
+	// A missing manifest is expected here; anything unsafe about the path is not.
+	if o, msg := checkManifestPath(opts.SessionManifest, opts.MuseHome); o == PreflightAuthAmbiguous {
+		return MuseSessionManifest{}, o, msg
+	}
+	entries, err := museSessionEntries(opts.MuseHome)
+	if err != nil {
+		return MuseSessionManifest{}, PreflightAuthAmbiguous, fmt.Sprintf("credential home session state unreadable: %v", err)
+	}
+	m := MuseSessionManifest{Version: museManifestVersion, MuseHome: filepath.Clean(opts.MuseHome), SessionEntries: entries}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return MuseSessionManifest{}, PreflightAuthAmbiguous, err.Error()
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(opts.SessionManifest), ".muse-session-*")
+	if err != nil {
+		return MuseSessionManifest{}, PreflightAuthAmbiguous, fmt.Sprintf("write session manifest: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+	_, werr := tmp.Write(append(data, '\n'))
+	if cerr := tmp.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Rename(tmp.Name(), opts.SessionManifest)
+	}
+	if werr != nil {
+		return MuseSessionManifest{}, PreflightAuthAmbiguous, fmt.Sprintf("write session manifest: %v", werr)
+	}
+	return m, PreflightReady, ""
 }
 
 // MusePreflight checks the installed runtime and the billing route without a
@@ -361,6 +546,10 @@ func MusePreflight(ctx context.Context, opts MuseOptions) PreflightReport {
 		return fail(o, "%s", msg)
 	}
 	rep.MuseHome = opts.MuseHome
+	if o, msg := checkSessionManifest(opts); o != PreflightReady {
+		return fail(o, "%s", msg)
+	}
+	rep.SessionManifest = opts.SessionManifest
 
 	stdout, stderr, err := opts.probe(ctx, exe, "--version")
 	if err != nil {
@@ -809,6 +998,8 @@ func museMain(ctx context.Context, args, environ []string, stdout, stderr io.Wri
 	museBin := fs.String("muse-bin", "muse", "muse executable (path or name)")
 	museHome := fs.String("muse-home", "", "absolute dedicated credential home; used as muse's HOME")
 	authRoute := fs.String("auth-route", "", "operator attestation of the billing route; must be "+MuseAuthRouteBrowserSession)
+	manifest := fs.String("session-manifest", "", "absolute path, outside --muse-home, of the recorded session manifest")
+	record := fs.Bool("record-session", false, "record the session manifest for a credential home the owner just verified; never starts muse")
 	pool := fs.String("account-pool", "", "account pool name recorded in the identity")
 	steps := fs.Int("max-model-steps", museDefaultSteps, "muse exec --max-model-steps")
 	timeout := fs.Duration("timeout", museDefaultTimeout, "limit for one muse exec run")
@@ -816,8 +1007,23 @@ func museMain(ctx context.Context, args, environ []string, stdout, stderr io.Wri
 		return 2
 	}
 	opts := MuseOptions{
-		Executable: *museBin, AuthRoute: *authRoute, MuseHome: *museHome, AccountPool: *pool,
+		Executable: *museBin, AuthRoute: *authRoute, MuseHome: *museHome, SessionManifest: *manifest, AccountPool: *pool,
 		MaxModelSteps: *steps, Timeout: *timeout, Environ: environ,
+	}
+
+	if *record {
+		m, outcome, msg := RecordMuseSession(opts)
+		if outcome != PreflightReady {
+			fmt.Fprintf(stderr, "muse: record session: %s: %s\n", outcome, msg)
+			return 1
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(m); err != nil {
+			fmt.Fprintln(stderr, "muse: encode manifest:", err)
+			return 2
+		}
+		return 0
 	}
 
 	if *preflight {
