@@ -18663,3 +18663,624 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		}
 	})
 }
+
+// Research permit and dispatch attempt lifecycle tests
+
+// testCreateProjectAndTask is a helper to create a project and task for testing
+func testCreateProjectAndTask(ctx context.Context, t *testing.T, store Store) (string, string) {
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{Title: "Test Task", Spec: "Test spec", DocumentID: doc.ID},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	return proj.ID, tasks[0].ID
+}
+
+func TestRequestPermitNewPermit(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID, taskID := testCreateProjectAndTask(ctx, t, store)
+
+	agentID := GenerateID()
+	model := "haiku"
+	accountPool := "test-pool"
+	requestID := "req-1"
+
+	permit, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, model, accountPool)
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	if permit.ID == "" {
+		t.Error("permit ID not set")
+	}
+	if permit.TaskID != taskID {
+		t.Errorf("expected task_id %q, got %q", taskID, permit.TaskID)
+	}
+	if permit.ProjectID != projectID {
+		t.Errorf("expected project_id %q, got %q", projectID, permit.ProjectID)
+	}
+	if permit.State != "active" {
+		t.Errorf("expected state 'active', got %q", permit.State)
+	}
+	if permit.AttemptID == "" {
+		t.Error("attempt_id not set")
+	}
+
+	// Verify attempt row was created
+	att, err := store.GetAttemptByID(ctx, permit.AttemptID)
+	if err != nil {
+		t.Fatalf("GetAttemptByID failed: %v", err)
+	}
+	if att.SequenceNumber != 1 {
+		t.Errorf("expected sequence_number 1, got %d", att.SequenceNumber)
+	}
+}
+
+func TestRequestPermitReplay(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	model := "haiku"
+	accountPool := "test-pool"
+	requestID := "req-1"
+
+	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, model, accountPool)
+	if err != nil {
+		t.Fatalf("first RequestPermit failed: %v", err)
+	}
+
+	// Replay with same request ID should return same permit
+	permit2, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, model, accountPool)
+	if err != nil {
+		t.Fatalf("replay RequestPermit failed: %v", err)
+	}
+
+	if permit2.ID != permit1.ID {
+		t.Errorf("expected same permit ID on replay, got %q vs %q", permit1.ID, permit2.ID)
+	}
+	if permit2.AttemptID != permit1.AttemptID {
+		t.Errorf("expected same attempt ID on replay, got %q vs %q", permit1.AttemptID, permit2.AttemptID)
+	}
+}
+
+func TestRequestPermitReplayMismatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+	accountPool := "test-pool"
+
+	_, err = store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", accountPool)
+	if err != nil {
+		t.Fatalf("first RequestPermit failed: %v", err)
+	}
+
+	// Replay with different task should fail
+	differentTaskID := GenerateID()
+	_, err = store.RequestPermit(ctx, requestID, differentTaskID, projectID, agentID, "haiku", accountPool)
+	if err != ErrReplayMismatch {
+		t.Errorf("expected ErrReplayMismatch for task mismatch, got %v", err)
+	}
+
+	// Replay with different project should fail
+	_, err = store.RequestPermit(ctx, requestID, taskID, GenerateID(), agentID, "haiku", accountPool)
+	if err != ErrReplayMismatch {
+		t.Errorf("expected ErrReplayMismatch for project mismatch, got %v", err)
+	}
+
+	// Replay with different model should fail
+	_, err = store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "opus", accountPool)
+	if err != ErrReplayMismatch {
+		t.Errorf("expected ErrReplayMismatch for model mismatch, got %v", err)
+	}
+}
+
+func TestGetPermit(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+
+	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	permit2, err := store.GetPermit(ctx, permit1.ID)
+	if err != nil {
+		t.Fatalf("GetPermit failed: %v", err)
+	}
+
+	if permit2.ID != permit1.ID {
+		t.Errorf("expected permit ID %q, got %q", permit1.ID, permit2.ID)
+	}
+	if permit2.State != "active" {
+		t.Errorf("expected state 'active', got %q", permit2.State)
+	}
+}
+
+func TestGetPermitNotFound(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	_, err = store.GetPermit(ctx, "nonexistent-id")
+	if err != ErrPermitNotFound {
+		t.Errorf("expected ErrPermitNotFound, got %v", err)
+	}
+}
+
+func TestRenewPermit(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+
+	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	permit2, err := store.RenewPermit(ctx, permit1.ID, permit1.AttemptID)
+	if err != nil {
+		t.Fatalf("RenewPermit failed: %v", err)
+	}
+
+	if permit2.State != "active" {
+		t.Errorf("expected state 'active' after renewal, got %q", permit2.State)
+	}
+	if permit2.UpdatedAt == permit1.UpdatedAt {
+		t.Errorf("expected updated_at to change on renewal")
+	}
+}
+
+func TestRenewPermitFenceMismatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+
+	permit, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	// Attempt to renew with wrong attempt ID should fail
+	_, err = store.RenewPermit(ctx, permit.ID, "wrong-attempt-id")
+	if err != ErrFenceMismatch {
+		t.Errorf("expected ErrFenceMismatch for wrong attempt ID, got %v", err)
+	}
+}
+
+func TestFinalizePermit(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+
+	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	exitClass := "completed"
+	usage := "1000"
+	permit2, err := store.FinalizePermit(ctx, permit1.ID, permit1.AttemptID, &exitClass, &usage)
+	if err != nil {
+		t.Fatalf("FinalizePermit failed: %v", err)
+	}
+
+	if permit2.State != "finalized" {
+		t.Errorf("expected state 'finalized', got %q", permit2.State)
+	}
+	if permit2.FinalizedAt == nil {
+		t.Error("expected finalized_at to be set")
+	}
+
+	// Verify attempt was updated
+	att, err := store.GetAttemptByID(ctx, permit1.AttemptID)
+	if err != nil {
+		t.Fatalf("GetAttemptByID failed: %v", err)
+	}
+	if att.ExitClass == nil || *att.ExitClass != "completed" {
+		t.Errorf("expected exit_class 'completed', got %v", att.ExitClass)
+	}
+	if att.UsageTokens == nil || *att.UsageTokens != "1000" {
+		t.Errorf("expected usage_tokens '1000', got %v", att.UsageTokens)
+	}
+}
+
+func TestFinalizePermitIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+
+	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	exitClass := "completed"
+	usage := "1000"
+
+	// First finalize
+	_, err = store.FinalizePermit(ctx, permit1.ID, permit1.AttemptID, &exitClass, &usage)
+	if err != nil {
+		t.Fatalf("first FinalizePermit failed: %v", err)
+	}
+
+	// Second finalize with same parameters should preserve the first outcome
+	usage2 := "2000"
+	_, err = store.FinalizePermit(ctx, permit1.ID, permit1.AttemptID, &exitClass, &usage2)
+	if err == nil {
+		// Finalize on finalized permit should fail (fence mismatch)
+		t.Errorf("expected error on second finalize, got nil")
+	}
+	if err != ErrFenceMismatch {
+		t.Errorf("expected ErrFenceMismatch on finalized permit, got %v", err)
+	}
+
+	// Verify usage is still the first value
+	att, err := store.GetAttemptByID(ctx, permit1.AttemptID)
+	if err != nil {
+		t.Fatalf("GetAttemptByID failed: %v", err)
+	}
+	if att.UsageTokens == nil || *att.UsageTokens != "1000" {
+		t.Errorf("expected usage_tokens to remain '1000', got %v", att.UsageTokens)
+	}
+}
+
+func TestFinalizePermitFenceMismatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+
+	permit, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	// Attempt to finalize with wrong attempt ID should fail
+	exitClass := "error"
+	_, err = store.FinalizePermit(ctx, permit.ID, "wrong-attempt-id", &exitClass, nil)
+	if err != ErrFenceMismatch {
+		t.Errorf("expected ErrFenceMismatch for wrong attempt ID, got %v", err)
+	}
+}
+
+func TestExpirePermit(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+
+	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	// Expire using a time after the permit's expires_at
+	futureTime := time.Now().Add(2 * time.Hour).Format(time.RFC3339)
+	count, err := store.ExpirePermit(ctx, futureTime)
+	if err != nil {
+		t.Fatalf("ExpirePermit failed: %v", err)
+	}
+
+	if count != 1 {
+		t.Errorf("expected 1 expired permit, got %d", count)
+	}
+
+	// Verify permit state changed
+	permit2, err := store.GetPermit(ctx, permit1.ID)
+	if err != nil {
+		t.Fatalf("GetPermit failed: %v", err)
+	}
+	if permit2.State != "expired" {
+		t.Errorf("expected state 'expired', got %q", permit2.State)
+	}
+}
+
+func TestCreateNextAttempt(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	requestID := "req-1"
+
+	permit1, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", "pool-1")
+	if err != nil {
+		t.Fatalf("RequestPermit failed: %v", err)
+	}
+
+	att1, permit2, err := store.CreateNextAttempt(ctx, permit1.ID)
+	if err != nil {
+		t.Fatalf("CreateNextAttempt failed: %v", err)
+	}
+
+	if att1.SequenceNumber != 2 {
+		t.Errorf("expected sequence_number 2, got %d", att1.SequenceNumber)
+	}
+	if permit2.AttemptID != att1.ID {
+		t.Errorf("expected permit.attempt_id to be %q, got %q", att1.ID, permit2.AttemptID)
+	}
+
+	// Create another attempt
+	att2, permit3, err := store.CreateNextAttempt(ctx, permit1.ID)
+	if err != nil {
+		t.Fatalf("second CreateNextAttempt failed: %v", err)
+	}
+
+	if att2.SequenceNumber != 3 {
+		t.Errorf("expected sequence_number 3, got %d", att2.SequenceNumber)
+	}
+	if permit3.AttemptID != att2.ID {
+		t.Errorf("expected permit.attempt_id to be %q, got %q", att2.ID, permit3.AttemptID)
+	}
+}
+
+func TestConcurrentPermitRequests(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+	accountPool := "test-pool"
+
+	// Simulate concurrent requests with different request IDs for the same task
+	// They should each get their own permit
+	const numRequests = 5
+	permits := make([]*ResearchPermit, numRequests)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			requestID := fmt.Sprintf("req-%d", index)
+			permit, err := store.RequestPermit(ctx, requestID, taskID, projectID, agentID, "haiku", accountPool)
+			if err != nil {
+				t.Errorf("RequestPermit failed: %v", err)
+				return
+			}
+			mu.Lock()
+			permits[index] = &permit
+			mu.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify all permits were created and have unique IDs
+	seen := make(map[string]bool)
+	for i, permit := range permits {
+		if permit == nil {
+			t.Errorf("permit %d is nil", i)
+			continue
+		}
+		if seen[permit.ID] {
+			t.Errorf("permit ID %q seen multiple times", permit.ID)
+		}
+		seen[permit.ID] = true
+	}
+
+	if len(seen) != numRequests {
+		t.Errorf("expected %d unique permits, got %d", numRequests, len(seen))
+	}
+}
+
+func TestListActivePermits(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID := GenerateID()
+	agentID := GenerateID()
+
+	// Create a few permits
+	permit1, _ := store.RequestPermit(ctx, "req-1", taskID, projectID, agentID, "haiku", "pool-1")
+	permit2, _ := store.RequestPermit(ctx, "req-2", GenerateID(), projectID, agentID, "haiku", "pool-1")
+
+	// Finalize one
+	store.FinalizePermit(ctx, permit1.ID, permit1.AttemptID, nil, nil)
+
+	// List active permits
+	active, err := store.ListActivePermits(ctx, "active")
+	if err != nil {
+		t.Fatalf("ListActivePermits failed: %v", err)
+	}
+
+	if len(active) != 1 {
+		t.Errorf("expected 1 active permit, got %d", len(active))
+	}
+	if active[0].ID != permit2.ID {
+		t.Errorf("expected active permit to be permit2, got %q", active[0].ID)
+	}
+
+	// List finalized permits
+	finalized, err := store.ListActivePermits(ctx, "finalized")
+	if err != nil {
+		t.Fatalf("ListActivePermits finalized failed: %v", err)
+	}
+
+	if len(finalized) != 1 {
+		t.Errorf("expected 1 finalized permit, got %d", len(finalized))
+	}
+}
+
+func TestListPermitsByProject(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID1 := GenerateID()
+	projectID2 := GenerateID()
+	taskID1 := GenerateID()
+	taskID2 := GenerateID()
+	agentID := GenerateID()
+
+	store.RequestPermit(ctx, "req-1", taskID1, projectID1, agentID, "haiku", "pool-1")
+	store.RequestPermit(ctx, "req-2", taskID2, projectID1, agentID, "haiku", "pool-1")
+	store.RequestPermit(ctx, "req-3", taskID1, projectID2, agentID, "haiku", "pool-1")
+
+	permits1, err := store.ListPermitsByProject(ctx, projectID1)
+	if err != nil {
+		t.Fatalf("ListPermitsByProject failed: %v", err)
+	}
+
+	if len(permits1) != 2 {
+		t.Errorf("expected 2 permits for project1, got %d", len(permits1))
+	}
+
+	permits2, err := store.ListPermitsByProject(ctx, projectID2)
+	if err != nil {
+		t.Fatalf("ListPermitsByProject failed: %v", err)
+	}
+
+	if len(permits2) != 1 {
+		t.Errorf("expected 1 permit for project2, got %d", len(permits2))
+	}
+}
+
+func TestListPermitsByPool(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	projectID := GenerateID()
+	taskID1 := GenerateID()
+	taskID2 := GenerateID()
+	taskID3 := GenerateID()
+	agentID := GenerateID()
+
+	store.RequestPermit(ctx, "req-1", taskID1, projectID, agentID, "haiku", "pool-1")
+	store.RequestPermit(ctx, "req-2", taskID2, projectID, agentID, "haiku", "pool-1")
+	store.RequestPermit(ctx, "req-3", taskID3, projectID, agentID, "haiku", "pool-2")
+
+	permits1, err := store.ListPermitsByPool(ctx, "pool-1")
+	if err != nil {
+		t.Fatalf("ListPermitsByPool failed: %v", err)
+	}
+
+	if len(permits1) != 2 {
+		t.Errorf("expected 2 permits for pool-1, got %d", len(permits1))
+	}
+
+	permits2, err := store.ListPermitsByPool(ctx, "pool-2")
+	if err != nil {
+		t.Fatalf("ListPermitsByPool failed: %v", err)
+	}
+
+	if len(permits2) != 1 {
+		t.Errorf("expected 1 permit for pool-2, got %d", len(permits2))
+	}
+}

@@ -1,8 +1,22 @@
 -- Add tables for research permit and attempt lifecycle tracking.
+-- research_account_pool: persistent pool state (tokens, refill time, occupancy).
 -- research_permit: main permit binding task/project/agent/model/pool and caller request.
 -- research_attempt: individual attempt tracking with optional usage.
 -- Stable retries recover the same permit; new attempts debit new starts.
 -- Renewal and finalize are idempotent and fenced by attempt identity.
+
+CREATE TABLE IF NOT EXISTS research_account_pool (
+  account_pool TEXT PRIMARY KEY,
+  tokens_available INTEGER NOT NULL DEFAULT 0,
+  last_refill_at TEXT NOT NULL,
+  concurrency_limit INTEGER NOT NULL,
+  concurrency_used INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_account_pool_tokens ON research_account_pool(tokens_available);
+CREATE INDEX IF NOT EXISTS idx_research_account_pool_concurrency ON research_account_pool(concurrency_used);
 
 CREATE TABLE IF NOT EXISTS research_permit (
   id TEXT PRIMARY KEY,
@@ -14,12 +28,11 @@ CREATE TABLE IF NOT EXISTS research_permit (
   request_id TEXT NOT NULL,
   attempt_id TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('active', 'expired', 'finalized')),
-  attempt_started_at TEXT NOT NULL,
-  attempt_finalized_at TEXT,
+  started_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  finalized_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (task_id) REFERENCES task(id),
-  FOREIGN KEY (project_id) REFERENCES project(id)
+  updated_at TEXT NOT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_research_permit_request_id ON research_permit(request_id);
@@ -27,6 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_research_permit_task_id ON research_permit(task_i
 CREATE INDEX IF NOT EXISTS idx_research_permit_project_id ON research_permit(project_id);
 CREATE INDEX IF NOT EXISTS idx_research_permit_account_pool ON research_permit(account_pool);
 CREATE INDEX IF NOT EXISTS idx_research_permit_state ON research_permit(state);
+CREATE INDEX IF NOT EXISTS idx_research_permit_expires_at ON research_permit(expires_at);
 
 CREATE TABLE IF NOT EXISTS research_attempt (
   id TEXT PRIMARY KEY,
@@ -42,4 +56,5 @@ CREATE TABLE IF NOT EXISTS research_attempt (
 );
 
 CREATE INDEX IF NOT EXISTS idx_research_attempt_permit_id ON research_attempt(permit_id);
-CREATE INDEX IF NOT EXISTS idx_research_attempt_state ON research_attempt(exit_class);
+CREATE INDEX IF NOT EXISTS idx_research_attempt_sequence ON research_attempt(permit_id, sequence_number);
+CREATE INDEX IF NOT EXISTS idx_research_attempt_finalized ON research_attempt(finalized_at);
