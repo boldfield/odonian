@@ -1,12 +1,19 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/boldfield/odonian/internal/api"
+	"github.com/boldfield/odonian/internal/policy"
+	"github.com/boldfield/odonian/internal/store"
 	"github.com/boldfield/odonian/internal/tuiclient"
 )
 
@@ -82,4 +89,100 @@ func TestSaveAttemptClearsStaleAndRejectsUnsafeIDs(t *testing.T) {
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+func newResearchServer(t *testing.T) (url string, advance func(time.Duration), taskID string) {
+	t.Helper()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	models := []string{"haiku", "sonnet", "opus"}
+	s, err := store.Open(filepath.Join(t.TempDir(), "r.db"), models, store.WithClock(clock))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	cfg := policy.Config{Mode: policy.ModeEnforce, AllowedModels: models, Pools: []policy.Pool{{
+		Name: "pool", AccountID: "acct", Models: models,
+		StartRate: 0.0001, BurstCapacity: 5, ConcurrentDispatchLimit: 5,
+	}}}
+	if err := s.SetResearchPolicy(t.Context(), clock(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	proj, err := s.CreateProject(t.Context(), "p", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := s.CreateDocument(t.Context(), proj.ID, "feature_spec", "doc", "doc.md", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := s.CreateTasks(t.Context(), proj.ID, []store.TaskInput{{
+		Title: "t", Spec: "spec", DocumentID: doc.ID, Model: "opus", Track: "research",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PromoteTask(t.Context(), tasks[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	srv := api.New(s, "tok", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts.URL, func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }, tasks[0].ID
+}
+
+// Each worker session is its own process environment sharing one state dir, as two
+// sessions of the same agent on one host would.
+func TestCLIFencesStaleSameAgentSessionAfterReclaim(t *testing.T) {
+	t.Setenv("ODONIAN_STATE_DIR", t.TempDir())
+	t.Setenv("ODONIAN_SESSION_ID", "")
+	url, advance, id := newResearchServer(t)
+	ctx := t.Context()
+	agent := []string{"--agent", "agent", "--model", "opus"}
+	prArgs := []string{"--agent", "agent", "--pr", "https://github.com/test/repo/pull/1", "--branch", "mr/x"}
+
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-old")
+	if err := executeClaim(ctx, url, "tok", append([]string{id}, agent...)); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	advance(6 * time.Minute)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-new")
+	if err := executeClaim(ctx, url, "tok", append([]string{id}, agent...)); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+
+	fenced := func(err error) bool {
+		var apiErr *tuiclient.APIError
+		return errors.As(err, &apiErr) && apiErr.Code == "ATTEMPT_FENCED"
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-old")
+	if err := executeHeartbeat(ctx, url, "tok", []string{id, "--agent", "agent"}); !fenced(err) {
+		t.Fatalf("stale heartbeat = %v, want ATTEMPT_FENCED", err)
+	}
+	if err := executeSubmit(ctx, url, "tok", append([]string{id, "--result", "STALE"}, prArgs...)); !fenced(err) {
+		t.Fatalf("stale submit = %v, want ATTEMPT_FENCED", err)
+	}
+
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-new")
+	if err := executeHeartbeat(ctx, url, "tok", []string{id, "--agent", "agent"}); err != nil {
+		t.Fatalf("current heartbeat: %v", err)
+	}
+	if err := executeSubmit(ctx, url, "tok", append([]string{id, "--result", "real"}, prArgs...)); err != nil {
+		t.Fatalf("current submit: %v", err)
+	}
+}
+
+func TestAttemptFileIsPerSession(t *testing.T) {
+	t.Setenv("ODONIAN_STATE_DIR", t.TempDir())
+	t.Setenv("ODONIAN_SESSION_ID", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "s1")
+	p1, _ := attemptPath("task-1")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "s2")
+	p2, _ := attemptPath("task-1")
+	t.Setenv("ODONIAN_SESSION_ID", "explicit")
+	p3, _ := attemptPath("task-1")
+	if p1 == p2 || p1 == p3 || p2 == p3 {
+		t.Fatalf("sessions share an attempt file: %s %s %s", p1, p2, p3)
+	}
 }

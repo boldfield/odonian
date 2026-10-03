@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -11,8 +13,13 @@ import (
 
 // A research claim returns an attempt ID that heartbeat and submit must send back
 // so a superseded attempt is fenced. The claim, heartbeat and submit are separate
-// CLI processes, so the claim saves the ID in a small per-task file that the
-// later commands read. --attempt overrides it; a task with no file sends none.
+// CLI processes, so the claim saves the ID in a small file that the later commands
+// read. The file belongs to the claiming worker session, not just the task: a
+// replacement session reclaiming the same task (even under the same agent ID)
+// writes its own file and can never overwrite the one a stale session reads.
+// The session is ODONIAN_SESSION_ID, else CLAUDE_CODE_SESSION_ID; with neither
+// set the file is per-task only, which cannot tell two sessions apart. --attempt
+// overrides the file; a task with no file sends no attempt.
 
 var safeTaskID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
@@ -30,7 +37,21 @@ func attemptPath(taskID string) (string, bool) {
 	if !safeTaskID.MatchString(taskID) {
 		return "", false
 	}
-	return filepath.Join(attemptDir(), taskID), true
+	name := taskID
+	if sess := workerSession(); sess != "" {
+		sum := sha256.Sum256([]byte(sess))
+		name += "@" + hex.EncodeToString(sum[:8])
+	}
+	return filepath.Join(attemptDir(), name), true
+}
+
+func workerSession() string {
+	for _, k := range []string{"ODONIAN_SESSION_ID", "CLAUDE_CODE_SESSION_ID"} {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // saveAttempt records the attempt the client's claim returned for taskID, or
