@@ -241,49 +241,31 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 	}
 	defer tx.Rollback()
 
-	// Check if job already exists for this sample/candidate pair
-	var existingJobID string
+	// Check if request_id is already bound (idempotency check first)
+	var boundJobID, boundSampleID, boundCandidateID, boundCreatedAt string
 	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM evaluation_job WHERE sample_id = ? AND candidate_id = ?`,
-		req.SampleID, req.CandidateID,
-	).Scan(&existingJobID)
-	if err == nil {
-		return EvaluationJobClaimResult{}, ErrEvaluationDuplicateJob
-	}
-	if err != sql.ErrNoRows {
-		return EvaluationJobClaimResult{}, fmt.Errorf("check existing job: %w", err)
-	}
-
-	// Check if request_id is already bound to a different job
-	var boundJobID string
-	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM evaluation_job WHERE request_id = ?`,
+		`SELECT id, sample_id, candidate_id, created_at FROM evaluation_job WHERE request_id = ?`,
 		req.RequestID,
-	).Scan(&boundJobID)
+	).Scan(&boundJobID, &boundSampleID, &boundCandidateID, &boundCreatedAt)
 	if err == nil {
-		// Request ID is already bound; fetch and return the existing attempt
-		var jobID, jobSampleID, jobCandidateID, jobCreatedAt string
-		err = tx.QueryRowContext(ctx,
-			`SELECT id, sample_id, candidate_id, created_at FROM evaluation_job WHERE request_id = ?`,
-			req.RequestID,
-		).Scan(&jobID, &jobSampleID, &jobCandidateID, &jobCreatedAt)
-		if err != nil {
-			return EvaluationJobClaimResult{}, fmt.Errorf("fetch existing job: %w", err)
+		// Request ID is already bound; verify it's for the same sample/candidate and return the existing job
+		if boundSampleID != req.SampleID || boundCandidateID != req.CandidateID {
+			return EvaluationJobClaimResult{}, fmt.Errorf("request ID is already bound to a different sample/candidate pair")
 		}
 
 		job := EvaluationJob{
-			ID:          jobID,
-			SampleID:    jobSampleID,
-			CandidateID: jobCandidateID,
-			RequestID:   req.RequestID,
-			CreatedAt:   jobCreatedAt,
+			ID:        boundJobID,
+			SampleID:  boundSampleID,
+			CandidateID: boundCandidateID,
+			RequestID: req.RequestID,
+			CreatedAt: boundCreatedAt,
 		}
 
 		// Fetch current attempt
 		var attemptID string
 		err = tx.QueryRowContext(ctx,
 			`SELECT current_attempt_id FROM evaluation_job WHERE id = ?`,
-			jobID,
+			boundJobID,
 		).Scan(&attemptID)
 		if err != nil {
 			return EvaluationJobClaimResult{}, fmt.Errorf("fetch current attempt id: %w", err)
@@ -303,6 +285,19 @@ func (s *sqliteStore) ClaimEvaluationJob(ctx context.Context, req EvaluationJobC
 	}
 	if err != sql.ErrNoRows {
 		return EvaluationJobClaimResult{}, fmt.Errorf("check request binding: %w", err)
+	}
+
+	// Check if job already exists for this sample/candidate pair (different request ID)
+	var existingJobID string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM evaluation_job WHERE sample_id = ? AND candidate_id = ?`,
+		req.SampleID, req.CandidateID,
+	).Scan(&existingJobID)
+	if err == nil {
+		return EvaluationJobClaimResult{}, ErrEvaluationDuplicateJob
+	}
+	if err != sql.ErrNoRows {
+		return EvaluationJobClaimResult{}, fmt.Errorf("check existing job: %w", err)
 	}
 
 	// Check candidate capacity: per-candidate attempts
