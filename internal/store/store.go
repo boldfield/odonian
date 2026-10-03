@@ -43,6 +43,7 @@ var validBranch = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 // Store is the interface for database operations.
 // Concrete implementations (sqliteStore) satisfy this interface.
 type Store interface {
+	ResearchPermitStore
 	Close() error
 	Conn() *sql.DB
 	AppendEvent(ctx context.Context, tx *sql.Tx, taskID, actor, kind string, verdict, note *string, findings ...json.RawMessage) (Event, error)
