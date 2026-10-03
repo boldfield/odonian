@@ -114,16 +114,50 @@ func (s *sqliteStore) RecordFindingDisposition(ctx context.Context, disposition 
 		disposition.CandidateID == "" || disposition.FindingID == "" || disposition.DecidedBy == "" {
 		return FindingDisposition{}, ErrEvaluationInvalidInput
 	}
+	if disposition.Evidence == "" {
+		return FindingDisposition{}, fmt.Errorf("%w: evidence must not be empty", ErrEvaluationInvalidInput)
+	}
 	switch disposition.Disposition {
 	case "valid", "invalid", "unresolved":
 	default:
 		return FindingDisposition{}, fmt.Errorf("%w: disposition must be valid/invalid/unresolved", ErrEvaluationInvalidInput)
 	}
 
+	// Verify that campaign, sample, candidate, and finding exist and belong together.
+	var exists int
+	err := s.readConn.QueryRowContext(ctx,
+		`SELECT 1 FROM evaluation_campaign WHERE id = ?`, disposition.CampaignID).Scan(&exists)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return FindingDisposition{}, ErrEvaluationCampaignNotFound
+		}
+		return FindingDisposition{}, fmt.Errorf("verify campaign: %w", err)
+	}
+
+	err = s.readConn.QueryRowContext(ctx,
+		`SELECT 1 FROM evaluation_sample WHERE id = ? AND campaign_id = ?`,
+		disposition.SampleID, disposition.CampaignID).Scan(&exists)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return FindingDisposition{}, ErrEvaluationSampleNotFound
+		}
+		return FindingDisposition{}, fmt.Errorf("verify sample: %w", err)
+	}
+
+	err = s.readConn.QueryRowContext(ctx,
+		`SELECT 1 FROM evaluation_candidate WHERE id = ? AND campaign_id = ?`,
+		disposition.CandidateID, disposition.CampaignID).Scan(&exists)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return FindingDisposition{}, ErrEvaluationCandidateNotFound
+		}
+		return FindingDisposition{}, fmt.Errorf("verify candidate: %w", err)
+	}
+
 	now := s.Now().UTC().Format(timestampLayout)
 	disposition.DecidedAt = now
 
-	_, err := s.conn.ExecContext(ctx,
+	_, err = s.conn.ExecContext(ctx,
 		`INSERT INTO evaluation_finding_disposition
 		 (id, campaign_id, sample_id, candidate_id, finding_id, disposition, evidence, decided_by, decided_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
