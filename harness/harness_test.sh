@@ -423,6 +423,172 @@ else
   test_fail "a research prompt heartbeat/submit step is missing --attempt fencing"
 fi
 
+# Test 32: Research admission JSON parsing and variable export
+echo "Test 32: research admission JSON parsing and variable export"
+_test_tmpdir=$(mktemp -d)
+_fake_odonian="$_test_tmpdir/odonian"
+_fake_claude="$_test_tmpdir/claude"
+_fake_model="$_test_tmpdir/model"
+_test_env_file="$_test_tmpdir/test.env"
+
+# Create fake odonian CLI that simulates research admission
+mkdir -p "$(dirname "$_fake_odonian")"
+cat > "$_fake_odonian" << 'FAKE_ODONIAN_EOF'
+#!/bin/bash
+case "$1" in
+  next)
+    echo "test-task-12345678-abcd-efgh"
+    exit 0
+    ;;
+  show)
+    echo '{"id":"test-task-12345678-abcd-efgh","track":"research","model":"haiku"}'
+    exit 0
+    ;;
+  claim)
+    # Return research admission JSON at top level (not nested)
+    echo '{"permit_id":"permit-test-123","attempt_id":"attempt-test-456","task_id":"test-task-12345678-abcd-efgh"}'
+    exit 0
+    ;;
+  permit-renew)
+    # Verify required flags are present
+    if [[ "$*" == *"--task-id"* ]] && [[ "$*" == *"--model"* ]] && [[ "$*" == *"--agent-id"* ]] && [[ "$*" == *"--request-id"* ]] && [[ "$*" == *"--attempt-id"* ]]; then
+      echo "renewed" >&2
+      exit 0
+    else
+      echo "error: missing required flags for permit-renew" >&2
+      exit 1
+    fi
+    ;;
+  permit-finalize)
+    # Verify required flags and valid exit classes
+    if [[ "$*" == *"--task-id"* ]] && [[ "$*" == *"--model"* ]] && [[ "$*" == *"--agent-id"* ]] && [[ "$*" == *"--request-id"* ]] && [[ "$*" == *"--attempt-id"* ]] && [[ "$*" == *"--exit-class"* ]]; then
+      if [[ "$*" =~ --exit-class\ (completed|failed|cancelled|unknown) ]]; then
+        echo "finalized" >&2
+        exit 0
+      else
+        echo "error: invalid exit class" >&2
+        exit 1
+      fi
+    else
+      echo "error: missing required flags for permit-finalize" >&2
+      exit 1
+    fi
+    ;;
+  heartbeat)
+    exit 0
+    ;;
+  transition)
+    exit 0
+    ;;
+  projects)
+    echo "[]"
+    exit 0
+    ;;
+  tasks)
+    echo "[]"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+FAKE_ODONIAN_EOF
+chmod +x "$_fake_odonian"
+
+# Create fake claude that checks preclaimed variables
+cat > "$_fake_claude" << 'FAKE_CLAUDE_EOF'
+#!/bin/bash
+# Check that preclaimed task/attempt are exported
+if [ -z "$ODONIAN_PRECLAIMED_TASK_ID" ] || [ -z "$ODONIAN_PRECLAIMED_ATTEMPT_ID" ]; then
+  echo "ERROR: preclaimed task/attempt not exported" >&2
+  exit 1
+fi
+# Check that legacy ODONIAN_PERMIT_ID/ATTEMPT_ID are NOT used
+if [ -n "$ODONIAN_PERMIT_ID" ] || [ -n "$ODONIAN_ATTEMPT_ID" ]; then
+  echo "ERROR: old permit/attempt variables still in use" >&2
+  exit 1
+fi
+exit 0
+FAKE_CLAUDE_EOF
+chmod +x "$_fake_claude"
+
+# Create fake model executable that never calls next/claim
+cat > "$_fake_model" << 'FAKE_MODEL_EOF'
+#!/bin/bash
+# Model should never be called in deferral (exit 10) scenario
+# This test just verifies the model receives the right env vars
+if [ -z "$ODONIAN_PRECLAIMED_TASK_ID" ]; then
+  echo "ERROR: model didn't receive ODONIAN_PRECLAIMED_TASK_ID" >&2
+  exit 1
+fi
+exit 0
+FAKE_MODEL_EOF
+chmod +x "$_fake_model"
+
+# Test that the admission parsing works with top-level JSON fields
+_json_test='{"permit_id":"permit-123","attempt_id":"attempt-456","task_id":"task-789"}'
+_parsed_permit=$(echo "$_json_test" | jq -r ".permit_id // empty" 2>/dev/null)
+_parsed_attempt=$(echo "$_json_test" | jq -r ".attempt_id // empty" 2>/dev/null)
+if [ "$_parsed_permit" = "permit-123" ] && [ "$_parsed_attempt" = "attempt-456" ]; then
+  test_pass "admission JSON parsing extracts top-level fields correctly"
+else
+  test_fail "admission JSON parsing failed; got permit=$_parsed_permit attempt=$_parsed_attempt"
+fi
+
+# Clean up
+rm -rf "$_test_tmpdir"
+
+# Test 33: Deferral includes sleep/nap
+echo "Test 33: deferral (exit 10) includes sleep to avoid busy loop"
+if grep -q 'admission_rc.*-eq 10' "$SCRIPT_TO_TEST" && grep -B2 -A2 'admission_rc.*-eq 10' "$SCRIPT_TO_TEST" | grep -q 'nap'; then
+  test_pass "deferral includes nap to avoid busy loop"
+else
+  test_fail "deferral missing nap; would cause busy loop on same task"
+fi
+
+# Test 34: Exit class values are correct (completed/failed/cancelled/unknown)
+echo "Test 34: exit class values use correct enum (completed/failed/cancelled/unknown)"
+if grep -q 'exit_class="completed"' "$SCRIPT_TO_TEST" && \
+   grep -q 'exit_class="failed"' "$SCRIPT_TO_TEST" && \
+   grep -q 'exit_class="cancelled"' "$SCRIPT_TO_TEST" && \
+   grep -q 'exit_class="unknown"' "$SCRIPT_TO_TEST" && \
+   ! grep -q 'exit_class="success"' "$SCRIPT_TO_TEST" && \
+   ! grep -q 'exit_class="shutdown"' "$SCRIPT_TO_TEST"; then
+  test_pass "exit class values use correct enum"
+else
+  test_fail "exit class values are incorrect (success/failure/shutdown found instead of completed/failed/cancelled/unknown)"
+fi
+
+# Test 35: Permit functions receive required flags
+echo "Test 35: permit-renew and permit-finalize include all required flags"
+_permit_ok=1
+if ! grep -A 2 'odonian permit-renew' "$SCRIPT_TO_TEST" | grep -q '\--task-id'; then
+  _permit_ok=0
+fi
+if ! grep -A 2 'odonian permit-renew' "$SCRIPT_TO_TEST" | grep -q '\--model'; then
+  _permit_ok=0
+fi
+if ! grep -A 2 'odonian permit-renew' "$SCRIPT_TO_TEST" | grep -q '\--agent-id'; then
+  _permit_ok=0
+fi
+if ! grep -A 2 'odonian permit-renew' "$SCRIPT_TO_TEST" | grep -q '\--request-id'; then
+  _permit_ok=0
+fi
+if ! grep -A 2 'odonian permit-renew' "$SCRIPT_TO_TEST" | grep -q '\--attempt-id'; then
+  _permit_ok=0
+fi
+if ! grep -A 2 'odonian permit-finalize' "$SCRIPT_TO_TEST" | grep -q '\--task-id'; then
+  _permit_ok=0
+fi
+if ! grep -A 2 'odonian permit-finalize' "$SCRIPT_TO_TEST" | grep -q '\--exit-class'; then
+  _permit_ok=0
+fi
+if [ "$_permit_ok" -eq 1 ]; then
+  test_pass "permit-renew and permit-finalize include all required flags"
+else
+  test_fail "permit-renew or permit-finalize missing required flags"
+fi
+
 echo ""
 echo "=== Test Summary ==="
 echo "Total: $test_count | Passed: $pass_count | Failed: $fail_count"

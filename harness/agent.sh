@@ -416,17 +416,19 @@ request_research_admission() {
 
 extract_admission_field() {
   local json="$1" field="$2"
-  echo "$json" | jq -r ".research_admission.$field // empty" 2>/dev/null || echo ""
+  echo "$json" | jq -r ".$field // empty" 2>/dev/null || echo ""
 }
 
 renew_permit() {
-  local permit_id="$1" attempt_id="$2"
-  odonian permit-renew "$permit_id" --attempt-id "$attempt_id" 2>/dev/null || return 1
+  local task_id="$1" permit_id="$2" attempt_id="$3"
+  odonian permit-renew "$permit_id" --task-id "$task_id" --model "$AGENT_MODEL" --agent-id "$AGENT_ID" \
+    --request-id "$AGENT_ID:$task_id" --attempt-id "$attempt_id" 2>/dev/null || return 1
 }
 
 finalize_permit() {
-  local permit_id="$1" attempt_id="$2" exit_class="${3:-unknown}"
-  odonian permit-finalize "$permit_id" --attempt-id "$attempt_id" --exit-class "$exit_class" 2>/dev/null || return 1
+  local task_id="$1" permit_id="$2" attempt_id="$3" exit_class="${4:-unknown}"
+  odonian permit-finalize "$permit_id" --task-id "$task_id" --model "$AGENT_MODEL" --agent-id "$AGENT_ID" \
+    --request-id "$AGENT_ID:$task_id" --attempt-id "$attempt_id" --exit-class "$exit_class" 2>/dev/null || return 1
 }
 
 # Run one claude task, shielded from Ctrl-C, waiting until it truly finishes. Captures claude's
@@ -444,8 +446,8 @@ dispatch() {
   # Export ODONIAN_MODEL for the dispatched agent to use (pr-feedback ack marker default is ${ODONIAN_MODEL:-fleet}-worker:)
   export ODONIAN_MODEL="$AGENT_MODEL"
 
-  [ -n "${ODONIAN_ATTEMPT_ID:-}" ] && export ODONIAN_ATTEMPT_ID
-  [ -n "${ODONIAN_PERMIT_ID:-}" ] && export ODONIAN_PERMIT_ID
+  [ -n "${ODONIAN_PRECLAIMED_TASK_ID:-}" ] && export ODONIAN_PRECLAIMED_TASK_ID
+  [ -n "${ODONIAN_PRECLAIMED_ATTEMPT_ID:-}" ] && export ODONIAN_PRECLAIMED_ATTEMPT_ID
 
   # Check if AGENT_MODEL is in AGENT_CODEX_MODELS (comma-separated list)
   local use_codex=0
@@ -468,17 +470,17 @@ dispatch() {
   fi
 
   CLAUDE_PID=$!   # tracked so request_stop()/cleanup() can tear down this claude's process group
-  local pid=$CLAUDE_PID rc=0 permit_id="${ODONIAN_PERMIT_ID:-}" attempt_id="${ODONIAN_ATTEMPT_ID:-}"
+  local pid=$CLAUDE_PID rc=0 task_id="${ODONIAN_TASK_ID:-}" permit_id="${ODONIAN_PRECLAIMED_PERMIT_ID:-}" attempt_id="${ODONIAN_PRECLAIMED_ATTEMPT_ID:-}"
   local last_renew=$(date +%s)
 
   while kill -0 "$pid" 2>/dev/null; do
     sleep 1
     wait "$pid" 2>/dev/null && break
 
-    if [ -n "$permit_id" ] && [ -n "$attempt_id" ]; then
+    if [ -n "$permit_id" ] && [ -n "$attempt_id" ] && [ -n "$task_id" ]; then
       local now=$(date +%s)
       if [ $((now - last_renew)) -ge 30 ]; then
-        renew_permit "$permit_id" "$attempt_id" || true
+        renew_permit "$task_id" "$permit_id" "$attempt_id" || true
         last_renew=$now
       fi
     fi
@@ -487,11 +489,12 @@ dispatch() {
 
   CLAUDE_PID=""
 
-  if [ -n "$permit_id" ] && [ -n "$attempt_id" ]; then
-    local exit_class="success"
-    [ "$rc" -ne 0 ] && exit_class="failure"
-    [ "$STOP" -eq 1 ] && exit_class="shutdown"
-    finalize_permit "$permit_id" "$attempt_id" "$exit_class" || true
+  if [ -n "$permit_id" ] && [ -n "$attempt_id" ] && [ -n "$task_id" ]; then
+    local exit_class="unknown"
+    [ "$rc" -eq 0 ] && exit_class="completed"
+    [ "$rc" -ne 0 ] && [ "$STOP" -ne 1 ] && exit_class="failed"
+    [ "$STOP" -eq 1 ] && exit_class="cancelled"
+    finalize_permit "$task_id" "$permit_id" "$attempt_id" "$exit_class" || true
   fi
 
   # If we're shutting down, the non-zero rc is our own TERM of claude — don't treat it as a credit
@@ -580,24 +583,24 @@ if [ "$MULTI" = 0 ]; then
       fi
 
       # Handle research admission before dispatch
-      unset ODONIAN_ATTEMPT_ID ODONIAN_PERMIT_ID
+      unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_PRECLAIMED_PERMIT_ID ODONIAN_TASK_ID
       if [ "$task_track" = "research" ]; then
-        odonian heartbeat "$task_id" 2>/dev/null || true
         admission_output=$(request_research_admission "$task_id" "$task_model")
         admission_rc=$?
 
         if [ "$admission_rc" -eq 10 ]; then
-          echo "[$AGENT_ID] $(date '+%H:%M:%S') research task $task_id deferred (scheduling); skipping"
-          continue
+          echo "[$AGENT_ID] $(date '+%H:%M:%S') research task $task_id deferred (scheduling); skipping"; nap 5; continue
         fi
 
         if [ "$admission_rc" -ne 0 ]; then
           echo "[$AGENT_ID] $(date '+%H:%M:%S') research admission failed for $task_id; skipping"; nap 10; continue
         fi
 
-        ODONIAN_ATTEMPT_ID=$(extract_admission_field "$admission_output" "attempt_id")
-        ODONIAN_PERMIT_ID=$(extract_admission_field "$admission_output" "permit_id")
-        if [ -z "$ODONIAN_ATTEMPT_ID" ] || [ -z "$ODONIAN_PERMIT_ID" ]; then
+        ODONIAN_PRECLAIMED_TASK_ID=$(extract_admission_field "$admission_output" "task_id")
+        ODONIAN_PRECLAIMED_ATTEMPT_ID=$(extract_admission_field "$admission_output" "attempt_id")
+        ODONIAN_PRECLAIMED_PERMIT_ID=$(extract_admission_field "$admission_output" "permit_id")
+        ODONIAN_TASK_ID="$task_id"
+        if [ -z "$ODONIAN_PRECLAIMED_ATTEMPT_ID" ] || [ -z "$ODONIAN_PRECLAIMED_PERMIT_ID" ]; then
           echo "[$AGENT_ID] $(date '+%H:%M:%S') failed to extract research admission details; skipping"
           continue
         fi
@@ -673,9 +676,8 @@ while true; do
     fi
 
     # Handle research admission before dispatch
-    unset ODONIAN_ATTEMPT_ID ODONIAN_PERMIT_ID
+    unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_PRECLAIMED_PERMIT_ID ODONIAN_TASK_ID
     if [ "$task_track" = "research" ]; then
-      odonian heartbeat "$task_id" 2>/dev/null || true
       admission_output=$(request_research_admission "$task_id" "$task_model")
       admission_rc=$?
 
@@ -689,9 +691,11 @@ while true; do
         continue
       fi
 
-      ODONIAN_ATTEMPT_ID=$(extract_admission_field "$admission_output" "attempt_id")
-      ODONIAN_PERMIT_ID=$(extract_admission_field "$admission_output" "permit_id")
-      if [ -z "$ODONIAN_ATTEMPT_ID" ] || [ -z "$ODONIAN_PERMIT_ID" ]; then
+      ODONIAN_PRECLAIMED_TASK_ID=$(extract_admission_field "$admission_output" "task_id")
+      ODONIAN_PRECLAIMED_ATTEMPT_ID=$(extract_admission_field "$admission_output" "attempt_id")
+      ODONIAN_PRECLAIMED_PERMIT_ID=$(extract_admission_field "$admission_output" "permit_id")
+      ODONIAN_TASK_ID="$task_id"
+      if [ -z "$ODONIAN_PRECLAIMED_ATTEMPT_ID" ] || [ -z "$ODONIAN_PRECLAIMED_PERMIT_ID" ]; then
         echo "[$AGENT_ID] $(date '+%H:%M:%S') failed to extract research admission details; skipping to next project"
         continue
       fi
