@@ -34,9 +34,9 @@ another worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — ri
 (step 2) or validate your preclaimed task (step 3), and again immediately **before and after** every
 slow step: fetching or verifying a source, running a named evidence tool, each `make check`, each
 `make test`, and any command you expect to take more than a minute. For preclaimed tasks with research
-admission, use the attempt_id from the preclaimed claim response for heartbeat and submit operations
-(the attempt_id is sent to you separately; store it in an environment variable or file so later
-heartbeat/submit can reference the same attempt). Pin heartbeats to those points; do not rely on
+admission, the attempt_id is provided via the `ODONIAN_PRECLAIMED_ATTEMPT_ID` environment variable.
+Use this with the `--attempt` flag on `odonian heartbeat` and `odonian submit` calls for proper
+fencing of the work to the specific permit. Pin heartbeats to those points; do not rely on
 sensing elapsed time.
 
 1. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.
@@ -196,14 +196,15 @@ sensing elapsed time.
      `odonian transition <id> --to blocked --note "<the gh error>"` and STOP.
 9. Submit. `odonian submit <id> --result "<what you verified; the tool commands you ran and a
    pointer to their verbatim output; confirm any make check/make test targets the repository
-   defines pass>" --pr "<full PR URL>" --branch "mr/<TASKID8>"`. **The `--pr` URL is REQUIRED, must be
-   the full PR URL (not `#123`), and must be the VERIFIED-OPEN URL from step 8** — never fabricated or
-   hand-built; `--pr` and `--branch` go together. Without a PR the reviewer has nothing to review and
-   will reject — EXCEPT a verified **no-op submit** (step 6), which uses `--no-op` instead (and no
-   `--pr`/`--branch`). ALWAYS pass `--pr <full PR URL> --branch mr/<TASKID8>` on EVERY non-no-op
-   submit (including rework) — the server dedups links, so re-sending is safe, and this prevents the
-   case where round-1 forgot the link and round-2 (rework) omitted it, leaving the task permanently
-   link-less.
+   defines pass>" --pr "<full PR URL>" --branch "mr/<TASKID8>"`. If `ODONIAN_PRECLAIMED_ATTEMPT_ID`
+   is set, also pass `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` to bind the submission to the
+   preclaimed attempt. **The `--pr` URL is REQUIRED, must be the full PR URL (not `#123`), and must
+   be the VERIFIED-OPEN URL from step 8** — never fabricated or hand-built; `--pr` and `--branch`
+   go together. Without a PR the reviewer has nothing to review and will reject — EXCEPT a verified
+   **no-op submit** (step 6), which uses `--no-op` instead (and no `--pr`/`--branch`). ALWAYS pass
+   `--pr <full PR URL> --branch mr/<TASKID8>` on EVERY non-no-op submit (including rework) — the
+   server dedups links, so re-sending is safe, and this prevents the case where round-1 forgot the
+   link and round-2 (rework) omitted it, leaving the task permanently link-less.
 10. STOP. Don't claim another task, don't merge, don't transition the task yourself.
 
 ## Rules

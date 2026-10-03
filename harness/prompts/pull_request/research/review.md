@@ -171,17 +171,18 @@ Submit with an empty findings array. Write your decision reasoning in a short pr
 
    - Submit: `odonian submit <review-task-id> --result "<prose findings + the fenced Findings JSON
      block above>" --verdict approve --findings-file "$F"` (or `--verdict reject --findings-file "$F"`).
-     Pass `--findings-file` on EVERY verdict, including an approve with an empty array `[]`. The
-     server records it on the parent and
-     drives the parent automatically: **reject → parent back to `ready`** (worker reworks); **approve
-     →** once *all* of this round's reviewers approve, the parent moves to `approved`. **Then mirror
-     your verdict as a PR comment** so a human draining the merge queue can see it: `gh pr comment
-     <pr-url> --body "__AGENT_MODEL__-reviewer: APPROVED — <summary>"` (or `"__AGENT_MODEL__-reviewer:
+     If `ODONIAN_PRECLAIMED_ATTEMPT_ID` is set, also pass `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"`
+     to bind the verdict to the preclaimed attempt. Pass `--findings-file` on EVERY verdict, including
+     an approve with an empty array `[]`. The server records it on the parent and drives the parent
+     automatically: **reject → parent back to `ready`** (worker reworks); **approve →** once *all* of
+     this round's reviewers approve, the parent moves to `approved`. **Then mirror your verdict as a
+     PR comment** so a human draining the merge queue can see it: `gh pr comment <pr-url> --body
+     "__AGENT_MODEL__-reviewer: APPROVED — <summary>"` (or `"__AGENT_MODEL__-reviewer:
      CHANGES REQUESTED — <numbered findings>"`).
 
 6-adjudicate. **Submit adjudication verdict (adjudication path only).** 
    - Write a brief summary of your reasoning: whether the finding is valid and blocks despite the worker's evidence, or whether it should be overturned.
-   - Submit: `odonian submit <review-task-id> --result "<your reasoning>" --verdict approve --findings-file <file>` (if the finding should be overturned, with `<file>` containing `[]`) or `--verdict reject --findings-file <file>` (if it should be upheld, with `<file>` containing `[]`).
+   - Submit: `odonian submit <review-task-id> --result "<your reasoning>" --verdict approve --findings-file <file>` (if the finding should be overturned, with `<file>` containing `[]`) or `--verdict reject --findings-file <file>` (if it should be upheld, with `<file>` containing `[]`). If `ODONIAN_PRECLAIMED_ATTEMPT_ID` is set, also pass `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"`.
    - The server records your verdict and it is **binding** for this finding alone. It does not vote on the review round.
    - **Then STOP — do not proceed to steps 3-6 or any other regular review steps.** Your work on the adjudication is complete.
 
