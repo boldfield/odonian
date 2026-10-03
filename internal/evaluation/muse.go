@@ -16,8 +16,23 @@ import (
 // MuseVersion is the pinned version of muse-spark that this adapter targets.
 const MuseVersion = "muse-spark-1.3"
 
-// MuseModelID is the model identifier to pass to muse exec.
-const MuseModelID = "muse-spark-1.3"
+// MuseModelID is the model identifier reported in the identity.
+const MuseModelID = "muse-code"
+
+// MuseExecModelFlag is the model flag to pass to muse exec.
+const MuseExecModelFlag = "muse-spark-1.3"
+
+// Muse JSONL output field names and result type identifiers.
+const (
+	jsonlFieldType      = "type"
+	jsonlTypeResult     = "result"
+	jsonlTypeCompletion = "completion"
+	jsonlFieldID        = "id"
+	jsonlFieldSeverity  = "severity"
+	jsonlFieldSummary   = "summary"
+	jsonlFieldClaim     = "claim"
+	jsonlFieldEvidence  = "evidence"
+)
 
 // MuseMain is the Muse adapter's entry point: `--request FILE [--preflight]`.
 // It reads the host-staged request, invokes the muse CLI, collects the result,
@@ -133,7 +148,7 @@ func buildMuseIdentity() (CandidateIdentity, error) {
 	return CandidateIdentity{
 		AdapterName:        "muse",
 		AdapterVersion:     "1",
-		ModelID:            "muse-code",
+		ModelID:            MuseModelID,
 		ModelRevision:      MuseVersion,
 		RuntimeName:        "muse-code-cli",
 		RuntimeVersion:     runtimeVersion,
@@ -142,7 +157,7 @@ func buildMuseIdentity() (CandidateIdentity, error) {
 		PromptVersion:      Unknown,
 		Tools:              UnknownNames(),
 		Observers:          UnknownNames(),
-		AccountPool:        "meta-power",
+		AccountPool:        Unknown,
 	}, nil
 }
 
@@ -183,25 +198,50 @@ func musePreflight(stderr io.Writer) ([]string, error) {
 		return nil, fmt.Errorf("muse cli not installed or not accessible: %w", err)
 	}
 
-	// Check that subscription auth is properly configured.
-	// We need to ensure that MUSE_AUTH or MUSE_CONFIG are set for subscription routing.
+	// Check subscription auth configuration and catch ambiguous routing.
+	// A valid configuration uses exactly one of: MUSE_AUTH, MUSE_CONFIG, or ~/.muse/auth.
 	authEnv := os.Getenv("MUSE_AUTH")
 	museCfg := os.Getenv("MUSE_CONFIG")
 
-	if authEnv == "" && museCfg == "" {
-		// Check if ~/.muse/auth exists as a fallback.
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("cannot determine home directory, and MUSE_AUTH/MUSE_CONFIG not set")
-		}
+	// Count configured auth sources.
+	authSourceCount := 0
+	if authEnv != "" {
+		authSourceCount++
+	}
+	if museCfg != "" {
+		authSourceCount++
+	}
+
+	// Check for ~/.muse/auth as a fallback.
+	home, err := os.UserHomeDir()
+	var defaultAuthExists bool
+	if err == nil {
 		defaultAuthPath := home + "/.muse/auth"
-		if !fileExists(defaultAuthPath) {
-			return nil, fmt.Errorf("no subscription auth configured: set MUSE_AUTH, MUSE_CONFIG, or configure ~/.muse/auth for subscription entitlement")
+		defaultAuthExists = fileExists(defaultAuthPath)
+		if defaultAuthExists && authSourceCount == 0 {
+			authSourceCount++
 		}
 	}
 
+	// Fail if multiple auth sources are configured (ambiguous routing).
+	if authSourceCount > 1 {
+		return nil, fmt.Errorf("ambiguous auth configuration: multiple auth sources set (MUSE_AUTH, MUSE_CONFIG, ~/.muse/auth); configure exactly one")
+	}
+
+	// Fail if no auth sources are configured.
+	if authSourceCount == 0 {
+		if err != nil {
+			return nil, fmt.Errorf("no subscription auth configured: cannot determine home directory, and MUSE_AUTH/MUSE_CONFIG not set")
+		}
+		return nil, fmt.Errorf("no subscription auth configured: set MUSE_AUTH, MUSE_CONFIG, or configure ~/.muse/auth for subscription entitlement")
+	}
+
+	// Validate that specified files exist.
 	if museCfg != "" && !fileExists(museCfg) {
 		return nil, fmt.Errorf("MUSE_CONFIG points to non-existent file: %s", museCfg)
+	}
+	if authEnv != "" && !fileExists(authEnv) {
+		return nil, fmt.Errorf("MUSE_AUTH points to non-existent file: %s", authEnv)
 	}
 
 	// All required capabilities are available by default in muse-spark-1.3.
@@ -210,11 +250,15 @@ func musePreflight(stderr io.Writer) ([]string, error) {
 }
 
 // invokeMuseExec runs the muse exec command with the given request.
+// It validates that the runtime emits an explicit completion signal in the JSONL stream,
+// not just that the process exits successfully.
 func invokeMuseExec(stderr io.Writer, req *CandidateRequest, base *CandidateResponse, writeResp func(CandidateResponse, int) int) int {
-	// Invoke: muse exec --model muse-spark-1.3 --output-format jsonl --workspace <snapshot> <prompt>
+	startTime := time.Now()
+
+	// Invoke: muse exec --model muse-spark-1.3 --output-format jsonl --workspace <snapshot> --input <prompt>
 	cmd := exec.Command(
 		"muse", "exec",
-		"--model", MuseModelID,
+		"--model", MuseExecModelFlag,
 		"--output-format", "jsonl",
 		"--workspace", req.SnapshotPath,
 		"--input", req.BlindedPrompt,
@@ -237,39 +281,54 @@ func invokeMuseExec(stderr io.Writer, req *CandidateRequest, base *CandidateResp
 		return writeResp(*base, 1)
 	}
 
-	// Parse JSONL output.
+	// Parse JSONL output and look for explicit completion signal.
 	var findings []Finding
+	var completionFound bool
 	scanner := bufio.NewScanner(stdout)
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
+
 		var jsonlEntry map[string]interface{}
 		if err := json.Unmarshal(line, &jsonlEntry); err != nil {
-			cmd.Wait() // Best effort cleanup
+			// Drain stdout to avoid deadlock, then kill the process.
+			io.Copy(io.Discard, stdout)
+			cmd.Wait()
 			base.Status = StatusFailed
 			base.ErrorClass = ErrClassOutputMalformed
 			base.ErrorMessage = fmt.Sprintf("malformed JSONL output: %v", err)
 			return writeResp(*base, 1)
 		}
 
-		// Try to extract a finding from the JSONL entry.
-		// The exact format depends on muse's JSONL schema; we'll adapt as we learn.
-		finding := Finding{
-			ID:       extractStringField(jsonlEntry, "id", ""),
-			Severity: Severity(extractStringField(jsonlEntry, "severity", string(SeverityNote))),
-			Summary:  extractStringField(jsonlEntry, "summary", ""),
-			Claim:    extractStringField(jsonlEntry, "claim", ""),
-			Evidence: extractStringField(jsonlEntry, "evidence", ""),
+		// Check if this is a completion or result event.
+		entryType := extractStringField(jsonlEntry, jsonlFieldType, "")
+		if entryType == jsonlTypeCompletion || entryType == jsonlTypeResult {
+			completionFound = true
 		}
-		if finding.ID != "" && finding.Summary != "" {
-			findings = append(findings, finding)
+
+		// Try to extract a finding from the JSONL entry.
+		// Findings should have id, severity, and summary fields.
+		if id := extractStringField(jsonlEntry, jsonlFieldID, ""); id != "" {
+			finding := Finding{
+				ID:       id,
+				Severity: Severity(extractStringField(jsonlEntry, jsonlFieldSeverity, string(SeverityNote))),
+				Summary:  extractStringField(jsonlEntry, jsonlFieldSummary, ""),
+				Claim:    extractStringField(jsonlEntry, jsonlFieldClaim, ""),
+				Evidence: extractStringField(jsonlEntry, jsonlFieldEvidence, ""),
+			}
+			if finding.Summary != "" {
+				findings = append(findings, finding)
+			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		cmd.Wait() // Best effort cleanup
+		// Drain stdout to avoid deadlock, then kill the process.
+		io.Copy(io.Discard, stdout)
+		cmd.Wait()
 		base.Status = StatusFailed
 		base.ErrorClass = ErrClassOutputMalformed
 		base.ErrorMessage = fmt.Sprintf("error reading JSONL output: %v", err)
@@ -284,12 +343,20 @@ func invokeMuseExec(stderr io.Writer, req *CandidateRequest, base *CandidateResp
 		return writeResp(*base, 1)
 	}
 
+	// Exit zero is not sufficient for success; we must have received an explicit completion signal.
+	if !completionFound {
+		base.Status = StatusFailed
+		base.ErrorClass = ErrClassOutputMissing
+		base.ErrorMessage = "muse exec exited successfully but did not emit a completion/result event"
+		return writeResp(*base, 1)
+	}
+
 	// Success: compile the response.
 	base.Status = StatusCompleted
 	base.ReviewCompleted = true
 	base.Findings = findings
 	base.Timing = Timing{
-		StartedAt:  time.Now().Add(-10 * time.Second), // Approximate; not measured
+		StartedAt:  startTime,
 		FinishedAt: time.Now(),
 	}
 	base.Usage = map[string]float64{} // Usage not reported by muse in this mode
