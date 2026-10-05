@@ -113,6 +113,9 @@ type Store interface {
 	RecordEvaluationStaging(ctx context.Context, staging EvaluationStaging) (EvaluationStaging, error)
 	GetEvaluationStaging(ctx context.Context, campaignID, sampleID, candidateID string) (EvaluationStaging, error)
 	ListEvaluationStagings(ctx context.Context, campaignID string) ([]EvaluationStaging, error)
+	RecordEvaluationDisposition(ctx context.Context, in EvaluationDispositionInput) (evaluation.Disposition, error)
+	ListEvaluationDispositions(ctx context.Context, campaignID string) ([]evaluation.Disposition, error)
+	GetEvaluationReport(ctx context.Context, campaignID string) (evaluation.Report, error)
 }
 
 // sqliteStore wraps a SQLite database connection and provides migration functionality.

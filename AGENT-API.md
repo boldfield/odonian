@@ -470,6 +470,13 @@ odonian evaluation-claim-job --sample s1 --candidate v1 --request-id run-1 --ttl
 odonian evaluation-renew-attempt --job <job_id> --attempt <attempt_id> --ttl-ms 600000
 odonian evaluation-finalize-attempt --job <job_id> --attempt <attempt_id> --exit-class completed \
   --result '{"status":"completed","duration_ms":4200,"findings":[{"id":"f1","severity":"minor","summary":"..."}]}'
+
+# Report and operator dispositions (the only source of finding labels)
+odonian evaluation-get-report --id c1
+odonian evaluation-record-disposition --campaign c1 --ref candidate:<attempt_id>:f1 \
+  --label valid --severity P1 --claim "claim 3 misstates the cited holding" \
+  --evidence "the opinion at p. 4 holds the opposite" --actor alice
+odonian evaluation-list-dispositions --campaign c1
 ```
 
 | Command | Flags | HTTP |
@@ -486,6 +493,9 @@ odonian evaluation-finalize-attempt --job <job_id> --attempt <attempt_id> --exit
 | `evaluation-claim-job` | `--sample`*, `--candidate`*, `--request-id`*, `--ttl-ms`* (1-3600000) | `POST /evaluation/jobs/claim` |
 | `evaluation-renew-attempt` | `--job`*, `--attempt`*, `--ttl-ms`* (1-3600000) | `POST /evaluation/jobs/{job}/attempts/{attempt}/renew` |
 | `evaluation-finalize-attempt` | `--job`*, `--attempt`*, `--exit-class`*, `--result` or `--result-file` | `POST /evaluation/jobs/{job}/attempts/{attempt}/finalize` |
+| `evaluation-get-report` | `--id`* | `GET /evaluation/campaigns/{id}/report` |
+| `evaluation-record-disposition` | `--campaign`*, `--ref`*, `--label`* (`valid`, `invalid`, `unresolved`), `--severity`* (`P1`-`P3`), `--claim`*, `--actor`*, `--evidence` or `--evidence-file` (one of them)* | `POST /evaluation/campaigns/{id}/dispositions` |
+| `evaluation-list-dispositions` | `--campaign`* | `GET /evaluation/campaigns/{id}/dispositions` |
 
 **Finalize payload.** `--result` (or `--result-file`) is a JSON object limited to `status`,
 `error_class`, `error_message`, `duration_ms`, `usage_tokens` and `findings`; any other key (including
@@ -506,6 +516,15 @@ paused), `CAPACITY_EXHAUSTED` (this candidate or campaign is out of attempts), `
 result arrived), `ATTEMPT_FINALIZED` (a repeat of an already recorded result; nothing changed),
 `POOL_NOT_CONFIGURED` or `ALREADY_PAUSED`. None of these should be retried blindly. Other errors
 (`400`, `404`, `5xx`) exit 1.
+
+**Report.** `evaluation-get-report` compares the exact same frozen samples across every candidate
+version and the production reviewers of that round, with per-reviewer coverage, adjudicated metrics,
+latency, provider-native usage and a list of material candidate-only findings for a human to read.
+It never sends anything or changes a task. Copy `ref` values from the report's `groups[].members[].ref`.
+A label needs evidence, an actor, a claim and a severity; revising one records a new row and keeps the
+old one. The server refuses a `ref` that is not part of the campaign (`404 FINDING_NOT_FOUND`, exit 1).
+Operating procedure: `docs/runbooks/reviewer-evaluation-rollout.md`. See `docs/api.md` for the field
+meanings.
 
 **Replay.** Re-running `evaluation-claim-job` with the same `--request-id` returns the original
 attempt without spending cap, so a worker may safely retry after a lost response. Re-running

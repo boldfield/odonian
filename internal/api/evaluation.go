@@ -67,6 +67,8 @@ func (s *Server) writeEvaluationError(w http.ResponseWriter, err error) {
 		s.errorResponse(w, http.StatusNotFound, "SAMPLE_NOT_FOUND", "Evaluation sample not found")
 	case errors.Is(err, store.ErrEvaluationCandidateNotFound):
 		s.errorResponse(w, http.StatusNotFound, "CANDIDATE_NOT_FOUND", "Evaluation candidate not found")
+	case errors.Is(err, store.ErrEvaluationFindingNotFound):
+		s.errorResponse(w, http.StatusNotFound, "FINDING_NOT_FOUND", "Finding not found in this campaign's comparison")
 	case errors.Is(err, store.ErrEvaluationJobNotFound), errors.Is(err, store.ErrEvaluationAttemptNotFound):
 		s.errorResponse(w, http.StatusNotFound, "ATTEMPT_NOT_FOUND", "Evaluation attempt not found")
 	case errors.Is(err, store.ErrEvaluationPoolNotConfigured):
@@ -573,4 +575,53 @@ func (s *Server) handleFinalizeEvaluationAttempt(w http.ResponseWriter, r *http.
 		"attempt":       attemptView(final),
 		"finding_count": len(payload.Findings),
 	})
+}
+
+type evaluationDispositionRequest struct {
+	Ref      string `json:"ref"`
+	Label    string `json:"label"`
+	Severity string `json:"severity"`
+	Claim    string `json:"claim"`
+	Evidence string `json:"evidence"`
+	Actor    string `json:"actor"`
+}
+
+// handleRecordEvaluationDisposition appends one operator label for one
+// finding. It never changes a task, review, verdict or scorecard.
+func (s *Server) handleRecordEvaluationDisposition(w http.ResponseWriter, r *http.Request) {
+	var req evaluationDispositionRequest
+	if !s.decodeEvaluationJSON(w, r, &req) {
+		return
+	}
+	d, err := s.store.RecordEvaluationDisposition(r.Context(), store.EvaluationDispositionInput{
+		CampaignID: r.PathValue("id"), Ref: req.Ref, Label: evaluation.FindingLabel(req.Label),
+		Severity: req.Severity, Claim: req.Claim, Evidence: req.Evidence, Actor: req.Actor,
+	})
+	if err != nil {
+		s.writeEvaluationError(w, err)
+		return
+	}
+	s.encodeJSON(w, http.StatusCreated, d)
+}
+
+// handleListEvaluationDispositions returns the full audit trail, oldest first,
+// including labels later revised.
+func (s *Server) handleListEvaluationDispositions(w http.ResponseWriter, r *http.Request) {
+	ds, err := s.store.ListEvaluationDispositions(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeEvaluationError(w, err)
+		return
+	}
+	s.encodeJSON(w, http.StatusOK, map[string]interface{}{"campaign_id": r.PathValue("id"), "dispositions": ds})
+}
+
+// handleGetEvaluationReport returns the compact comparison report. It is read
+// only and sends no message.
+func (s *Server) handleGetEvaluationReport(w http.ResponseWriter, r *http.Request) {
+	rep, err := s.store.GetEvaluationReport(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeEvaluationError(w, err)
+		return
+	}
+	s.encodeJSON(w, http.StatusOK, rep)
 }

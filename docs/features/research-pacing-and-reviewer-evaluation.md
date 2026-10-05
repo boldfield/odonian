@@ -105,7 +105,13 @@ Compare findings only on the same submitted artifact/round. Human/evidence-backe
 
 Surface potentially material Muse-only findings for human attention through the operator report, without automatic production state changes or unsolicited external messages. Existing Astra/Fable approvals and human merge remain authoritative. A report never automatically replaces a reviewer or routes future work to a cheaper model.
 
+### Operating the report
+
+The report is `GET /evaluation/campaigns/{id}/report` (`odonian evaluation-get-report`) and operator labels are recorded with `odonian evaluation-record-disposition` (`POST /evaluation/campaigns/{id}/dispositions`, append-only, evidence/actor/claim/severity required). The server builds one row per candidate version and one per production baseline reviewer of the same round; there is no per-model column. Findings are matched only through an operator-recorded claim on the same sample, so disagreements and provenance stay visible. Metrics cover completed samples only and are reported with per-reviewer denominators plus a common-sample view; failed, unavailable, incomplete, unfinished and excluded runs (including a run staged from an artifact other than the frozen sample, and a baseline whose round pinned a different commit) never count as clean. The production scorecard and acceptance code are not read or changed by it. Field meanings are in `docs/api.md`; the operator procedure is [`docs/runbooks/reviewer-evaluation-rollout.md`](../runbooks/reviewer-evaluation-rollout.md); writing a new backend such as Pi connected to Spark is covered in [`docs/runbooks/evaluation-adapter-guide.md`](../runbooks/evaluation-adapter-guide.md).
+
 ## Rollout and open operating values
+
+Evaluation operating guide: [`docs/runbooks/reviewer-evaluation-rollout.md`](../runbooks/reviewer-evaluation-rollout.md) covers checking the Power subscription route, choosing finite cohort and attempt caps, running one evaluation process at a time, stopping selection by pausing the campaign, and recording dispositions.
 
 Milestone 1 operating guide: [`docs/runbooks/research-pacing-rollout.md`](../runbooks/research-pacing-rollout.md) covers the illustrative configuration shapes, calibration from observed attempts, shared-account headroom, the safe rollout and rollback, the lease/partition limits and the smoke test (`bash harness/research_pacing_smoke_test.sh`). It sets no production values.
 
