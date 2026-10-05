@@ -815,3 +815,236 @@ func TestEvaluationAPIFinalizeRecordsAttemptDetail(t *testing.T) {
 		t.Fatalf("recorded detail = %+v, %v", got, err)
 	}
 }
+
+// reportSample seeds a frozen sample, staged for the given candidates, so a
+// completed run on it is verifiable.
+func (e *evalAPI) reportSample(campaign, id string, candidates ...string) {
+	e.t.Helper()
+	snap, src := "snap-"+id, "src-"+id
+	_, err := e.store.CreateEvaluationSample(e.t.Context(), store.EvaluationSample{
+		ID: id, CampaignID: campaign, ProjectID: "proj1", OriginalTaskID: "task-" + id, OriginalReviewRound: 1,
+		SubmittedSHA: "abc123", SnapshotDigest: &snap, SourceDigest: &src, PromptVersion: "v1", ModelVersion: "v1", RuntimeVersion: "v1",
+	})
+	if err != nil {
+		e.t.Fatalf("seed sample: %v", err)
+	}
+	for _, c := range candidates {
+		cand, err := e.store.GetEvaluationCandidate(e.t.Context(), c)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if _, err := e.store.RecordEvaluationStaging(e.t.Context(), store.EvaluationStaging{
+			ID: "st-" + id + "-" + c, CampaignID: campaign, SampleID: id, CandidateID: c, CandidateConfigDigest: cand.Digest(),
+			SnapshotDigest: snap, SourceDigest: src, PromptVersion: "v1", PromptDigest: "pd", LimitsJSON: "{}",
+		}); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+}
+
+func (e *evalAPI) finish(sample, candidate, request string, durationMs int, usage map[string]float64, findings ...map[string]interface{}) string {
+	e.t.Helper()
+	c := e.claim(sample, candidate, request)
+	cand, err := e.store.GetEvaluationCandidate(e.t.Context(), candidate)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	res := completedResult(c.attemptID, findings...)
+	res["duration_ms"] = durationMs
+	d := map[string]interface{}{"candidate_digest": cand.Digest(), "launched": true}
+	if usage != nil {
+		d["usage"] = usage
+	}
+	res["detail"] = d
+	e.expect("POST", c.path("finalize"), res, 200, "")
+	return c.attemptID
+}
+
+func TestEvaluationAPIReportTwoFakeCandidates(t *testing.T) {
+	e := newEvalAPI(t)
+	e.pool("pool1", 5)
+	e.campaign("camp1", 20)
+	e.candidate("camp1", "cand-a", "model-a", "pool1", 10)
+	e.candidate("camp1", "cand-b", "model-b", "pool1", 10)
+	e.reportSample("camp1", "s1", "cand-a", "cand-b")
+	e.reportSample("camp1", "s2", "cand-a")
+
+	attA := e.finish("s1", "cand-a", "ra1", 100, map[string]float64{"tokens": 40},
+		map[string]interface{}{"id": "a1", "severity": "material", "summary": "wording one"})
+	e.finish("s2", "cand-a", "ra2", 300, map[string]float64{"tokens": 60})
+	attB := e.finish("s1", "cand-b", "rb1", 50, map[string]float64{"gpu_seconds": 2.5},
+		map[string]interface{}{"id": "b1", "severity": "material", "summary": "completely different wording"},
+		map[string]interface{}{"id": "b2", "severity": "material", "summary": "only B says this"})
+
+	refA, refB, refB2 := "candidate:"+attA+":a1", "candidate:"+attB+":b1", "candidate:"+attB+":b2"
+	disp := func(ref, label, sev, claim string) map[string]interface{} {
+		return e.expect("POST", "/evaluation/campaigns/camp1/dispositions", map[string]interface{}{
+			"ref": ref, "label": label, "severity": sev, "claim": claim, "evidence": "checked against the pinned source", "actor": "operator-1",
+		}, 201, "")
+	}
+	d := disp(refA, "valid", "P1", "the holding is misquoted")
+	if d["sample_id"] != "s1" || d["candidate_id"] != "cand-a" || d["actor"] != "operator-1" || d["id"] == "" {
+		t.Fatalf("disposition = %v", d)
+	}
+	disp(refB, "valid", "P1", "The holding is  misquoted")
+	disp(refB2, "valid", "P2", "an unsupported source")
+
+	rep := e.expect("GET", "/evaluation/campaigns/camp1/report", nil, 200, "")
+	if rep["campaign_id"] != "camp1" || rep["sample_total"] != float64(2) {
+		t.Fatalf("report header = %v", rep)
+	}
+	reviewers := rep["reviewers"].([]interface{})
+	if len(reviewers) != 2 {
+		t.Fatalf("reviewers = %d, want exactly the two candidates", len(reviewers))
+	}
+	byKey := map[string]map[string]interface{}{}
+	for _, r := range reviewers {
+		m := r.(map[string]interface{})
+		byKey[m["key"].(string)] = m
+	}
+	a, b := byKey["candidate:cand-a"], byKey["candidate:cand-b"]
+	if a == nil || b == nil {
+		t.Fatalf("reviewer keys = %v", byKey)
+	}
+	if cov := a["coverage"].(map[string]interface{}); cov["samples"] != float64(2) || cov["completed"] != float64(2) || cov["clean"] != float64(1) {
+		t.Errorf("A coverage = %v", cov)
+	}
+	if cov := b["coverage"].(map[string]interface{}); cov["samples"] != float64(2) || cov["completed"] != float64(1) || cov["not_run"] != float64(1) {
+		t.Errorf("B coverage (unequal) = %v", cov)
+	}
+	if m := a["metrics"].(map[string]interface{}); m["confirmed"] != float64(1) || m["confirmed_p1"] != float64(1) || m["unique"] != float64(0) {
+		t.Errorf("A metrics = %v", m)
+	}
+	if m := b["metrics"].(map[string]interface{}); m["confirmed"] != float64(2) || m["unique"] != float64(1) || m["unique_p1_p2"] != float64(1) || m["misses"] != float64(0) {
+		t.Errorf("B metrics = %v", m)
+	}
+	if u := a["usage"].(map[string]interface{})["tokens"].(map[string]interface{}); u["sum"] != float64(100) || u["attempts"] != float64(2) {
+		t.Errorf("A usage = %v", u)
+	}
+	if u := b["usage"].(map[string]interface{}); len(u) != 1 || u["gpu_seconds"] == nil {
+		t.Errorf("B usage must keep its own unit only: %v", u)
+	}
+	if l := a["latency"].(map[string]interface{}); l["mean_ms"] != float64(200) {
+		t.Errorf("A latency = %v", l)
+	}
+
+	var shared map[string]interface{}
+	for _, g := range rep["groups"].([]interface{}) {
+		gm := g.(map[string]interface{})
+		if len(gm["members"].([]interface{})) == 2 {
+			shared = gm
+		}
+	}
+	if shared == nil || shared["label"] != "valid" || shared["severity"] != "P1" || shared["sample_id"] != "s1" {
+		t.Fatalf("the two differently worded findings were not matched through their claim: %v", rep["groups"])
+	}
+	att := rep["attention"].([]interface{})
+	// With no production baseline reviewer for these samples, every valid
+	// material group is candidate-only and is surfaced for a human.
+	if len(att) != 2 {
+		t.Fatalf("attention = %v", att)
+	}
+	seen := map[string]bool{}
+	for _, it := range att {
+		im := it.(map[string]interface{})
+		seen[im["refs"].([]interface{})[0].(string)] = true
+		if im["baseline_covered"] != false {
+			t.Errorf("attention item claims baseline coverage: %v", im)
+		}
+	}
+	if !seen[refB2] || !(seen[refA] || seen[refB]) {
+		t.Errorf("attention refs = %v", seen)
+	}
+
+	listed := e.expect("GET", "/evaluation/campaigns/camp1/dispositions", nil, 200, "")
+	if ds := listed["dispositions"].([]interface{}); len(ds) != 3 || listed["campaign_id"] != "camp1" {
+		t.Errorf("dispositions = %v", listed)
+	}
+	if rep["dispositions"].(map[string]interface{})["recorded"] != float64(3) {
+		t.Errorf("totals = %v", rep["dispositions"])
+	}
+}
+
+func TestEvaluationAPIDispositionValidation(t *testing.T) {
+	e := newEvalAPI(t)
+	e.pool("pool1", 5)
+	e.campaign("camp1", 20)
+	e.candidate("camp1", "cand-a", "model-a", "pool1", 10)
+	e.reportSample("camp1", "s1", "cand-a")
+	att := e.finish("s1", "cand-a", "r1", 10, nil, map[string]interface{}{"id": "a1", "severity": "material", "summary": "x"})
+	good := func(mut map[string]interface{}) map[string]interface{} {
+		m := map[string]interface{}{"ref": "candidate:" + att + ":a1", "label": "valid", "severity": "P1", "claim": "c", "evidence": "e", "actor": "op"}
+		for k, v := range mut {
+			m[k] = v
+		}
+		return m
+	}
+	path := "/evaluation/campaigns/camp1/dispositions"
+	for _, body := range map[string]map[string]interface{}{
+		"unknown label":   good(map[string]interface{}{"label": "majority_agrees"}),
+		"no label":        good(map[string]interface{}{"label": ""}),
+		"bad severity":    good(map[string]interface{}{"severity": "material"}),
+		"no severity":     good(map[string]interface{}{"severity": ""}),
+		"no claim":        good(map[string]interface{}{"claim": ""}),
+		"no evidence":     good(map[string]interface{}{"evidence": " "}),
+		"no actor":        good(map[string]interface{}{"actor": ""}),
+		"malformed ref":   good(map[string]interface{}{"ref": "a1"}),
+		"unknown field":   good(map[string]interface{}{"accepted_by_writer": true}),
+		"ambiguous kinds": good(map[string]interface{}{"ref": "writer:" + att + ":a1"}),
+	} {
+		e.expect("POST", path, body, 400, "INVALID_INPUT")
+	}
+	e.expect("POST", path, "{not json", 400, "INVALID_INPUT")
+	e.expect("POST", path, nil, 400, "INVALID_INPUT")
+	e.expect("POST", path, good(map[string]interface{}{"ref": "candidate:" + att + ":zz"}), 404, "FINDING_NOT_FOUND")
+	e.expect("POST", path, good(map[string]interface{}{"ref": "candidate:nope:a1"}), 404, "FINDING_NOT_FOUND")
+	e.expect("POST", path, good(map[string]interface{}{"ref": "baseline:nope:f1"}), 404, "FINDING_NOT_FOUND")
+	e.expect("POST", "/evaluation/campaigns/nope/dispositions", good(nil), 404, "CAMPAIGN_NOT_FOUND")
+	e.expect("GET", "/evaluation/campaigns/nope/dispositions", nil, 404, "CAMPAIGN_NOT_FOUND")
+	e.expect("GET", "/evaluation/campaigns/nope/report", nil, 404, "CAMPAIGN_NOT_FOUND")
+	if ds := e.expect("GET", path, nil, 200, "")["dispositions"].([]interface{}); len(ds) != 0 {
+		t.Fatalf("rejected requests left %d dispositions", len(ds))
+	}
+	e.expect("POST", path, good(nil), 201, "")
+}
+
+func TestEvaluationAPIReportRoutesRequireAuth(t *testing.T) {
+	e := newEvalAPI(t)
+	for _, route := range []struct{ method, path string }{
+		{"POST", "/evaluation/campaigns/c1/dispositions"}, {"GET", "/evaluation/campaigns/c1/dispositions"},
+		{"GET", "/evaluation/campaigns/c1/report"},
+	} {
+		req := httptest.NewRequest(route.method, route.path, strings.NewReader("{}"))
+		w := httptest.NewRecorder()
+		e.server.mux.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s %s without auth: status %d, want 401", route.method, route.path, w.Code)
+		}
+	}
+}
+
+func TestEvaluationAPIReportLeavesTasksAndScorecardsUntouched(t *testing.T) {
+	e := newEvalAPI(t)
+	taskID := setupTaskInReview(t, e.server, evalAuth)
+	task, err := e.store.GetTask(t.Context(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := e.store.GetResearchReviewerScorecards(t.Context(), task.ProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.pool("pool1", 5)
+	e.campaign("camp1", 5, task.ProjectID)
+	e.candidate("camp1", "cand-a", "model-a", "pool1", 5)
+	e.sample("camp1", "s1", task.ProjectID, taskID)
+	e.expect("GET", "/evaluation/campaigns/camp1/report", nil, 200, "")
+	after, err := e.store.GetResearchReviewerScorecards(t.Context(), task.ProjectID)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("scorecards changed: %v %v", err, after)
+	}
+	got, err := e.store.GetTask(t.Context(), taskID)
+	if err != nil || got.State != task.State {
+		t.Fatalf("task state changed: %v -> %v", task.State, got.State)
+	}
+}

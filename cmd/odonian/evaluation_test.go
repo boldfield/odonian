@@ -90,6 +90,12 @@ func TestEvaluationCLIRequests(t *testing.T) {
 			"POST", "/evaluation/jobs/j1/attempts/a1/finalize", map[string]interface{}{
 				"fence_attempt_id": "a1", "exit_class": "completed", "status": "completed", "duration_ms": 12.0,
 				"findings": []interface{}{map[string]interface{}{"id": "f1", "severity": "minor", "summary": "s"}}}},
+		{"report", "evaluation-get-report", []string{"--id", "c1"}, "GET", "/evaluation/campaigns/c1/report", nil},
+		{"list-dispositions", "evaluation-list-dispositions", []string{"--campaign", "c1"}, "GET", "/evaluation/campaigns/c1/dispositions", nil},
+		{"record-disposition", "evaluation-record-disposition", []string{"--campaign", "c1", "--ref", "candidate:a1:f1", "--label", "valid",
+			"--severity", "P1", "--claim", "c", "--evidence", "e", "--actor", "op"},
+			"POST", "/evaluation/campaigns/c1/dispositions", map[string]interface{}{
+				"ref": "candidate:a1:f1", "label": "valid", "severity": "P1", "claim": "c", "evidence": "e", "actor": "op"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,6 +204,13 @@ func TestEvaluationCLIFlagValidation(t *testing.T) {
 		{"evaluation-finalize-attempt", []string{"--job", "j", "--attempt", "a"}, "--exit-class required"},
 		{"evaluation-get-sample", []string{"--campaign", "c"}, "--sample required"},
 		{"evaluation-pause-campaign", []string{"--id", "c", "extra"}, "unexpected argument"},
+		{"evaluation-get-report", nil, "--id required"},
+		{"evaluation-list-dispositions", nil, "--campaign required"},
+		{"evaluation-record-disposition", []string{"--campaign", "c", "--ref", "r", "--label", "valid", "--severity", "P1", "--claim", "c", "--evidence", "e"}, "--actor required"},
+		{"evaluation-record-disposition", []string{"--campaign", "c", "--ref", "r", "--label", "valid", "--severity", "P1", "--claim", "c", "--actor", "a"}, "--evidence or --evidence-file required"},
+		{"evaluation-record-disposition", []string{"--campaign", "c", "--ref", "r", "--label", "valid", "--severity", "P1", "--claim", "c", "--actor", "a", "--evidence", "  "}, "--evidence or --evidence-file required"},
+		{"evaluation-record-disposition", []string{"--campaign", "c", "--ref", "r", "--label", "valid", "--severity", "P1", "--claim", "c", "--actor", "a", "--evidence", "e", "--evidence-file", "x"}, "not both"},
+		{"evaluation-record-disposition", []string{"--campaign", "c", "--ref", "r", "--label", "valid", "--claim", "c", "--actor", "a", "--evidence", "e"}, "--severity required"},
 		{"evaluation-get-campaign-status", []string{"--bogus"}, "failed to parse flags"},
 	}
 	for _, tc := range cases {
@@ -354,6 +367,29 @@ func TestEvaluationCLILifecycleAgainstAPI(t *testing.T) {
 	}
 	if fs, _ := s.ListEvaluationFindings(t.Context(), attemptID); len(fs) != 1 {
 		t.Fatalf("findings after replay: %v", fs)
+	}
+
+	d := call("evaluation-record-disposition", "--campaign", "c1", "--ref", "candidate:"+attemptID+":f1", "--label", "invalid",
+		"--severity", "P3", "--claim", "style nit", "--evidence", "the heading matches the house style", "--actor", "operator-1")
+	if d["label"] != "invalid" || d["sample_id"] != "s1" || d["candidate_id"] != "v1" || d["actor"] != "operator-1" {
+		t.Fatalf("disposition: %v", d)
+	}
+	_, err = runEval(t, ts.URL, "evaluation-record-disposition", "--campaign", "c1", "--ref", "candidate:"+attemptID+":nope", "--label", "valid",
+		"--severity", "P1", "--claim", "c", "--evidence", "e", "--actor", "a")
+	if err == nil || !strings.Contains(err.Error(), "FINDING_NOT_FOUND") {
+		t.Fatalf("unknown finding: %v", err)
+	}
+	if got := call("evaluation-list-dispositions", "--campaign", "c1")["dispositions"].([]interface{}); len(got) != 1 {
+		t.Fatalf("dispositions: %v", got)
+	}
+	rep := call("evaluation-get-report", "--id", "c1")
+	if rep["campaign_id"] != "c1" || rep["sample_total"] != 2.0 || len(rep["reviewers"].([]interface{})) != 1 {
+		t.Fatalf("report: %v", rep)
+	}
+	// The sample was never staged, so the run is excluded rather than counted.
+	cov := rep["reviewers"].([]interface{})[0].(map[string]interface{})["coverage"].(map[string]interface{})
+	if cov["excluded"] != 1.0 || cov["completed"] != 0.0 || cov["clean"] != 0.0 {
+		t.Fatalf("coverage: %v", cov)
 	}
 
 	st := call("evaluation-get-campaign-status", "--id", "c1")

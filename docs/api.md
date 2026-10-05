@@ -1838,6 +1838,97 @@ There is no verdict, task ID or review field: an evaluation result cannot vote.
 
 Invalid payloads are `400 INVALID_INPUT` and leave the attempt live.
 
+#### `POST /evaluation/campaigns/{id}/dispositions`
+
+Append one operator decision about one finding. This is the **only** source of finding labels in the
+evaluation report: nothing is inferred from agreement between reviewers or from a writer accepting an
+edit. A disposition changes no task, review, verdict, scorecard or acceptance state.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ref` | string, required | the finding, as printed in the report: `candidate:<attempt_id>:<finding_id>` for a candidate's recorded finding, or `baseline:<review_task_id>:<finding_id>` for a production reviewer's finding on the sample's exact first round. Anything else is rejected |
+| `label` | string, required | `valid`, `invalid` or `unresolved` |
+| `severity` | string, required | `P1`, `P2` or `P3`, the severity the operator assigns |
+| `claim` | string, required | the claim the finding asserts, at most 200 bytes; whitespace is collapsed and case is ignored when matching |
+| `evidence` | string, required | the evidence behind the label, non-blank, at most 4000 bytes |
+| `actor` | string, required | who decided, at most 200 bytes; there is no default |
+
+Unknown fields (for example `accepted_by_writer`) are rejected. The sample and candidate are derived
+from the finding, never taken from the request, and the finding must exist in this campaign: an
+unknown attempt, a finding the attempt did not record, a review task of another round or a finding the
+review did not contain is `404 FINDING_NOT_FOUND`.
+
+**Response (201):** the stored disposition `{id, sample_id, source_kind, source_id, candidate_id?,
+finding_id, label, severity, claim, evidence, actor, created_at}`.
+
+Dispositions are append-only (a database trigger refuses updates and deletes). To revise a label,
+record another disposition for the same `ref`: the latest one wins in the report, the report counts
+the revisions, and the earlier rows stay as the audit trail. Findings that assert the **same claim on
+the same sample** are matched into one issue group, whichever reviewer reported them and however they
+word it; a claim never matches across samples.
+
+#### `GET /evaluation/campaigns/{id}/dispositions`
+
+**Response (200):** `{"campaign_id", "dispositions": [...]}`, oldest first, including revised ones.
+
+#### `GET /evaluation/campaigns/{id}/report`
+
+The compact comparison report. Read only: it writes nothing, sends no message and changes no task.
+Compare only the exact original submitted SHA and round of each frozen sample, across any number of
+candidate versions and the production reviewers who reviewed that same round (rows
+`baseline:<model>`, for example the existing Astra/Fable reviewers, read from the board). The report
+has one row per candidate version (`candidate:<id>`), generated from the stored candidates; there are
+no per-model columns.
+
+Top level: `version`, `campaign_id`, `campaign_name`, `generated_at`, `standard` (the text below),
+`sample_total`, `reviewers`, `common`, `groups`, `attention`, `unlabeled_findings`, `dispositions`
+(`recorded`, `findings_labeled`, `ignored`; ignored counts dispositions about findings that are not
+part of any compared run).
+
+Each `reviewers[]` row:
+
+| Field | Meaning |
+|---|---|
+| `key`, `kind`, `label` | `candidate:<id>` or `baseline:<model>` |
+| `identity`, `candidate_digest`, `effective_digests`, `runtime_drift` | the candidate's declared model/runtime/tool/observer configuration, and what the runtime reported about itself; `runtime_drift` is true when any reported effective digest differs from the declared candidate digest |
+| `coverage` | against all `samples`: `completed`, `clean` (completed with no finding), `failed`, `unavailable`, `incomplete`, `in_progress`, `not_run`, `excluded`, and `attempts` |
+| `outcomes` | the outcome and reason for each sample |
+| `metrics` | over completed samples only: `findings`, `groups` (deduplicated issues), `confirmed` (with `_p1`/`_p2`/`_p3`), `unique` and `unique_p1_p2` (valid issues no other reviewer reported), `false_positives`, `unresolved`, `known_valid`, `misses`, `misses_p1_p2`, `recall_vs_known` |
+| `latency` | `count`, `unknown`, true `mean_ms`, `median_ms`, `max_ms` over completed attempts with a recorded duration; absent durations are counted as unknown, never zero |
+| `usage`, `usage_unknown_attempts` | totals per provider-native unit with the number of attempts that reported it; attempts that reported none are counted as unknown. Units are never summed together, converted or priced |
+
+Outcomes are `completed`, `failed`, `unavailable`, `incomplete`, `in_progress`, `not_run` and
+`excluded`. A failed, unavailable, incomplete, unfinished, not-run or excluded sample **never counts
+as clean** and contributes no finding and no miss. A completed run is `excluded` when it has no
+staging record, was staged from a snapshot or candidate configuration other than the frozen sample's,
+or (for a baseline) when the round's pinned commit is not the sample's SHA or is ambiguous. A later
+round, a corrected artifact or a later review therefore can never enter the comparison. An attempt
+past its lease that nothing has finalized yet is reported as failed (`lease_expired`) without being
+written.
+
+`common` restricts every reviewer's metrics to the samples all of them completed, so unequal coverage
+can neither flatter nor punish a reviewer; compare `metrics` for each reviewer's own denominator and
+`common` for a like-for-like view.
+
+`groups[]` are the deduplicated issues. Findings join a group only through a recorded `claim` on the
+same sample; unlabeled findings stay alone. Each group has `label` (`valid`, `invalid`,
+`unresolved`, `unlabeled` or `disputed` when members were labeled both valid and invalid),
+`severity` (the most severe the operator assigned), `disagreement` (members differ in label or
+severity; both remain visible), `reviewers`, `baseline_reported`, `candidate_only` and `members` with
+each finding's reported severity, summary, location and the label, severity, claim, evidence, actor,
+`disposition_id` and `revisions` of its latest disposition.
+
+`attention[]` lists material candidate-only groups that are not labeled invalid (reported as
+`material` by the candidate, or adjudicated P1/P2) so that a human sees them. Listing is all that
+happens: no message is sent and no task changes state.
+
+`standard` always states: misses and recall are relative to the known adjudicated finding set (the
+findings an operator labeled valid on the compared samples), which is not exhaustive ground truth;
+labels come only from explicit dispositions; failed, unavailable, incomplete, unfinished and excluded
+runs never count as clean; usage is never converted to money.
+
+Errors: `404 CAMPAIGN_NOT_FOUND`.
+
 ### Evaluation error codes
 
 | Status | Code | Meaning |
@@ -1845,6 +1936,7 @@ Invalid payloads are `400 INVALID_INPUT` and leave the attempt live.
 | 400 | `INVALID_INPUT` | malformed or invalid body, cap or ttl out of range |
 | 400 | `MODEL_NOT_ALLOWED` | candidate model not allowed by the campaign |
 | 404 | `CAMPAIGN_NOT_FOUND`, `CANDIDATE_NOT_FOUND`, `SAMPLE_NOT_FOUND`, `ATTEMPT_NOT_FOUND` | unknown ID |
+| 404 | `FINDING_NOT_FOUND` | a disposition names a finding that is not part of this campaign's comparison |
 | 409 | `ALREADY_EXISTS` | campaign or candidate ID already used |
 | 409 | `ALREADY_PAUSED`, `PAUSED_WAITING` | pause requested twice; admission refused while paused |
 | 409 | `CAPACITY_EXHAUSTED` | campaign or candidate cap spent |

@@ -34,6 +34,9 @@ var evaluationVerbs = map[string]bool{
 	"evaluation-claim-job":           true,
 	"evaluation-renew-attempt":       true,
 	"evaluation-finalize-attempt":    true,
+	"evaluation-get-report":          true,
+	"evaluation-record-disposition":  true,
+	"evaluation-list-dispositions":   true,
 }
 
 func executeEvaluation(ctx context.Context, verb, baseURL, token string, args []string, out io.Writer) error {
@@ -93,6 +96,18 @@ func executeEvaluation(ctx context.Context, verb, baseURL, token string, args []
 		method, path, body, err = evaluationRenewAttempt(fs, args)
 	case "evaluation-finalize-attempt":
 		method, path, body, err = evaluationFinalizeAttempt(fs, args)
+	case "evaluation-get-report":
+		id := fs.String("id", "", "campaign ID")
+		if err = parseEvalFlags(fs, args, requireFlags(id, "--id")); err == nil {
+			method, path = http.MethodGet, "/evaluation/campaigns/"+url.PathEscape(*id)+"/report"
+		}
+	case "evaluation-list-dispositions":
+		campaign := fs.String("campaign", "", "campaign ID")
+		if err = parseEvalFlags(fs, args, requireFlags(campaign, "--campaign")); err == nil {
+			method, path = http.MethodGet, "/evaluation/campaigns/"+url.PathEscape(*campaign)+"/dispositions"
+		}
+	case "evaluation-record-disposition":
+		method, path, body, err = evaluationRecordDisposition(fs, args)
 	default:
 		return fmt.Errorf("unknown command %q", verb)
 	}
@@ -320,4 +335,38 @@ func evaluationFinalizeAttempt(fs *flag.FlagSet, args []string) (string, string,
 		evaluationResult
 	}{FenceAttemptID: *attempt, ExitClass: *exitClass, evaluationResult: res}
 	return http.MethodPost, evaluationAttemptPath(*job, *attempt, "finalize"), body, nil
+}
+
+// evaluationRecordDisposition appends one operator label. Every field is
+// required: there is no default actor and no label without evidence.
+func evaluationRecordDisposition(fs *flag.FlagSet, args []string) (string, string, interface{}, error) {
+	campaign := fs.String("campaign", "", "campaign ID")
+	ref := fs.String("ref", "", "finding ref from the report: candidate:<attempt>:<finding> or baseline:<review task>:<finding>")
+	label := fs.String("label", "", "valid, invalid or unresolved")
+	severity := fs.String("severity", "", "P1, P2 or P3 as judged by the operator")
+	claim := fs.String("claim", "", "the claim the finding asserts; findings sharing a claim on one sample are matched")
+	evidence := fs.String("evidence", "", "the evidence behind the label")
+	evidenceFile := fs.String("evidence-file", "", "read the evidence from a file")
+	actor := fs.String("actor", "", "who is recording the label")
+	if err := parseEvalFlags(fs, args, requireFlags(campaign, "--campaign", ref, "--ref", label, "--label",
+		severity, "--severity", claim, "--claim", actor, "--actor")); err != nil {
+		return "", "", nil, err
+	}
+	if *evidence != "" && *evidenceFile != "" {
+		return "", "", nil, fmt.Errorf("give --evidence or --evidence-file, not both")
+	}
+	text := *evidence
+	if *evidenceFile != "" {
+		data, err := os.ReadFile(*evidenceFile)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("failed to read --evidence-file: %w", err)
+		}
+		text = string(data)
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", "", nil, fmt.Errorf("--evidence or --evidence-file required")
+	}
+	return http.MethodPost, "/evaluation/campaigns/" + url.PathEscape(*campaign) + "/dispositions", map[string]interface{}{
+		"ref": *ref, "label": *label, "severity": *severity, "claim": *claim, "evidence": text, "actor": *actor,
+	}, nil
 }
