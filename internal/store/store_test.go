@@ -18912,13 +18912,11 @@ func TestTopicPriorityInheritance(t *testing.T) {
 	})
 
 	// Test 4: Adjudication task inherits parent priority
-	// (Tested via existing adjudication tests in link_round_test.go)
-	// This verifies that spawnAdjudicationTask correctly reads and uses parent priority.
 	t.Run("adjudication_inherits_parent_priority", func(t *testing.T) {
 		// Create implementation task P=750
 		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
 			{
-				Title:        "Impl task P=750",
+				Title:        "Impl task P=750 for adjudication",
 				Spec:         "spec",
 				DocumentID:   doc.ID,
 				Model:        "haiku",
@@ -18932,12 +18930,40 @@ func TestTopicPriorityInheritance(t *testing.T) {
 		}
 		implTaskID := tasks[0].ID
 
-		// Verify adjudication task inherits by checking that the store code
-		// correctly reads parent priority in spawnAdjudicationTask. The actual
-		// adjudication spawning requires dispute resolution which is tested
-		// separately in link_round_test.go. This test ensures the code path exists.
-		if got := getRawPriority(implTaskID); got != 750 {
-			t.Errorf("impl task raw priority = %d, want 750", got)
+		// Spawn an adjudication task directly via transaction to test priority inheritance
+		ss := store.(*sqliteStore)
+		tx, err := ss.conn.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("failed to begin tx: %v", err)
+		}
+		defer tx.Rollback()
+
+		parent, err := store.GetTask(ctx, implTaskID)
+		if err != nil {
+			t.Fatalf("failed to get parent: %v", err)
+		}
+
+		anchor := Dispute{FindingID: "f1", Evidence: "test evidence", Round: 1, Lineage: researchReviewerLineage("opus", 0)}
+		finding := Finding{ID: "f1", Severity: "P2", File: "a.md", Line: 3, Summary: "test finding", Status: "new"}
+
+		now := nowTimestamp()
+		if err := ss.spawnAdjudicationTask(ctx, tx, implTaskID, parent.ProjectID, parent.DocumentID, parent.Track, anchor, finding, 2, now); err != nil {
+			t.Fatalf("failed to spawn adjudication: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("failed to commit: %v", err)
+		}
+
+		// Find the adjudication task by querying the database directly
+		// (adjudicate_finding_id is not exposed in the Task struct)
+		var adjTaskID string
+		if err := ss.conn.QueryRowContext(ctx, `SELECT id FROM task WHERE target_task_id = ? AND adjudicate_finding_id = ?`, implTaskID, "f1").Scan(&adjTaskID); err != nil {
+			t.Fatalf("failed to find adjudication task: %v", err)
+		}
+
+		// Verify the adjudication task inherited the parent priority
+		if got := getRawPriority(adjTaskID); got != 750 {
+			t.Errorf("adjudication task raw priority = %d, want 750", got)
 		}
 	})
 
@@ -19048,16 +19074,17 @@ func TestTopicPriorityInheritance(t *testing.T) {
 		}
 	})
 
-	// Test 7: Task state, lease, hold unchanged by priority operations
+	// Test 7: Task state, lease, hold unchanged by priority operations (Set and Front)
 	t.Run("task_state_lease_hold_result_unchanged", func(t *testing.T) {
 		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
 			{
-				Title:      "State test P=500",
-				Spec:       "spec",
-				DocumentID: doc.ID,
-				Model:      "haiku",
-				Track:      "build",
-				Priority:   ptrInt64(500),
+				Title:        "State test P=500",
+				Spec:         "spec",
+				DocumentID:   doc.ID,
+				Model:        "haiku",
+				Track:        "build",
+				Priority:     ptrInt64(500),
+				ReviewModels: []string{"opus"},
 			},
 		})
 		if err != nil {
@@ -19065,56 +19092,60 @@ func TestTopicPriorityInheritance(t *testing.T) {
 		}
 		taskID := tasks[0].ID
 
-		// Get initial state
-		initial, err := store.GetTask(ctx, taskID)
-		if err != nil {
-			t.Fatalf("failed to get: %v", err)
-		}
-		initialState := initial.State
-		initialHeld := initial.Held
-
+		// Promote and claim the task to set state/lease/hold
 		if _, err = store.PromoteTask(ctx, taskID); err != nil {
 			t.Fatalf("failed to promote: %v", err)
 		}
-
-		promoted, err := store.GetTask(ctx, taskID)
-		if err != nil {
-			t.Fatalf("failed to get promoted: %v", err)
-		}
-		if promoted.State == initialState {
-			t.Errorf("expected state to change after promotion")
-		}
-
 		if _, err = store.ClaimTask(ctx, taskID, "a", "haiku", 5*time.Minute); err != nil {
 			t.Fatalf("failed to claim: %v", err)
 		}
 
-		claimed, err := store.GetTask(ctx, taskID)
+		// Snapshot state, lease, hold before priority operations
+		before, err := store.GetTask(ctx, taskID)
 		if err != nil {
-			t.Fatalf("failed to get claimed: %v", err)
+			t.Fatalf("failed to get before: %v", err)
 		}
-		if claimed.LeaseExpiresAt == nil {
-			t.Errorf("expected lease_expires_at to be set after claim")
+		beforeState := before.State
+		beforeLease := before.LeaseExpiresAt
+		beforeHeld := before.Held
+
+		// Run SetTaskPriority on the task (a priority operation that should not affect state/lease/hold)
+		if _, err := store.SetTaskPriority(ctx, SetPriorityRequest{ActionKey: "k-set-state-test", TaskID: taskID, Priority: 600, Actor: "testactor", Reason: "test"}); err != nil {
+			t.Fatalf("failed to set priority: %v", err)
 		}
 
-		if _, err = store.SubmitTask(ctx, taskID, "a", "result", nil, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
-			t.Fatalf("failed to submit: %v", err)
-		}
-
-		submitted, err := store.GetTask(ctx, taskID)
+		// Verify state/lease/hold are unchanged
+		afterSet, err := store.GetTask(ctx, taskID)
 		if err != nil {
-			t.Fatalf("failed to get submitted: %v", err)
+			t.Fatalf("failed to get after set: %v", err)
+		}
+		if afterSet.State != beforeState {
+			t.Errorf("SetTaskPriority changed state from %s to %s, expected unchanged", beforeState, afterSet.State)
+		}
+		if (beforeLease == nil) != (afterSet.LeaseExpiresAt == nil) || (beforeLease != nil && afterSet.LeaseExpiresAt != nil && *beforeLease != *afterSet.LeaseExpiresAt) {
+			t.Errorf("SetTaskPriority changed lease_expires_at, expected unchanged")
+		}
+		if afterSet.Held != beforeHeld {
+			t.Errorf("SetTaskPriority changed held from %v to %v, expected unchanged", beforeHeld, afterSet.Held)
 		}
 
-		// Verify state/hold/result changed only through workflow transitions, not through priority operations
-		if submitted.Result == nil {
-			t.Errorf("expected result to be set")
+		// Also test MoveTaskToFront doesn't affect state/lease/hold
+		if _, err := store.MoveTaskToFront(ctx, FrontPriorityRequest{ActionKey: "k-front-state-test", TaskID: taskID, Actor: "testactor", Reason: "test"}); err != nil {
+			t.Fatalf("failed to move to front: %v", err)
 		}
-		if submitted.State != "review" {
-			t.Errorf("expected state to be 'review' after submit, got %s", submitted.State)
+
+		afterFront, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get after front: %v", err)
 		}
-		if submitted.Held != initialHeld {
-			t.Errorf("expected held to be unchanged by submit")
+		if afterFront.State != beforeState {
+			t.Errorf("MoveTaskToFront changed state from %s to %s, expected unchanged", beforeState, afterFront.State)
+		}
+		if (beforeLease == nil) != (afterFront.LeaseExpiresAt == nil) || (beforeLease != nil && afterFront.LeaseExpiresAt != nil && *beforeLease != *afterFront.LeaseExpiresAt) {
+			t.Errorf("MoveTaskToFront changed lease_expires_at, expected unchanged")
+		}
+		if afterFront.Held != beforeHeld {
+			t.Errorf("MoveTaskToFront changed held from %v to %v, expected unchanged", beforeHeld, afterFront.Held)
 		}
 	})
 
@@ -19153,6 +19184,105 @@ func TestTopicPriorityInheritance(t *testing.T) {
 		// Verify B unchanged
 		if got := getRawPriority(taskBID); got != 750 {
 			t.Errorf("independent task B priority = %d, want 750", got)
+		}
+	})
+
+	// Test 9: Rejection → rework → new review round preserves priority
+	// Verifies that when a review is rejected and the task is reworked with a new submission,
+	// the round 2 review task stores the topic priority.
+	t.Run("rejection_rework_new_review_preserves_priority", func(t *testing.T) {
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{
+				Title:        "Rework test P=950",
+				Spec:         "spec",
+				DocumentID:   doc.ID,
+				Model:        "haiku",
+				Track:        "build",
+				Priority:     ptrInt64(950),
+				ReviewModels: []string{"opus"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create: %v", err)
+		}
+		taskID := tasks[0].ID
+
+		// Round 1: Submit the task (creates round 1 review)
+		if _, err = store.PromoteTask(ctx, taskID); err != nil {
+			t.Fatalf("failed to promote: %v", err)
+		}
+		if _, err = store.ClaimTask(ctx, taskID, "a", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim: %v", err)
+		}
+		if _, err = store.SubmitTask(ctx, taskID, "a", "done", nil, []LinkInput{{Kind: "pr", Value: "#rework"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+			t.Fatalf("failed to submit: %v", err)
+		}
+
+		// Find the round 1 review task
+		allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list: %v", err)
+		}
+
+		var review1ID string
+		for _, tk := range allTasks {
+			if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == taskID && tk.ReviewRound == 1 {
+				review1ID = tk.ID
+				break
+			}
+		}
+		if review1ID == "" {
+			t.Fatalf("expected round 1 review task")
+		}
+
+		// Claim and reject the round 1 review (task goes back to ready for rework)
+		if _, err = store.ClaimTask(ctx, review1ID, "b", "opus", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim review: %v", err)
+		}
+
+		findings := json.RawMessage(`[{"id":"f1","severity":"P3","status":"new","summary":"Test","file":"x.go","line":1,"in_changed_text":false}]`)
+		verdict := "reject"
+		if _, err = store.SubmitTask(ctx, review1ID, "b", "done", &verdict, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget, findings); err != nil {
+			t.Fatalf("failed to reject: %v", err)
+		}
+
+		// Verify task is back in ready state for rework
+		task, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get task: %v", err)
+		}
+		if task.State != "ready" {
+			t.Fatalf("expected task to be ready for rework, got state: %s", task.State)
+		}
+
+		// Round 2: Rework the task by claiming and submitting again (no promote needed, task is already "ready")
+		if _, err = store.ClaimTask(ctx, taskID, "a", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim for rework: %v", err)
+		}
+		if _, err = store.SubmitTask(ctx, taskID, "a", "done", nil, []LinkInput{{Kind: "pr", Value: "#rework2"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+			t.Fatalf("failed to submit rework: %v", err)
+		}
+
+		// Find the round 2 review task
+		allTasks, err = store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list after rework: %v", err)
+		}
+
+		var review2ID string
+		for _, tk := range allTasks {
+			if tk.Kind == "review" && tk.TargetTaskID != nil && *tk.TargetTaskID == taskID && tk.ReviewRound == 2 {
+				review2ID = tk.ID
+				break
+			}
+		}
+		if review2ID == "" {
+			t.Fatalf("expected round 2 review task")
+		}
+
+		// Verify the round 2 review task inherited the priority
+		if got := getRawPriority(review2ID); got != 950 {
+			t.Errorf("round 2 review task raw priority = %d, want 950", got)
 		}
 	})
 }
