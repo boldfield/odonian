@@ -561,3 +561,303 @@ func TestSetPriorityMissingFields(t *testing.T) {
 		})
 	}
 }
+
+// TestFrontRegressionOrdering verifies the spec requirement: Front returns value > 1000,
+// and successive Front calls return strictly increasing values, exceeding all manual priorities.
+func TestFrontRegressionOrdering(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+
+	topic := createTestTask(t, server, projectID, docID)
+	task2 := createTestTask(t, server, projectID, docID)
+	task3 := createTestTask(t, server, projectID, docID)
+
+	// Set topic to max manual priority (500)
+	req1 := makeSetPriorityRequest(topic.ID, "setup-500", int64(500), "testactor", "set to 500")
+	w1 := httptest.NewRecorder()
+	server.mux.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("setup request failed: %d", w1.Code)
+	}
+
+	// Move topic to front: should be > 1000
+	reqFront1 := makeFrontRequest(topic.ID, "front-1", "testactor", "move to front", nil)
+	wFront1 := httptest.NewRecorder()
+	server.mux.ServeHTTP(wFront1, reqFront1)
+	if wFront1.Code != http.StatusOK {
+		t.Fatalf("front request 1 failed: %d, %s", wFront1.Code, wFront1.Body.String())
+	}
+
+	var result1 map[string]interface{}
+	json.NewDecoder(wFront1.Body).Decode(&result1)
+	priority1 := int64(result1["priority"].(float64))
+
+	if priority1 <= 1000 {
+		t.Errorf("expected Front to return > 1000, got %d", priority1)
+	}
+
+	// Try to set manual priority 505 on task2: should succeed
+	req2 := makeSetPriorityRequest(task2.ID, "set-505", int64(505), "testactor", "set to 505")
+	w2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("manual set 505 failed: %d", w2.Code)
+	}
+
+	// Try to set manual priority 1000 on task3: should succeed
+	req3 := makeSetPriorityRequest(task3.ID, "set-1000", int64(1000), "testactor", "set to 1000")
+	w3 := httptest.NewRecorder()
+	server.mux.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("manual set 1000 failed: %d", w3.Code)
+	}
+
+	// Move topic to front again: should be > first Front value
+	reqFront2 := makeFrontRequest(topic.ID, "front-2", "testactor", "move to front again", nil)
+	wFront2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(wFront2, reqFront2)
+	if wFront2.Code != http.StatusOK {
+		t.Fatalf("front request 2 failed: %d, %s", wFront2.Code, wFront2.Body.String())
+	}
+
+	var result2 map[string]interface{}
+	json.NewDecoder(wFront2.Body).Decode(&result2)
+	priority2 := int64(result2["priority"].(float64))
+
+	if priority2 <= priority1 {
+		t.Errorf("expected second Front to be higher than first (%d), got %d", priority1, priority2)
+	}
+
+	if priority2 <= 1000 {
+		t.Errorf("expected Front to always return > 1000, got %d", priority2)
+	}
+}
+
+// TestSetPriorityAuth verifies 401 response for missing/invalid auth.
+func TestSetPriorityAuth(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	tests := []struct {
+		name       string
+		authHeader string
+	}{
+		{"missing auth", ""},
+		{"invalid token", "Bearer wrong-token"},
+		{"invalid format", "NotBearer test-token"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := map[string]interface{}{
+				"action_key": "auth-test-key",
+				"priority":   int64(500),
+				"actor":      "testactor",
+				"reason":     "test",
+			}
+			body, _ := json.Marshal(payload)
+			req := httptest.NewRequest("POST", fmt.Sprintf("/tasks/%s/priority/set", task.ID), bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("expected 401, got %d", w.Code)
+			}
+		})
+	}
+}
+
+// TestFrontAuth verifies 401 response for missing/invalid auth on Front endpoint.
+func TestFrontAuth(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	tests := []struct {
+		name       string
+		authHeader string
+	}{
+		{"missing auth", ""},
+		{"invalid token", "Bearer wrong-token"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := makeFrontRequest(task.ID, "auth-key", "testactor", "test", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			} else {
+				req.Header.Del("Authorization")
+			}
+
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("expected 401, got %d", w.Code)
+			}
+		})
+	}
+}
+
+// TestSetPriorityFractionalPayloads verifies rejection of fractional values like 1.5.
+func TestSetPriorityFractionalPayloads(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{"fractional 1.5", `{"action_key":"key1","priority":1.5,"actor":"testactor","reason":"test"}`},
+		{"exponent form 1e3", `{"action_key":"key2","priority":1e3,"actor":"testactor","reason":"test"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", fmt.Sprintf("/tasks/%s/priority/set", task.ID), bytes.NewReader([]byte(tt.payload)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer test-token")
+
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected 400 for fractional/exponent, got %d", w.Code)
+			}
+		})
+	}
+}
+
+// TestSetPriorityTrailingJSON verifies rejection of trailing JSON data.
+func TestSetPriorityTrailingJSON(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	// Valid JSON followed by more JSON
+	payload := `{"action_key":"key1","priority":500,"actor":"testactor","reason":"test"}{"priority":999}`
+	req := httptest.NewRequest("POST", fmt.Sprintf("/tasks/%s/priority/set", task.ID), bytes.NewReader([]byte(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for trailing JSON, got %d", w.Code)
+	}
+
+	var errResp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&errResp)
+	errObj := errResp["error"].(map[string]interface{})
+	if errObj["code"] != "JSON_DECODE_ERROR" {
+		t.Errorf("expected JSON_DECODE_ERROR, got %s", errObj["code"])
+	}
+}
+
+// TestFrontTrailingJSON verifies rejection of trailing JSON on Front endpoint.
+func TestFrontTrailingJSON(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	payload := `{"action_key":"key1","actor":"testactor","reason":"test"}{"priority":999}`
+	req := httptest.NewRequest("POST", fmt.Sprintf("/tasks/%s/priority/front", task.ID), bytes.NewReader([]byte(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for trailing JSON on Front, got %d", w.Code)
+	}
+}
+
+// TestHeldTopicStaysHeldAfterSetPriority verifies that holding a task is preserved after priority set.
+func TestHeldTopicStaysHeldAfterSetPriority(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	// Hold the task
+	holdReq := httptest.NewRequest("POST", fmt.Sprintf("/tasks/%s/hold", task.ID), bytes.NewReader([]byte(`{"reason":"test hold"}`)))
+	holdReq.Header.Set("Content-Type", "application/json")
+	holdReq.Header.Set("Authorization", "Bearer test-token")
+	holdW := httptest.NewRecorder()
+	server.mux.ServeHTTP(holdW, holdReq)
+
+	if holdW.Code != http.StatusOK {
+		t.Fatalf("failed to hold task: %d", holdW.Code)
+	}
+
+	// Set priority
+	req := makeSetPriorityRequest(task.ID, "held-set-key", int64(600), "testactor", "set priority on held task")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("set priority on held task failed: %d", w.Code)
+	}
+
+	// Verify task is still held
+	getReq := httptest.NewRequest("GET", fmt.Sprintf("/tasks/%s", task.ID), nil)
+	getReq.Header.Set("Authorization", "Bearer test-token")
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+
+	var result map[string]interface{}
+	json.NewDecoder(getW.Body).Decode(&result)
+
+	if result["held"] != true {
+		t.Errorf("expected task to remain held after set priority, got held=%v", result["held"])
+	}
+}
+
+// TestHeldTopicStaysHeldAfterFront verifies that holding a task is preserved after Front.
+func TestHeldTopicStaysHeldAfterFront(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	// Hold the task
+	holdReq := httptest.NewRequest("POST", fmt.Sprintf("/tasks/%s/hold", task.ID), bytes.NewReader([]byte(`{"reason":"test hold"}`)))
+	holdReq.Header.Set("Content-Type", "application/json")
+	holdReq.Header.Set("Authorization", "Bearer test-token")
+	holdW := httptest.NewRecorder()
+	server.mux.ServeHTTP(holdW, holdReq)
+
+	if holdW.Code != http.StatusOK {
+		t.Fatalf("failed to hold task: %d", holdW.Code)
+	}
+
+	// Move to front
+	req := makeFrontRequest(task.ID, "held-front-key", "testactor", "front on held task", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("front on held task failed: %d, %s", w.Code, w.Body.String())
+	}
+
+	// Verify task is still held
+	getReq := httptest.NewRequest("GET", fmt.Sprintf("/tasks/%s", task.ID), nil)
+	getReq.Header.Set("Authorization", "Bearer test-token")
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+
+	var result map[string]interface{}
+	json.NewDecoder(getW.Body).Decode(&result)
+
+	if result["held"] != true {
+		t.Errorf("expected task to remain held after Front, got held=%v", result["held"])
+	}
+}

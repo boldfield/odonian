@@ -1526,6 +1526,64 @@ revoke a lease or unclaim the task. Claimability still depends on state, depende
 **Response:** `200 OK` with the task object and `held: false`; `404 NOT_FOUND` if absent,
 or `500 RELEASE_ERROR` on failure.
 
+#### `POST /tasks/{id}/priority/set`
+
+Set or update a task's manual priority within the range 1–1000. The priority defaults to 500 and
+controls task ordering in the queue (higher priority first, then creation order). The action is
+identified by a unique idempotency key (`action_key`) so replaying the same request with identical
+parameters returns the same result. An idempotency mismatch (same key with different priority)
+returns `409 IDEMPOTENCY_MISMATCH`. Response includes the updated priority and the anchor task id.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" -H "Content-Type: application/json" \
+  -d '{"action_key":"key-123","priority":750,"actor":"operator","reason":"urgent fix"}' \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/priority/set
+```
+
+**Request Body:**
+- `action_key` (required, string, max 200 chars): Unique identifier for idempotency
+- `priority` (required, integer 1–1000): The manual priority
+- `actor` (required, string): Operator or system identifier
+- `reason` (required, string): Rationale for the change
+
+**Response:** `200 OK` with object `{"priority": <int>, "topic_anchor_id": "<id>", "replayed": <bool>}`;
+`400 INVALID_PRIORITY` if outside 1–1000;
+`400 INVALID_ACTION_KEY` if empty or >200 chars;
+`400 ACTOR_REQUIRED` if actor is empty;
+`400 REASON_REQUIRED` if reason is empty;
+`404 NOT_FOUND`; `409 ARCHIVED`; `409 IDEMPOTENCY_MISMATCH`; `500 PRIORITY_ERROR`.
+
+#### `POST /tasks/{id}/priority/front`
+
+Move a task's topic to the front of the queue by assigning a server-calculated priority that exceeds
+all manually assignable values (>1000). The priority is calculated atomically as `max(1000, max(P_queued)) + 1`,
+where `P_queued` is the maximum priority among all non-archived, non-terminal tasks. Successive calls
+return strictly increasing values, ensuring the task remains ahead of any manual assignments.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" -H "Content-Type: application/json" \
+  -d '{"action_key":"front-456","actor":"operator","reason":"critical production issue"}' \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/priority/front
+```
+
+**Request Body:**
+- `action_key` (required, string, max 200 chars): Unique identifier for idempotency
+- `actor` (required, string): Operator or system identifier
+- `reason` (required, string): Rationale for the move
+
+**Response:** `200 OK` with object `{"priority": <int>, "topic_anchor_id": "<id>", "replayed": <bool>}`;
+`400 INVALID_ACTION_KEY` if empty or >200 chars;
+`400 ACTOR_REQUIRED` if actor is empty;
+`400 REASON_REQUIRED` if reason is empty;
+`404 NOT_FOUND`; `409 ARCHIVED`; `409 IDEMPOTENCY_MISMATCH`; `500 PRIORITY_ERROR`.
+
+Both endpoints:
+- Reject unknown fields and trailing JSON with `400 JSON_DECODE_ERROR`
+- Support optional replication key (same key replayed returns cached result with `"replayed": true`)
+- Return task anchor (root of topic lineage) in `topic_anchor_id`
+- Preserve `held` status, holds, eligibility, permits, and merge gates
+- Do not deploy research holds or enable paid operations
+
 #### `POST /tasks/{id}/landing`
 
 Reserve an `approved` `local_commit` task while `odonian approve` lands the work reviewed in a

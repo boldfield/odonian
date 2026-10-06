@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -307,7 +308,7 @@ func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, v interface{
 	return nil
 }
 
-// decodeJSONStrict decodes a JSON body with strict checking (no unknown fields).
+// decodeJSONStrict decodes a JSON body with strict checking (no unknown fields, no trailing data).
 func (s *Server) decodeJSONStrict(w http.ResponseWriter, r *http.Request, v interface{}) error {
 	if r.Body == nil {
 		return errors.New("empty body")
@@ -319,11 +320,16 @@ func (s *Server) decodeJSONStrict(w http.ResponseWriter, r *http.Request, v inte
 		return err
 	}
 
-	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(v); err != nil {
 		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Invalid JSON in request body")
 		return err
+	}
+
+	if decoder.More() {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Trailing data after JSON object")
+		return errors.New("trailing data in request body")
 	}
 
 	return nil
