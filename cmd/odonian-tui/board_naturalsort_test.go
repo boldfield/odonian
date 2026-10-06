@@ -2,56 +2,90 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/boldfield/odonian/internal/tuiclient"
 )
 
-func TestNaturalLess(t *testing.T) {
-	// Each element must sort strictly before the next.
-	ordered := []string{"MR-1a", "MR-1b", "MR-2", "MR-3", "MR-9", "MR-10", "MR-11", "MR-100"}
-	for i := 0; i+1 < len(ordered); i++ {
-		if !naturalLess(ordered[i], ordered[i+1]) {
-			t.Errorf("expected %q < %q", ordered[i], ordered[i+1])
-		}
-		if naturalLess(ordered[i+1], ordered[i]) {
-			t.Errorf("expected NOT %q < %q", ordered[i+1], ordered[i])
-		}
-	}
-	// Leading zeros compare by numeric value, not string length.
-	if naturalLess("MR-10", "MR-009") {
-		t.Errorf("expected MR-009 (9) < MR-10")
-	}
-}
+func TestSortTasksByPriority(t *testing.T) {
+	p500 := int64(500)
+	p1000 := int64(1000)
+	p750 := int64(750)
 
-func TestSortTasksNatural(t *testing.T) {
+	now := time.Now().Format(time.RFC3339)
+	before := time.Now().Add(-time.Hour).Format(time.RFC3339)
+
 	tasks := []tuiclient.Task{
-		{ID: "a", Title: "MR-10 — approved lane"},
-		{ID: "b", Title: "MR-2 — columns"},
-		{ID: "c", Title: "MR-1b — rebuild"},
-		{ID: "d", Title: "MR-1a — runner"},
+		{ID: "d", Priority: nil, CreatedAt: now, Title: "default priority, newer"},
+		{ID: "c", Priority: &p500, CreatedAt: before, Title: "explicit 500, older"},
+		{ID: "b", Priority: &p1000, CreatedAt: now, Title: "1000 priority"},
+		{ID: "a", Priority: &p750, CreatedAt: now, Title: "750 priority"},
 	}
-	sortTasksNatural(tasks)
-	want := []string{
-		"MR-1a — runner",
-		"MR-1b — rebuild",
-		"MR-2 — columns",
-		"MR-10 — approved lane",
-	}
+
+	sortTasksByPriority(tasks)
+
+	// Expected order: p1000 (b), p750 (a), p500 older (c), p500 default newer (d)
+	want := []string{"b", "a", "c", "d"}
 	for i := range want {
-		if tasks[i].Title != want[i] {
-			t.Errorf("position %d: got %q want %q", i, tasks[i].Title, want[i])
+		if tasks[i].ID != want[i] {
+			t.Errorf("position %d: got ID %q want %q", i, tasks[i].ID, want[i])
 		}
 	}
 }
 
-func TestSortTasksNaturalStableByID(t *testing.T) {
-	// Identical titles fall back to ID order for stable rendering across refreshes.
+func TestSortTasksByPriorityDescending(t *testing.T) {
+	p100 := int64(100)
+	p200 := int64(200)
+	p300 := int64(300)
+
 	tasks := []tuiclient.Task{
-		{ID: "z", Title: "same"},
-		{ID: "a", Title: "same"},
+		{ID: "a", Priority: &p100, CreatedAt: "2025-01-01T00:00:00Z", Title: "100"},
+		{ID: "b", Priority: &p300, CreatedAt: "2025-01-01T00:00:00Z", Title: "300"},
+		{ID: "c", Priority: &p200, CreatedAt: "2025-01-01T00:00:00Z", Title: "200"},
 	}
-	sortTasksNatural(tasks)
-	if tasks[0].ID != "a" || tasks[1].ID != "z" {
-		t.Errorf("expected ID-stable order [a z], got [%s %s]", tasks[0].ID, tasks[1].ID)
+
+	sortTasksByPriority(tasks)
+
+	// Higher priority first
+	want := []string{"b", "c", "a"}
+	for i := range want {
+		if tasks[i].ID != want[i] {
+			t.Errorf("position %d: got ID %q want %q", i, tasks[i].ID, want[i])
+		}
+	}
+}
+
+func TestSortTasksByPrioritySameValueOldestFirst(t *testing.T) {
+	p500 := int64(500)
+	old := "2025-01-01T00:00:00Z"
+	new := "2025-01-02T00:00:00Z"
+
+	tasks := []tuiclient.Task{
+		{ID: "new", Priority: &p500, CreatedAt: new, Title: "newer"},
+		{ID: "old", Priority: &p500, CreatedAt: old, Title: "older"},
+	}
+
+	sortTasksByPriority(tasks)
+
+	// Older should come first when priority is the same
+	want := []string{"old", "new"}
+	for i := range want {
+		if tasks[i].ID != want[i] {
+			t.Errorf("position %d: got ID %q want %q", i, tasks[i].ID, want[i])
+		}
+	}
+}
+
+func TestSortTasksByPriorityMixedTimestampPrecision(t *testing.T) {
+	priority := int64(500)
+	tasks := []tuiclient.Task{
+		{ID: "later", Priority: &priority, CreatedAt: "2026-10-06T20:16:03.500Z"},
+		{ID: "earlier", Priority: &priority, CreatedAt: "2026-10-06T20:16:03Z"},
+	}
+
+	sortTasksByPriority(tasks)
+
+	if tasks[0].ID != "earlier" {
+		t.Errorf("Expected chronologically older task first despite mixed precision, got %s first", tasks[0].ID)
 	}
 }

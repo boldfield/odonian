@@ -3,6 +3,7 @@
 /dist/
 /odonian
 /odonian-tui
+/cmd/odonian-tui/odonian-tui
 *.exe
 
 # Go

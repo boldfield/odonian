@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
 )
 
 // boardMode identifies the current interaction mode of the board.
@@ -59,6 +61,20 @@ const (
 	modeHoldTaskConfirm
 	// modeReleaseTaskConfirm is the "Release task? [y/N]" confirmation step.
 	modeReleaseTaskConfirm
+	// modeSetPriorityReason is the required reason input step for a set priority action.
+	modeSetPriorityReason
+	// modeSetPriorityInput is the priority value input step for a set priority action.
+	modeSetPriorityInput
+	// modeSetPriorityConfirm is the confirmation step for a set priority action.
+	modeSetPriorityConfirm
+	// modeMoveToFrontReason is the required reason input step for a move to front action.
+	modeMoveToFrontReason
+	// modeMoveToFrontConfirm is the confirmation step for a move to front action.
+	modeMoveToFrontConfirm
+	// modeResetPriorityReason is the required reason input step for a reset priority action.
+	modeResetPriorityReason
+	// modeResetPriorityConfirm is the confirmation step for a reset priority action.
+	modeResetPriorityConfirm
 )
 
 // BoardModel is the Bubble Tea model for the task board view.
@@ -89,6 +105,12 @@ type BoardModel struct {
 	pendingProjectID string          // ID of the project being archived
 	inputHint        string          // hint displayed below the input (e.g. "reason required")
 	reviewFromDetail bool            // true when the review flow was started from the detail view
+
+	// Priority action state
+	pendingPriorityReason string          // captured reason for priority action
+	pendingPriority       int64           // captured priority value for set priority action
+	lastPriorityAttempt   priorityAttempt // most recent unconfirmed-outcome request, kept so a retry resends the same key
+	statusMessage         string          // success text from the last priority action, shown above the board list
 
 	// Detail view state
 	detailTask      tuiclient.TaskDetail // the currently displayed task detail
@@ -211,15 +233,20 @@ type promoteErrorMsg struct {
 	err    string
 }
 
-// reviewActionMsg is returned when a review action (approve/reject) completes.
+// reviewActionMsg is returned when a review action (approve/reject/priority) completes.
 // It carries either a successful refetch (tasks != nil) or an error string.
 // fromDetail is true when the action was initiated from the full-screen detail view;
 // the handler uses this to return to modeNormal (the board) so the result is visible.
 type reviewActionMsg struct {
 	// tasks is non-nil on success; it holds the refreshed board data.
-	tasks      map[string][]tuiclient.Task
-	err        string
-	fromDetail bool
+	tasks         map[string][]tuiclient.Task
+	err           string
+	fromDetail    bool
+	actionSuccess bool   // true only when the priority action itself succeeded
+	status        string // success text shown above the refreshed list (not an error)
+	// actionRejected is true when the server definitively refused the priority action
+	// (4xx other than timeout/rate-limit), so its idempotency key cannot be retried.
+	actionRejected bool
 }
 
 // projectArchiveMsg is returned when a project archive completes.
@@ -554,6 +581,127 @@ func (m *BoardModel) releaseTaskCmd(taskID string, fromDetail bool) tea.Cmd {
 	}
 }
 
+// setTaskPriorityCmd creates a command that sets a task's priority.
+func (m *BoardModel) setTaskPriorityCmd(taskID string, priority int64, reason string, actionKey string, fromDetail bool) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		req := tuiclient.SetTaskPriorityRequest{
+			ActionKey: actionKey,
+			Priority:  priority,
+			Actor:     "tui-worker",
+			Reason:    reason,
+		}
+
+		change, err := m.client.SetTaskPriority(ctx, taskID, req)
+		if err != nil {
+			var apiErr *tuiclient.APIError
+			if errors.As(err, &apiErr) {
+				msg := m.fetchTasksInline(ctx, fmt.Sprintf("set priority %d: %s", apiErr.StatusCode, apiErr.Message))
+				msg.fromDetail = fromDetail
+				msg.actionSuccess = false
+				msg.actionRejected = isDefinitiveRejection(apiErr.StatusCode)
+				return msg
+			}
+			msg := m.fetchTasksInline(ctx, fmt.Sprintf("set priority failed: %v", err))
+			msg.fromDetail = fromDetail
+			msg.actionSuccess = false
+			return msg
+		}
+
+		statusMsg := fmt.Sprintf("priority set to %d for %s", change.Priority, change.TopicAnchorID)
+		msg := m.fetchTasksInline(ctx, "")
+		msg.status = statusMsg
+		msg.fromDetail = fromDetail
+		msg.actionSuccess = true
+		return msg
+	}
+}
+
+// moveTaskToFrontCmd creates a command that moves a task to the front of the queue.
+func (m *BoardModel) moveTaskToFrontCmd(taskID string, reason string, actionKey string, fromDetail bool) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		req := tuiclient.MoveTaskToFrontRequest{
+			ActionKey: actionKey,
+			Actor:     "tui-worker",
+			Reason:    reason,
+		}
+
+		change, err := m.client.MoveTaskToFront(ctx, taskID, req)
+		if err != nil {
+			var apiErr *tuiclient.APIError
+			if errors.As(err, &apiErr) {
+				msg := m.fetchTasksInline(ctx, fmt.Sprintf("move to front %d: %s", apiErr.StatusCode, apiErr.Message))
+				msg.fromDetail = fromDetail
+				msg.actionSuccess = false
+				msg.actionRejected = isDefinitiveRejection(apiErr.StatusCode)
+				return msg
+			}
+			msg := m.fetchTasksInline(ctx, fmt.Sprintf("move to front failed: %v", err))
+			msg.fromDetail = fromDetail
+			msg.actionSuccess = false
+			return msg
+		}
+
+		statusMsg := fmt.Sprintf("moved to front with priority %d for %s", change.Priority, change.TopicAnchorID)
+		msg := m.fetchTasksInline(ctx, "")
+		msg.status = statusMsg
+		msg.fromDetail = fromDetail
+		msg.actionSuccess = true
+		return msg
+	}
+}
+
+// resetTaskPriorityCmd creates a command that resets a task's priority to 500.
+func (m *BoardModel) resetTaskPriorityCmd(taskID string, reason string, actionKey string, fromDetail bool) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		req := tuiclient.SetTaskPriorityRequest{
+			ActionKey: actionKey,
+			Priority:  500,
+			Actor:     "tui-worker",
+			Reason:    reason,
+		}
+
+		change, err := m.client.SetTaskPriority(ctx, taskID, req)
+		if err != nil {
+			var apiErr *tuiclient.APIError
+			if errors.As(err, &apiErr) {
+				msg := m.fetchTasksInline(ctx, fmt.Sprintf("reset priority %d: %s", apiErr.StatusCode, apiErr.Message))
+				msg.fromDetail = fromDetail
+				msg.actionSuccess = false
+				msg.actionRejected = isDefinitiveRejection(apiErr.StatusCode)
+				return msg
+			}
+			msg := m.fetchTasksInline(ctx, fmt.Sprintf("reset priority failed: %v", err))
+			msg.fromDetail = fromDetail
+			msg.actionSuccess = false
+			return msg
+		}
+
+		statusMsg := fmt.Sprintf("priority reset to %d for %s", change.Priority, change.TopicAnchorID)
+		msg := m.fetchTasksInline(ctx, "")
+		msg.status = statusMsg
+		msg.fromDetail = fromDetail
+		msg.actionSuccess = true
+		return msg
+	}
+}
+
+// isDefinitiveRejection reports whether an HTTP status means the server refused the request
+// itself (so its idempotency key can never succeed on retry), as opposed to a timeout or
+// rate limit where an identical retry is still meaningful.
+func isDefinitiveRejection(statusCode int) bool {
+	return statusCode >= 400 && statusCode < 500 &&
+		statusCode != http.StatusRequestTimeout && statusCode != http.StatusTooManyRequests
+}
+
 // fetchTasksInline performs a synchronous ListTasks call within an already-running command
 // closure (i.e. uses an already-created context) and returns a reviewActionMsg so the
 // result surfaces through the reviewActionMsg handler instead of tasksFetchedMsg. This
@@ -684,60 +832,52 @@ func bucketTasksByState(tasks []tuiclient.Task) map[string][]tuiclient.Task {
 		bucketed[task.State] = append(bucketed[task.State], task)
 	}
 
-	// Sort each state's tasks in natural title order
+	// Sort each state's tasks by priority (descending), then created_at (ascending), then ID (ascending)
 	for _, taskList := range bucketed {
-		sortTasksNatural(taskList)
+		sortTasksByPriority(taskList)
 	}
 
 	return bucketed
 }
 
-// sortTasksNatural orders tasks within a column by title in natural order, so MR-1 < MR-2 <
-// ... < MR-10 (a plain lexicographic sort puts MR-10 before MR-2). Ties break by ID so the
-// order is stable across refreshes. Note: tasks created in one batch share a created_at, so
-// sorting by time can't disambiguate them — title order is the predictable choice.
-func sortTasksNatural(tasks []tuiclient.Task) {
+// sortTasksByPriority orders tasks within a column by numeric priority (descending),
+// then by created_at (ascending) for ties, then by ID (ascending) for final tie-breaking.
+func sortTasksByPriority(tasks []tuiclient.Task) {
 	sort.Slice(tasks, func(i, j int) bool {
-		if tasks[i].Title != tasks[j].Title {
-			return naturalLess(tasks[i].Title, tasks[j].Title)
+		// Get priority values (default 500 if nil)
+		priI := int64(500)
+		if tasks[i].Priority != nil {
+			priI = *tasks[i].Priority
 		}
+		priJ := int64(500)
+		if tasks[j].Priority != nil {
+			priJ = *tasks[j].Priority
+		}
+
+		// Sort by priority descending (higher priority first)
+		if priI != priJ {
+			return priI > priJ
+		}
+
+		// Tie-break by created_at ascending (older first)
+		if createdBefore, differs := compareCreatedAt(tasks[i].CreatedAt, tasks[j].CreatedAt); differs {
+			return createdBefore
+		}
+
+		// Final tie-break by ID ascending
 		return tasks[i].ID < tasks[j].ID
 	})
 }
 
-// naturalLess reports whether a sorts before b in natural order: runs of digits are compared
-// numerically (so "MR-2" < "MR-10"), all other characters byte-by-byte.
-func naturalLess(a, b string) bool {
-	ia, ib := 0, 0
-	for ia < len(a) && ib < len(b) {
-		da := a[ia] >= '0' && a[ia] <= '9'
-		db := b[ib] >= '0' && b[ib] <= '9'
-		if da && db {
-			ja, jb := ia, ib
-			for ja < len(a) && a[ja] >= '0' && a[ja] <= '9' {
-				ja++
-			}
-			for jb < len(b) && b[jb] >= '0' && b[jb] <= '9' {
-				jb++
-			}
-			na := strings.TrimLeft(a[ia:ja], "0")
-			nb := strings.TrimLeft(b[ib:jb], "0")
-			if len(na) != len(nb) {
-				return len(na) < len(nb)
-			}
-			if na != nb {
-				return na < nb
-			}
-			ia, ib = ja, jb
-			continue
-		}
-		if a[ia] != b[ib] {
-			return a[ia] < b[ib]
-		}
-		ia++
-		ib++
+// compareCreatedAt compares RFC3339 timestamps chronologically (raw string order is wrong when
+// fractional-second precision differs). Unparseable values fall back to string comparison.
+func compareCreatedAt(a, b string) (aBeforeB bool, differs bool) {
+	timeA, errA := time.Parse(time.RFC3339Nano, a)
+	timeB, errB := time.Parse(time.RFC3339Nano, b)
+	if errA == nil && errB == nil {
+		return timeA.Before(timeB), !timeA.Equal(timeB)
 	}
-	return len(a)-ia < len(b)-ib
+	return a < b, a != b
 }
 
 // fetchProjects creates a command that fetches the list of projects.
@@ -790,6 +930,8 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		m.statusMessage = ""
+
 		// Detail mode: all keys go to the detail handler — board nav must not fire.
 		if m.mode == modeDetail {
 			return m.updateDetailMode(msg)
@@ -1004,6 +1146,48 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		// Set Priority: set priority for the selected task
+		case "i":
+			if m.selectedTaskID != "" {
+				m.pendingTaskID = m.selectedTaskID
+				m.reviewInput.Placeholder = "priority (1-1000)"
+				m.reviewInput.SetValue("")
+				m.reviewInput.Focus()
+				m.inputHint = ""
+				m.mode = modeSetPriorityInput
+				var cmd tea.Cmd
+				m.reviewInput, cmd = m.reviewInput.Update(nil)
+				return m, cmd
+			}
+
+		// Move to Front: move selected task to front (server-calculated priority)
+		case "w":
+			if m.selectedTaskID != "" {
+				m.pendingTaskID = m.selectedTaskID
+				m.reviewInput.Placeholder = "reason for moving to front (required)"
+				m.reviewInput.SetValue("")
+				m.reviewInput.Focus()
+				m.inputHint = ""
+				m.mode = modeMoveToFrontReason
+				var cmd tea.Cmd
+				m.reviewInput, cmd = m.reviewInput.Update(nil)
+				return m, cmd
+			}
+
+		// Reset Priority: reset selected task priority to 500
+		case "e":
+			if m.selectedTaskID != "" {
+				m.pendingTaskID = m.selectedTaskID
+				m.reviewInput.Placeholder = "reason for resetting priority (required)"
+				m.reviewInput.SetValue("")
+				m.reviewInput.Focus()
+				m.inputHint = ""
+				m.mode = modeResetPriorityReason
+				var cmd tea.Cmd
+				m.reviewInput, cmd = m.reviewInput.Update(nil)
+				return m, cmd
+			}
+
 		// Scorecards: show research reviewer scorecards
 		case "c":
 			m.mode = modeScorecards
@@ -1073,16 +1257,23 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case reviewActionMsg:
-		if msg.err != "" {
-			m.error = msg.err
-		} else {
-			m.error = ""
-		}
 		if msg.tasks != nil {
 			m.loading = false
 			m.tasks = msg.tasks
 			m.lastRefresh = time.Now()
 			m.ensureSelectionInColumn()
+		}
+		if msg.err != "" {
+			m.error = msg.err
+		} else {
+			m.error = ""
+		}
+		m.statusMessage = msg.status
+		// Keep the attempt (and its key) across retryable failures so an identical
+		// retry replays rather than double-applies; drop it on success or when the
+		// server rejected the request outright.
+		if msg.actionSuccess || msg.actionRejected {
+			m.clearPriorityActionState()
 		}
 		// When the action originated from the detail view, the task has left "review"
 		// (or a race was detected). Return to the board so m.error and the refreshed
@@ -1264,6 +1455,45 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.reviewInput, cmd = m.reviewInput.Update(nil)
 			return m, cmd
 		}
+
+	// Set Priority: set priority for the task (detail view)
+	case "i":
+		m.pendingTaskID = m.detailTask.ID
+		m.reviewInput.Placeholder = "priority (1-1000)"
+		m.reviewInput.SetValue("")
+		m.reviewInput.Focus()
+		m.inputHint = ""
+		m.mode = modeSetPriorityInput
+		m.reviewFromDetail = true
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(nil)
+		return m, cmd
+
+	// Move to Front: move task to front (server-calculated priority, detail view)
+	case "w":
+		m.pendingTaskID = m.detailTask.ID
+		m.reviewInput.Placeholder = "reason for moving to front (required)"
+		m.reviewInput.SetValue("")
+		m.reviewInput.Focus()
+		m.inputHint = ""
+		m.mode = modeMoveToFrontReason
+		m.reviewFromDetail = true
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(nil)
+		return m, cmd
+
+	// Reset Priority: reset task priority to 500 (detail view)
+	case "e":
+		m.pendingTaskID = m.detailTask.ID
+		m.reviewInput.Placeholder = "reason for resetting priority (required)"
+		m.reviewInput.SetValue("")
+		m.reviewInput.Focus()
+		m.inputHint = ""
+		m.mode = modeResetPriorityReason
+		m.reviewFromDetail = true
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(nil)
+		return m, cmd
 
 	// Switch project from detail view
 	case "P":
@@ -1593,6 +1823,152 @@ func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Ignore all other keys in confirm mode.
 		return m, nil
 
+	case modeSetPriorityInput:
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(msg)
+		switch msg.String() {
+		case "esc":
+			// Cancel priority input
+			m.clearPriorityActionState()
+			m.cancelReviewMode()
+			return m, nil
+		case "enter":
+			// Validate and move to reason input
+			input := m.reviewInput.Value()
+			if input == "" {
+				m.inputHint = "priority value required"
+				return m, nil
+			}
+			priority, err := strconv.ParseInt(input, 10, 64)
+			if err != nil || priority < 1 || priority > 1000 {
+				m.inputHint = "priority must be an integer between 1 and 1000"
+				return m, nil
+			}
+			m.pendingPriority = priority
+			// Move to reason input
+			m.reviewInput.Placeholder = "reason for priority change (required)"
+			m.reviewInput.SetValue("")
+			m.inputHint = ""
+			m.mode = modeSetPriorityReason
+			m.reviewInput.Focus()
+			return m, nil
+		}
+		return m, cmd
+
+	case modeSetPriorityReason:
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(msg)
+		switch msg.String() {
+		case "esc":
+			// Cancel priority change
+			m.clearPriorityActionState()
+			m.cancelReviewMode()
+			return m, nil
+		case "enter":
+			// Capture reason and show confirmation
+			reason := m.reviewInput.Value()
+			if reason == "" {
+				m.inputHint = "reason required"
+				return m, nil
+			}
+			m.pendingPriorityReason = reason
+			m.mode = modeSetPriorityConfirm
+			m.inputHint = ""
+			return m, nil
+		}
+		return m, cmd
+
+	case modeSetPriorityConfirm:
+		switch msg.String() {
+		case "esc", "n", "N":
+			m.clearPriorityActionState()
+			m.cancelReviewMode()
+			return m, nil
+		case "y", "Y":
+			taskID := m.pendingTaskID
+			priority := m.pendingPriority
+			reason := m.pendingPriorityReason
+			actionKey := m.priorityActionKey(taskID, priorityActionSet, priority, reason)
+			originFromDetail := m.reviewFromDetail
+			m.cancelReviewMode()
+			return m, m.setTaskPriorityCmd(taskID, priority, reason, actionKey, originFromDetail)
+		}
+		return m, nil
+
+	case modeMoveToFrontReason:
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(msg)
+		switch msg.String() {
+		case "esc":
+			m.clearPriorityActionState()
+			m.cancelReviewMode()
+			return m, nil
+		case "enter":
+			reason := m.reviewInput.Value()
+			if reason == "" {
+				m.inputHint = "reason required"
+				return m, nil
+			}
+			m.pendingPriorityReason = reason
+			m.mode = modeMoveToFrontConfirm
+			m.inputHint = ""
+			return m, nil
+		}
+		return m, cmd
+
+	case modeMoveToFrontConfirm:
+		switch msg.String() {
+		case "esc", "n", "N":
+			m.clearPriorityActionState()
+			m.cancelReviewMode()
+			return m, nil
+		case "y", "Y":
+			taskID := m.pendingTaskID
+			reason := m.pendingPriorityReason
+			actionKey := m.priorityActionKey(taskID, priorityActionFront, 0, reason)
+			originFromDetail := m.reviewFromDetail
+			m.cancelReviewMode()
+			return m, m.moveTaskToFrontCmd(taskID, reason, actionKey, originFromDetail)
+		}
+		return m, nil
+
+	case modeResetPriorityReason:
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(msg)
+		switch msg.String() {
+		case "esc":
+			m.clearPriorityActionState()
+			m.cancelReviewMode()
+			return m, nil
+		case "enter":
+			reason := m.reviewInput.Value()
+			if reason == "" {
+				m.inputHint = "reason required"
+				return m, nil
+			}
+			m.pendingPriorityReason = reason
+			m.mode = modeResetPriorityConfirm
+			m.inputHint = ""
+			return m, nil
+		}
+		return m, cmd
+
+	case modeResetPriorityConfirm:
+		switch msg.String() {
+		case "esc", "n", "N":
+			m.clearPriorityActionState()
+			m.cancelReviewMode()
+			return m, nil
+		case "y", "Y":
+			taskID := m.pendingTaskID
+			reason := m.pendingPriorityReason
+			actionKey := m.priorityActionKey(taskID, priorityActionReset, 500, reason)
+			originFromDetail := m.reviewFromDetail
+			m.cancelReviewMode()
+			return m, m.resetTaskPriorityCmd(taskID, reason, actionKey, originFromDetail)
+		}
+		return m, nil
+
 	case modeArchiveProjectConfirm:
 		switch msg.String() {
 		case "esc", "n", "N":
@@ -1628,6 +2004,51 @@ func (m *BoardModel) cancelReviewMode() {
 	m.inputHint = ""
 	m.reviewInput.SetValue("")
 	m.reviewInput.Blur()
+	// Priority attempt state is intentionally left alone: confirm handlers call this
+	// before the command runs, and a failed attempt must survive for an identical retry.
+	// Explicit cancels call clearPriorityActionState.
+}
+
+// clearPriorityActionState drops captured priority input and any remembered attempt.
+func (m *BoardModel) clearPriorityActionState() {
+	m.lastPriorityAttempt = priorityAttempt{}
+	m.pendingPriority = 0
+	m.pendingPriorityReason = ""
+}
+
+const (
+	priorityActionSet   = "set"
+	priorityActionFront = "front"
+	priorityActionReset = "reset"
+)
+
+// priorityAttempt identifies one priority request by everything the server hashes into
+// its idempotency check (action, task, value, reason) plus the key sent for it.
+type priorityAttempt struct {
+	key      string
+	taskID   string
+	action   string
+	priority int64
+	reason   string
+}
+
+// priorityActionKey returns the idempotency key for the request. An identical repeat of the
+// last attempt reuses its key (server replays instead of re-applying); any difference mints
+// a fresh key because the server would otherwise answer IDEMPOTENCY_MISMATCH.
+func (m *BoardModel) priorityActionKey(taskID, action string, priority int64, reason string) string {
+	attempt := m.lastPriorityAttempt
+	if attempt.key != "" && attempt.taskID == taskID && attempt.action == action &&
+		attempt.priority == priority && attempt.reason == reason {
+		return attempt.key
+	}
+	m.lastPriorityAttempt = priorityAttempt{
+		key:      fmt.Sprintf("odonian-tui-%s", uuid.New().String()),
+		taskID:   taskID,
+		action:   action,
+		priority: priority,
+		reason:   reason,
+	}
+	return m.lastPriorityAttempt.key
 }
 
 // getTasksInSelectedColumn returns the tasks in the currently selected column.
@@ -1871,6 +2292,60 @@ func (m *BoardModel) renderReviewOverlay() string {
 		}
 		b.WriteString(fmt.Sprintf("Release %s (restore automated flow)? [y/N] ", taskID))
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
+	case modeSetPriorityInput:
+		b.WriteString("Set priority — enter a value (1-1000):\n")
+		b.WriteString(m.reviewInput.View())
+		b.WriteString("\n")
+		if m.inputHint != "" {
+			b.WriteString("hint: " + m.inputHint + "\n")
+		}
+		b.WriteString("(enter to continue, esc to cancel)\n")
+	case modeSetPriorityReason:
+		b.WriteString("Set priority — reason (required):\n")
+		b.WriteString(m.reviewInput.View())
+		b.WriteString("\n")
+		if m.inputHint != "" {
+			b.WriteString("hint: " + m.inputHint + "\n")
+		}
+		b.WriteString("(enter to submit, esc to cancel)\n")
+	case modeSetPriorityConfirm:
+		taskID := m.pendingTaskID
+		if len(taskID) > 8 {
+			taskID = taskID[:8]
+		}
+		b.WriteString(fmt.Sprintf("Set priority to %d for %s? [y/N] ", m.pendingPriority, taskID))
+		b.WriteString("(y to confirm, n/esc to cancel)\n")
+	case modeMoveToFrontReason:
+		b.WriteString("Move to front — reason (required):\n")
+		b.WriteString(m.reviewInput.View())
+		b.WriteString("\n")
+		if m.inputHint != "" {
+			b.WriteString("hint: " + m.inputHint + "\n")
+		}
+		b.WriteString("(enter to submit, esc to cancel)\n")
+	case modeMoveToFrontConfirm:
+		taskID := m.pendingTaskID
+		if len(taskID) > 8 {
+			taskID = taskID[:8]
+		}
+		b.WriteString(fmt.Sprintf("Move %s to front? [y/N] ", taskID))
+		b.WriteString("(server will assign priority > all current priorities)\n")
+		b.WriteString("(y to confirm, n/esc to cancel)\n")
+	case modeResetPriorityReason:
+		b.WriteString("Reset priority to 500 — reason (required):\n")
+		b.WriteString(m.reviewInput.View())
+		b.WriteString("\n")
+		if m.inputHint != "" {
+			b.WriteString("hint: " + m.inputHint + "\n")
+		}
+		b.WriteString("(enter to submit, esc to cancel)\n")
+	case modeResetPriorityConfirm:
+		taskID := m.pendingTaskID
+		if len(taskID) > 8 {
+			taskID = taskID[:8]
+		}
+		b.WriteString(fmt.Sprintf("Reset priority to 500 for %s? [y/N] ", taskID))
+		b.WriteString("(y to confirm, n/esc to cancel)\n")
 	case modeArchiveProjectConfirm:
 		b.WriteString("Archive project? [y/N] ")
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
@@ -1931,10 +2406,15 @@ func (m *BoardModel) renderColumnTasks() string {
 		return fmt.Sprintf("Error: %s\nPress 'r' to retry.", m.error)
 	}
 
+	statusLine := ""
+	if m.statusMessage != "" {
+		statusLine = m.statusMessage + "\n"
+	}
+
 	tasksInColumn := m.getTasksInSelectedColumn()
 
 	if len(tasksInColumn) == 0 {
-		return "(empty)"
+		return statusLine + "(empty)"
 	}
 
 	// Calculate the visible task range
@@ -1945,6 +2425,7 @@ func (m *BoardModel) renderColumnTasks() string {
 	}
 
 	var b strings.Builder
+	b.WriteString(statusLine)
 	for i := m.scrollOffset; i < endOffset; i++ {
 		task := tasksInColumn[i]
 		isSelected := task.ID == m.selectedTaskID
@@ -1962,7 +2443,21 @@ func (m *BoardModel) renderColumnTasks() string {
 		if task.Held {
 			held = " [HELD]"
 		}
-		b.WriteString(fmt.Sprintf("%s %s %s%s  %s\n", prefix, taskIDDisplay, modelBadge, held, task.Title))
+		priority := ""
+		if task.Priority != nil {
+			priority = fmt.Sprintf(" P:%d", *task.Priority)
+		} else {
+			priority = " P:500"
+		}
+		anchor := ""
+		if task.TopicAnchorID != nil && *task.TopicAnchorID != "" && *task.TopicAnchorID != task.ID {
+			anchorDisplay := *task.TopicAnchorID
+			if len(anchorDisplay) > 8 {
+				anchorDisplay = anchorDisplay[:8]
+			}
+			anchor = fmt.Sprintf(" [anchor:%s]", anchorDisplay)
+		}
+		b.WriteString(fmt.Sprintf("%s %s %s%s%s%s  %s\n", prefix, taskIDDisplay, modelBadge, held, priority, anchor, task.Title))
 
 		// Show assignee for in_progress, review, approved, and done states
 		shouldShowAssignee := task.State == stateInProgress || task.State == stateReview ||
@@ -2048,16 +2543,17 @@ func (m *BoardModel) renderHelpBar() string {
 	if m.mode != modeNormal {
 		return "esc cancel"
 	}
+	priorityKeys := "   i set priority   w move to front   e reset priority"
 	switch m.selectedColumn {
 	case 0: // backlog
-		return "←/→ column   ↑/↓ select   enter detail   p promote   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   p promote   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
 	case 3: // review
-		return "←/→ column   ↑/↓ select   enter detail   a approve   x reject   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   a approve   x reject   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
 	case 4: // approved
-		return "←/→ column   ↑/↓ select   enter detail   b bounce   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   b bounce   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
 	case 6: // blocked
-		return "←/→ column   ↑/↓ select   enter detail   u unblock   f fail   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   u unblock   f fail   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
 	default:
-		return "←/→ column   ↑/↓ select   enter detail   t hold/release   z archive   c scorecards   P switch project   r refresh   q quit"
+		return "←/→ column   ↑/↓ select   enter detail   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
 	}
 }

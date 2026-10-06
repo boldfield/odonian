@@ -211,6 +211,22 @@ func (m *BoardModel) buildDetailContent(task tuiclient.TaskDetail) string {
 		b.WriteString(fmt.Sprintf("Lease: %s\n", m.formatLeaseCountdown(*task.LeaseExpiresAt)))
 	}
 
+	// Priority
+	priorityStr := "500"
+	if task.Priority != nil {
+		priorityStr = fmt.Sprintf("%d", *task.Priority)
+	}
+	if task.Held {
+		b.WriteString(fmt.Sprintf("Priority: %s [HELD]\n", priorityStr))
+	} else {
+		b.WriteString(fmt.Sprintf("Priority: %s\n", priorityStr))
+	}
+
+	// Topic anchor
+	if task.TopicAnchorID != nil {
+		b.WriteString(fmt.Sprintf("Topic Anchor: %s\n", *task.TopicAnchorID))
+	}
+
 	// Timestamps
 	b.WriteString(fmt.Sprintf("Created: %s\n", m.formatAbsTime(task.CreatedAt)))
 	b.WriteString(fmt.Sprintf("Updated: %s\n", m.formatAbsTime(task.UpdatedAt)))
@@ -389,7 +405,7 @@ func (m *BoardModel) initDetailViewport(task tuiclient.TaskDetail) {
 
 // renderDetailHelpBar returns the help bar text appropriate for detail view.
 func (m *BoardModel) renderDetailHelpBar() string {
-	base := "esc back   ↑/↓/pgup/pgdn scroll spec   o open PR   s source doc   d design doc   P switch project"
+	base := "esc back   ↑/↓/pgup/pgdn scroll spec   o open PR   s source doc   d design doc   P switch project   i set priority   w move to front   e reset priority"
 	if m.detailTask.State == stateReview {
 		base += "   a approve   x reject"
 	}
