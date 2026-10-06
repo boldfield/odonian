@@ -109,6 +109,38 @@ type topicGraph struct {
 	children map[string][]string
 }
 
+// lineageParentSQL selects the single lineage parent of the task aliased c, or NULL for a
+// topic root. Precedence: review/adjudication/merge work (target_task_id), a superseding
+// replacement (superseded_by), then an approved continuation child (continuation_parent
+// link). A relation whose parent row does not exist is skipped. The graph loader and the
+// per-task anchor walk below both use this one expression, so they cannot disagree.
+const lineageParentSQL = `COALESCE(
+	(SELECT p.id FROM task p WHERE p.id = c.target_task_id AND p.id <> c.id),
+	(SELECT o.id FROM task o WHERE o.superseded_by = c.id AND o.id <> c.id ORDER BY o.id LIMIT 1),
+	(SELECT p.id FROM task_link l JOIN task p ON p.id = l.value
+		WHERE l.task_id = c.id AND l.kind = 'continuation_parent' AND l.tombstoned_at IS NULL AND p.id <> c.id
+		ORDER BY p.id LIMIT 1))`
+
+// topicAnchorSQL resolves the topic anchor of the outer task row by walking lineage
+// upward; it requires the outer query to read FROM task unaliased. The walk is bounded by
+// lineage depth and ends on a cycle (UNION dedupes), where it yields no root and the
+// caller falls back to the task itself.
+const topicAnchorSQL = `COALESCE((
+	WITH RECURSIVE lineage_up(id, parent_id) AS (
+		SELECT c.id, ` + lineageParentSQL + ` FROM task c WHERE c.id = task.id
+		UNION
+		SELECT c.id, ` + lineageParentSQL + ` FROM task c JOIN lineage_up u ON c.id = u.parent_id
+	)
+	SELECT id FROM lineage_up WHERE parent_id IS NULL LIMIT 1
+), task.id)`
+
+// taskTopicColumns are the two Task columns that expose the topic: the effective priority
+// (the anchor's priority, which Set and Front write across the topic and which descendants
+// born later inherit by lineage) and the anchor id. Every Task read selects them in this
+// order, after the row's own columns, so all views agree.
+const taskTopicColumns = `COALESCE((SELECT a.priority FROM task a WHERE a.id = ` + topicAnchorSQL + `), task.priority) AS topic_priority,
+		` + topicAnchorSQL + ` AS topic_anchor_id`
+
 func loadTopicGraph(ctx context.Context, q queryer) (*topicGraph, error) {
 	g := &topicGraph{
 		nodes:    map[string]topicNode{},
@@ -116,27 +148,21 @@ func loadTopicGraph(ctx context.Context, q queryer) (*topicGraph, error) {
 		children: map[string][]string{},
 	}
 
-	type edge struct{ child, parent string }
-	var targets, supersedes, continuations []edge
-
-	rows, err := q.QueryContext(ctx, `SELECT id, state, archived_at IS NOT NULL, priority, target_task_id, superseded_by FROM task`)
+	rows, err := q.QueryContext(ctx, `SELECT c.id, c.state, c.archived_at IS NOT NULL, c.priority, `+lineageParentSQL+` FROM task c`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load task lineage: %w", err)
 	}
 	for rows.Next() {
 		var id string
 		var node topicNode
-		var target, supersededBy *string
-		if err := rows.Scan(&id, &node.state, &node.archived, &node.priority, &target, &supersededBy); err != nil {
+		var parent *string
+		if err := rows.Scan(&id, &node.state, &node.archived, &node.priority, &parent); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("failed to scan task lineage: %w", err)
 		}
 		g.nodes[id] = node
-		if target != nil {
-			targets = append(targets, edge{id, *target})
-		}
-		if supersededBy != nil {
-			supersedes = append(supersedes, edge{*supersededBy, id})
+		if parent != nil {
+			g.parent[id] = *parent
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -145,38 +171,6 @@ func loadTopicGraph(ctx context.Context, q queryer) (*topicGraph, error) {
 	}
 	rows.Close()
 
-	linkRows, err := q.QueryContext(ctx, `SELECT task_id, value FROM task_link WHERE kind = 'continuation_parent' AND tombstoned_at IS NULL`)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load continuation lineage: %w", err)
-	}
-	for linkRows.Next() {
-		var child, parent string
-		if err := linkRows.Scan(&child, &parent); err != nil {
-			linkRows.Close()
-			return nil, fmt.Errorf("failed to scan continuation lineage: %w", err)
-		}
-		continuations = append(continuations, edge{child, parent})
-	}
-	if err := linkRows.Err(); err != nil {
-		linkRows.Close()
-		return nil, fmt.Errorf("failed to iterate continuation lineage: %w", err)
-	}
-	linkRows.Close()
-
-	for _, group := range [][]edge{targets, supersedes, continuations} {
-		for _, e := range group {
-			if _, ok := g.nodes[e.child]; !ok {
-				continue
-			}
-			if _, ok := g.nodes[e.parent]; !ok {
-				continue
-			}
-			if _, set := g.parent[e.child]; set || e.child == e.parent {
-				continue
-			}
-			g.parent[e.child] = e.parent
-		}
-	}
 	for child, parent := range g.parent {
 		g.children[parent] = append(g.children[parent], child)
 	}
@@ -186,14 +180,18 @@ func loadTopicGraph(ctx context.Context, q queryer) (*topicGraph, error) {
 	return g, nil
 }
 
-// root walks up to the topic anchor. The visited set only guards against a corrupt
-// cycle, where the walk stops at the first repeated task.
+// root walks up to the topic anchor. A corrupt cycle has no root, so the task is its own
+// anchor, matching topicAnchorSQL.
 func (g *topicGraph) root(id string) string {
+	start := id
 	seen := map[string]bool{id: true}
 	for {
 		parent, ok := g.parent[id]
-		if !ok || seen[parent] {
+		if !ok {
 			return id
+		}
+		if seen[parent] {
+			return start
 		}
 		seen[parent] = true
 		id = parent
@@ -230,16 +228,6 @@ func (g *topicGraph) outstandingTopics() map[string]int64 {
 		out[anchor] = g.nodes[anchor].priority
 	}
 	return out
-}
-
-// resolveTopicAnchor returns the lineage root of a task from the known lifecycle
-// relations, whether or not the topic was ever reprioritized.
-func (s *sqliteStore) resolveTopicAnchor(ctx context.Context, q queryer, taskID string) (string, error) {
-	g, err := loadTopicGraph(ctx, q)
-	if err != nil {
-		return "", err
-	}
-	return g.root(taskID), nil
 }
 
 func priorityRequestHash(action, taskID string, priority int64, actor, reason string) string {
@@ -356,7 +344,7 @@ func (s *sqliteStore) applyPriorityAction(ctx context.Context, action, actionKey
 	}
 
 	for _, memberID := range graph.members(anchorID) {
-		if _, err := tx.ExecContext(ctx, `UPDATE task SET priority = ?, topic_anchor_id = ? WHERE id = ?`, newPriority, anchorID, memberID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE task SET priority = ? WHERE id = ?`, newPriority, memberID); err != nil {
 			return PriorityChange{}, fmt.Errorf("failed to update topic priority: %w", err)
 		}
 	}

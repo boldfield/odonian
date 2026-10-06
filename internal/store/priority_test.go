@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 type priorityFixture struct {
@@ -214,12 +215,11 @@ func TestPriorityDefaultsOnMigratedDatabase(t *testing.T) {
 	}
 
 	var priority int64
-	var anchor sql.NullString
-	if err := conn.QueryRowContext(ctx, `SELECT priority, topic_anchor_id FROM task WHERE id = 'old'`).Scan(&priority, &anchor); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT priority FROM task WHERE id = 'old'`).Scan(&priority); err != nil {
 		t.Fatal(err)
 	}
-	if priority != 500 || anchor.Valid {
-		t.Fatalf("migrated row priority=%d anchor=%v, want 500 and NULL", priority, anchor)
+	if priority != 500 {
+		t.Fatalf("migrated row priority=%d, want 500", priority)
 	}
 	if _, err := conn.ExecContext(ctx, `UPDATE task SET priority = 0 WHERE id = 'old'`); err == nil {
 		t.Fatal("priority below 1 must violate the column CHECK")
@@ -923,5 +923,100 @@ func TestListTasksOrdersByPriorityThenCreatedAtThenID(t *testing.T) {
 		if listed[i].ID != rows[i].id {
 			t.Fatalf("position %d = %s, want %s", i, listed[i].ID, rows[i].id)
 		}
+	}
+}
+
+func (f *priorityFixture) listed(id string) Task {
+	f.t.Helper()
+	tasks, err := f.store.ListTasks(f.ctx, f.projectID, TaskListFilter{IncludeSuperseded: true})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	for _, task := range tasks {
+		if task.ID == id {
+			return task
+		}
+	}
+	f.t.Fatalf("task %s not listed", id)
+	return Task{}
+}
+
+func TestTaskViewsAgreeOnAnchorBeforeAndAfterAnyPriorityAction(t *testing.T) {
+	f := newPriorityFixture(t)
+	l := f.buildLineage()
+
+	graph, err := loadTopicGraph(f.ctx, f.store.Conn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := append(l.members(), l.outsiders()...)
+	check := func(stage string, wantMemberPriority int64) {
+		t.Helper()
+		for _, id := range all {
+			wantAnchor := graph.root(id)
+			if got := f.get(id).TopicAnchorID; got != wantAnchor {
+				t.Fatalf("%s: GetTask anchor of %s = %s, want %s", stage, id, got, wantAnchor)
+			}
+			if got := f.listed(id).TopicAnchorID; got != wantAnchor {
+				t.Fatalf("%s: ListTasks anchor of %s = %s, want %s", stage, id, got, wantAnchor)
+			}
+		}
+		for _, id := range l.members() {
+			if got := f.get(id).Priority; got != wantMemberPriority {
+				t.Fatalf("%s: GetTask priority of %s = %d, want %d", stage, id, got, wantMemberPriority)
+			}
+			if got := f.listed(id).Priority; got != wantMemberPriority {
+				t.Fatalf("%s: ListTasks priority of %s = %d, want %d", stage, id, got, wantMemberPriority)
+			}
+		}
+	}
+	check("never reprioritized", 500)
+	f.front("front-anchor", l.anchor)
+	check("after front", 1001)
+}
+
+func TestDescendantBornAfterFrontInheritsEffectivePriorityInEveryView(t *testing.T) {
+	f := newPriorityFixture(t)
+	parent := f.task("review", 500)
+	rival := f.task("ready", 730)
+	change := f.front("front-parent", parent)
+	if change.Priority != 1001 {
+		t.Fatalf("front = %d, want 1001", change.Priority)
+	}
+
+	late := f.task("ready", 500)
+	f.exec(`UPDATE task SET kind = 'review', target_task_id = ? WHERE id = ?`, parent, late)
+
+	if got := f.get(late); got.Priority != 1001 || got.TopicAnchorID != parent {
+		t.Fatalf("GetTask late review priority=%d anchor=%s, want 1001 and %s", got.Priority, got.TopicAnchorID, parent)
+	}
+	listed := f.listed(late)
+	if listed.Priority != 1001 || listed.TopicAnchorID != parent {
+		t.Fatalf("ListTasks late review priority=%d anchor=%s, want 1001 and %s", listed.Priority, listed.TopicAnchorID, parent)
+	}
+	if f.priorityOf(rival) != 730 {
+		t.Fatalf("unrelated topic changed")
+	}
+
+	tasks, err := f.store.ListTasks(f.ctx, f.projectID, TaskListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := map[string]int{}
+	for i, task := range tasks {
+		position[task.ID] = i
+	}
+	if position[late] > position[rival] || position[parent] > position[rival] {
+		t.Fatalf("topic members must sort ahead of the 730 topic: %v", position)
+	}
+
+	claimed := f.task("ready", 500)
+	f.exec(`UPDATE task SET target_task_id = ? WHERE id = ?`, parent, claimed)
+	got, err := f.store.ClaimTask(f.ctx, claimed, "agent-1", "haiku", time.Hour)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if got.Priority != 1001 || got.TopicAnchorID != parent {
+		t.Fatalf("ClaimTask priority=%d anchor=%s, want 1001 and %s", got.Priority, got.TopicAnchorID, parent)
 	}
 }
