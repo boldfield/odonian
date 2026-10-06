@@ -697,13 +697,17 @@ func executeTasks(ctx context.Context, baseURL, token string, jsonOutput bool, a
 		fmt.Fprintln(out, string(output))
 	} else {
 		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tSTATE\tMODEL\tKIND\tTITLE")
+		fmt.Fprintln(w, "ID\tSTATE\tMODEL\tKIND\tPRIORITY\tTITLE")
 		for _, task := range filtered {
 			id := task.ID
 			if len(id) > 8 {
 				id = id[:8]
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, task.State, task.Model, task.Kind, task.Title)
+			priorityStr := ""
+			if task.Priority != nil {
+				priorityStr = fmt.Sprintf("%d", *task.Priority)
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", id, task.State, task.Model, task.Kind, priorityStr, task.Title)
 		}
 		w.Flush()
 	}
@@ -792,6 +796,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		fmt.Fprintf(out, "Kind: %s\n", task.Kind)
 		if task.Branch != "" {
 			fmt.Fprintf(out, "Branch: %s\n", task.Branch)
+		}
+		if task.Priority != nil {
+			fmt.Fprintf(out, "Priority: %d\n", *task.Priority)
+		}
+		if task.TopicAnchorID != nil {
+			fmt.Fprintf(out, "Topic Anchor ID: %s\n", *task.TopicAnchorID)
 		}
 		fmt.Fprintf(out, "Title: %s\n", task.Title)
 		fmt.Fprintf(out, "Spec: %s\n", task.Spec)
@@ -1256,6 +1266,7 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 	frontFlag := fs.Bool("front", false, "move to front")
 	resetFlag := fs.Bool("reset", false, "reset to default priority (500)")
 	reasonFlag := fs.String("reason", "", "reason for the priority change (required)")
+	actionKeyFlag := fs.String("action-key", "", "optional action key for idempotent retries")
 	positionals, err := parseFlagsWithPositionals(fs, args)
 	if err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
@@ -1303,8 +1314,13 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
 
-	// Generate action key once per invocation for idempotency
-	actionKey := generateActionKey()
+	// Use provided action key if available, otherwise generate a new one for idempotency
+	var actionKey string
+	if *actionKeyFlag != "" {
+		actionKey = *actionKeyFlag
+	} else {
+		actionKey = generateActionKey()
+	}
 
 	var result tuiclient.PriorityChange
 	if setFlagProvided {
@@ -1350,6 +1366,7 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		fmt.Fprintf(out, "Action: %s\n", result.Action)
 		fmt.Fprintf(out, "Task ID: %s\n", result.TaskID)
 		fmt.Fprintf(out, "Topic Anchor ID: %s\n", result.TopicAnchorID)
+		fmt.Fprintf(out, "Action Key: %s\n", actionKey)
 		fmt.Fprintf(out, "Old Priority: %d\n", result.OldPriority)
 		fmt.Fprintf(out, "New Priority: %d\n", result.Priority)
 		if result.QueueMaxPriority != nil {
