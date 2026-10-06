@@ -15,11 +15,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/boldfield/odonian/internal/api"
 	"github.com/boldfield/odonian/internal/forge"
@@ -170,7 +173,7 @@ func run(args []string) error {
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
-	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize":
+	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize", "priority":
 		return runClient(args[1], args[2:])
 	default:
 		if evaluationVerbs[args[1]] {
@@ -214,6 +217,7 @@ Commands:
   research-status        Get current research pool status
   permit-renew           Renew a research permit
   permit-finalize        Finalize a research permit
+  priority               Set task priority or move to front
   evaluation-*           Isolated reviewer-comparison campaigns (see AGENT-API.md)
   help, -h, --help       Show this help message
 `, version)
@@ -529,6 +533,8 @@ func runClient(verb string, args []string) error {
 		return executePermitRenew(ctx, baseURL, token, args, os.Stdout)
 	case "permit-finalize":
 		return executePermitFinalize(ctx, baseURL, token, args, os.Stdout)
+	case "priority":
+		return executePriority(ctx, baseURL, token, jsonOutput, args, os.Stdout)
 	default:
 		if evaluationVerbs[verb] {
 			return executeEvaluation(ctx, verb, baseURL, token, args, os.Stdout)
@@ -692,13 +698,17 @@ func executeTasks(ctx context.Context, baseURL, token string, jsonOutput bool, a
 		fmt.Fprintln(out, string(output))
 	} else {
 		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tSTATE\tMODEL\tKIND\tTITLE")
+		fmt.Fprintln(w, "ID\tSTATE\tMODEL\tKIND\tPRIORITY\tTITLE")
 		for _, task := range filtered {
 			id := task.ID
 			if len(id) > 8 {
 				id = id[:8]
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, task.State, task.Model, task.Kind, task.Title)
+			priorityStr := ""
+			if task.Priority != nil {
+				priorityStr = fmt.Sprintf("%d", *task.Priority)
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", id, task.State, task.Model, task.Kind, priorityStr, task.Title)
 		}
 		w.Flush()
 	}
@@ -787,6 +797,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		fmt.Fprintf(out, "Kind: %s\n", task.Kind)
 		if task.Branch != "" {
 			fmt.Fprintf(out, "Branch: %s\n", task.Branch)
+		}
+		if task.Priority != nil {
+			fmt.Fprintf(out, "Priority: %d\n", *task.Priority)
+		}
+		if task.TopicAnchorID != nil {
+			fmt.Fprintf(out, "Topic Anchor ID: %s\n", *task.TopicAnchorID)
 		}
 		fmt.Fprintf(out, "Title: %s\n", task.Title)
 		fmt.Fprintf(out, "Spec: %s\n", task.Spec)
@@ -1237,6 +1253,203 @@ func executeHeartbeat(ctx context.Context, baseURL, token string, args []string)
 	return nil
 }
 
+const priorityUsage = `usage: odonian priority <task-id> (--set N | --front | --reset) --reason <reason> [--action-key <key>]
+  --set N:      Set the topic priority to integer N, 1..1000
+  --front:      Move to front; the server atomically assigns max(1000, max queued priority) + 1,
+                so the result is always above 1000. No numeric value is accepted.
+  --reset:      Reset the topic priority to the default, 500
+  --reason:     Required; the reason for this change
+  --action-key: Optional; reuse the printed key to retry the same action without repeating it
+Exactly one of --set, --front, --reset is required.
+Notes: filters (project/model/kind) do not scope the global Front maximum, which covers all
+outstanding non-archived topics on the server. Changing priority only reorders work; it does
+not release holds or promote backlog work.
+`
+
+func priorityActor() string {
+	if agentID := os.Getenv("AGENT_ID"); agentID != "" {
+		return agentID
+	}
+	return "odonian-cli"
+}
+
+func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool, args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("priority", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	setFlag := fs.Int64("set", 0, "set priority to N (1-1000)")
+	frontFlag := fs.Bool("front", false, "move to front")
+	resetFlag := fs.Bool("reset", false, "reset to default priority (500)")
+	reasonFlag := fs.String("reason", "", "reason for the priority change (required)")
+	actionKeyFlag := fs.String("action-key", "", "optional action key for idempotent retries")
+	positionals, err := parseFlagsWithPositionals(fs, args)
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Fprint(out, priorityUsage)
+		return nil
+	}
+	if err != nil {
+		fmt.Fprint(os.Stderr, priorityUsage)
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	if len(positionals) < 1 {
+		fmt.Fprint(os.Stderr, priorityUsage)
+		return fmt.Errorf("task ID is required")
+	}
+	if len(positionals) > 1 {
+		return fmt.Errorf("exactly one task ID required; got %d positional arguments", len(positionals))
+	}
+	taskID := positionals[0]
+
+	if *reasonFlag == "" {
+		return fmt.Errorf("--reason flag is required")
+	}
+
+	// Check if --set flag was explicitly provided (handles --set 0 case)
+	setFlagProvided := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "set" {
+			setFlagProvided = true
+		}
+	})
+
+	// Count how many operations are specified (should be exactly one)
+	numOps := 0
+	if setFlagProvided {
+		numOps++
+	}
+	if *frontFlag {
+		numOps++
+	}
+	if *resetFlag {
+		numOps++
+	}
+
+	if numOps != 1 {
+		return fmt.Errorf("exactly one of --set, --front, or --reset must be specified")
+	}
+
+	// Validate --set value if provided
+	if setFlagProvided {
+		if *setFlag < 1 || *setFlag > 1000 {
+			return fmt.Errorf("priority must be an integer between 1 and 1000")
+		}
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+
+	// Use provided action key if available, otherwise generate a new one for idempotency
+	var actionKey string
+	if *actionKeyFlag != "" {
+		actionKey = *actionKeyFlag
+	} else {
+		actionKey = generateActionKey()
+	}
+
+	// Print action key to stderr before sending request so operator has it even on failure
+	fmt.Fprintf(os.Stderr, "Action Key: %s\n", actionKey)
+
+	var result tuiclient.PriorityChange
+	if setFlagProvided {
+		req := tuiclient.SetTaskPriorityRequest{
+			ActionKey: actionKey,
+			Priority:  *setFlag,
+			Actor:     priorityActor(),
+			Reason:    *reasonFlag,
+		}
+		result, err = client.SetTaskPriority(ctx, taskID, req)
+		if err != nil {
+			return fmt.Errorf("failed to set priority (action key %s): %w", actionKey, err)
+		}
+	} else if *frontFlag {
+		req := tuiclient.MoveTaskToFrontRequest{
+			ActionKey: actionKey,
+			Actor:     priorityActor(),
+			Reason:    *reasonFlag,
+		}
+		result, err = client.MoveTaskToFront(ctx, taskID, req)
+		if err != nil {
+			return fmt.Errorf("failed to move to front (action key %s): %w", actionKey, err)
+		}
+	} else if *resetFlag {
+		req := tuiclient.SetTaskPriorityRequest{
+			ActionKey: actionKey,
+			Priority:  500,
+			Actor:     priorityActor(),
+			Reason:    *reasonFlag,
+		}
+		result, err = client.SetTaskPriority(ctx, taskID, req)
+		if err != nil {
+			return fmt.Errorf("failed to reset priority (action key %s): %w", actionKey, err)
+		}
+	}
+
+	// Ensure the result includes the action key
+	result.ActionKey = actionKey
+
+	// Output result
+	if jsonOutput {
+		if err := json.NewEncoder(out).Encode(result); err != nil {
+			return fmt.Errorf("failed to encode JSON: %w", err)
+		}
+	} else {
+		fmt.Fprintf(out, "Action: %s\n", result.Action)
+		fmt.Fprintf(out, "Task ID: %s\n", result.TaskID)
+		fmt.Fprintf(out, "Topic Anchor ID: %s\n", result.TopicAnchorID)
+		fmt.Fprintf(out, "Action Key: %s\n", actionKey)
+		fmt.Fprintf(out, "Old Priority: %d\n", result.OldPriority)
+		fmt.Fprintf(out, "New Priority: %d\n", result.Priority)
+		if result.QueueMaxPriority != nil {
+			fmt.Fprintf(out, "Queue Max Priority: %d\n", *result.QueueMaxPriority)
+		}
+		if result.Replayed {
+			fmt.Fprintf(out, "Status: Replayed (idempotent)\n")
+		}
+	}
+
+	return nil
+}
+
+// sortTasksByPriorityOrder applies the single queue comparator: priority
+// descending (unset means the default 500), created_at ascending, ID ascending.
+func sortTasksByPriorityOrder(tasks []tuiclient.Task) {
+	effectivePriority := func(task tuiclient.Task) int64 {
+		if task.Priority == nil {
+			return 500
+		}
+		return *task.Priority
+	}
+	sort.SliceStable(tasks, func(left, right int) bool {
+		leftPriority, rightPriority := effectivePriority(tasks[left]), effectivePriority(tasks[right])
+		if leftPriority != rightPriority {
+			return leftPriority > rightPriority
+		}
+		if tasks[left].CreatedAt != tasks[right].CreatedAt {
+			leftTime, leftErr := time.Parse(time.RFC3339Nano, tasks[left].CreatedAt)
+			rightTime, rightErr := time.Parse(time.RFC3339Nano, tasks[right].CreatedAt)
+			if leftErr == nil && rightErr == nil && !leftTime.Equal(rightTime) {
+				return leftTime.Before(rightTime)
+			}
+			if leftErr != nil || rightErr != nil {
+				return tasks[left].CreatedAt < tasks[right].CreatedAt
+			}
+		}
+		return tasks[left].ID < tasks[right].ID
+	})
+}
+
+// generateActionKey creates a stable action key for idempotency using a UUID.
+// This key is stable across retries of the same operation.
+func generateActionKey() string {
+	return fmt.Sprintf("odonian-cli-%s", uuid.New().String())
+}
+
 // parseSlowRequestThreshold parses ODONIAN_SLOW_REQUEST_MS.
 // Returns the threshold in milliseconds. Default is 500ms;
 // negative or non-integer values fall back to default with warning.
@@ -1510,6 +1723,7 @@ func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		return &claimError{message: "nothing claimable", code: 2}
 	}
 
+	sortTasksByPriorityOrder(tasks)
 	task := tasks[0]
 
 	if *claimFlag {

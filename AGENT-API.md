@@ -645,6 +645,30 @@ curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/priority/front" \
 **Response:** `200 OK` with `{"priority": <int>, "topic_anchor_id": "<task_id>", "replayed": <bool>}`;
 priority is always >1000 and strictly increases on subsequent calls with different keys.
 
+### CLI: priority management
+
+The `odonian priority` command provides CLI access to priority management.
+
+```bash
+odonian priority <task-id> --set <N> --reason "<reason>"          # Set priority 1-1000
+odonian priority <task-id> --front --reason "<reason>"             # Move to front (>1000)
+odonian priority <task-id> --reset --reason "<reason>"             # Reset to default (500)
+odonian priority <task-id> --set <N> --action-key "<key>" --reason "<reason>"  # Use provided action key for retries
+```
+
+- `--set <N>`: Set priority to N (1–1000); returns `INVALID_PRIORITY` if outside range
+- `--front`: Move task to front; the server atomically assigns `max(1000, max queued priority) + 1` (always >1000)
+- `--reset`: Reset priority to default value (500)
+- `--reason`: Why the priority is being changed (required)
+- `--action-key`: Optional action key for idempotent retries; if omitted, generates a new UUID per invocation
+
+**Output:** displays action key, old/new priority values, and `Replayed: true` if idempotently matched.
+
+**Important:** Priority changes do not affect task eligibility or permissions. Filters in `odonian next`
+do not change the global "front" maximum calculation—the server always assigns a value exceeding all
+manually-assignable priorities. A task's `held` status and merge gates are preserved regardless of
+priority changes.
+
 Both priority endpoints:
 - Return `404 NOT_FOUND` if the task does not exist
 - Return `409 ARCHIVED` if the task has been archived

@@ -42,6 +42,8 @@ type Client interface {
 	GetResearchStatus(ctx context.Context) (ResearchStatus, error)
 	RenewResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error)
 	FinalizeResearchPermit(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error)
+	SetTaskPriority(ctx context.Context, taskID string, req SetTaskPriorityRequest) (PriorityChange, error)
+	MoveTaskToFront(ctx context.Context, taskID string, req MoveTaskToFrontRequest) (PriorityChange, error)
 }
 
 // Response structs for the TUI client (distinct from internal/store)
@@ -51,6 +53,32 @@ type Project struct {
 	Name      string `json:"name"`
 	Repo      string `json:"repo"`
 	CreatedAt string `json:"created_at"`
+}
+
+type SetTaskPriorityRequest struct {
+	ActionKey string `json:"action_key"`
+	Priority  int64  `json:"priority"`
+	Actor     string `json:"actor"`
+	Reason    string `json:"reason"`
+}
+
+type MoveTaskToFrontRequest struct {
+	ActionKey string `json:"action_key"`
+	Actor     string `json:"actor"`
+	Reason    string `json:"reason"`
+}
+
+type PriorityChange struct {
+	Action           string `json:"action"`
+	TaskID           string `json:"task_id"`
+	TopicAnchorID    string `json:"topic_anchor_id"`
+	ActionKey        string `json:"action_key"`
+	OldPriority      int64  `json:"old_priority"`
+	Priority         int64  `json:"priority"`
+	QueueMaxPriority *int64 `json:"queue_max_priority,omitempty"`
+	Actor            string `json:"actor"`
+	Reason           string `json:"reason"`
+	Replayed         bool   `json:"replayed"`
 }
 
 type Task struct {
@@ -68,6 +96,8 @@ type Task struct {
 	LeaseExpiresAt *string `json:"lease_expires_at"`
 	Result         *string `json:"result"`
 	Held           bool    `json:"held"`
+	Priority       *int64  `json:"priority"`
+	TopicAnchorID  *string `json:"topic_anchor_id"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`
 }
@@ -92,6 +122,8 @@ type TaskDetail struct {
 	LeaseExpiresAt      *string              `json:"lease_expires_at"`
 	Result              *string              `json:"result"`
 	Held                bool                 `json:"held"`
+	Priority            *int64               `json:"priority"`
+	TopicAnchorID       *string              `json:"topic_anchor_id"`
 	ReviewRound         int                  `json:"review_round"`
 	TargetTaskID        *string              `json:"target_task_id"`
 	AgentMerge          bool                 `json:"agent_merge"`
@@ -1063,4 +1095,36 @@ func (c *HTTPClient) FinalizeResearchPermit(ctx context.Context, permitID, taskI
 	}
 
 	return result.Attempt, nil
+}
+
+// SetTaskPriority sets manual priority (1..1000) for a task's topic.
+func (c *HTTPClient) SetTaskPriority(ctx context.Context, taskID string, req SetTaskPriorityRequest) (PriorityChange, error) {
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/priority/set", url.PathEscape(taskID)), req)
+	if err != nil {
+		return PriorityChange{}, err
+	}
+	defer resp.Body.Close()
+
+	var result PriorityChange
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return PriorityChange{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return result, nil
+}
+
+// MoveTaskToFront moves a task's topic to the front of the queue.
+func (c *HTTPClient) MoveTaskToFront(ctx context.Context, taskID string, req MoveTaskToFrontRequest) (PriorityChange, error) {
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/priority/front", url.PathEscape(taskID)), req)
+	if err != nil {
+		return PriorityChange{}, err
+	}
+	defer resp.Body.Close()
+
+	var result PriorityChange
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return PriorityChange{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return result, nil
 }

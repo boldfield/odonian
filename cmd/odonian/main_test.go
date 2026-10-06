@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/boldfield/odonian/internal/forge"
@@ -1813,6 +1814,62 @@ func TestExecuteTasksMissingToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ODONIAN_TOKEN") {
 		t.Errorf("expected error to mention ODONIAN_TOKEN, got: %v", err)
+	}
+}
+
+func TestExecuteTasksPriority(t *testing.T) {
+	// Test that priority is displayed in the tasks table output
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/proj-1/tasks" {
+			w.Header().Set("Content-Type", "application/json")
+			priority600 := int64(600)
+			priority1001 := int64(1001) // Above 1000, from Front action
+			json.NewEncoder(w).Encode([]tuiclient.Task{
+				{
+					ID:       "task-1",
+					State:    "ready",
+					Model:    "haiku",
+					Kind:     "implement",
+					Title:    "Task with Priority 600",
+					Priority: &priority600,
+				},
+				{
+					ID:       "task-2",
+					State:    "ready",
+					Model:    "haiku",
+					Kind:     "implement",
+					Title:    "Task with Priority 1001",
+					Priority: &priority1001,
+				},
+				{
+					ID:    "task-3",
+					State: "ready",
+					Model: "haiku",
+					Kind:  "implement",
+					Title: "Task without Priority",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeTasks(context.Background(), server.URL, "test-token", false, []string{"--project", "proj-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeTasks failed: %v", err)
+	}
+
+	output := buf.String()
+	// Check that PRIORITY column header is present
+	if !strings.Contains(output, "PRIORITY") {
+		t.Errorf("expected 'PRIORITY' column header in output, got: %s", output)
+	}
+	// Check that values are displayed (600, 1001, empty for task-3)
+	if !strings.Contains(output, "600") {
+		t.Errorf("expected priority value '600' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "1001") {
+		t.Errorf("expected priority value '1001' in output, got: %s", output)
 	}
 }
 
@@ -5872,6 +5929,86 @@ func TestExecuteShowJSONKeepsContinuationAndFollowUpsSeparate(t *testing.T) {
 	}
 }
 
+func TestExecuteShowPriority(t *testing.T) {
+	// Test that priority and topic anchor are displayed in show output
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+			w.Header().Set("Content-Type", "application/json")
+			priority600 := int64(600)
+			topicID := "topic-anchor-123"
+
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:            "task-1",
+				State:         "ready",
+				Model:         "haiku",
+				Kind:          "implement",
+				Title:         "Task with Priority",
+				Spec:          "Test spec",
+				Priority:      &priority600,
+				TopicAnchorID: &topicID,
+			})
+		}
+		if r.URL.Path == "/tasks/task-1/events" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	// Check that priority is displayed
+	if !strings.Contains(output, "Priority: 600") {
+		t.Errorf("expected 'Priority: 600' in output, got: %s", output)
+	}
+	// Check that topic anchor is displayed
+	if !strings.Contains(output, "Topic Anchor ID: topic-anchor-123") {
+		t.Errorf("expected 'Topic Anchor ID: topic-anchor-123' in output, got: %s", output)
+	}
+}
+
+func TestExecuteShowPriorityAbove1000(t *testing.T) {
+	// Test that priority values above 1000 (from Front action) are displayed
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+			w.Header().Set("Content-Type", "application/json")
+			priority := int64(1001) // From Front action
+
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:       "task-1",
+				State:    "ready",
+				Model:    "haiku",
+				Kind:     "implement",
+				Title:    "Task with Front Priority",
+				Spec:     "Test spec",
+				Priority: &priority,
+			})
+		}
+		if r.URL.Path == "/tasks/task-1/events" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	// Check that priority above 1000 is displayed
+	if !strings.Contains(output, "Priority: 1001") {
+		t.Errorf("expected 'Priority: 1001' in output, got: %s", output)
+	}
+}
+
 func TestPermitRenewConflictExitCodes(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -6135,6 +6272,87 @@ func TestExecuteNextNotBeforeOnlyDenial(t *testing.T) {
 	}
 }
 
+func TestExecuteNextPriorityOrdering(t *testing.T) {
+	priorityOf := func(value int64) *int64 { return &value }
+	testCases := []struct {
+		name     string
+		tasks    []tuiclient.Task
+		wantTask string
+	}{
+		{
+			name: "higher priority wins over older lower priority",
+			tasks: []tuiclient.Task{
+				{ID: "task-old-500", Priority: priorityOf(500), CreatedAt: "2026-01-01T08:00:00Z"},
+				{ID: "task-new-800", Priority: priorityOf(800), CreatedAt: "2026-01-01T10:00:00Z"},
+			},
+			wantTask: "task-new-800",
+		},
+		{
+			name: "value above 1000 beats 1000",
+			tasks: []tuiclient.Task{
+				{ID: "task-1000", Priority: priorityOf(1000), CreatedAt: "2026-01-01T08:00:00Z"},
+				{ID: "task-1001", Priority: priorityOf(1001), CreatedAt: "2026-01-01T10:00:00Z"},
+			},
+			wantTask: "task-1001",
+		},
+		{
+			name: "equal priority picks oldest created_at",
+			tasks: []tuiclient.Task{
+				{ID: "task-600-new", Priority: priorityOf(600), CreatedAt: "2026-01-01T11:00:00Z"},
+				{ID: "task-600-old", Priority: priorityOf(600), CreatedAt: "2026-01-01T09:00:00Z"},
+			},
+			wantTask: "task-600-old",
+		},
+		{
+			name: "equal priority and created_at picks lowest id",
+			tasks: []tuiclient.Task{
+				{ID: "task-b", Priority: priorityOf(600), CreatedAt: "2026-01-01T09:00:00Z"},
+				{ID: "task-a", Priority: priorityOf(600), CreatedAt: "2026-01-01T09:00:00Z"},
+			},
+			wantTask: "task-a",
+		},
+		{
+			name: "unset priority counts as default 500",
+			tasks: []tuiclient.Task{
+				{ID: "task-499", Priority: priorityOf(499), CreatedAt: "2026-01-01T08:00:00Z"},
+				{ID: "task-unset", CreatedAt: "2026-01-01T10:00:00Z"},
+			},
+			wantTask: "task-unset",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			// The fake server deliberately returns the list in the wrong order so the
+			// test proves the CLI applies the comparator rather than trusting list order.
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				tasks := make([]tuiclient.Task, len(testCase.tasks))
+				copy(tasks, testCase.tasks)
+				for index := range tasks {
+					tasks[index].State = "ready"
+					tasks[index].Model = "haiku"
+					tasks[index].Kind = "implement"
+				}
+				json.NewEncoder(w).Encode(tasks)
+			}))
+			defer server.Close()
+
+			output := captureStdout(t, func() {
+				err := executeNext(context.Background(), server.URL, "test-token", false, []string{
+					"--project", "proj-1", "--model", "haiku", "--kind", "implement",
+				})
+				if err != nil {
+					t.Fatalf("executeNext failed: %v", err)
+				}
+			})
+			if strings.TrimSpace(output) != testCase.wantTask {
+				t.Errorf("executeNext selected %q, want %q", strings.TrimSpace(output), testCase.wantTask)
+			}
+		})
+	}
+}
+
 func TestClaimRequestIdentityConflictsExit11(t *testing.T) {
 	t.Setenv("AGENT_ID", "test-agent")
 	t.Setenv("AGENT_MODEL", "haiku")
@@ -6363,4 +6581,440 @@ func captureStdout(t *testing.T, fn func()) string {
 	var buf bytes.Buffer
 	buf.ReadFrom(r)
 	return buf.String()
+}
+
+func TestExecutePrioritySetValid(t *testing.T) {
+	tests := []struct {
+		name     string
+		priority int64
+	}{
+		{"min boundary", 1},
+		{"default value", 500},
+		{"max boundary", 1000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/tasks/task-123/priority/set" && r.Method == "POST" {
+					var req tuiclient.SetTaskPriorityRequest
+					json.NewDecoder(r.Body).Decode(&req)
+					json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+						Action:           "set",
+						TaskID:           "task-123",
+						TopicAnchorID:    "topic-123",
+						ActionKey:        req.ActionKey,
+						OldPriority:      500,
+						Priority:         tt.priority,
+						QueueMaxPriority: nil,
+						Replayed:         false,
+					})
+				} else {
+					w.WriteHeader(http.StatusNotFound)
+					json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+				}
+			}))
+			defer server.Close()
+
+			buf := &bytes.Buffer{}
+			err := executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--set", fmt.Sprintf("%d", tt.priority), "--reason", "test reason"}, buf)
+			if err != nil {
+				t.Fatalf("executePriority failed: %v", err)
+			}
+
+			output := buf.String()
+			if !strings.Contains(output, "New Priority") {
+				t.Errorf("expected output to contain 'New Priority', got: %s", output)
+			}
+		})
+	}
+}
+
+func TestExecutePrioritySetInvalid(t *testing.T) {
+	tests := []struct {
+		name     string
+		priority string
+		wantErr  string
+	}{
+		{"zero value", "0", "priority must be an integer between 1 and 1000"},
+		{"negative value", "-1", "priority must be an integer between 1 and 1000"},
+		{"above max", "1001", "priority must be an integer between 1 and 1000"},
+		{"way above max", "9999", "priority must be an integer between 1 and 1000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("server should not be called for invalid input")
+			}))
+			defer server.Close()
+
+			buf := &bytes.Buffer{}
+			err := executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--set", tt.priority, "--reason", "test reason"}, buf)
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestExecutePriorityFront(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/tasks/task-123/priority/front" && r.Method == "POST" {
+			var req tuiclient.MoveTaskToFrontRequest
+			json.NewDecoder(r.Body).Decode(&req)
+			queueMax := int64(1001)
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:           "front",
+				TaskID:           "task-123",
+				TopicAnchorID:    "topic-123",
+				ActionKey:        req.ActionKey,
+				OldPriority:      500,
+				Priority:         1001,
+				QueueMaxPriority: &queueMax,
+				Replayed:         false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--front", "--reason", "test reason"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority --front failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Action: front") {
+		t.Errorf("expected output to contain 'Action: front', got: %s", output)
+	}
+	if !strings.Contains(output, "New Priority: 1001") {
+		t.Errorf("expected output to contain 'New Priority: 1001', got: %s", output)
+	}
+}
+
+func TestExecutePriorityReset(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/tasks/task-123/priority/set" && r.Method == "POST" {
+			var req tuiclient.SetTaskPriorityRequest
+			json.NewDecoder(r.Body).Decode(&req)
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:           "reset",
+				TaskID:           "task-123",
+				TopicAnchorID:    "topic-123",
+				ActionKey:        req.ActionKey,
+				OldPriority:      750,
+				Priority:         500,
+				QueueMaxPriority: nil,
+				Replayed:         false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--reset", "--reason", "test reason"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority --reset failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "New Priority: 500") {
+		t.Errorf("expected output to contain 'New Priority: 500', got: %s", output)
+	}
+}
+
+func TestExecutePriorityMutualExclusivity(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"set and front", []string{"task-123", "--set", "600", "--front", "--reason", "test"}},
+		{"set and reset", []string{"task-123", "--set", "600", "--reset", "--reason", "test"}},
+		{"front and reset", []string{"task-123", "--front", "--reset", "--reason", "test"}},
+		{"all three", []string{"task-123", "--set", "600", "--front", "--reset", "--reason", "test"}},
+		{"no operation", []string{"task-123", "--reason", "test"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("server should not be called for invalid input")
+			}))
+			defer server.Close()
+
+			buf := &bytes.Buffer{}
+			err := executePriority(context.Background(), server.URL, "test-token", false, tt.args, buf)
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", tt.name)
+			}
+			if !strings.Contains(err.Error(), "exactly one of") {
+				t.Errorf("expected error containing 'exactly one of', got: %v", err)
+			}
+		})
+	}
+}
+
+func TestExecutePriorityMissingReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("server should not be called for missing reason")
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--set", "600"}, buf)
+	if err == nil {
+		t.Fatal("expected error for missing --reason, got nil")
+	}
+	if !strings.Contains(err.Error(), "--reason flag is required") {
+		t.Errorf("expected error containing '--reason flag is required', got: %v", err)
+	}
+}
+
+func TestExecutePriorityJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/tasks/task-123/priority/set" && r.Method == "POST" {
+			var req tuiclient.SetTaskPriorityRequest
+			json.NewDecoder(r.Body).Decode(&req)
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:           "set",
+				TaskID:           "task-123",
+				TopicAnchorID:    "topic-123",
+				ActionKey:        req.ActionKey,
+				OldPriority:      500,
+				Priority:         750,
+				QueueMaxPriority: nil,
+				Replayed:         false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", true, []string{"task-123", "--set", "750", "--reason", "test"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority --json failed: %v", err)
+	}
+
+	output := buf.String()
+	var result tuiclient.PriorityChange
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+
+	if result.Priority != 750 {
+		t.Errorf("expected Priority 750, got %d", result.Priority)
+	}
+}
+
+func TestExecutePriorityInheritedValue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/tasks/task-123/priority/front" && r.Method == "POST" {
+			var req tuiclient.MoveTaskToFrontRequest
+			json.NewDecoder(r.Body).Decode(&req)
+			queueMax := int64(1001)
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:           "front",
+				TaskID:           "task-123",
+				TopicAnchorID:    "topic-123",
+				ActionKey:        req.ActionKey,
+				OldPriority:      1000,
+				Priority:         1001,
+				QueueMaxPriority: &queueMax,
+				Replayed:         false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--front", "--reason", "test"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority with inherited value failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "New Priority: 1001") {
+		t.Errorf("expected output to contain 'New Priority: 1001', got: %s", output)
+	}
+}
+
+func TestExecutePriorityRetryIdentity(t *testing.T) {
+	// Test that the action key is stable when provided via --action-key flag
+	// and that distinct invocations generate different keys when no flag is provided
+	var requestedKeys []string
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/tasks/task-123/priority/set" && r.Method == "POST" {
+			var req tuiclient.SetTaskPriorityRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "bad request"})
+				return
+			}
+
+			mu.Lock()
+			requestedKeys = append(requestedKeys, req.ActionKey)
+			mu.Unlock()
+
+			// Verify action key is present
+			if req.ActionKey == "" {
+				t.Error("ActionKey is empty")
+			}
+
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:        "set",
+				TaskID:        "task-123",
+				TopicAnchorID: "topic-123",
+				ActionKey:     req.ActionKey,
+				OldPriority:   500,
+				Priority:      600,
+				Replayed:      false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	// Test 1: Invocation with explicit --action-key flag uses that key
+	buf := &bytes.Buffer{}
+	explicitKey := "test-action-key-123"
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--set", "600", "--reason", "test", "--action-key", explicitKey}, buf)
+	if err != nil {
+		t.Fatalf("executePriority with explicit key failed: %v", err)
+	}
+
+	if len(requestedKeys) != 1 || requestedKeys[0] != explicitKey {
+		t.Errorf("Expected action key %q, got %q", explicitKey, requestedKeys[0])
+	}
+
+	// Verify the key is printed in the output
+	if !strings.Contains(buf.String(), "Action Key: test-action-key-123") {
+		t.Errorf("Action key not printed in output: %s", buf.String())
+	}
+
+	// Test 2: Two invocations without --action-key flag generate different keys
+	requestedKeys = nil
+	buf = &bytes.Buffer{}
+	err = executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--set", "600", "--reason", "test"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority without key failed: %v", err)
+	}
+
+	key1 := requestedKeys[0]
+
+	buf = &bytes.Buffer{}
+	err = executePriority(context.Background(), server.URL, "test-token", false, []string{"task-123", "--set", "600", "--reason", "test"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority second invocation failed: %v", err)
+	}
+
+	key2 := requestedKeys[1]
+
+	if key1 == key2 {
+		t.Errorf("Expected distinct keys for separate invocations, but got same key: %s", key1)
+	}
+}
+
+func TestExecutePriorityHelpWithoutEnvironment(t *testing.T) {
+	for _, helpFlag := range []string{"-h", "--help"} {
+		buf := &bytes.Buffer{}
+		if err := executePriority(context.Background(), "", "", false, []string{helpFlag}, buf); err != nil {
+			t.Fatalf("executePriority %s returned error: %v", helpFlag, err)
+		}
+		usage := buf.String()
+		for _, want := range []string{"1..1000", "max(1000, max queued priority) + 1", "do not scope the global Front maximum", "does\nnot release holds or promote"} {
+			if !strings.Contains(usage, want) {
+				t.Errorf("usage for %s missing %q:\n%s", helpFlag, want, usage)
+			}
+		}
+	}
+}
+
+func TestExecutePriorityRetryAfterFailureReusesKey(t *testing.T) {
+	var receivedKeys []string
+	var mu sync.Mutex
+	attempts := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/tasks/task-123/priority/front" || r.Method != "POST" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req tuiclient.MoveTaskToFrontRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		receivedKeys = append(receivedKeys, req.ActionKey)
+		attempts++
+		attempt := attempts
+		mu.Unlock()
+		if attempt == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "boom"})
+			return
+		}
+		json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+			Action: "front", TaskID: "task-123", TopicAnchorID: "topic-123",
+			ActionKey: req.ActionKey, OldPriority: 500, Priority: 1001, Replayed: attempt > 2,
+		})
+	}))
+	defer server.Close()
+
+	firstErr := executePriority(context.Background(), server.URL, "test-token", false,
+		[]string{"task-123", "--front", "--reason", "retry test"}, &bytes.Buffer{})
+	if firstErr == nil {
+		t.Fatal("expected first attempt to fail")
+	}
+	const keyMarker = "action key "
+	messageText := firstErr.Error()
+	markerIndex := strings.Index(messageText, keyMarker)
+	if markerIndex < 0 {
+		t.Fatalf("error does not report the action key: %v", firstErr)
+	}
+	reportedKey := messageText[markerIndex+len(keyMarker):]
+	reportedKey = reportedKey[:strings.Index(reportedKey, ")")]
+	if reportedKey == "" || reportedKey != receivedKeys[0] {
+		t.Fatalf("reported key %q does not match key sent %q", reportedKey, receivedKeys[0])
+	}
+
+	buf := &bytes.Buffer{}
+	if err := executePriority(context.Background(), server.URL, "test-token", true,
+		[]string{"task-123", "--front", "--reason", "retry test", "--action-key", reportedKey}, buf); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if len(receivedKeys) != 2 || receivedKeys[1] != reportedKey {
+		t.Errorf("retry sent keys %v, want both %q", receivedKeys, reportedKey)
+	}
+	var result tuiclient.PriorityChange
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON output: %v", err)
+	}
+	if result.ActionKey != reportedKey || result.Priority != 1001 {
+		t.Errorf("unexpected JSON result: %+v", result)
+	}
 }
