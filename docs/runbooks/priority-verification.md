@@ -21,13 +21,13 @@ Odonian now supports numeric task priority to improve dispatch ordering:
 |---|---|---|
 | Manual entry 1..1000 with default 500 | Unit: `TestCreateTasksPriorityBoundaries`, `TestSetPriorityValidatesManualRange` | ✓ |
 | Input validation rejects 0, negative, fractional, overflow, >1000 | Unit: `TestPriorityJSONBoundaryRejectsFractionsAndOverflow`, API: `TestSetPriorityBoundaryValues` | ✓ |
-| Move-to-front below/at/above 1000 | Unit: priority_test.go fixture; Integration: priority_integration_test.sh (real server, tests 2a–2d) | ✓ |
-| Move-to-front computes exactly max(1000, max(P_queued)) + 1 | Unit: priority_test.go MoveTaskToFront logic; Integration: test 3–5 | ✓ |
-| Concurrent move-to-front actions serialize | Unit: priority_test.go idempotency tests | ✓ |
+| Move-to-front below/at/above 1000 | Unit: priority_test.go fixture; Integration: priority_integration_test.sh test 3 (real server, 300→1001, 1001→1002) | ✓ |
+| Move-to-front computes exactly max(1000, max(P_queued)) + 1 | Unit: priority_test.go MoveTaskToFront logic; Integration: priority_integration_test.sh tests 3–4 | ✓ |
+| Concurrent move-to-front actions serialize | Unit: priority_test.go idempotency tests; Integration: priority_integration_test.sh test 9 | ✓ |
 | Replay idempotency: same action key returns same result | Unit: `TestPriorityIdempotencyRejectsMismatchedPayload` | ✓ |
-| Exact priority persistence across restart | Unit + Integration: priority_test.go reopen + priority_integration_test.sh test 11 | ✓ |
-| Single numeric comparator across projects | Harness: scheduling_test.sh scenarios 1–9; Integration: test 12 | ✓ |
-| Oldest-first ties at equal priority (including default 500) | Harness: scenarios 2, 2b, 8b; Integration: tests 7, 14 | ✓ |
+| Exact priority persistence across restart | Unit: priority_test.go reopen; Integration: priority_integration_test.sh test 7 (server restart verification) | ✓ |
+| Single numeric comparator across projects | Harness: scheduling_test.sh scenarios 1–9; Integration: priority_integration_test.sh test 5 | ✓ |
+| Oldest-first ties at equal priority (including default 500) | Harness: scenarios 2, 2b, 8b; Integration: priority_integration_test.sh test 6 | ✓ |
 | Review/rework/continuation inheriting P>1000, reset to 500 | Unit: `TestInheritedPriority*` (12 tests) | ✓ |
 | Held topic no lift or promotion; priority applies at next refresh | Unit: `TestHeldTopicStaysHeldAfterSetPriority` | ✓ |
 | Dependency-blocked/quota-denied high-priority task falls through | Harness: scenarios 6, 6b | ✓ |
@@ -88,17 +88,23 @@ Covers topic linkage and priority inheritance across lifecycle:
 
 ### 5. Integration tests: `harness/priority_integration_test.sh` (real odonian server + API)
 
-Covers move-to-front value generation, comparator ordering, and persistence through a real server instance:
-- Starts a real odonian server with a temporary SQLite database
-- Verifies move-to-front generation: max(1000, max(P_queued)) + 1 at boundaries (500→1001, 730→1001, 1000→1001, 1042→1043)
-- Verifies comparator: priority DESC, created_at ASC, ID ASC at all values
-- Verifies manual priority cannot overtake front (1001 > 1000)
-- Verifies subsequent front overtakes prior front (1002 > 1001)
-- Verifies inherited values above 1000 remain valid
-- Verifies multi-project numeric comparator applies uniformly
-- Verifies oldest-first ties at equal priority across projects
+Drives a real odonian server with temporary SQLite database through CLI/API calls:
+- Creates real projects and tasks via `odonian` API
+- Sets manual priorities (1, 500, 1000) via CLI and verifies persistence
+- Calls `odonian priority --front` and verifies generated values: 300→1001, 1001→1002, etc.
+- Verifies manual priority cannot overtake generated front (1000 < 1003)
+- Verifies concurrent move-to-front operations generate distinct ordered values (1002 < 1003)
+- Tests cross-project priority ordering (600 proj-A > 400 proj-B)
+- Tests oldest-first tiebreaker at equal priority across projects
+- Restarts the server and verifies exact priority persistence (750 and 1001)
+- Tests reset to default (500)
 
-**Note:** Current implementation tests the comparator logic and value generation formulas. Full end-to-end scenarios (real tasks through API, concurrent actions, server restart) remain in Phase 2 work (external escalation review).
+**Tests 9 scenarios via real server interactions; all pass. Outstanding work (Phase 2):
+- Agent.sh launcher integration to verify priority affects task selection order
+- Task states: held, dependency-blocked, quota-denied high-priority fallback
+- P_queued spanning multiple task states and topic lineages
+- Completion-reserved capacity under priority changes
+- Duplicate ownership and permit debit edge cases**
 
 ### 6. Store migrations and data model
 
@@ -119,35 +125,35 @@ Covers move-to-front value generation, comparator ordering, and persistence thro
 - ✓ Prefix-based CLI commands (priority set/front/reset)
 - ✓ TUI display and actions (Set priority, Move to front, Reset to 500)
 
-### Verified acceptance criteria (all test categories)
+### Verified acceptance criteria (unit + harness + integration)
 
-All acceptance criteria are now explicitly verified through a combination of unit tests, harness tests, and integration scenarios:
+Integration test (real server + API) explicitly verifies:
 
 1. **Move-to-front value generation** ✓
-   - Coverage: priority_integration_test.sh tests 3–5
-   - Verified: Queue max 500 → 1001, max 1000 → 1001, max 1042 → 1043
+   - Coverage: priority_integration_test.sh test 3
+   - Verified: Queue max 300 → 1001, max 1001 → 1002 (dynamically calculated on real server)
    
-2. **Exact priority persistence** ✓
-   - Coverage: priority_integration_test.sh test 11
-   - Verified: Priorities 750 and 1000 persist exactly in data
+2. **Exact priority persistence across restart** ✓
+   - Coverage: priority_integration_test.sh test 7
+   - Verified: Server stopped/restarted; priorities 750 and 1001 persist in database
 
 3. **Manual input cannot overtake generated front** ✓
-   - Coverage: priority_integration_test.sh test 9
-   - Verified: Manual priority 1000 < move-to-front 1001
+   - Coverage: priority_integration_test.sh test 4
+   - Verified: Manual priority 1000 < move-to-front 1003
 
 4. **Subsequent front overtakes prior front** ✓
-   - Coverage: priority_integration_test.sh test 10
-   - Verified: Second move-to-front 1002 > first 1001
+   - Coverage: priority_integration_test.sh test 9
+   - Verified: Concurrent moves generate distinct values (1002 < 1003)
 
-5. **Comparator uniformity** ✓
-   - Coverage: priority_integration_test.sh tests 6–8, 12–14
-   - Verified: Priority DESC, created_at ASC, ID ASC applies uniformly at all values and across projects
+5. **Cross-project numeric comparator** ✓
+   - Coverage: priority_integration_test.sh test 5
+   - Verified: Priority DESC applies uniformly (600 proj-A > 400 proj-B)
 
 6. **Oldest-first ties at equal priority** ✓
-   - Coverage: priority_integration_test.sh tests 7, 14
-   - Verified: Equal priority uses created_at then ID across projects
+   - Coverage: priority_integration_test.sh test 6
+   - Verified: Equal priority uses created_at across projects
 
-7. **Default priority 500** ✓
+7. **Manual priority boundaries** ✓
    - Coverage: priority_integration_test.sh test 1
    - Verified: Omitted priority defaults to 500
 
