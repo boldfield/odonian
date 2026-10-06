@@ -5360,13 +5360,53 @@ func (s *sqliteStore) SetTaskPriority(ctx context.Context, taskID string, priori
 // max(1000, max(P_queued)) + 1 where P_queued is the maximum priority across
 // all outstanding non-archived topics (held, backlog, blocked, waiting, in-flight).
 // Uses a serialized transaction for idempotency and records an audit event.
-// Returns conflict error if no outstanding topics exist.
+// Idempotency is stable: replaying with the same parameters returns the original result;
+// replaying with different parameters is rejected with a mismatch error.
 func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason string) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	// 0. Check action idempotency - use task_id as the action key, hash the request
+	actionKey := taskID + ":front"
+	requestHash := hex.EncodeToString(sha256.New().Sum([]byte(actor + reason)))[:16] // use first 16 chars of hash
+
+	// Check if this action already exists
+	var existingResult int
+	var existingHash string
+	err = tx.QueryRowContext(ctx, `
+		SELECT result_priority, request_hash FROM action_idempotency
+		WHERE action_key = ?
+	`, actionKey).Scan(&existingResult, &existingHash)
+
+	if err == nil {
+		// Action exists - check if request hash matches
+		if existingHash != requestHash {
+			return Task{}, conflict("IDEMPOTENCY_MISMATCH",
+				fmt.Sprintf("action %q was already executed with different parameters (mismatch: %s vs %s)",
+					actionKey, existingHash, requestHash))
+		}
+		// Same request hash - return the original result
+		// Reconstruct the task with the original priority
+		var t Task
+		var reviewModelsJSON *string
+		err = tx.QueryRowContext(ctx, `
+			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, priority, created_at, updated_at, archived_at, superseded_by
+			FROM task WHERE id = ?
+		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+		if err == nil {
+			t.ReviewModels = []string{}
+			if reviewModelsJSON != nil {
+				json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels)
+			}
+			tx.Commit()
+			return t, nil
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return Task{}, fmt.Errorf("failed to check idempotency: %w", err)
+	}
 
 	// 1. Load the task being moved
 	var t Task
@@ -5389,17 +5429,19 @@ func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason
 		}
 	}
 
-	// 2. Reject terminal states
+	// 2. Reject terminal states and archived tasks
 	switch t.State {
 	case "done", "failed", "abandoned", "superseded":
 		return Task{}, conflict("TERMINAL_STATE", fmt.Sprintf("cannot move to front a task in terminal state %q", t.State))
+	}
+	if t.ArchivedAt != nil {
+		return Task{}, conflict("ARCHIVED", "cannot move to front an archived task")
 	}
 
 	// 3. Compute max(P_queued) across all outstanding non-archived topics
 	// Outstanding = not archived (archived_at IS NULL)
 	// This includes: held, backlog, blocked, waiting, in_progress, ready
-	// For topic roots with dependencies, we include them only if they have active descendants
-	var maxPriority int
+	var maxPriority int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(priority), 0)
 		FROM task
@@ -5411,22 +5453,29 @@ func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason
 	}
 
 	// 4. Compute new priority: max(1000, maxPriority) + 1
-	// If maxPriority is 0 (no outstanding tasks), use 1000
+	// Check for overflow BEFORE incrementing
+	if maxPriority >= 9223372036854775806 { // math.MaxInt64 - 1
+		return Task{}, conflict("OVERFLOW", "priority computation would overflow")
+	}
+
 	newPriority := maxPriority
 	if newPriority < 1000 {
 		newPriority = 1000
 	}
 	newPriority++
 
-	// 5. Check for overflow
-	if newPriority > 2147483647 { // max int32
-		return Task{}, conflict("OVERFLOW", "priority computation would overflow")
-	}
-
 	now := nowTimestamp()
 	oldPriority := t.Priority
-	if _, err := tx.ExecContext(ctx, `UPDATE task SET priority = ?, updated_at = ? WHERE id = ?`, newPriority, now, taskID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE task SET priority = ?, updated_at = ? WHERE id = ?`, int(newPriority), now, taskID); err != nil {
 		return Task{}, fmt.Errorf("failed to update task priority: %w", err)
+	}
+
+	// Record the idempotency entry
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO action_idempotency (action_key, task_id, action, request_hash, result_priority, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, actionKey, taskID, "front", requestHash, int(newPriority), now); err != nil {
+		return Task{}, fmt.Errorf("failed to record idempotency: %w", err)
 	}
 
 	note := fmt.Sprintf("moved to front: %d → %d (max_queued=%d, reason: %s)", oldPriority, newPriority, maxPriority, reason)
@@ -5438,7 +5487,7 @@ func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason
 		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	t.Priority = newPriority
+	t.Priority = int(newPriority)
 	t.UpdatedAt = now
 	return t, nil
 }

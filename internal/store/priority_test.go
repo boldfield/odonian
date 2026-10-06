@@ -375,6 +375,181 @@ func TestPriorityWithHolds(t *testing.T) {
 	}
 }
 
+func TestMoveTaskToFrontIdempotency(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "https://example.com/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "test-doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			DocumentID: doc.ID,
+			Title:      "test task",
+			Spec:       "spec",
+			Model:      "haiku",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// First call to move to front
+	moved1, err := store.MoveTaskToFront(ctx, taskID, "actor1", "reason1")
+	if err != nil {
+		t.Fatalf("first move to front failed: %v", err)
+	}
+	priority1 := moved1.Priority
+
+	// Replay with same parameters - should return same result
+	moved2, err := store.MoveTaskToFront(ctx, taskID, "actor1", "reason1")
+	if err != nil {
+		t.Fatalf("replay move to front failed: %v", err)
+	}
+	if moved2.Priority != priority1 {
+		t.Errorf("replay returned different priority: expected %d, got %d", priority1, moved2.Priority)
+	}
+
+	// Call with different parameters - should be rejected with mismatch error
+	_, err = store.MoveTaskToFront(ctx, taskID, "actor2", "reason2")
+	if err == nil {
+		t.Fatal("expected idempotency mismatch error for different parameters")
+	}
+	if conflictErr, ok := err.(*ConflictError); !ok || conflictErr.Code != "IDEMPOTENCY_MISMATCH" {
+		t.Errorf("expected IDEMPOTENCY_MISMATCH error, got: %v", err)
+	}
+}
+
+func TestMoveTaskToFrontArchivedRejection(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "https://example.com/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "test-doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create and archive a task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			DocumentID: doc.ID,
+			Title:      "task to archive",
+			Spec:       "spec",
+			Model:      "haiku",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Archive the task
+	_, err = store.ArchiveTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to archive task: %v", err)
+	}
+
+	// Try to move archived task to front - should fail
+	_, err = store.MoveTaskToFront(ctx, taskID, "actor", "reason")
+	if err == nil {
+		t.Fatal("expected error when moving archived task to front")
+	}
+	if conflictErr, ok := err.(*ConflictError); !ok || conflictErr.Code != "ARCHIVED" {
+		t.Errorf("expected ARCHIVED error, got: %v (type %T)", err, err)
+	}
+}
+
+func TestSetTaskPriorityBoundaries(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "https://example.com/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "test-doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			DocumentID: doc.ID,
+			Title:      "test task",
+			Spec:       "spec",
+			Model:      "haiku",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Test 1: Fractional priority via JSON should be rejected
+	// (This would need to be tested via API, not through SetTaskPriority)
+
+	// Test 2: Test invalid priorities
+	testCases := []struct {
+		priority int
+		wantErr  bool
+		errMsg   string
+	}{
+		{0, true, "0 should be invalid"},
+		{-1, true, "-1 should be invalid"},
+		{-100, true, "-100 should be invalid"},
+		{1001, true, "1001 should be invalid"},
+		{1002, true, "1002 should be invalid"},
+		{2000, true, "2000 should be invalid"},
+		{1, false, ""},
+		{500, false, ""},
+		{1000, false, ""},
+	}
+
+	for _, tc := range testCases {
+		_, err := store.SetTaskPriority(ctx, taskID, tc.priority, "actor", "reason")
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected error but got none", tc.errMsg)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("priority %d: expected no error but got %v", tc.priority, err)
+			}
+		}
+	}
+}
+
 // Helper functions
 func intPtr(i int) *int {
 	return &i
