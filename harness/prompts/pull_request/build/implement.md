@@ -16,31 +16,42 @@ Run `odonian <verb> -h` for flags. (Raw API — docs/api.md / AGENT-API.md — o
 
 ## Your iteration
 
-**Claim before you work.** Steps 1–2 (find + claim) are your VERY FIRST actions. Do NOT read the
-spec in depth, explore the repo, run any git command, or edit a single file before the claim
-succeeds. The claim flips the task to `in_progress` so the human watching the board sees it being
+**Preclaimed tasks.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, you are working a preclaimed task that
+has been claimed by the harness and is ready for work. Skip steps 1–2 entirely and go directly to 
+step 3: use the preclaimed task ID as-is. You must not call `odonian next` or `odonian claim` again, 
+and never work any task other than `ODONIAN_PRECLAIMED_TASK_ID`. The attempt identity is supplied 
+as `ODONIAN_PRECLAIMED_ATTEMPT_ID`; pass it as `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on 
+every `odonian heartbeat` and `odonian submit`.
+
+**Ordinary (non-preclaimed) mode.** If `ODONIAN_PRECLAIMED_TASK_ID` is NOT set, follow steps 1–2 
+below as written (`odonian next`, then `odonian claim`).
+
+**Claim before you work.** Steps 1–2 (find + claim) are your VERY FIRST actions (only if not preclaimed). 
+Do NOT read the spec in depth, explore the repo, run any git command, or edit a single file before the 
+claim succeeds. The claim flips the task to `in_progress` so the human watching the board sees it being
 worked, and it is your lock + lease — without it, another worker can grab the same task. Working
 first and claiming at the end is wrong.
 
 **Keep your lease alive.** A lease lapses if you go quiet too long, and a lapsed lease lets
-another worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — right after you claim,
-and again immediately **before and after** every slow step: each `make check`, each `make test`, and
-any build or command you expect to take more than a minute. Pin heartbeats to those points; do not
-rely on sensing elapsed time.
+another worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — right after you claim
+(or right after validating a preclaimed task), and again immediately **before and after** every slow 
+step: each `make check`, each `make test`, and any build or command you expect to take more than a minute. 
+For preclaimed tasks, pass `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on every heartbeat. Pin 
+heartbeats to those points; do not rely on sensing elapsed time.
 
-1. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.
-   It prints the id of the first claimable `implement`-kind task for your model tier — `--kind implement`
-   excludes `review`-kind tasks (a reviewer's job; never claim one). Exit code 2 / "nothing claimable"
-   → STOP. Otherwise note the id it printed.
-2. Claim it — immediately, as your first mutating call, before any code-reading or editing:
-   `odonian claim <id>`. Your `model`/identity come from `$AGENT_MODEL`/`$AGENT_ID` automatically; the
-   claim is rejected if your model doesn't match the task's. Exit code 3 / "already claimed" → another
-   worker took it; STOP.
-3. Understand it. Read the task's `spec` in full (`odonian show <id>`). Also read
+1. **Resolve task ID.** If `ODONIAN_PRECLAIMED_TASK_ID` is set (environment variable), use it as your task id 
+   and skip steps 1a–1b. Otherwise:
+   1a. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.
+       It prints the id of the first claimable `implement`-kind task for your model tier. Exit code 2 / 
+       "nothing claimable" → STOP. Otherwise note the id it printed.
+   1b. Claim it — immediately, as your first mutating call, before any code-reading or editing:
+       `odonian claim <id>`. Your `model`/identity come from `$AGENT_MODEL`/`$AGENT_ID` automatically. 
+       Exit code 3 / "already claimed" → STOP.
+2. Understand it. Read the task's `spec` in full (`odonian show <task_id>`). Also read
    `docs/features/model-and-review.md` for design context. The spec gives intent, constraints,
    pattern pointers (file:line) and acceptance criteria — and deliberately NO code. You write the
    implementation.
-4. Set up your branch. You are in your OWN worktree — NEVER run `git checkout main` (main is
+3. Set up your branch. You are in your OWN worktree — NEVER run `git checkout main` (main is
    checked out in another worktree and the command will fail). Always branch from the remote, and
    always work **DETACHED** so a branch checkout can't collide with another worker's worktree.
 
@@ -48,19 +59,19 @@ rely on sensing elapsed time.
    of the task id (the part before the first `-`, e.g. task `c47fc9f6-254a-...` → `mr/c47fc9f6`).
    It is a pure function of the task id, so every build AND every rework of the SAME task resolve to
    the SAME branch — exactly one branch and one PR per task, no duplicates. Use this same name in
-   steps 4, 8, and 9. **NEVER run `git checkout <named-branch>`** — a named-branch checkout fails
+   steps 3, 7, and 8. **NEVER run `git checkout <named-branch>`** — a named-branch checkout fails
    with "already checked out" when another worktree holds that branch, and **that error is NOT a
    reason to block** (work detached + push-to-ref, below). Always `git fetch origin` first, then:
    - **REWORK — `origin/mr/<TASKID8>` already exists** (a prior attempt was pushed and the task was
      bounced back to ready): continue it. `git checkout --detach origin/mr/<TASKID8>`; make your
-     fixes; publish in step 8 with `git push origin HEAD:mr/<TASKID8>` — it stays the same branch and
-     PR. You address and acknowledge the reviewer's feedback in the mandatory rework step 7 below.
-     (Merge conflicts are cleared by the sync in step 6.)
+     fixes; publish in step 7 with `git push origin HEAD:mr/<TASKID8>` — it stays the same branch and
+     PR. You address and acknowledge the reviewer's feedback in the mandatory rework step 6 below.
+     (Merge conflicts are cleared by the sync in step 5.)
    - **FRESH — `origin/mr/<TASKID8>` does not exist** (first attempt): `git checkout --detach
-     origin/main`; you'll create the branch and PR by pushing in step 8.
-5. Implement exactly what the spec requires — nothing more, nothing less. Keep the diff scoped to
+     origin/main`; you'll create the branch and PR by pushing in step 7.
+4. Implement exactly what the spec requires — nothing more, nothing less. Keep the diff scoped to
    this one task. Follow its constraints and the pattern pointers it names.
-6. Sync with main, then verify. FIRST `git fetch origin && git merge origin/main` to bring your
+5. Sync with main, then verify. FIRST `git fetch origin && git merge origin/main` to bring your
    branch up to date so the PR merges cleanly. If the merge conflicts, resolve it — keep both
    sides' intent (for test files that almost always means keeping every test) — then `git add` the
    resolved files and complete the merge. THEN: heartbeat, run `make check`, heartbeat; then
@@ -72,16 +83,16 @@ rely on sensing elapsed time.
    the task's acceptance criteria are ALREADY met and you have NO diff to commit (`git status`
    clean, nothing to add), do NOT block and do NOT fabricate a PR (`gh pr create` would fail with
    "No commits between main and <branch>" anyway). Skip the rework step 7 and the push/PR step 8
-   entirely and go straight to a **no-op submit** (step 9): `odonian submit <id> --result "acceptance already satisfied on main
+   entirely and go straight to a **no-op submit** (step 8): `odonian submit <task_id> --result "acceptance already satisfied on main
    at <commit>; no changes needed" --no-op` — the `--no-op` flag sets the already-satisfied marker and
    attaches no `pr` link. The reviewer verifies the claim against `main` and
    either approves it to `done` or rejects with the gap — you do NOT self-declare `done`. Only take
    this path when the diff is genuinely empty; if any real change is needed, do the work and submit
-   a normal PR.
-7. **Address & acknowledge PR feedback (REWORK ONLY — mandatory, gated).** This step applies ONLY
+   a normal PR. For preclaimed tasks, also pass `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` if set.
+6. **Address & acknowledge PR feedback (REWORK ONLY — mandatory, gated).** This step applies ONLY
    on a REWORK — when you are continuing an existing `origin/mr/<TASKID8>` / an existing PR. On a
    FRESH first attempt there is no PR yet and no feedback to address, so this step is a **no-op**;
-   skip straight to step 8.
+   skip straight to step 7.
 
    On a rework you MUST clear the reviewer's feedback before you may submit. Start by reading the full
    review context: run `odonian show <task-id>` to see the recorded review round, verdicts, and findings
@@ -101,9 +112,9 @@ rely on sensing elapsed time.
    Then address all feedback:
    - Run `odonian pr-feedback list <pr-url>` to enumerate EVERY unaddressed item — both inline
      review threads AND global comments. (`<pr-url>` is the same PR you resolve in the find-or-create
-     step 8; on a rework it already exists.)
+     step 7; on a rework it already exists.)
    - You MUST address every returned item in your diff. After the commit that fixes each item (you
-     create those commits in step 8), run `odonian pr-feedback ack <pr-url> <item-id> <sha>`, where
+     create those commits in step 7), run `odonian pr-feedback ack <pr-url> <item-id> <sha>`, where
      `<sha>` is the commit that addressed it. **Every listed item — inline threads included — is
      acknowledged ONLY by running `odonian pr-feedback ack` with that item's id; a prose comment
      does not count and leaves the item outstanding.** **`odonian pr-feedback ack` automatically stamps replies
@@ -119,7 +130,7 @@ rely on sensing elapsed time.
    listed items unaddressed and unacked is INVALID — the reviewer will reject it. Do NOT proceed to
    the submit step until `pr-feedback list` returns nothing outstanding. Empty GitHub feedback alone
    is not sufficient — ensure your diff addresses the recorded review findings shown by `odonian show`.
-8. Commit, push, PR. End the commit message with a blank line then
+7. Commit, push, PR. End the commit message with a blank line then
    `Co-Authored-By: Claude (<value of $AGENT_MODEL>) <noreply@anthropic.com>`. Push your (detached)
    HEAD to the deterministic branch: `git push origin HEAD:mr/<TASKID8>`. Then **FIND-OR-CREATE the
    PR** — never fabricate one:
@@ -132,16 +143,17 @@ rely on sensing elapsed time.
    - **VERIFY the URL resolves to a real OPEN PR before attaching it:** `gh pr view <url> --json
      number,state` must succeed and report `OPEN`. If `gh pr create` errored or the URL doesn't
      resolve, do NOT fabricate a link — retry the find-or-create once; if it still fails, run
-     `odonian transition <id> --to blocked --note "<the gh error>"` and STOP.
-9. Submit. `odonian submit <id> --result "<what you did; confirm make check & make test pass>" --pr
-   "<full PR URL>" --branch "mr/<TASKID8>"`. **The `--pr` URL is REQUIRED, must be the full PR URL (not
-   `#123`), and must be the VERIFIED-OPEN URL from step 8** — never fabricated or hand-built; `--pr` and
+     `odonian transition <task_id> --to blocked --note "<the gh error>"` and STOP.
+8. Submit. `odonian submit <task_id> --result "<what you did; confirm make check & make test pass>" --pr
+   "<full PR URL>" --branch "mr/<TASKID8>"`. For preclaimed tasks, also pass 
+   `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` if set. **The `--pr` URL is REQUIRED, must be the full PR URL (not
+   `#123`), and must be the VERIFIED-OPEN URL from step 7** — never fabricated or hand-built; `--pr` and
    `--branch` go together. Without a PR the reviewer has nothing to review and will reject — EXCEPT a
-   verified **no-op submit** (step 6), which uses `--no-op` instead (and no `--pr`/`--branch`). ALWAYS
+   verified **no-op submit** (step 5), which uses `--no-op` instead (and no `--pr`/`--branch`). ALWAYS
    pass `--pr <full PR URL> --branch mr/<TASKID8>` on EVERY non-no-op submit (including rework) — the
    server dedups links, so re-sending is safe, and this prevents the case where round-1 forgot the link
    and round-2 (rework) omitted it, leaving the task permanently link-less.
-10. STOP. Don't claim another task, don't merge, don't transition the task yourself.
+9. STOP. Don't claim another task, don't merge, don't transition the task yourself.
 
 ## Rules
 - You do the engineering; the spec contains no code by design — write it.

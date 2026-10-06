@@ -480,6 +480,30 @@ deferral_secs() {
   echo "$secs"
 }
 
+# Claim a non-research task $1 on model $2. Sets P_TASK, P_ATTEMPT (if provided), P_MODEL.
+# Returns 0 on success, 1 on failure (race, transient error). Does not defer.
+claim_non_research_task() {
+  local task_id="$1" model="$2" out rc errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/odonian-claim.XXXXXX")"
+  out="$(odonian claim "$task_id" --agent "$AGENT_ID" --model "$model" 2>"$errf")"; rc=$?
+  case "$rc" in
+    0)
+      P_TASK="$task_id"; P_MODEL="$model"
+      P_ATTEMPT="$(printf '%s' "$out" | jq -r '.attempt_id // empty' 2>/dev/null)"
+      P_REQUEST="$(printf '%s' "$out" | jq -r '.request_id // empty' 2>/dev/null)"
+      P_PERMIT=""   # non-research tasks don't use permits
+      rm -f "$errf"; return 0 ;;
+    3)
+      # Race: another worker claimed it first
+      rm -f "$errf"; return 1 ;;
+    *)
+      # Transient error; defer briefly and continue
+      defer_task "$task_id" 1
+      echo "[$AGENT_ID] $(date '+%H:%M:%S') claim failed for ${task_id:0:8} (rc=$rc); deferring briefly" >&2
+      rm -f "$errf"; return 1 ;;
+  esac
+}
+
 # Request admission for research task $1 on model $2. Sets ADM_STATE and, when granted, P_*:
 #   granted    — task is claimed by us (P_PERMIT/P_ATTEMPT are set when the server issued a permit; they
 #                are empty when the policy is disabled/not enforcing and the claim carried no permit).
@@ -820,8 +844,11 @@ if [ "$MULTI" = 0 ]; then
           continue
         fi
       else
-        # For non-research tasks, pass the selected task through so the prompt doesn't claim a different one
-        P_TASK="$task_id"
+        # Non-research: claim the task in the harness so the prompt gets a preclaimed task
+        if ! claim_non_research_task "$task_id" "$task_model"; then
+          [ "$STOP" -eq 1 ] && break
+          continue
+        fi
       fi
       echo "[$AGENT_ID] $(date '+%H:%M:%S') claimable $KIND; dispatching ($task_model/$task_track)…"
       export AGENT_MODEL="$task_model"
@@ -862,8 +889,6 @@ while true; do
   while IFS=$'\t' read -r pid prepo; do
     [ -z "$pid" ] && continue
     in_allow "$pid" || continue
-    # Re-check claimable work exists in this project
-    has_claimable_work "$pid" || continue
     # Get all claimable tasks for this project
     tasks_json=$(odonian tasks --project "$pid" --claimable --kind "$KIND" --json 2>/dev/null) || continue
     # Extract (task_id, model, priority, created_at, project_id, repo) tuples
@@ -912,8 +937,11 @@ while true; do
         continue
       fi
     else
-      # For non-research tasks, pass the selected task through so the prompt doesn't claim a different one
-      P_TASK="$task_id"
+      # Non-research: claim the task in the harness so the prompt gets a preclaimed task
+      if ! claim_non_research_task "$task_id" "$task_model"; then
+        [ "$STOP" -eq 1 ] && break
+        continue
+      fi
     fi
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatching ($task_model/$task_track/$KIND) on $(norm_repo "$prepo") [${pid:0:8}]…"
     export AGENT_MODEL="$task_model"
@@ -922,7 +950,7 @@ while true; do
     git -C "$wt" checkout --detach --force origin/main --quiet 2>/dev/null || true
     worked=1
     break   # one task per discovery pass, then re-poll fresh
-  done < <(printf '%s\n' "${task_rows[@]}" | sort -t$'\t' -k1nr -k2,2 -k3,3)
+  done < <(printf '%s\n' "${task_rows[@]}" | LC_ALL=C sort -t$'\t' -k1,1nr -k2,2 -k3,3)
   [ "$STOP" -eq 1 ] && break
   # All tasks either raced away, were deferred, or had unavailable models — brief sleep, then re-poll.
   # A research deferral means other candidates may still be eligible: re-poll straight away.
