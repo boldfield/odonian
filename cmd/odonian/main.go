@@ -1680,6 +1680,10 @@ func validateResearchDefaultModel(modelStr string, allowedModels []string) (stri
 	return modelStr, nil
 }
 
+// selectedTaskEnv names the environment variable the fleet harness sets to pin `odonian next` to
+// the one task it selected under the global scheduling comparator.
+const selectedTaskEnv = "ODONIAN_SELECTED_TASK_ID"
+
 func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, args []string) error {
 	if baseURL == "" {
 		return fmt.Errorf("ODONIAN_URL environment variable not set")
@@ -1717,6 +1721,19 @@ func executeNext(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 	tasks, err := client.ListTasks(ctx, *projectFlag, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to list tasks: %w", err)
+	}
+
+	// The fleet harness compares candidates across projects and pins the dispatched agent to the
+	// task it selected: `next` then offers only that task, so a race or a newly queued task can
+	// never make the agent pick (and claim) a different one. If it is no longer claimable, nothing is.
+	if selectedID := os.Getenv(selectedTaskEnv); selectedID != "" {
+		selected := make([]tuiclient.Task, 0, 1)
+		for _, candidate := range tasks {
+			if candidate.ID == selectedID {
+				selected = append(selected, candidate)
+			}
+		}
+		tasks = selected
 	}
 
 	if len(tasks) == 0 {

@@ -2281,6 +2281,48 @@ func TestExecuteNextWithClaim(t *testing.T) {
 	}
 }
 
+func TestExecuteNextPinnedToSelectedTask(t *testing.T) {
+	high := int64(1001)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/proj-1/tasks" && r.URL.Query().Get("claimable") == "true" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Task{
+				{ID: "task-low", State: "ready", Model: "haiku", Kind: "implement", Title: "Low"},
+				{ID: "task-high", State: "ready", Model: "haiku", Kind: "implement", Title: "High", Priority: &high},
+			})
+		}
+	}))
+	defer server.Close()
+	args := []string{"--project", "proj-1", "--model", "haiku", "--kind", "implement"}
+
+	t.Setenv(selectedTaskEnv, "task-low")
+	out := captureStdout(t, func() {
+		if err := executeNext(context.Background(), server.URL, "test-token", false, args); err != nil {
+			t.Fatalf("executeNext pinned: %v", err)
+		}
+	})
+	if strings.TrimSpace(out) != "task-low" {
+		t.Fatalf("pinned next printed %q, want the selected task-low", out)
+	}
+
+	t.Setenv(selectedTaskEnv, "task-gone")
+	err := executeNext(context.Background(), server.URL, "test-token", false, args)
+	var claimErr *claimError
+	if !errors.As(err, &claimErr) || claimErr.code != 2 {
+		t.Fatalf("pinned to a task that is no longer claimable: got %v, want exit-2 claimError", err)
+	}
+
+	t.Setenv(selectedTaskEnv, "")
+	out = captureStdout(t, func() {
+		if err := executeNext(context.Background(), server.URL, "test-token", false, args); err != nil {
+			t.Fatalf("executeNext unpinned: %v", err)
+		}
+	})
+	if strings.TrimSpace(out) != "task-high" {
+		t.Fatalf("unpinned next printed %q, want the highest-priority task-high", out)
+	}
+}
+
 func TestExecuteNextRaced(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/projects/proj-1/tasks" && r.URL.Query().Get("claimable") == "true" {

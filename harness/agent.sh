@@ -53,6 +53,55 @@ case "${KIND:?--kind required}" in implement|review|merge) ;; *) echo "kind must
 
 export AGENT_MODEL="$MODEL"
 
+# ============================== GLOBAL SCHEDULING ==============================
+# One comparator orders every candidate the fleet can start, at every priority value: priority
+# DESCENDING, task created_at ASCENDING, task ID ASCENDING. All allowed projects are compared as one
+# set before anything is dispatched; there is no project shuffle and no per-project head-of-line pick.
+# (The server's `next` and the TUI apply the same comparator within a project.)
+#
+# Candidate rows are US-separated (a non-whitespace separator, so an empty field never collapses):
+#   <priority, 20-digit zero-padded><created_at, normalized><task id><model><project id><repo>
+# The zero-padded priority and the fixed-width created_at make a byte-wise `LC_ALL=C sort` an exact
+# integer / timestamp comparison, independent of locale and of sort's numeric parsing (priorities
+# above 1000 — server-generated Move-to-front values — are ordinary integers, never special cased).
+US=$'\037'
+ALLOW="${ODONIAN_PROJECTS:-}"   # optional comma-separated project id allowlist (MULTI mode)
+in_allow() { [ -z "$ALLOW" ] && return 0; case ",$ALLOW," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+# Sort candidate rows on stdin by the comparator above.
+sort_candidates() { LC_ALL=C sort -t "$US" -k1,1r -k2,2 -k3,3; }
+
+# Emit candidate rows for the claimable kind-$2 tasks of project $1 (repo $3 is carried through).
+# The integer priority is quoted before jq sees it so a large value is never rounded through a
+# float; a missing priority means the default 500. created_at is normalized to a fixed-width UTC
+# form (fraction right-padded to 9 digits) because RFC 3339 trims trailing fractional zeros, which
+# would otherwise misorder 12:00:00Z against 12:00:00.5Z; a stamp that isn't plain UTC is kept as is.
+project_candidates() {
+  local pid="$1" kind="$2" repo="${3:-}" tasks_json
+  tasks_json="$(odonian tasks --project "$pid" --claimable --kind "$kind" --json 2>/dev/null)" || return 0
+  printf '%s' "$tasks_json" | sed -E 's/"priority":[[:space:]]*([0-9]+)/"priority":"\1"/g' \
+    | jq -r --arg pid "$pid" --arg repo "$repo" --arg us "$US" '
+        def ts: . as $s
+          | (capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.(?<frac>[0-9]+))?(Z|\\+00:00)$") // null) as $m
+          | if $m == null then $s else $m.base + "." + ((($m.frac // "") + "000000000")[0:9]) + "Z" end;
+        def pad: if test("^[0-9]{1,20}$") then ("00000000000000000000" + .)[-20:] else "00000000000000000500" end;
+        .[]? | [ ((.priority // 500) | tostring | pad), ((.created_at // "") | ts), .id, (.model // ""), $pid, $repo ]
+        | join($us)' 2>/dev/null
+}
+
+# Emit the globally sorted candidate rows of kind $1 across every allowed project that reports
+# claimable work. $2 = "repo" restricts to projects with a repo (clone-based worker/reviewer MULTI).
+global_candidates() {
+  local kind="$1" need_repo="${2:-}" pid prepo
+  while IFS="$US" read -r pid prepo; do
+    [ -n "$pid" ] || continue
+    in_allow "$pid" || continue
+    project_candidates "$pid" "$kind" "$prepo"
+  done < <(odonian projects --claimable --kind "$kind" --json 2>/dev/null \
+      | jq -r --arg us "$US" --arg need "$need_repo" '.[]? | select($need != "repo" or ((.repo // "") != "")) | [.id, (.repo // "")] | join($us)' 2>/dev/null) \
+    | sort_candidates
+}
+
 # ============================== MERGE-KIND (REPO-LESS) ==============================
 # Merge tasks are handled via REST API (internal/forge) and need NO local repo, NO worktree.
 # Run as a separate early loop before any clone/worktree setup, then exit.
@@ -100,34 +149,34 @@ if [ "$KIND" = "merge" ]; then
     done
   else
     # ---- MULTI-PROJECT MERGE MODE ----
-    ALLOW="${ODONIAN_PROJECTS:-}"
-    in_allow() { [ -z "$ALLOW" ] && return 0; case ",$ALLOW," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
-
     echo "[$AGENT_ID] merger (merge/MULTI) @ $ODONIAN_URL${ALLOW:+ (allow: $ALLOW)}; discovering work across projects"
     while true; do
       [ "$STOP" -eq 1 ] && break
-      # Discover projects holding claimable merge work
-      rows=()
-      while IFS= read -r _row; do rows+=("$_row"); done < <(odonian projects --claimable --kind merge --json \
-          | jq -r '.[] | .id' 2>/dev/null | sort -R)
-      if [ "${#rows[@]}" -eq 0 ]; then
+      # Compare every claimable merge task across all allowed projects as one set (priority desc,
+      # created_at asc, id asc) and try them in that order. ODONIAN_SELECTED_TASK_ID pins `next` to
+      # the chosen task, so a race or a newer task can never make it claim a different one: it
+      # reports nothing claimable and we fall through to the next candidate.
+      candidates=()
+      while IFS= read -r _row; do candidates+=("$_row"); done < <(global_candidates merge)
+      if [ "${#candidates[@]}" -eq 0 ]; then
         echo "[$AGENT_ID] $(date '+%H:%M:%S') no claimable merge work in any project; sleeping 30s"; nap 30; continue
       fi
 
       worked=0
-      for pid in "${rows[@]}"; do
+      for _row in "${candidates[@]}"; do
         [ "$STOP" -eq 1 ] && break
-        in_allow "$pid" || continue
-        task_id=$(odonian next --project "$pid" --kind merge --claim 2>/dev/null)
-        if [ -n "$task_id" ]; then
+        IFS="$US" read -r _ _ task_id _ pid _ <<< "$_row"
+        [ -n "$task_id" ] || continue
+        claimed_id=$(ODONIAN_SELECTED_TASK_ID="$task_id" odonian next --project "$pid" --kind merge --claim 2>/dev/null)
+        if [ -n "$claimed_id" ]; then
           echo "[$AGENT_ID] $(date '+%H:%M:%S') merging on project [${pid:0:8}]…"
-          odonian merge "$task_id"
+          merge_one "$claimed_id"
           worked=1
           break
         fi
       done
       [ "$STOP" -eq 1 ] && break
-      [ "$worked" -eq 0 ] && { echo "[$AGENT_ID] $(date '+%H:%M:%S') candidate projects raced away; sleeping 10s"; nap 10; }
+      [ "$worked" -eq 0 ] && { echo "[$AGENT_ID] $(date '+%H:%M:%S') candidate tasks raced away; sleeping 10s"; nap 10; }
     done
   fi
   exit 0
@@ -378,6 +427,7 @@ clear_model_failures() {
 #
 # State of the admission currently held (set by admit_research_task, cleared by clear_preclaim):
 P_TASK="" P_ATTEMPT="" P_PERMIT="" P_REQUEST="" P_MODEL=""
+SELECTED_TASK_ID=""   # task the loop selected for a legacy (non-preclaimed) dispatch; see dispatch()
 ADM_STATE=""    # granted | deferred | busy | lost | ambiguous (outcome of the last admit_research_task)
 
 clear_preclaim() { P_TASK="" P_ATTEMPT="" P_PERMIT="" P_REQUEST="" P_MODEL=""; }
@@ -620,21 +670,20 @@ monitor_dispatch() {
   exit 0
 }
 
-# Select the highest-priority claimable task of kind $2 in project $1 whose model is not
-# currently in a failure backoff window, skipping past any head task(s) pinned to an unavailable
-# model. Echoes "id<TAB>model" of the chosen task, or nothing if the project has no claimable
-# task of this kind, or every claimable task is deferred or on an unavailable model (the caller then falls back
-# to its normal "nothing claimable" nap — the agent only backs off entirely in that case).
+# Select the first claimable task of kind $2 in project $1 under the shared comparator (priority
+# desc, created_at asc, id asc) whose model is not currently in a failure backoff window and which
+# is not locally deferred, skipping past any head task(s) that are. Echoes "id<TAB>model" of the
+# chosen task, or nothing if the project has no such task (the caller then falls back to its normal
+# "nothing claimable" nap — the agent only backs off entirely in that case).
 pick_claimable_task() {
-  local project="$1" kind="$2" json id model
-  json=$(odonian tasks --project "$project" --claimable --kind "$kind" --json 2>/dev/null) || return 0
-  while IFS=$'\t' read -r id model; do
+  local project="$1" kind="$2" id model
+  while IFS="$US" read -r _ _ id model _ _; do
     [ -n "$id" ] || continue
     model_unavailable "$model" && continue
     task_deferred "$id" && continue
     printf '%s\t%s\n' "$id" "$model"
     return 0
-  done < <(printf '%s' "$json" | jq -r '.[]? | "\(.id)\t\(.model)"' 2>/dev/null)
+  done < <(project_candidates "$project" "$kind" | sort_candidates)
   return 0
 }
 
@@ -656,10 +705,15 @@ dispatch() {
   # Preclaimed contract (research): the harness already claimed the task, so the prompt must skip
   # next/claim and fence its heartbeat/submit to the admitted attempt. Always reset first — these
   # are exported and must never leak from one dispatch into the next (legacy) one.
-  unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID
+  unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_SELECTED_TASK_ID
   if [ -n "$P_TASK" ]; then
     export ODONIAN_PRECLAIMED_TASK_ID="$P_TASK"
     [ -n "$P_ATTEMPT" ] && export ODONIAN_PRECLAIMED_ATTEMPT_ID="$P_ATTEMPT"
+  elif [ -n "${SELECTED_TASK_ID:-}" ]; then
+    # Legacy (build/design/review) dispatch: the agent still runs `odonian next` + `claim` itself,
+    # but `next` is pinned to the task this harness selected under the global comparator. If that
+    # task was raced away `next` reports nothing claimable; it never falls back to another task.
+    export ODONIAN_SELECTED_TASK_ID="$SELECTED_TASK_ID"
   fi
 
   # Check if AGENT_MODEL is in AGENT_CODEX_MODELS (comma-separated list)
@@ -702,7 +756,7 @@ dispatch() {
     [ -e "$ctl/fenced" ] && fenced=1
     rm -rf "$ctl"
   fi
-  unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID
+  unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_SELECTED_TASK_ID
   # Finalize the research permit exactly once, now that the process is truly gone (never earlier:
   # a submit ends task ownership, not the dispatch). rc 126/127 = the model binary could not be
   # launched at all; that and any non-zero exit are `failed`, a fenced/stopped run `cancelled`.
@@ -731,12 +785,6 @@ dispatch() {
 }
 
 nap() { sleep "$1" & wait $! 2>/dev/null; }
-
-# Check if a project has claimable tasks for THIS agent's kind (any model).
-# Returns 0 if claimable work exists, 1 if not.
-has_claimable_work() {
-  odonian next --project "$1" --kind "$KIND" >/dev/null 2>&1
-}
 
 # Cleanup: drop ALL of this slot's worktrees (single wt-$SLOT and multi wt-$SLOT-*), prune clones.
 cleanup() {
@@ -792,44 +840,42 @@ if [ "$MULTI" = 0 ]; then
   while true; do
     [ "$STOP" -eq 1 ] && break
     prune_deferred
-    if has_claimable_work "$ODONIAN_PROJECT"; then
-      # Pick the highest-priority claimable task whose model isn't in a failure backoff window
-      # (skipping past any head task pinned to an unavailable model — see pick_claimable_task).
-      sel=$(pick_claimable_task "$ODONIAN_PROJECT" "$KIND")
-      if [ -z "$sel" ]; then
-        _idle="$(idle_nap 30)"
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND) with an available model; sleeping ${_idle}s"; nap "$_idle"; continue
-      fi
-      task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
-      # Read track from task, default to 'build' if absent
-      task_track=$(odonian show "$task_id" --json 2>/dev/null | jq -r '.track // "build"')
-      # An unreadable task must not default to a build prompt: a research task would then reach a
-      # model without admission. Treat it as transient and look again shortly.
-      if [ -z "$task_track" ]; then echo "[$AGENT_ID] $(date '+%H:%M:%S') could not read task $task_id; retrying shortly" >&2; nap 5; continue; fi
-      PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
-      if [ ! -f "$PROMPT_FILE" ]; then
-        odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
-      fi
-      # Research is paced: get admitted for THIS task before any model process exists. A denial
-      # leaves the task untouched, launches nothing, and defers it (honoring the server's retry hint)
-      # so the next pass picks other eligible work instead of re-asking.
-      if [ "$task_track" = "research" ]; then
-        if ! admit_research_task "$task_id" "$task_model"; then
-          [ "$STOP" -eq 1 ] && break
-          continue
-        fi
-      fi
-      echo "[$AGENT_ID] $(date '+%H:%M:%S') claimable $KIND; dispatching ($task_model/$task_track)…"
-      export AGENT_MODEL="$task_model"
-      dispatch
-      [ -n "$MODEL" ] && export AGENT_MODEL="$MODEL"   # restore original model for slot identity (if initially provided)
-      [ -n "$WT" ] && git -C "$WT" fetch origin --quiet 2>/dev/null || true
-      [ -n "$WT" ] && git -C "$WT" checkout --detach --force origin/main --quiet 2>/dev/null || true
-      [ "$STOP" -eq 1 ] && break
-    else
-      echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND); sleeping 30s"; nap 30
+    # Pick the first claimable task under the shared comparator (priority desc, created_at asc, id
+    # asc) whose model isn't in a failure backoff window and that isn't deferred (see pick_claimable_task).
+    sel=$(pick_claimable_task "$ODONIAN_PROJECT" "$KIND")
+    if [ -z "$sel" ]; then
+      _idle="$(idle_nap 30)"
+      echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND) with an available model; sleeping ${_idle}s"; nap "$_idle"; continue
     fi
+    task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
+    # Read track from task, default to 'build' if absent
+    task_track=$(odonian show "$task_id" --json 2>/dev/null | jq -r '.track // "build"')
+    # An unreadable task must not default to a build prompt: a research task would then reach a
+    # model without admission. Treat it as transient and look again shortly.
+    if [ -z "$task_track" ]; then echo "[$AGENT_ID] $(date '+%H:%M:%S') could not read task $task_id; retrying shortly" >&2; nap 5; continue; fi
+    PROMPT_FILE="$(get_prompt_file "$task_track" "$KIND")"
+    if [ ! -f "$PROMPT_FILE" ]; then
+      odonian transition "$task_id" --to blocked --note "no prompt for $DELIVERY_MODE/$task_track/$KIND: $PROMPT_FILE"
+      echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
+    fi
+    # Research is paced: get admitted for THIS task before any model process exists. A denial
+    # leaves the task untouched, launches nothing, and defers it (honoring the server's retry hint)
+    # so the next pass picks other eligible work instead of re-asking.
+    if [ "$task_track" = "research" ]; then
+      if ! admit_research_task "$task_id" "$task_model"; then
+        [ "$STOP" -eq 1 ] && break
+        continue
+      fi
+    fi
+    echo "[$AGENT_ID] $(date '+%H:%M:%S') claimable $KIND; dispatching ($task_model/$task_track)…"
+    export AGENT_MODEL="$task_model"
+    SELECTED_TASK_ID="$task_id"
+    dispatch
+    SELECTED_TASK_ID=""
+    [ -n "$MODEL" ] && export AGENT_MODEL="$MODEL"   # restore original model for slot identity (if initially provided)
+    [ -n "$WT" ] && git -C "$WT" fetch origin --quiet 2>/dev/null || true
+    [ -n "$WT" ] && git -C "$WT" checkout --detach --force origin/main --quiet 2>/dev/null || true
+    [ "$STOP" -eq 1 ] && break
   done
   exit 0
 fi
@@ -841,46 +887,39 @@ if [ "$DELIVERY_MODE" = "local_commit" ]; then
   exit 1
 fi
 
-ALLOW="${ODONIAN_PROJECTS:-}"   # optional comma-separated id allowlist
-in_allow() { [ -z "$ALLOW" ] && return 0; case ",$ALLOW," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
-
 AGENT_MODEL_STR="${MODEL:+$MODEL/}$KIND"
 echo "[$AGENT_ID] $ROLE ($AGENT_MODEL_STR) MULTI @ $ODONIAN_URL${ALLOW:+ (allow: $ALLOW)}; discovering work across projects"
 while true; do
   [ "$STOP" -eq 1 ] && break
-  # Discover projects holding my kind claimable work (any model) — one call (v0.4.0 filter).
-  # (while-read, not mapfile: macOS ships bash 3.2.) sort -R shuffles so projects drain fairly.
-  rows=()
-  while IFS= read -r _row; do rows+=("$_row"); done < <(odonian projects --claimable --kind "$KIND" --json \
-      | jq -r '.[] | select(.repo != null and .repo != "") | "\(.id)\t\(.repo)"' 2>/dev/null \
-      | sort -R)
-  if [ "${#rows[@]}" -eq 0 ]; then
+  # Collect EVERY claimable task of my kind (any model) from all allowed projects and order the
+  # whole set by the shared comparator (priority desc, created_at asc, id asc) before dispatching
+  # anything: the best task wins regardless of which project it is in, including when every task has
+  # the default priority (oldest first). No project shuffle. (while-read, not mapfile: macOS ships
+  # bash 3.2.)
+  candidates=()
+  while IFS= read -r _row; do candidates+=("$_row"); done < <(global_candidates "$KIND" repo)
+  if [ "${#candidates[@]}" -eq 0 ]; then
     echo "[$AGENT_ID] $(date '+%H:%M:%S') no claimable $KIND work in any project; sleeping 30s"; nap 30; continue
   fi
 
   worked=0
   deferred_this_pass=0
+  failed_projects=" "
   prune_deferred
-  for row in "${rows[@]}"; do
+  for _row in "${candidates[@]}"; do
     [ "$STOP" -eq 1 ] && break
-    pid="${row%%$'\t'*}"; prepo="${row#*$'\t'}"
-    [ -z "$pid" ] && continue
-    in_allow "$pid" || continue
-    # Re-check claimable (the listing can race another worker); skip if it emptied out.
-    has_claimable_work "$pid" || continue
-    # Pick the highest-priority claimable task whose model isn't in a failure backoff window
-    # (skipping past any head task pinned to an unavailable model — see pick_claimable_task).
-    # Done before cloning so a project whose only claimable work is on a down backend doesn't
-    # cost a clone/worktree setup — try the next project instead.
-    sel=$(pick_claimable_task "$pid" "$KIND")
-    if [ -z "$sel" ]; then
-      continue   # raced away, or every claimable task's model is unavailable — try next project
-    fi
-    task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
+    IFS="$US" read -r _ _ task_id task_model pid prepo <<< "$_row"
+    [ -n "$task_id" ] && [ -n "$pid" ] || continue
+    # Local filters: a task pinned to a backend in a failure backoff window, or one still inside
+    # its admission-denial/claim-race deferral, is passed over so lower candidates (other models,
+    # other projects) still make progress. Done before cloning so an ineligible task costs nothing.
+    model_unavailable "$task_model" && continue
+    task_deferred "$task_id" && continue
+    case "$failed_projects" in *" $pid "*) continue ;; esac   # clone/worktree setup already failed this pass
     apply_owner_token "$(norm_repo "$prepo" | cut -d/ -f1)"   # auth as the repo's owner (default auth if unmapped)
     prune_repos_cache "$REPOS_DIR/$(repo_slug "$prepo")"
-    clone="$(ensure_clone "$prepo")" || continue
-    wt="$(ensure_worktree "$clone")" || continue
+    clone="$(ensure_clone "$prepo")" || { failed_projects="$failed_projects$pid "; continue; }
+    wt="$(ensure_worktree "$clone")" || { failed_projects="$failed_projects$pid "; continue; }
     export ODONIAN_PROJECT="$pid" ODONIAN_REPO="$wt"
     cd "$wt" || continue
     # Read track from task, default to 'build' if absent
@@ -892,7 +931,7 @@ while true; do
       echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
     fi
     # Research is paced: get admitted for THIS task before any model process exists. A denial leaves
-    # the task untouched, launches nothing, and defers it; move on to the next project/task.
+    # the task untouched, launches nothing, and defers it; move on to the next candidate.
     if [ "$task_track" = "research" ]; then
       if ! admit_research_task "$task_id" "$task_model"; then
         [ "$STOP" -eq 1 ] && break
@@ -902,17 +941,19 @@ while true; do
     fi
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatching ($task_model/$task_track/$KIND) on $(norm_repo "$prepo") [${pid:0:8}]…"
     export AGENT_MODEL="$task_model"
+    SELECTED_TASK_ID="$task_id"
     dispatch
+    SELECTED_TASK_ID=""
     [ -n "$MODEL" ] && export AGENT_MODEL="$MODEL"   # restore original model for slot identity (if initially provided)
     git -C "$wt" checkout --detach --force origin/main --quiet 2>/dev/null || true
     worked=1
-    break   # one task per discovery pass, then re-poll fresh (keeps the shuffle honest)
+    break   # one task per discovery pass, then re-list fresh so the next pick sees current priorities
   done
   [ "$STOP" -eq 1 ] && break
-  # rows existed but every candidate raced away / failed setup — brief sleep, then re-poll.
-  # A research deferral this pass means other candidates (same project, next task) may still be
-  # eligible: re-poll straight away, skipping the deferred task. Otherwise wait, but no longer than
-  # the earliest deferral expiry.
+  # candidates existed but every one raced away / was ineligible / failed setup — brief sleep, then
+  # re-list. A research deferral this pass means other candidates may still be eligible: re-list
+  # straight away, skipping the deferred task. Otherwise wait, but no longer than the earliest
+  # deferral expiry.
   if [ "$worked" -eq 0 ]; then
     if [ "$deferred_this_pass" -eq 1 ]; then _idle=1; else _idle="$(idle_nap 10)"; fi
     echo "[$AGENT_ID] $(date '+%H:%M:%S') no dispatchable candidate this pass; sleeping ${_idle}s"; nap "$_idle"
