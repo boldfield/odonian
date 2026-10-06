@@ -5074,8 +5074,8 @@ func TestBoardModel_SetPriorityFlow_ValidInput(t *testing.T) {
 	}
 
 	// Verify priority state was cleared after success
-	if model.pendingActionKey != "" {
-		t.Errorf("Expected pendingActionKey cleared after success, got %q", model.pendingActionKey)
+	if model.lastPriorityAttempt.key != "" {
+		t.Errorf("Expected remembered attempt cleared after success, got %q", model.lastPriorityAttempt.key)
 	}
 	if model.pendingPriority != 0 {
 		t.Errorf("Expected pendingPriority cleared after success, got %d", model.pendingPriority)
@@ -5293,13 +5293,6 @@ func TestBoardModel_ActionKeyPreservation(t *testing.T) {
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = m.(*BoardModel)
 
-	// Capture the key
-	firstKey := model.pendingActionKey
-
-	if firstKey == "" {
-		t.Fatalf("Expected pendingActionKey to be set, got empty")
-	}
-
 	// Type reason and confirm
 	for _, ch := range "test" {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
@@ -5319,8 +5312,8 @@ func TestBoardModel_ActionKeyPreservation(t *testing.T) {
 	if len(keys) == 0 {
 		t.Fatalf("Expected action key to be sent to API")
 	}
-	if keys[0] != firstKey {
-		t.Errorf("Expected API to receive key %q, got %q", firstKey, keys[0])
+	if keys[0] == "" {
+		t.Errorf("Expected non-empty action key to be sent to API")
 	}
 }
 
@@ -5555,8 +5548,8 @@ func TestBoardModel_PriorityDisplayWithTopicAnchor(t *testing.T) {
 	output := model.View()
 
 	// Verify topic anchor is displayed
-	if !strings.Contains(output, "[api-feature]") {
-		t.Errorf("Expected topic anchor [api-feature] in view:\n%s", output)
+	if !strings.Contains(output, "[anchor:api-feat]") {
+		t.Errorf("Expected shortened topic anchor [anchor:api-feat] in view:\n%s", output)
 	}
 
 	// Verify priority is still displayed
@@ -5603,121 +5596,234 @@ func TestDetailView_HeldPlusPriority(t *testing.T) {
 	}
 }
 
-// TestBoardModel_ActionFailureKeepsPendingKey tests that action key is preserved after failure.
-func TestBoardModel_ActionFailureKeepsPendingKey(t *testing.T) {
-	var callCount int
+// priorityTestFlow drives a priority action through the keyboard: the start key, optional
+// manual value, reason, and the final confirmation. It returns the model and confirm command.
+func priorityTestFlow(t *testing.T, model *BoardModel, startKey rune, value, reason string) (*BoardModel, tea.Cmd) {
+	t.Helper()
+	typeText := func(text string) {
+		for _, ch := range text {
+			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+			model = m.(*BoardModel)
+		}
+		m, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = m.(*BoardModel)
+	}
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{startKey}})
+	model = m.(*BoardModel)
+	if value != "" {
+		typeText(value)
+	}
+	typeText(reason)
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	return m.(*BoardModel), cmd
+}
+
+// serverLikeIdempotency mimics the server: a key bound to one request replays that request and
+// rejects (409 IDEMPOTENCY_MISMATCH) any different request using the same key.
+type serverLikeIdempotency struct {
+	seen map[string]tuiclient.SetTaskPriorityRequest
+}
+
+func (s *serverLikeIdempotency) check(req tuiclient.SetTaskPriorityRequest) error {
+	if s.seen == nil {
+		s.seen = map[string]tuiclient.SetTaskPriorityRequest{}
+	}
+	if prior, ok := s.seen[req.ActionKey]; ok && (prior.Priority != req.Priority || prior.Reason != req.Reason) {
+		return &tuiclient.APIError{StatusCode: http.StatusConflict, Code: "IDEMPOTENCY_MISMATCH", Message: "action key already used for a different priority request"}
+	}
+	s.seen[req.ActionKey] = req
+	return nil
+}
+
+// TestBoardModel_ActionFailureRetrySendsSameKey drives a failed Set (lost response), then an
+// identical retry through the UI, and asserts both calls carry the same non-empty key.
+func TestBoardModel_ActionFailureRetrySendsSameKey(t *testing.T) {
+	var requests []tuiclient.SetTaskPriorityRequest
 	mockClient := &tuiclient.MockClient{
 		SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
-			callCount++
-			if callCount == 1 {
-				// First call fails
+			requests = append(requests, req)
+			if len(requests) == 1 {
 				return tuiclient.PriorityChange{}, fmt.Errorf("timeout")
 			}
-			// Second call succeeds
-			return tuiclient.PriorityChange{
-				Priority:    750,
-				OldPriority: 500,
-			}, nil
+			return tuiclient.PriorityChange{TopicAnchorID: "topic-1", Priority: 750, OldPriority: 500}, nil
 		},
 		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
-			return []tuiclient.Task{
-				{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(750)},
-			}, nil
+			return []tuiclient.Task{{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(500)}}, nil
 		},
 	}
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{{ID: "task-1", Title: "Task", State: "ready"}})
 
-	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
-		{ID: "task-1", Title: "Task", State: "ready"},
-	})
-
-	// Start set priority flow
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
-	model = m.(*BoardModel)
-
-	// Type priority
-	for _, ch := range "750" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
-		model = m.(*BoardModel)
+	model, cmd := priorityTestFlow(t, model, 'i', "750", "urgent")
+	model = executeReviewCmd(t, model, cmd)
+	if !strings.Contains(model.error, "set priority failed") {
+		t.Fatalf("Expected failure message, got %q", model.error)
+	}
+	if model.lastPriorityAttempt.key == "" {
+		t.Fatalf("Expected attempt kept after retryable failure")
+	}
+	if len(model.tasks["ready"]) != 1 {
+		t.Errorf("Expected board state preserved after failure, got %v", model.tasks["ready"])
 	}
 
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	model = m.(*BoardModel)
-
-	// Type reason
-	for _, ch := range "test" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
-		model = m.(*BoardModel)
-	}
-
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	model = m.(*BoardModel)
-
-	// Capture key before first attempt
-	firstKey := model.pendingActionKey
-	if firstKey == "" {
-		t.Fatalf("Expected pendingActionKey to be set")
-	}
-
-	// Confirm (first attempt fails)
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	model = m.(*BoardModel)
-
-	// Execute command (will fail)
+	model, cmd = priorityTestFlow(t, model, 'i', "750", "urgent")
 	model = executeReviewCmd(t, model, cmd)
 
-	// After failure, key should still be there for retry
-	if model.pendingActionKey != firstKey {
-		t.Errorf("Expected key to be preserved after failure, was %q, now %q", firstKey, model.pendingActionKey)
+	if len(requests) != 2 {
+		t.Fatalf("Expected 2 requests, got %d", len(requests))
+	}
+	if requests[0].ActionKey == "" || requests[0].ActionKey != requests[1].ActionKey {
+		t.Errorf("Expected identical non-empty keys, got %q and %q", requests[0].ActionKey, requests[1].ActionKey)
+	}
+	if requests[0].Priority != requests[1].Priority || requests[0].Reason != requests[1].Reason {
+		t.Errorf("Expected identical requests, got %+v and %+v", requests[0], requests[1])
+	}
+	if model.lastPriorityAttempt.key != "" {
+		t.Errorf("Expected attempt cleared after success")
+	}
+	if !strings.Contains(model.error, "priority set to 750") {
+		t.Errorf("Expected success message, got %q", model.error)
 	}
 }
 
-// TestBoardModel_ActionKeyTiedToTaskAndAction tests that keys are tied to (task, action) tuple.
-func TestBoardModel_ActionKeyTiedToTaskAndAction(t *testing.T) {
-	mockClient := &tuiclient.MockClient{}
+// TestBoardModel_ActionRetryWithChangedRequestMintsFreshKey checks a retry whose value or reason
+// differs does not reuse the failed attempt's key (the server would answer IDEMPOTENCY_MISMATCH).
+func TestBoardModel_ActionRetryWithChangedRequestMintsFreshKey(t *testing.T) {
+	cases := []struct {
+		name       string
+		value      string
+		reason     string
+		wantNewKey bool
+	}{
+		{"changed value", "800", "urgent", true},
+		{"changed reason", "750", "very urgent", true},
+		{"identical", "750", "urgent", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			idempotency := &serverLikeIdempotency{}
+			var requests []tuiclient.SetTaskPriorityRequest
+			mockClient := &tuiclient.MockClient{
+				SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+					requests = append(requests, req)
+					if err := idempotency.check(req); err != nil {
+						return tuiclient.PriorityChange{}, err
+					}
+					if len(requests) == 1 {
+						return tuiclient.PriorityChange{}, fmt.Errorf("timeout after commit")
+					}
+					return tuiclient.PriorityChange{TopicAnchorID: "topic-1", Priority: req.Priority}, nil
+				},
+				ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+					return []tuiclient.Task{{ID: "task-1", Title: "Task", State: "ready"}}, nil
+				},
+			}
+			model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{{ID: "task-1", Title: "Task", State: "ready"}})
 
+			model, cmd := priorityTestFlow(t, model, 'i', "750", "urgent")
+			model = executeReviewCmd(t, model, cmd)
+			model, cmd = priorityTestFlow(t, model, 'i', tc.value, tc.reason)
+			model = executeReviewCmd(t, model, cmd)
+
+			if len(requests) != 2 {
+				t.Fatalf("Expected 2 requests, got %d", len(requests))
+			}
+			if gotNew := requests[0].ActionKey != requests[1].ActionKey; gotNew != tc.wantNewKey {
+				t.Errorf("fresh key = %v, want %v", gotNew, tc.wantNewKey)
+			}
+			if strings.Contains(model.error, "409") {
+				t.Errorf("Retry hit idempotency mismatch: %q", model.error)
+			}
+		})
+	}
+}
+
+// TestBoardModel_RejectedActionDropsKey checks a definitive 4xx rejection clears the remembered
+// key so the operator is not stuck, and a timeout (408) keeps it.
+func TestBoardModel_RejectedActionDropsKey(t *testing.T) {
+	cases := []struct {
+		status   int
+		wantKept bool
+	}{
+		{http.StatusBadRequest, false},
+		{http.StatusConflict, false},
+		{http.StatusRequestTimeout, true},
+		{http.StatusTooManyRequests, true},
+		{http.StatusInternalServerError, true},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("status_%d", tc.status), func(t *testing.T) {
+			mockClient := &tuiclient.MockClient{
+				MoveTaskToFrontFunc: func(ctx context.Context, taskID string, req tuiclient.MoveTaskToFrontRequest) (tuiclient.PriorityChange, error) {
+					return tuiclient.PriorityChange{}, &tuiclient.APIError{StatusCode: tc.status, Message: "nope"}
+				},
+				ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+					return []tuiclient.Task{{ID: "task-1", Title: "Task", State: "ready"}}, nil
+				},
+			}
+			model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{{ID: "task-1", Title: "Task", State: "ready"}})
+			model, cmd := priorityTestFlow(t, model, 'w', "", "because")
+			model = executeReviewCmd(t, model, cmd)
+
+			if !strings.Contains(model.error, fmt.Sprintf("move to front %d", tc.status)) {
+				t.Errorf("Expected real status in error, got %q", model.error)
+			}
+			if kept := model.lastPriorityAttempt.key != ""; kept != tc.wantKept {
+				t.Errorf("key kept = %v, want %v", kept, tc.wantKept)
+			}
+		})
+	}
+}
+
+// TestBoardModel_ActionKeyTiedToRequest checks keys are never shared across tasks or actions and
+// that an explicit cancel drops the remembered attempt.
+func TestBoardModel_ActionKeyTiedToRequest(t *testing.T) {
+	var keys []string
+	mockClient := &tuiclient.MockClient{
+		SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+			keys = append(keys, req.ActionKey)
+			return tuiclient.PriorityChange{}, fmt.Errorf("timeout")
+		},
+		MoveTaskToFrontFunc: func(ctx context.Context, taskID string, req tuiclient.MoveTaskToFrontRequest) (tuiclient.PriorityChange, error) {
+			keys = append(keys, req.ActionKey)
+			return tuiclient.PriorityChange{}, fmt.Errorf("timeout")
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{
+				{ID: "task-1", Title: "Task 1", State: "ready"},
+				{ID: "task-2", Title: "Task 2", State: "ready"},
+			}, nil
+		},
+	}
 	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
 		{ID: "task-1", Title: "Task 1", State: "ready"},
 		{ID: "task-2", Title: "Task 2", State: "ready"},
 	})
 
-	// Start set priority on task-1
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
-	model = m.(*BoardModel)
+	model, cmd := priorityTestFlow(t, model, 'i', "750", "urgent")
+	model = executeReviewCmd(t, model, cmd)
 
-	// Type priority
-	for _, ch := range "750" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
-		model = m.(*BoardModel)
+	// Different action on the same task, then the same action on a different task.
+	model, cmd = priorityTestFlow(t, model, 'w', "", "urgent")
+	model = executeReviewCmd(t, model, cmd)
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = m.(*BoardModel)
+	model, cmd = priorityTestFlow(t, model, 'w', "", "urgent")
+	model = executeReviewCmd(t, model, cmd)
+
+	if len(keys) != 3 {
+		t.Fatalf("Expected 3 requests, got %d", len(keys))
+	}
+	if keys[0] == keys[1] || keys[1] == keys[2] || keys[0] == keys[2] {
+		t.Errorf("Expected distinct keys across action/task changes, got %v", keys)
 	}
 
-	key1 := model.pendingActionKey
-	_ = model.pendingActionTaskID // saved for verification of state changes
-	_ = model.pendingActionType   // saved for verification of state changes
-
-	// Cancel the flow
+	// Explicit cancel clears the remembered attempt.
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	model = m.(*BoardModel)
-
-	// After cancel, key should be cleared
-	if model.pendingActionKey != "" {
-		t.Errorf("Expected pendingActionKey to be cleared on cancel, got %q", model.pendingActionKey)
-	}
-
-	// Now start front action on task-2
-	// First, move to task-2
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
-	model = m.(*BoardModel)
-
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
-	model = m.(*BoardModel)
-
-	if model.pendingTaskID != "task-2" {
-		t.Errorf("Expected pendingTaskID to be task-2, got %q", model.pendingTaskID)
-	}
-
-	// New action should get a new key, not reuse the old one
-	if model.pendingActionKey == key1 || model.pendingActionType != "front" {
-		t.Errorf("Expected new key for different action on different task, reused old key or wrong action type")
+	if model.lastPriorityAttempt.key != "" || model.pendingPriority != 0 || model.pendingPriorityReason != "" {
+		t.Errorf("Expected priority state cleared on cancel, got %+v", model.lastPriorityAttempt)
 	}
 }
 

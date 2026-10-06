@@ -107,12 +107,9 @@ type BoardModel struct {
 	reviewFromDetail bool            // true when the review flow was started from the detail view
 
 	// Priority action state
-	pendingPriorityReason string // captured reason for priority action
-	pendingPriority       int64  // captured priority value for set priority action
-	pendingActionKey      string // action key for priority action (for retry preservation)
-	pendingActionTaskID   string // task ID associated with the pending action key
-	pendingActionType     string // action type ("set", "front", "reset") associated with the pending action key
-	pendingActionPriority int64  // priority value associated with the pending action key (for set/reset)
+	pendingPriorityReason string          // captured reason for priority action
+	pendingPriority       int64           // captured priority value for set priority action
+	lastPriorityAttempt   priorityAttempt // most recent unconfirmed-outcome request, kept so a retry resends the same key
 
 	// Detail view state
 	detailTask      tuiclient.TaskDetail // the currently displayed task detail
@@ -245,6 +242,9 @@ type reviewActionMsg struct {
 	err           string
 	fromDetail    bool
 	actionSuccess bool // true only when the priority action itself succeeded
+	// actionRejected is true when the server definitively refused the priority action
+	// (4xx other than timeout/rate-limit), so its idempotency key cannot be retried.
+	actionRejected bool
 }
 
 // projectArchiveMsg is returned when a project archive completes.
@@ -599,6 +599,7 @@ func (m *BoardModel) setTaskPriorityCmd(taskID string, priority int64, reason st
 				msg := m.fetchTasksInline(ctx, fmt.Sprintf("set priority %d: %s", apiErr.StatusCode, apiErr.Message))
 				msg.fromDetail = fromDetail
 				msg.actionSuccess = false
+				msg.actionRejected = isDefinitiveRejection(apiErr.StatusCode)
 				return msg
 			}
 			msg := m.fetchTasksInline(ctx, fmt.Sprintf("set priority failed: %v", err))
@@ -634,6 +635,7 @@ func (m *BoardModel) moveTaskToFrontCmd(taskID string, reason string, actionKey 
 				msg := m.fetchTasksInline(ctx, fmt.Sprintf("move to front %d: %s", apiErr.StatusCode, apiErr.Message))
 				msg.fromDetail = fromDetail
 				msg.actionSuccess = false
+				msg.actionRejected = isDefinitiveRejection(apiErr.StatusCode)
 				return msg
 			}
 			msg := m.fetchTasksInline(ctx, fmt.Sprintf("move to front failed: %v", err))
@@ -670,6 +672,7 @@ func (m *BoardModel) resetTaskPriorityCmd(taskID string, reason string, actionKe
 				msg := m.fetchTasksInline(ctx, fmt.Sprintf("reset priority %d: %s", apiErr.StatusCode, apiErr.Message))
 				msg.fromDetail = fromDetail
 				msg.actionSuccess = false
+				msg.actionRejected = isDefinitiveRejection(apiErr.StatusCode)
 				return msg
 			}
 			msg := m.fetchTasksInline(ctx, fmt.Sprintf("reset priority failed: %v", err))
@@ -684,6 +687,14 @@ func (m *BoardModel) resetTaskPriorityCmd(taskID string, reason string, actionKe
 		msg.actionSuccess = true
 		return msg
 	}
+}
+
+// isDefinitiveRejection reports whether an HTTP status means the server refused the request
+// itself (so its idempotency key can never succeed on retry), as opposed to a timeout or
+// rate limit where an identical retry is still meaningful.
+func isDefinitiveRejection(statusCode int) bool {
+	return statusCode >= 400 && statusCode < 500 &&
+		statusCode != http.StatusRequestTimeout && statusCode != http.StatusTooManyRequests
 }
 
 // fetchTasksInline performs a synchronous ListTasks call within an already-running command
@@ -844,13 +855,24 @@ func sortTasksByPriority(tasks []tuiclient.Task) {
 		}
 
 		// Tie-break by created_at ascending (older first)
-		if tasks[i].CreatedAt != tasks[j].CreatedAt {
-			return tasks[i].CreatedAt < tasks[j].CreatedAt
+		if createdBefore, differs := compareCreatedAt(tasks[i].CreatedAt, tasks[j].CreatedAt); differs {
+			return createdBefore
 		}
 
 		// Final tie-break by ID ascending
 		return tasks[i].ID < tasks[j].ID
 	})
+}
+
+// compareCreatedAt compares RFC3339 timestamps chronologically (raw string order is wrong when
+// fractional-second precision differs). Unparseable values fall back to string comparison.
+func compareCreatedAt(a, b string) (aBeforeB bool, differs bool) {
+	timeA, errA := time.Parse(time.RFC3339Nano, a)
+	timeB, errB := time.Parse(time.RFC3339Nano, b)
+	if errA == nil && errB == nil {
+		return timeA.Before(timeB), !timeA.Equal(timeB)
+	}
+	return a < b, a != b
 }
 
 // fetchProjects creates a command that fetches the list of projects.
@@ -1121,12 +1143,6 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "i":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
-				// Only reuse the existing key if it's for the same task and action type
-				if m.pendingActionKey == "" || m.pendingActionTaskID != m.selectedTaskID || m.pendingActionType != "set" {
-					m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
-					m.pendingActionTaskID = m.selectedTaskID
-					m.pendingActionType = "set"
-				}
 				m.reviewInput.Placeholder = "priority (1-1000)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1141,12 +1157,6 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "w":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
-				// Only reuse the existing key if it's for the same task and action type
-				if m.pendingActionKey == "" || m.pendingActionTaskID != m.selectedTaskID || m.pendingActionType != "front" {
-					m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
-					m.pendingActionTaskID = m.selectedTaskID
-					m.pendingActionType = "front"
-				}
 				m.reviewInput.Placeholder = "reason for moving to front (required)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1161,12 +1171,6 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
-				// Only reuse the existing key if it's for the same task and action type
-				if m.pendingActionKey == "" || m.pendingActionTaskID != m.selectedTaskID || m.pendingActionType != "reset" {
-					m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
-					m.pendingActionTaskID = m.selectedTaskID
-					m.pendingActionType = "reset"
-				}
 				m.reviewInput.Placeholder = "reason for resetting priority (required)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1257,9 +1261,10 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.error = ""
 		}
-		// Clear priority action state only when the action itself succeeded.
-		// On action failure, keep the key and state for retry; only clear on success.
-		if msg.actionSuccess && m.pendingActionKey != "" {
+		// Keep the attempt (and its key) across retryable failures so an identical
+		// retry replays rather than double-applies; drop it on success or when the
+		// server rejected the request outright.
+		if msg.actionSuccess || msg.actionRejected {
 			m.clearPriorityActionState()
 		}
 		// When the action originated from the detail view, the task has left "review"
@@ -1446,12 +1451,6 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Set Priority: set priority for the task (detail view)
 	case "i":
 		m.pendingTaskID = m.detailTask.ID
-		// Only reuse the existing key if it's for the same task and action type
-		if m.pendingActionKey == "" || m.pendingActionTaskID != m.detailTask.ID || m.pendingActionType != "set" {
-			m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
-			m.pendingActionTaskID = m.detailTask.ID
-			m.pendingActionType = "set"
-		}
 		m.reviewInput.Placeholder = "priority (1-1000)"
 		m.reviewInput.SetValue("")
 		m.reviewInput.Focus()
@@ -1465,12 +1464,6 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Move to Front: move task to front (server-calculated priority, detail view)
 	case "w":
 		m.pendingTaskID = m.detailTask.ID
-		// Only reuse the existing key if it's for the same task and action type
-		if m.pendingActionKey == "" || m.pendingActionTaskID != m.detailTask.ID || m.pendingActionType != "front" {
-			m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
-			m.pendingActionTaskID = m.detailTask.ID
-			m.pendingActionType = "front"
-		}
 		m.reviewInput.Placeholder = "reason for moving to front (required)"
 		m.reviewInput.SetValue("")
 		m.reviewInput.Focus()
@@ -1484,12 +1477,6 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Reset Priority: reset task priority to 500 (detail view)
 	case "e":
 		m.pendingTaskID = m.detailTask.ID
-		// Only reuse the existing key if it's for the same task and action type
-		if m.pendingActionKey == "" || m.pendingActionTaskID != m.detailTask.ID || m.pendingActionType != "reset" {
-			m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
-			m.pendingActionTaskID = m.detailTask.ID
-			m.pendingActionType = "reset"
-		}
 		m.reviewInput.Placeholder = "reason for resetting priority (required)"
 		m.reviewInput.SetValue("")
 		m.reviewInput.Focus()
@@ -1893,7 +1880,7 @@ func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			taskID := m.pendingTaskID
 			priority := m.pendingPriority
 			reason := m.pendingPriorityReason
-			actionKey := m.pendingActionKey
+			actionKey := m.priorityActionKey(taskID, priorityActionSet, priority, reason)
 			originFromDetail := m.reviewFromDetail
 			m.cancelReviewMode()
 			return m, m.setTaskPriorityCmd(taskID, priority, reason, actionKey, originFromDetail)
@@ -1930,7 +1917,7 @@ func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "y", "Y":
 			taskID := m.pendingTaskID
 			reason := m.pendingPriorityReason
-			actionKey := m.pendingActionKey
+			actionKey := m.priorityActionKey(taskID, priorityActionFront, 0, reason)
 			originFromDetail := m.reviewFromDetail
 			m.cancelReviewMode()
 			return m, m.moveTaskToFrontCmd(taskID, reason, actionKey, originFromDetail)
@@ -1967,7 +1954,7 @@ func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "y", "Y":
 			taskID := m.pendingTaskID
 			reason := m.pendingPriorityReason
-			actionKey := m.pendingActionKey
+			actionKey := m.priorityActionKey(taskID, priorityActionReset, 500, reason)
 			originFromDetail := m.reviewFromDetail
 			m.cancelReviewMode()
 			return m, m.resetTaskPriorityCmd(taskID, reason, actionKey, originFromDetail)
@@ -1995,7 +1982,6 @@ func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // cancelReviewMode resets all review-mode state and returns to the appropriate mode.
 // If the review was started from the detail view, we return to modeDetail; otherwise modeNormal.
-// If clearPriorityState is true, also clears the priority action state (for explicit cancels).
 func (m *BoardModel) cancelReviewMode() {
 	if m.reviewFromDetail {
 		m.mode = modeDetail
@@ -2010,16 +1996,51 @@ func (m *BoardModel) cancelReviewMode() {
 	m.inputHint = ""
 	m.reviewInput.SetValue("")
 	m.reviewInput.Blur()
-	// Note: Do NOT clear priority action state here. The confirm handlers call this
-	// before executing the action, so clearing here would lose the action key before
-	// the command runs. Only clear on explicit user cancel (pressing 'n').
+	// Priority attempt state is intentionally left alone: confirm handlers call this
+	// before the command runs, and a failed attempt must survive for an identical retry.
+	// Explicit cancels call clearPriorityActionState.
 }
 
-// clearPriorityActionState clears the pending state for priority actions after successful completion.
+// clearPriorityActionState drops captured priority input and any remembered attempt.
 func (m *BoardModel) clearPriorityActionState() {
-	m.pendingActionKey = ""
+	m.lastPriorityAttempt = priorityAttempt{}
 	m.pendingPriority = 0
 	m.pendingPriorityReason = ""
+}
+
+const (
+	priorityActionSet   = "set"
+	priorityActionFront = "front"
+	priorityActionReset = "reset"
+)
+
+// priorityAttempt identifies one priority request by everything the server hashes into
+// its idempotency check (action, task, value, reason) plus the key sent for it.
+type priorityAttempt struct {
+	key      string
+	taskID   string
+	action   string
+	priority int64
+	reason   string
+}
+
+// priorityActionKey returns the idempotency key for the request. An identical repeat of the
+// last attempt reuses its key (server replays instead of re-applying); any difference mints
+// a fresh key because the server would otherwise answer IDEMPOTENCY_MISMATCH.
+func (m *BoardModel) priorityActionKey(taskID, action string, priority int64, reason string) string {
+	attempt := m.lastPriorityAttempt
+	if attempt.key != "" && attempt.taskID == taskID && attempt.action == action &&
+		attempt.priority == priority && attempt.reason == reason {
+		return attempt.key
+	}
+	m.lastPriorityAttempt = priorityAttempt{
+		key:      fmt.Sprintf("odonian-tui-%s", uuid.New().String()),
+		taskID:   taskID,
+		action:   action,
+		priority: priority,
+		reason:   reason,
+	}
+	return m.lastPriorityAttempt.key
 }
 
 // getTasksInSelectedColumn returns the tasks in the currently selected column.
@@ -2415,8 +2436,12 @@ func (m *BoardModel) renderColumnTasks() string {
 			priority = " P:500"
 		}
 		anchor := ""
-		if task.TopicAnchorID != nil && *task.TopicAnchorID != "" {
-			anchor = fmt.Sprintf(" [%s]", *task.TopicAnchorID)
+		if task.TopicAnchorID != nil && *task.TopicAnchorID != "" && *task.TopicAnchorID != task.ID {
+			anchorDisplay := *task.TopicAnchorID
+			if len(anchorDisplay) > 8 {
+				anchorDisplay = anchorDisplay[:8]
+			}
+			anchor = fmt.Sprintf(" [anchor:%s]", anchorDisplay)
 		}
 		b.WriteString(fmt.Sprintf("%s %s %s%s%s%s  %s\n", prefix, taskIDDisplay, modelBadge, held, priority, anchor, task.Title))
 

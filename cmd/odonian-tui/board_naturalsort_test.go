@@ -75,3 +75,17 @@ func TestSortTasksByPrioritySameValueOldestFirst(t *testing.T) {
 		}
 	}
 }
+
+func TestSortTasksByPriorityMixedTimestampPrecision(t *testing.T) {
+	priority := int64(500)
+	tasks := []tuiclient.Task{
+		{ID: "later", Priority: &priority, CreatedAt: "2026-10-06T20:16:03.500Z"},
+		{ID: "earlier", Priority: &priority, CreatedAt: "2026-10-06T20:16:03Z"},
+	}
+
+	sortTasksByPriority(tasks)
+
+	if tasks[0].ID != "earlier" {
+		t.Errorf("Expected chronologically older task first despite mixed precision, got %s first", tasks[0].ID)
+	}
+}
