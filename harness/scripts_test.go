@@ -16,7 +16,7 @@ func TestHarnessScripts(t *testing.T) {
 	if err != nil {
 		t.Skip("bash not installed")
 	}
-	for _, script := range []string{"harness_test.sh", "scheduling_test.sh", "research_admission_test.sh", "research_pacing_smoke_test.sh", "model_failover_test.sh"} {
+	for _, script := range []string{"harness_test.sh", "scheduling_test.sh", "research_admission_test.sh", "research_pacing_smoke_test.sh", "model_failover_test.sh", "priority_integration_test.sh"} {
 		t.Run(script, func(t *testing.T) {
 			t.Parallel()
 			out, err := exec.Command(bash, script).CombinedOutput()

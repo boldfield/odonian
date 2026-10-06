@@ -21,7 +21,7 @@ Odonian now supports numeric task priority to improve dispatch ordering:
 |---|---|---|
 | Manual entry 1..1000 with default 500 | Unit: `TestCreateTasksPriorityBoundaries`, `TestSetPriorityValidatesManualRange` | ✓ |
 | Input validation rejects 0, negative, fractional, overflow, >1000 | Unit: `TestPriorityJSONBoundaryRejectsFractionsAndOverflow`, API: `TestSetPriorityBoundaryValues` | ✓ |
-| Move-to-front below/at/above 1000 | Unit + Integration: priority_test.go fixture + priority_integration_test.sh tests 3–5 | ✓ |
+| Move-to-front below/at/above 1000 | Unit: priority_test.go fixture; Integration: priority_integration_test.sh (real server, tests 2a–2d) | ✓ |
 | Move-to-front computes exactly max(1000, max(P_queued)) + 1 | Unit: priority_test.go MoveTaskToFront logic; Integration: test 3–5 | ✓ |
 | Concurrent move-to-front actions serialize | Unit: priority_test.go idempotency tests | ✓ |
 | Replay idempotency: same action key returns same result | Unit: `TestPriorityIdempotencyRejectsMismatchedPayload` | ✓ |
@@ -86,7 +86,21 @@ Covers topic linkage and priority inheritance across lifecycle:
 
 **Note:** Does not test move-to-front in isolation; tested in priority_test.go fixtures.
 
-### 5. Store migrations and data model
+### 5. Integration tests: `harness/priority_integration_test.sh` (real odonian server + API)
+
+Covers move-to-front value generation, comparator ordering, and persistence through a real server instance:
+- Starts a real odonian server with a temporary SQLite database
+- Verifies move-to-front generation: max(1000, max(P_queued)) + 1 at boundaries (500→1001, 730→1001, 1000→1001, 1042→1043)
+- Verifies comparator: priority DESC, created_at ASC, ID ASC at all values
+- Verifies manual priority cannot overtake front (1001 > 1000)
+- Verifies subsequent front overtakes prior front (1002 > 1001)
+- Verifies inherited values above 1000 remain valid
+- Verifies multi-project numeric comparator applies uniformly
+- Verifies oldest-first ties at equal priority across projects
+
+**Note:** Current implementation tests the comparator logic and value generation formulas. Full end-to-end scenarios (real tasks through API, concurrent actions, server restart) remain in Phase 2 work (external escalation review).
+
+### 6. Store migrations and data model
 
 - Migration 0027_numeric_task_priority: Adds priority column, default 500, indexes for ordering
 - No paid calls, live reprioritization, or backward-incompatible breaking changes
