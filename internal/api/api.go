@@ -307,6 +307,28 @@ func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, v interface{
 	return nil
 }
 
+// decodeJSONStrict decodes a JSON body with strict checking (no unknown fields).
+func (s *Server) decodeJSONStrict(w http.ResponseWriter, r *http.Request, v interface{}) error {
+	if r.Body == nil {
+		return errors.New("empty body")
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "READ_ERROR", "Failed to read request body")
+		return err
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(v); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Invalid JSON in request body")
+		return err
+	}
+
+	return nil
+}
+
 // encodeJSON encodes a value as JSON with the given status code.
 func (s *Server) encodeJSON(w http.ResponseWriter, statusCode int, v interface{}) error {
 	w.Header().Set("Content-Type", "application/json")
@@ -1453,30 +1475,22 @@ func (s *Server) handleSetPriority(w http.ResponseWriter, r *http.Request) {
 
 	var payload struct {
 		ActionKey string `json:"action_key"`
-		Priority  int64  `json:"priority"`
+		Priority  *int64 `json:"priority"`
 		Actor     string `json:"actor"`
 		Reason    string `json:"reason"`
 	}
-	if err := s.decodeJSON(w, r, &payload); err != nil {
+	if err := s.decodeJSONStrict(w, r, &payload); err != nil {
 		return
 	}
-	if strings.TrimSpace(payload.ActionKey) == "" {
-		s.errorResponse(w, http.StatusBadRequest, "INVALID_REQUEST", "action_key is required")
-		return
-	}
-	if strings.TrimSpace(payload.Actor) == "" {
-		s.errorResponse(w, http.StatusBadRequest, "INVALID_REQUEST", "actor is required")
-		return
-	}
-	if strings.TrimSpace(payload.Reason) == "" {
-		s.errorResponse(w, http.StatusBadRequest, "INVALID_REQUEST", "reason is required")
+	if payload.Priority == nil {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "priority is required")
 		return
 	}
 
 	change, err := s.store.SetTaskPriority(r.Context(), store.SetPriorityRequest{
 		ActionKey: payload.ActionKey,
 		TaskID:    taskID,
-		Priority:  payload.Priority,
+		Priority:  *payload.Priority,
 		Actor:     payload.Actor,
 		Reason:    payload.Reason,
 	})
@@ -1509,19 +1523,7 @@ func (s *Server) handleMoveToFront(w http.ResponseWriter, r *http.Request) {
 		Actor     string `json:"actor"`
 		Reason    string `json:"reason"`
 	}
-	if err := s.decodeJSON(w, r, &payload); err != nil {
-		return
-	}
-	if strings.TrimSpace(payload.ActionKey) == "" {
-		s.errorResponse(w, http.StatusBadRequest, "INVALID_REQUEST", "action_key is required")
-		return
-	}
-	if strings.TrimSpace(payload.Actor) == "" {
-		s.errorResponse(w, http.StatusBadRequest, "INVALID_REQUEST", "actor is required")
-		return
-	}
-	if strings.TrimSpace(payload.Reason) == "" {
-		s.errorResponse(w, http.StatusBadRequest, "INVALID_REQUEST", "reason is required")
+	if err := s.decodeJSONStrict(w, r, &payload); err != nil {
 		return
 	}
 
@@ -1532,11 +1534,14 @@ func (s *Server) handleMoveToFront(w http.ResponseWriter, r *http.Request) {
 		Reason:    payload.Reason,
 	})
 	var conflictErr *store.ConflictError
+	var validationErr *store.ValidationError
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 	case errors.As(err, &conflictErr):
 		s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+	case errors.As(err, &validationErr):
+		s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
 	case err != nil:
 		s.errorResponse(w, http.StatusInternalServerError, "PRIORITY_ERROR", "Failed to move to front")
 	default:
