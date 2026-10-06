@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/boldfield/odonian/internal/store"
 )
@@ -1008,5 +1010,277 @@ func TestFrontIncreasesOnSuccessiveCalls(t *testing.T) {
 	// Second front call should return higher priority
 	if priority2 <= priority1 {
 		t.Errorf("second front should have priority > %d, got %d", priority1, priority2)
+	}
+}
+
+func doAuthedJSON(t *testing.T, server *Server, method, path string, payload interface{}) (int, map[string]interface{}) {
+	t.Helper()
+	var reader *bytes.Reader
+	if payload != nil {
+		body, _ := json.Marshal(payload)
+		reader = bytes.NewReader(body)
+	} else {
+		reader = bytes.NewReader(nil)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	var out map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&out)
+	return w.Code, out
+}
+
+func promoteTestTask(t *testing.T, server *Server, taskID string) {
+	t.Helper()
+	code, body := doAuthedJSON(t, server, "POST", "/tasks/"+taskID+"/promote", nil)
+	if code != http.StatusOK {
+		t.Fatalf("promote %s failed: %d %v", taskID, code, body)
+	}
+}
+
+func listTaskIDsInOrder(t *testing.T, server *Server, projectID string) []string {
+	t.Helper()
+	req := httptest.NewRequest("GET", fmt.Sprintf("/projects/%s/tasks?claimable=true&model=haiku", projectID), nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list tasks failed: %d", w.Code)
+	}
+	var tasks []map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&tasks)
+	ids := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		ids = append(ids, task["id"].(string))
+	}
+	return ids
+}
+
+func indexOfID(ids []string, id string) int {
+	for i, candidate := range ids {
+		if candidate == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestFrontRegressionExactOrdering pins the spec regression: queue max 500 -> Front is exactly
+// 1001; later manual 505 and 1000 cannot overtake it; a later Front on another topic can.
+func TestFrontRegressionExactOrdering(t *testing.T) {
+	// The shared in-memory test store accumulates other tests' Front values, so use a private DB.
+	isolatedStore, err := store.Open(filepath.Join(t.TempDir(), "front-regression.db"), defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open isolated store: %v", err)
+	}
+	t.Cleanup(func() { isolatedStore.Close() })
+	server := New(isolatedStore, "test-token", 5*time.Minute, 5, nil, nil, 999999, false, 500, nil)
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+
+	fronted := createTestTask(t, server, projectID, docID)
+	manual505 := createTestTask(t, server, projectID, docID)
+	manual1000 := createTestTask(t, server, projectID, docID)
+	laterFront := createTestTask(t, server, projectID, docID)
+	for _, task := range []store.Task{fronted, manual505, manual1000, laterFront} {
+		promoteTestTask(t, server, task.ID)
+	}
+
+	code, result := doAuthedJSON(t, server, "POST", "/tasks/"+fronted.ID+"/priority/front",
+		map[string]interface{}{"action_key": "regress-front-1", "actor": "op", "reason": "urgent"})
+	if code != http.StatusOK {
+		t.Fatalf("front failed: %d %v", code, result)
+	}
+	if got := int64(result["priority"].(float64)); got != 1001 {
+		t.Fatalf("expected Front on queue max 500 to return exactly 1001, got %d (queue_max_priority=%v)", got, result["queue_max_priority"])
+	}
+	if got := int64(result["queue_max_priority"].(float64)); got != 500 {
+		t.Fatalf("expected queue_max_priority 500, got %d", got)
+	}
+
+	for i, manual := range []struct {
+		task     store.Task
+		priority int64
+	}{{manual505, 505}, {manual1000, 1000}} {
+		code, body := doAuthedJSON(t, server, "POST", "/tasks/"+manual.task.ID+"/priority/set",
+			map[string]interface{}{"action_key": fmt.Sprintf("regress-set-%d", i), "priority": manual.priority, "actor": "op", "reason": "manual"})
+		if code != http.StatusOK {
+			t.Fatalf("manual set %d failed: %d %v", manual.priority, code, body)
+		}
+	}
+
+	order := listTaskIDsInOrder(t, server, projectID)
+	if len(order) < 4 {
+		t.Fatalf("expected 4 claimable tasks, got %v", order)
+	}
+	wantPrefix := []string{fronted.ID, manual1000.ID, manual505.ID, laterFront.ID}
+	for i, id := range wantPrefix {
+		if order[i] != id {
+			t.Fatalf("order mismatch at %d: want %v got %v", i, wantPrefix, order)
+		}
+	}
+
+	code, result = doAuthedJSON(t, server, "POST", "/tasks/"+laterFront.ID+"/priority/front",
+		map[string]interface{}{"action_key": "regress-front-2", "actor": "op", "reason": "more urgent"})
+	if code != http.StatusOK {
+		t.Fatalf("later front failed: %d %v", code, result)
+	}
+	if got := int64(result["priority"].(float64)); got != 1002 {
+		t.Fatalf("expected later Front to return 1002, got %d", got)
+	}
+
+	order = listTaskIDsInOrder(t, server, projectID)
+	if order[0] != laterFront.ID || order[1] != fronted.ID {
+		t.Fatalf("later Front should move ahead of earlier Front; got order %v", order)
+	}
+}
+
+// TestPriorityEndpointsPrefixResolution covers unique-prefix success and ambiguous-prefix errors
+// for both priority routes.
+func TestPriorityEndpointsPrefixResolution(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, id := range []string{"prioamb1-task-full-a", "prioamb1-task-full-b"} {
+		if _, err := server.store.Conn().Exec(`
+			INSERT INTO task (id, project_id, document_id, title, spec, state, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, id, projectID, docID, "Ambiguous "+id, "spec", "backlog", now, now); err != nil {
+			t.Fatalf("failed to insert task %s: %v", id, err)
+		}
+	}
+
+	task := createTestTask(t, server, projectID, docID)
+	prefix := task.ID[:12]
+
+	t.Run("set via unique prefix", func(t *testing.T) {
+		code, body := doAuthedJSON(t, server, "POST", "/tasks/"+prefix+"/priority/set",
+			map[string]interface{}{"action_key": "prefix-set", "priority": 321, "actor": "op", "reason": "r"})
+		if code != http.StatusOK {
+			t.Fatalf("expected 200, got %d %v", code, body)
+		}
+		if body["task_id"] != task.ID {
+			t.Errorf("expected resolved task_id %s, got %v", task.ID, body["task_id"])
+		}
+		if int64(body["priority"].(float64)) != 321 {
+			t.Errorf("expected priority 321, got %v", body["priority"])
+		}
+	})
+
+	t.Run("front via unique prefix", func(t *testing.T) {
+		code, body := doAuthedJSON(t, server, "POST", "/tasks/"+prefix+"/priority/front",
+			map[string]interface{}{"action_key": "prefix-front", "actor": "op", "reason": "r"})
+		if code != http.StatusOK {
+			t.Fatalf("expected 200, got %d %v", code, body)
+		}
+		if body["task_id"] != task.ID {
+			t.Errorf("expected resolved task_id %s, got %v", task.ID, body["task_id"])
+		}
+		if int64(body["priority"].(float64)) <= 1000 {
+			t.Errorf("expected Front priority > 1000, got %v", body["priority"])
+		}
+	})
+
+	for _, route := range []struct {
+		name    string
+		path    string
+		payload map[string]interface{}
+	}{
+		{"set", "/tasks/prioamb1/priority/set", map[string]interface{}{"action_key": "amb-set", "priority": 100, "actor": "op", "reason": "r"}},
+		{"front", "/tasks/prioamb1/priority/front", map[string]interface{}{"action_key": "amb-front", "actor": "op", "reason": "r"}},
+	} {
+		t.Run("ambiguous prefix "+route.name, func(t *testing.T) {
+			code, body := doAuthedJSON(t, server, "POST", route.path, route.payload)
+			if code != http.StatusConflict {
+				t.Fatalf("expected 409, got %d %v", code, body)
+			}
+			errObj, _ := body["error"].(map[string]interface{})
+			if errObj["code"] != "AMBIGUOUS_ID" {
+				t.Errorf("expected AMBIGUOUS_ID, got %v", errObj["code"])
+			}
+		})
+	}
+
+	t.Run("unknown prefix", func(t *testing.T) {
+		code, _ := doAuthedJSON(t, server, "POST", "/tasks/zzzzzzzz/priority/front",
+			map[string]interface{}{"action_key": "unk", "actor": "op", "reason": "r"})
+		if code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d", code)
+		}
+	})
+}
+
+// TestInheritedPrioritySerialization verifies a descendant (spawned review task) reports its
+// topic anchor's effective priority, including a server-generated value above 1000.
+func TestInheritedPrioritySerialization(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+
+	anchor := createTestTask(t, server, projectID, docID)
+	promoteTestTask(t, server, anchor.ID)
+
+	code, front := doAuthedJSON(t, server, "POST", "/tasks/"+anchor.ID+"/priority/front",
+		map[string]interface{}{"action_key": "inherit-front", "actor": "op", "reason": "urgent"})
+	if code != http.StatusOK {
+		t.Fatalf("front failed: %d %v", code, front)
+	}
+	frontPriority := front["priority"].(float64)
+	if frontPriority <= 1000 {
+		t.Fatalf("expected Front > 1000, got %v", frontPriority)
+	}
+
+	code, body := doAuthedJSON(t, server, "POST", "/tasks/"+anchor.ID+"/claim",
+		map[string]interface{}{"agent_id": "agent-1", "model": "haiku"})
+	if code != http.StatusOK {
+		t.Fatalf("claim failed: %d %v", code, body)
+	}
+	code, body = doAuthedJSON(t, server, "POST", "/tasks/"+anchor.ID+"/submit", map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   "done",
+		"links":    []map[string]string{{"kind": "pr", "value": "https://github.com/example/test-repo/pull/1"}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("submit failed: %d %v", code, body)
+	}
+
+	req := httptest.NewRequest("GET", fmt.Sprintf("/projects/%s/tasks", projectID), nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	var tasks []map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&tasks)
+
+	var reviewID string
+	for _, task := range tasks {
+		if task["kind"] == "review" && task["target_task_id"] == anchor.ID {
+			reviewID = task["id"].(string)
+			if task["priority"] != frontPriority {
+				t.Errorf("list: review priority = %v, want anchor's %v", task["priority"], frontPriority)
+			}
+			if task["topic_anchor_id"] != anchor.ID {
+				t.Errorf("list: review topic_anchor_id = %v, want %s", task["topic_anchor_id"], anchor.ID)
+			}
+		}
+	}
+	if reviewID == "" {
+		t.Fatalf("review descendant not found in list")
+	}
+
+	code, detail := doAuthedJSON(t, server, "GET", "/tasks/"+reviewID, nil)
+	if code != http.StatusOK {
+		t.Fatalf("get review failed: %d", code)
+	}
+	if detail["priority"] != frontPriority {
+		t.Errorf("detail: review priority = %v, want anchor's %v", detail["priority"], frontPriority)
+	}
+	if detail["topic_anchor_id"] != anchor.ID {
+		t.Errorf("detail: review topic_anchor_id = %v, want %s", detail["topic_anchor_id"], anchor.ID)
+	}
+
+	code, detail = doAuthedJSON(t, server, "GET", "/tasks/"+anchor.ID, nil)
+	if code != http.StatusOK || detail["priority"] != frontPriority || detail["topic_anchor_id"] != anchor.ID {
+		t.Errorf("anchor detail priority/topic_anchor_id wrong: %v", detail)
 	}
 }
