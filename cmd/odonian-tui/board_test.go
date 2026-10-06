@@ -5069,8 +5069,11 @@ func TestBoardModel_SetPriorityFlow_ValidInput(t *testing.T) {
 	}
 
 	// Verify success message shows new priority
-	if !strings.Contains(model.error, "priority set to 750") {
-		t.Errorf("Expected success message in error field containing 'priority set to 750', got %q", model.error)
+	if model.error != "" {
+		t.Errorf("Expected no error after success, got %q", model.error)
+	}
+	if !strings.Contains(model.statusMessage, "priority set to 750") {
+		t.Errorf("Expected status message containing 'priority set to 750', got %q", model.statusMessage)
 	}
 
 	// Verify priority state was cleared after success
@@ -5223,8 +5226,11 @@ func TestBoardModel_MoveToFrontFlow(t *testing.T) {
 	}
 
 	// Verify success shows priority > 1000
-	if !strings.Contains(model.error, "priority 1500") {
-		t.Errorf("Expected priority 1500 in success message, got error: %q", model.error)
+	if model.error != "" {
+		t.Errorf("Expected no error after success, got %q", model.error)
+	}
+	if !strings.Contains(model.statusMessage, "priority 1500") {
+		t.Errorf("Expected priority 1500 in success message, got status: %q", model.statusMessage)
 	}
 }
 
@@ -5680,8 +5686,8 @@ func TestBoardModel_ActionFailureRetrySendsSameKey(t *testing.T) {
 	if model.lastPriorityAttempt.key != "" {
 		t.Errorf("Expected attempt cleared after success")
 	}
-	if !strings.Contains(model.error, "priority set to 750") {
-		t.Errorf("Expected success message, got %q", model.error)
+	if model.error != "" || !strings.Contains(model.statusMessage, "priority set to 750") {
+		t.Errorf("Expected success status and no error, got status %q error %q", model.statusMessage, model.error)
 	}
 }
 
@@ -5876,4 +5882,70 @@ func intPtr(v int64) *int64 {
 // strPtr returns a pointer to a string
 func strPtr(v string) *string {
 	return &v
+}
+
+// TestBoardModel_SuccessfulPriorityActionKeepsRefreshedListVisible checks that after each
+// successful priority action View() shows the resolved topic/value as a status line and the
+// refreshed task list, and never the error screen.
+func TestBoardModel_SuccessfulPriorityActionKeepsRefreshedListVisible(t *testing.T) {
+	cases := []struct {
+		name       string
+		startKey   rune
+		value      string
+		wantStatus string
+		wantRow    string
+	}{
+		{"set", 'i', "750", "priority set to 750 for topic-1", "P:750"},
+		{"front", 'w', "", "moved to front with priority 1001 for topic-1", "P:1001"},
+		{"reset", 'e', "", "priority reset to 500 for topic-1", "P:500"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var wantPriority int64
+			switch tc.startKey {
+			case 'i':
+				wantPriority = 750
+			case 'w':
+				wantPriority = 1001
+			default:
+				wantPriority = 500
+			}
+			change := tuiclient.PriorityChange{TopicAnchorID: "topic-1", Priority: wantPriority}
+			mockClient := &tuiclient.MockClient{
+				SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+					return change, nil
+				},
+				MoveTaskToFrontFunc: func(ctx context.Context, taskID string, req tuiclient.MoveTaskToFrontRequest) (tuiclient.PriorityChange, error) {
+					return change, nil
+				},
+				ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+					return []tuiclient.Task{
+						{ID: "task-1", Title: "Refreshed task", State: "ready", Priority: intPtr(wantPriority)},
+					}, nil
+				},
+			}
+			model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(300)},
+			})
+
+			model, cmd := priorityTestFlow(t, model, tc.startKey, tc.value, "because")
+			model = executeReviewCmd(t, model, cmd)
+
+			output := model.View()
+			if strings.Contains(output, "Error:") || strings.Contains(output, "Press 'r' to retry") {
+				t.Errorf("Success rendered as an error:\n%s", output)
+			}
+			if !strings.Contains(output, tc.wantStatus) {
+				t.Errorf("Expected status %q in view:\n%s", tc.wantStatus, output)
+			}
+			if !strings.Contains(output, "Refreshed task") || !strings.Contains(output, tc.wantRow) {
+				t.Errorf("Expected refreshed list row with %q in view:\n%s", tc.wantRow, output)
+			}
+
+			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+			if strings.Contains(m.(*BoardModel).View(), tc.wantStatus) {
+				t.Errorf("Status should clear on next keypress")
+			}
+		})
+	}
 }

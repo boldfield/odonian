@@ -110,6 +110,7 @@ type BoardModel struct {
 	pendingPriorityReason string          // captured reason for priority action
 	pendingPriority       int64           // captured priority value for set priority action
 	lastPriorityAttempt   priorityAttempt // most recent unconfirmed-outcome request, kept so a retry resends the same key
+	statusMessage         string          // success text from the last priority action, shown above the board list
 
 	// Detail view state
 	detailTask      tuiclient.TaskDetail // the currently displayed task detail
@@ -241,7 +242,8 @@ type reviewActionMsg struct {
 	tasks         map[string][]tuiclient.Task
 	err           string
 	fromDetail    bool
-	actionSuccess bool // true only when the priority action itself succeeded
+	actionSuccess bool   // true only when the priority action itself succeeded
+	status        string // success text shown above the refreshed list (not an error)
 	// actionRejected is true when the server definitively refused the priority action
 	// (4xx other than timeout/rate-limit), so its idempotency key cannot be retried.
 	actionRejected bool
@@ -609,7 +611,8 @@ func (m *BoardModel) setTaskPriorityCmd(taskID string, priority int64, reason st
 		}
 
 		statusMsg := fmt.Sprintf("priority set to %d for %s", change.Priority, change.TopicAnchorID)
-		msg := m.fetchTasksInline(ctx, statusMsg)
+		msg := m.fetchTasksInline(ctx, "")
+		msg.status = statusMsg
 		msg.fromDetail = fromDetail
 		msg.actionSuccess = true
 		return msg
@@ -645,7 +648,8 @@ func (m *BoardModel) moveTaskToFrontCmd(taskID string, reason string, actionKey 
 		}
 
 		statusMsg := fmt.Sprintf("moved to front with priority %d for %s", change.Priority, change.TopicAnchorID)
-		msg := m.fetchTasksInline(ctx, statusMsg)
+		msg := m.fetchTasksInline(ctx, "")
+		msg.status = statusMsg
 		msg.fromDetail = fromDetail
 		msg.actionSuccess = true
 		return msg
@@ -682,7 +686,8 @@ func (m *BoardModel) resetTaskPriorityCmd(taskID string, reason string, actionKe
 		}
 
 		statusMsg := fmt.Sprintf("priority reset to %d for %s", change.Priority, change.TopicAnchorID)
-		msg := m.fetchTasksInline(ctx, statusMsg)
+		msg := m.fetchTasksInline(ctx, "")
+		msg.status = statusMsg
 		msg.fromDetail = fromDetail
 		msg.actionSuccess = true
 		return msg
@@ -925,6 +930,8 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		m.statusMessage = ""
+
 		// Detail mode: all keys go to the detail handler — board nav must not fire.
 		if m.mode == modeDetail {
 			return m.updateDetailMode(msg)
@@ -1261,6 +1268,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.error = ""
 		}
+		m.statusMessage = msg.status
 		// Keep the attempt (and its key) across retryable failures so an identical
 		// retry replays rather than double-applies; drop it on success or when the
 		// server rejected the request outright.
@@ -2398,10 +2406,15 @@ func (m *BoardModel) renderColumnTasks() string {
 		return fmt.Sprintf("Error: %s\nPress 'r' to retry.", m.error)
 	}
 
+	statusLine := ""
+	if m.statusMessage != "" {
+		statusLine = m.statusMessage + "\n"
+	}
+
 	tasksInColumn := m.getTasksInSelectedColumn()
 
 	if len(tasksInColumn) == 0 {
-		return "(empty)"
+		return statusLine + "(empty)"
 	}
 
 	// Calculate the visible task range
@@ -2412,6 +2425,7 @@ func (m *BoardModel) renderColumnTasks() string {
 	}
 
 	var b strings.Builder
+	b.WriteString(statusLine)
 	for i := m.scrollOffset; i < endOffset; i++ {
 		task := tasksInColumn[i]
 		isSelected := task.ID == m.selectedTaskID
