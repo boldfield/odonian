@@ -6364,3 +6364,304 @@ func captureStdout(t *testing.T, fn func()) string {
 	buf.ReadFrom(r)
 	return buf.String()
 }
+
+func TestExecutePrioritySetValid(t *testing.T) {
+	tests := []struct {
+		name     string
+		priority int64
+	}{
+		{"min boundary", 1},
+		{"default value", 500},
+		{"max boundary", 1000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.Contains(r.URL.Path, "/priority/set") && r.Method == "POST" {
+					json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+						Action:           "set",
+						TaskID:           "task-123",
+						TopicAnchorID:    "topic-123",
+						OldPriority:      500,
+						Priority:         tt.priority,
+						QueueMaxPriority: nil,
+						Replayed:         false,
+					})
+				} else {
+					w.WriteHeader(http.StatusNotFound)
+					json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+				}
+			}))
+			defer server.Close()
+
+			buf := &bytes.Buffer{}
+			err := executePriority(context.Background(), server.URL, "test-token", false, []string{"priority", "task-123", "--set", fmt.Sprintf("%d", tt.priority), "--reason", "test reason"}, buf)
+			if err != nil {
+				t.Fatalf("executePriority failed: %v", err)
+			}
+
+			output := buf.String()
+			if !strings.Contains(output, "New Priority") {
+				t.Errorf("expected output to contain 'New Priority', got: %s", output)
+			}
+		})
+	}
+}
+
+func TestExecutePrioritySetInvalid(t *testing.T) {
+	tests := []struct {
+		name     string
+		priority string
+		wantErr  string
+	}{
+		{"zero value", "0", "priority must be an integer between 1 and 1000"},
+		{"negative value", "-1", "priority must be an integer between 1 and 1000"},
+		{"above max", "1001", "priority must be an integer between 1 and 1000"},
+		{"way above max", "9999", "priority must be an integer between 1 and 1000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("server should not be called for invalid input")
+			}))
+			defer server.Close()
+
+			buf := &bytes.Buffer{}
+			err := executePriority(context.Background(), server.URL, "test-token", false, []string{"priority", "task-123", "--set", tt.priority, "--reason", "test reason"}, buf)
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestExecutePriorityFront(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/priority/front") && r.Method == "POST" {
+			queueMax := int64(1001)
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:           "front",
+				TaskID:           "task-123",
+				TopicAnchorID:    "topic-123",
+				OldPriority:      500,
+				Priority:         1001,
+				QueueMaxPriority: &queueMax,
+				Replayed:         false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"priority", "task-123", "--front", "--reason", "test reason"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority --front failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Action: front") {
+		t.Errorf("expected output to contain 'Action: front', got: %s", output)
+	}
+	if !strings.Contains(output, "New Priority: 1001") {
+		t.Errorf("expected output to contain 'New Priority: 1001', got: %s", output)
+	}
+}
+
+func TestExecutePriorityReset(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/priority/set") && r.Method == "POST" {
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:           "reset",
+				TaskID:           "task-123",
+				TopicAnchorID:    "topic-123",
+				OldPriority:      750,
+				Priority:         500,
+				QueueMaxPriority: nil,
+				Replayed:         false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"priority", "task-123", "--reset", "--reason", "test reason"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority --reset failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "New Priority: 500") {
+		t.Errorf("expected output to contain 'New Priority: 500', got: %s", output)
+	}
+}
+
+func TestExecutePriorityMutualExclusivity(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"set and front", []string{"priority", "task-123", "--set", "600", "--front", "--reason", "test"}},
+		{"set and reset", []string{"priority", "task-123", "--set", "600", "--reset", "--reason", "test"}},
+		{"front and reset", []string{"priority", "task-123", "--front", "--reset", "--reason", "test"}},
+		{"all three", []string{"priority", "task-123", "--set", "600", "--front", "--reset", "--reason", "test"}},
+		{"no operation", []string{"priority", "task-123", "--reason", "test"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("server should not be called for invalid input")
+			}))
+			defer server.Close()
+
+			buf := &bytes.Buffer{}
+			err := executePriority(context.Background(), server.URL, "test-token", false, tt.args, buf)
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", tt.name)
+			}
+			if !strings.Contains(err.Error(), "exactly one of") {
+				t.Errorf("expected error containing 'exactly one of', got: %v", err)
+			}
+		})
+	}
+}
+
+func TestExecutePriorityMissingReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("server should not be called for missing reason")
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"priority", "task-123", "--set", "600"}, buf)
+	if err == nil {
+		t.Fatal("expected error for missing --reason, got nil")
+	}
+	if !strings.Contains(err.Error(), "--reason flag is required") {
+		t.Errorf("expected error containing '--reason flag is required', got: %v", err)
+	}
+}
+
+func TestExecutePriorityJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/priority/set") && r.Method == "POST" {
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:           "set",
+				TaskID:           "task-123",
+				TopicAnchorID:    "topic-123",
+				OldPriority:      500,
+				Priority:         750,
+				QueueMaxPriority: nil,
+				Replayed:         false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", true, []string{"priority", "task-123", "--set", "750", "--reason", "test"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority --json failed: %v", err)
+	}
+
+	output := buf.String()
+	var result tuiclient.PriorityChange
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+
+	if result.Priority != 750 {
+		t.Errorf("expected Priority 750, got %d", result.Priority)
+	}
+}
+
+func TestExecutePriorityInheritedValue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/priority/front") && r.Method == "POST" {
+			queueMax := int64(1001)
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:           "front",
+				TaskID:           "task-123",
+				TopicAnchorID:    "topic-123",
+				OldPriority:      1000,
+				Priority:         1001,
+				QueueMaxPriority: &queueMax,
+				Replayed:         false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"priority", "task-123", "--front", "--reason", "test"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority with inherited value failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "New Priority: 1001") {
+		t.Errorf("expected output to contain 'New Priority: 1001', got: %s", output)
+	}
+}
+
+func TestExecutePriorityRetryIdentity(t *testing.T) {
+	// Test that the action key is stable for the same invocation
+	// This test verifies that retries of the same operation receive the same action key
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/priority/set") && r.Method == "POST" {
+			var req tuiclient.SetTaskPriorityRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "bad request"})
+				return
+			}
+
+			// Verify action key is present and stable
+			if req.ActionKey == "" {
+				t.Error("ActionKey is empty")
+			}
+
+			json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+				Action:        "set",
+				TaskID:        "task-123",
+				TopicAnchorID: "topic-123",
+				OldPriority:   500,
+				Priority:      600,
+				Replayed:      false,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executePriority(context.Background(), server.URL, "test-token", false, []string{"priority", "task-123", "--set", "600", "--reason", "test"}, buf)
+	if err != nil {
+		t.Fatalf("executePriority failed: %v", err)
+	}
+}

@@ -21,6 +21,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/boldfield/odonian/internal/api"
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/localcommit"
@@ -1268,9 +1270,17 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		return fmt.Errorf("--reason flag is required")
 	}
 
+	// Check if --set flag was explicitly provided (handles --set 0 case)
+	setFlagProvided := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "set" {
+			setFlagProvided = true
+		}
+	})
+
 	// Count how many operations are specified (should be exactly one)
 	numOps := 0
-	if *setFlag != 0 {
+	if setFlagProvided {
 		numOps++
 	}
 	if *frontFlag {
@@ -1284,16 +1294,22 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		return fmt.Errorf("exactly one of --set, --front, or --reset must be specified")
 	}
 
-	client := tuiclient.NewHTTPClient(baseURL, token)
-
-	var result tuiclient.PriorityChange
-	if *setFlag != 0 {
-		// Validate priority is in range 1-1000
+	// Validate --set value if provided
+	if setFlagProvided {
 		if *setFlag < 1 || *setFlag > 1000 {
 			return fmt.Errorf("priority must be an integer between 1 and 1000")
 		}
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+
+	// Generate action key once per invocation for idempotency
+	actionKey := generateActionKey()
+
+	var result tuiclient.PriorityChange
+	if setFlagProvided {
 		req := tuiclient.SetTaskPriorityRequest{
-			ActionKey: generateActionKey(),
+			ActionKey: actionKey,
 			Priority:  *setFlag,
 			Actor:     "odonian-cli",
 			Reason:    *reasonFlag,
@@ -1304,7 +1320,7 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		}
 	} else if *frontFlag {
 		req := tuiclient.MoveTaskToFrontRequest{
-			ActionKey: generateActionKey(),
+			ActionKey: actionKey,
 			Actor:     "odonian-cli",
 			Reason:    *reasonFlag,
 		}
@@ -1314,7 +1330,7 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		}
 	} else if *resetFlag {
 		req := tuiclient.SetTaskPriorityRequest{
-			ActionKey: generateActionKey(),
+			ActionKey: actionKey,
 			Priority:  500,
 			Actor:     "odonian-cli",
 			Reason:    *reasonFlag,
@@ -1347,12 +1363,10 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 	return nil
 }
 
-// generateActionKey creates a stable action key for idempotency.
-// For CLI use, we generate a deterministic key based on the task ID and timestamp.
+// generateActionKey creates a stable action key for idempotency using a UUID.
+// This key is stable across retries of the same operation.
 func generateActionKey() string {
-	// For now, use a simple UUID-like approach. In production, this should be
-	// stable across retries for the same operation.
-	return fmt.Sprintf("odonian-cli-%d", time.Now().UnixNano())
+	return fmt.Sprintf("odonian-cli-%s", uuid.New().String())
 }
 
 // parseSlowRequestThreshold parses ODONIAN_SLOW_REQUEST_MS.

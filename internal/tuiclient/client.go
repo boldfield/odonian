@@ -95,6 +95,8 @@ type Task struct {
 	LeaseExpiresAt *string `json:"lease_expires_at"`
 	Result         *string `json:"result"`
 	Held           bool    `json:"held"`
+	Priority       *int64  `json:"priority"`
+	TopicAnchorID  *string `json:"topic_anchor_id"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`
 }
@@ -119,6 +121,8 @@ type TaskDetail struct {
 	LeaseExpiresAt      *string              `json:"lease_expires_at"`
 	Result              *string              `json:"result"`
 	Held                bool                 `json:"held"`
+	Priority            *int64               `json:"priority"`
+	TopicAnchorID       *string              `json:"topic_anchor_id"`
 	ReviewRound         int                  `json:"review_round"`
 	TargetTaskID        *string              `json:"target_task_id"`
 	AgentMerge          bool                 `json:"agent_merge"`
