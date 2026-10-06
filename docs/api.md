@@ -583,6 +583,7 @@ Bulk-create tasks for a project.
 - `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
 - `escalate` (optional, default `true`): Allow replacement by a higher model tier after the review threshold is exceeded.
 - `track` (optional, default `build`): `build`, `design`, or `research`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
+- `priority` (optional, default `500`): Manual priority (1–1000); default is 500. Values outside this range return `400 INVALID_PRIORITY`. The priority determines task ordering in the queue (higher priority first, then by creation time).
 - `branch` (optional, `local_commit` only): Name of an MR branch shared across tasks. Every task with the same `branch` starts its worktree from, and freezes onto, `wi/<branch>`, so a dependent task builds on earlier tasks' approved work without anything landing on `main`. Omitted or empty keeps the default: the task gets its own `wi/<slug of its title>`. Must be lowercase letters, digits, and single dashes (e.g. `event-platform`); otherwise `400 INVALID_BRANCH`. A task superseded or escalated to a new model keeps its branch. Each task still works on its own `wip/<id>` branch, so tasks sharing a branch can run concurrently: on approve, a task fast-forwards `wi/<branch>` when nothing else has landed on it since the task started, and is otherwise merged into it. A merge runs the repository's `make check` and `make test` on the merged result first, because the combination was never built or reviewed together. The gate runs the tasks' code, so it gets a scrubbed environment (no tokens or credentials) and refuses to run outside a sandbox (`SANDBOX_NAME` unset) unless `odonian approve --allow-host-gate` is passed; `--gate-timeout` (default 8m) bounds it. The scrubbed environment keeps the basics and the usual Go, Rust, Python, Node and Java toolchain variables; name any others the repository's `make` needs in `ODONIAN_GATE_ENV` (comma-separated). A merge conflict, a failing gate, or a gate that cannot run refuses the approve and leaves the task `approved` and the branch unchanged. After the gate, approve reserves the task for landing (`POST /tasks/{id}/landing`), conditional on it still being approved in the review round it prepared, so a task reworked and re-approved while the gate ran is never landed with its old version; it then moves `wi/<branch>`, and only then marks the task `done`, so dependents become claimable only once the work is on the branch they start from. It holds a per-branch lock in the repository (`refs/odonian/locks/<branch>`) throughout, so approves on one branch run one at a time. Use `depends_on` when a task needs another task's code to exist before it starts.
 
 | Delivery mode | Supported tracks |
@@ -616,6 +617,8 @@ superseding the task will not resolve a missing prompt.
     "assignee": null,
     "lease_expires_at": null,
     "result": null,
+    "priority": 500,
+    "topic_anchor_id": "770e8400-e29b-41d4-a716-446655440002",
     "created_at": "2026-06-05T21:00:00.000000000Z",
     "updated_at": "2026-06-05T21:00:00.000000000Z"
   },
@@ -633,6 +636,8 @@ superseding the task will not resolve a missing prompt.
     "assignee": null,
     "lease_expires_at": null,
     "result": null,
+    "priority": 500,
+    "topic_anchor_id": "880e8400-e29b-41d4-a716-446655440003",
     "created_at": "2026-06-05T21:00:00.000000000Z",
     "updated_at": "2026-06-05T21:00:00.000000000Z"
   }
@@ -645,6 +650,7 @@ superseding the task will not resolve a missing prompt.
 - `400 UNKNOWN_MODEL`: The `model` or a `review_models` entry is not in the deployment allowlist
 - `400 UNKNOWN_TRACK`: The `track` field is not one of `"build"`, `"design"`, or `"research"`
 - `400 INVALID_BRANCH`: The `branch` field is not lowercase letters, digits, and single dashes
+- `400 INVALID_PRIORITY`: The `priority` field is not an integer between 1 and 1000
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `400 <other validation errors>`: Client input validation errors
 - `500 CREATE_ERROR`: Server error creating tasks
@@ -781,6 +787,8 @@ curl -H "Authorization: Bearer token" \
   "assignee": "agent-1",
   "lease_expires_at": null,
   "result": "Completed successfully",
+  "priority": 500,
+  "topic_anchor_id": "770e8400-e29b-41d4-a716-446655440002",
   "created_at": "2026-06-05T21:00:00.000000000Z",
   "updated_at": "2026-06-05T21:05:00.000000000Z",
   "depends_on": [
@@ -1525,6 +1533,66 @@ revoke a lease or unclaim the task. Claimability still depends on state, depende
 
 **Response:** `200 OK` with the task object and `held: false`; `404 NOT_FOUND` if absent,
 or `500 RELEASE_ERROR` on failure.
+
+#### `POST /tasks/{id}/priority/set`
+
+Set or update a task's manual priority within the range 1–1000. The priority defaults to 500 and
+controls task ordering in the queue (higher priority first, then creation order). The action is
+identified by a unique idempotency key (`action_key`) so replaying the same request with identical
+parameters returns the same result. An idempotency mismatch (same key with different priority)
+returns `409 IDEMPOTENCY_MISMATCH`. Response includes the updated priority and the anchor task id.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" -H "Content-Type: application/json" \
+  -d '{"action_key":"key-123","priority":750,"actor":"operator","reason":"urgent fix"}' \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/priority/set
+```
+
+**Request Body:**
+- `action_key` (required, string, max 200 chars): Unique identifier for idempotency
+- `priority` (required, integer 1–1000): The manual priority
+- `actor` (required, string): Operator or system identifier
+- `reason` (required, string): Rationale for the change
+
+**Response:** `200 OK` with object `{"priority": <int>, "topic_anchor_id": "<id>", "replayed": <bool>}`;
+`400 INVALID_PRIORITY` if outside 1–1000;
+`400 INVALID_ACTION_KEY` if empty or >200 chars;
+`400 ACTOR_REQUIRED` if actor is empty;
+`400 REASON_REQUIRED` if reason is empty;
+`404 NOT_FOUND`; `409 ARCHIVED`; `409 IDEMPOTENCY_MISMATCH`; `500 PRIORITY_ERROR`.
+
+#### `POST /tasks/{id}/priority/front`
+
+Move a task's topic to the front of the queue by assigning a server-calculated priority that exceeds
+all manually assignable values (>1000). The priority is calculated atomically as `max(1000, max(P_queued)) + 1`,
+where `P_queued` is the maximum priority among all non-archived execution topics (including held, backlog,
+blocked, waiting, and in-flight work; terminal roots contribute through their active descendants).
+Successive calls return strictly increasing values, ensuring the task remains ahead of any manual assignments.
+
+```bash
+curl -X POST -H "Authorization: Bearer token" -H "Content-Type: application/json" \
+  -d '{"action_key":"front-456","actor":"operator","reason":"critical production issue"}' \
+  https://api.example.com/tasks/770e8400-e29b-41d4-a716-446655440002/priority/front
+```
+
+**Request Body:**
+- `action_key` (required, string, max 200 chars): Unique identifier for idempotency
+- `actor` (required, string): Operator or system identifier
+- `reason` (required, string): Rationale for the move
+
+**Response:** `200 OK` with object `{"priority": <int>, "topic_anchor_id": "<id>", "replayed": <bool>}`;
+`400 INVALID_ACTION_KEY` if empty or >200 chars;
+`400 ACTOR_REQUIRED` if actor is empty;
+`400 REASON_REQUIRED` if reason is empty;
+`404 NOT_FOUND`; `409 ARCHIVED`; `409 IDEMPOTENCY_MISMATCH`; `500 PRIORITY_ERROR`.
+
+Both endpoints:
+- Reject unknown fields and trailing JSON with `400 JSON_DECODE_ERROR`
+- Support required idempotency key (`action_key`); same key replayed returns the same result with `"replayed": true`
+- Return the topic anchor (root of topic lineage) in `topic_anchor_id` and the new/resulting priority in `priority`
+- Response includes `action` (operation type), `task_id`, `old_priority`, `queue_max_priority`, `actor`, `reason`, `priority`, `topic_anchor_id`, and `replayed` fields
+- Preserve `held` status, holds, eligibility, permits, and merge gates
+- For descendants (tasks in a topic lineage), `priority` in summaries and detail views shows the topic anchor's effective priority (inherited)
 
 #### `POST /tasks/{id}/landing`
 

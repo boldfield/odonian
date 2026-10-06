@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,8 @@ func taskToSummary(task store.Task) map[string]interface{} {
 		"escalate":         task.Escalate,
 		"track":            task.Track,
 		"branch":           task.Branch,
+		"priority":         task.Priority,
+		"topic_anchor_id":  task.TopicAnchorID,
 		"created_at":       task.CreatedAt,
 		"updated_at":       task.UpdatedAt,
 		"archived_at":      task.ArchivedAt,
@@ -141,6 +144,8 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("DELETE /tasks/{id}/landing", wrapProtected("DELETE /tasks/{id}/landing", server.handleCancelLanding))
 	mux.HandleFunc("POST /tasks/{id}/landing/complete", wrapProtected("POST /tasks/{id}/landing/complete", server.handleCompleteLanding))
 	mux.HandleFunc("POST /tasks/{id}/release", wrapProtected("POST /tasks/{id}/release", server.handleRelease))
+	mux.HandleFunc("POST /tasks/{id}/priority/set", wrapProtected("POST /tasks/{id}/priority/set", server.handleSetPriority))
+	mux.HandleFunc("POST /tasks/{id}/priority/front", wrapProtected("POST /tasks/{id}/priority/front", server.handleMoveToFront))
 	mux.HandleFunc("POST /tasks/{id}/archive", wrapProtected("POST /tasks/{id}/archive", server.handleArchiveTask))
 	mux.HandleFunc("POST /tasks/{id}/unarchive", wrapProtected("POST /tasks/{id}/unarchive", server.handleUnarchiveTask))
 	mux.HandleFunc("POST /projects/{id}/archive", wrapProtected("POST /projects/{id}/archive", server.handleArchiveProject))
@@ -298,6 +303,35 @@ func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, v interface{
 	if err := json.Unmarshal(body, v); err != nil {
 		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Invalid JSON in request body")
 		return err
+	}
+
+	return nil
+}
+
+// decodeJSONStrict decodes a JSON body with strict checking (no unknown fields, no trailing data).
+func (s *Server) decodeJSONStrict(w http.ResponseWriter, r *http.Request, v interface{}) error {
+	if r.Body == nil {
+		return errors.New("empty body")
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "READ_ERROR", "Failed to read request body")
+		return err
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(v); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Invalid JSON in request body")
+		return err
+	}
+
+	// Reject trailing data after the JSON object with a second decode.
+	// A well-formed body yields io.EOF on the second decode; anything else is trailing data.
+	if err := decoder.Decode(new(interface{})); err != io.EOF {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Trailing data after JSON object")
+		return errors.New("trailing data in request body")
 	}
 
 	return nil
@@ -1437,6 +1471,90 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.encodeJSON(w, http.StatusOK, task)
+}
+
+// handleSetPriority handles POST /tasks/{id}/priority/set to set manual priority (1..1000).
+// Body: {"action_key": "...", "priority": N, "actor": "...", "reason": "..."}.
+func (s *Server) handleSetPriority(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
+
+	var payload struct {
+		ActionKey string `json:"action_key"`
+		Priority  *int64 `json:"priority"`
+		Actor     string `json:"actor"`
+		Reason    string `json:"reason"`
+	}
+	if err := s.decodeJSONStrict(w, r, &payload); err != nil {
+		return
+	}
+	if payload.Priority == nil {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "priority is required")
+		return
+	}
+
+	change, err := s.store.SetTaskPriority(r.Context(), store.SetPriorityRequest{
+		ActionKey: payload.ActionKey,
+		TaskID:    taskID,
+		Priority:  *payload.Priority,
+		Actor:     payload.Actor,
+		Reason:    payload.Reason,
+	})
+	var conflictErr *store.ConflictError
+	var validationErr *store.ValidationError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+	case errors.As(err, &conflictErr):
+		s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+	case errors.As(err, &validationErr):
+		s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
+	case err != nil:
+		s.errorResponse(w, http.StatusInternalServerError, "PRIORITY_ERROR", "Failed to set priority")
+	default:
+		s.encodeJSON(w, http.StatusOK, change)
+	}
+}
+
+// handleMoveToFront handles POST /tasks/{id}/priority/front to move a topic to front.
+// Body: {"action_key": "...", "actor": "...", "reason": "..."}.
+func (s *Server) handleMoveToFront(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
+
+	var payload struct {
+		ActionKey string `json:"action_key"`
+		Actor     string `json:"actor"`
+		Reason    string `json:"reason"`
+	}
+	if err := s.decodeJSONStrict(w, r, &payload); err != nil {
+		return
+	}
+
+	change, err := s.store.MoveTaskToFront(r.Context(), store.FrontPriorityRequest{
+		ActionKey: payload.ActionKey,
+		TaskID:    taskID,
+		Actor:     payload.Actor,
+		Reason:    payload.Reason,
+	})
+	var conflictErr *store.ConflictError
+	var validationErr *store.ValidationError
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+	case errors.As(err, &conflictErr):
+		s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+	case errors.As(err, &validationErr):
+		s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
+	case err != nil:
+		s.errorResponse(w, http.StatusInternalServerError, "PRIORITY_ERROR", "Failed to move to front")
+	default:
+		s.encodeJSON(w, http.StatusOK, change)
+	}
 }
 
 // handleGetResearchPolicy handles GET /research/policy to read safe policy configuration.

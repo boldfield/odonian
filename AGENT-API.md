@@ -603,6 +603,56 @@ curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/transition" -d '{"to":"fa
 
 This retires the blocked task to terminal state without re-entering the ready queue.
 
+## Task priority management
+
+Tasks are ordered in the execution queue by priority (higher first), then creation order, then ID.
+Manual priority ranges from 1–1000 (default 500). The server can assign higher priorities (>1000)
+to move tasks to the front and keep them ahead of all manual assignments.
+
+### Set manual priority
+
+Assign a manual priority (1–1000) to control task ordering. The priority is idempotent: replaying
+the same `action_key` with the same priority returns the cached result.
+
+```bash
+curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/priority/set" \
+  -d '{"action_key":"key-12345","priority":750,"actor":"operator","reason":"urgent fix needed"}'
+```
+
+- `action_key` (required): Unique identifier for idempotency (max 200 chars)
+- `priority` (required): Integer from 1 to 1000; `400 INVALID_PRIORITY` if outside range
+- `actor` (required): Who is making the change
+- `reason` (required): Why the priority is being changed
+
+**Response:** `200 OK` with `{"priority": <int>, "topic_anchor_id": "<task_id>", "replayed": <bool>}`;
+`409 IDEMPOTENCY_MISMATCH` if the same key is used with a different priority.
+
+### Move task to front of queue
+
+Assign a server-calculated priority exceeding all manual assignments (always >1000) to move a task
+to the front of the queue. Successive calls return strictly increasing values, ensuring the task
+remains ahead of any subsequent manual priority assignments.
+
+```bash
+curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/priority/front" \
+  -d '{"action_key":"front-key-xyz","actor":"operator","reason":"production critical"}'
+```
+
+- `action_key` (required): Unique identifier for idempotency (max 200 chars)
+- `actor` (required): Who is making the change
+- `reason` (required): Why the task is being moved
+
+**Response:** `200 OK` with `{"priority": <int>, "topic_anchor_id": "<task_id>", "replayed": <bool>}`;
+priority is always >1000 and strictly increases on subsequent calls with different keys.
+
+Both priority endpoints:
+- Return `404 NOT_FOUND` if the task does not exist
+- Return `409 ARCHIVED` if the task has been archived
+- Return `400 INVALID_ACTION_KEY` if `action_key` is empty or >200 characters
+- Return `400 JSON_DECODE_ERROR` if the JSON is malformed or contains unknown fields
+- Support required idempotency key (`action_key`); same key replayed returns the same result with `"replayed": true`
+- Preserve the task's `held` status and all merge gates
+
 ## Rules
 
 - **One task at a time.** Finish, block, or fail it before touching another.
