@@ -5388,6 +5388,23 @@ func TestBoardModel_ResetPriorityFlow(t *testing.T) {
 		t.Fatalf("Expected modeResetPriorityReason, got %d", model.mode)
 	}
 
+	// Verify view shows reset reason prompt
+	output := model.View()
+	if !strings.Contains(output, "Reset priority to 500 — reason (required)") {
+		t.Errorf("Expected reset priority reason prompt in view, got:\n%s", output)
+	}
+
+	// Submitting an empty reason keeps the prompt and shows a hint
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+	if model.mode != modeResetPriorityReason {
+		t.Fatalf("Expected to remain in modeResetPriorityReason on empty reason, got %d", model.mode)
+	}
+	output = model.View()
+	if !strings.Contains(output, "hint:") || !strings.Contains(output, "Reset priority to 500 — reason (required)") {
+		t.Errorf("Expected reset reason prompt with hint after empty reason, got:\n%s", output)
+	}
+
 	// Type reason
 	for _, ch := range "no longer urgent" {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
@@ -5402,6 +5419,15 @@ func TestBoardModel_ResetPriorityFlow(t *testing.T) {
 		t.Fatalf("Expected modeResetPriorityConfirm, got %d", model.mode)
 	}
 
+	// Verify confirm view
+	output = model.View()
+	if !strings.Contains(output, "Reset priority to 500 for task-1? [y/N]") {
+		t.Errorf("Expected reset priority confirm prompt in view, got:\n%s", output)
+	}
+	if !strings.Contains(output, "(y to confirm, n/esc to cancel)") {
+		t.Errorf("Expected confirm help in reset confirm view, got:\n%s", output)
+	}
+
 	// Confirm with 'y'
 	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	model = m.(*BoardModel)
@@ -5413,6 +5439,12 @@ func TestBoardModel_ResetPriorityFlow(t *testing.T) {
 
 	// Execute the command
 	model = executeReviewCmd(t, model, cmd)
+
+	// Verify the refreshed board shows the reset value
+	output = model.View()
+	if !strings.Contains(output, "P:500") {
+		t.Errorf("Expected refreshed list to show P:500 after reset, got:\n%s", output)
+	}
 
 	// Verify API call
 	if capturedTaskID != "task-1" {
@@ -5489,6 +5521,154 @@ func TestDetailView_ResetPriorityFlow(t *testing.T) {
 	// Verify
 	if capturedReq.Priority != 500 {
 		t.Errorf("Expected priority 500, got %d", capturedReq.Priority)
+	}
+}
+
+// TestDetailView_PriorityFlowsRenderPrompts drives Set priority, Move to front and Reset
+// priority from the detail view and asserts every step's View() output: the detail help
+// bar advertises the key, each input/confirm overlay is visible, cancelling returns to the
+// rendered detail view, and a confirmed action lands on the refreshed board with status.
+func TestDetailView_PriorityFlowsRenderPrompts(t *testing.T) {
+	tests := []struct {
+		name          string
+		startKey      rune
+		helpLabel     string
+		value         string
+		valuePrompt   string
+		reasonPrompt  string
+		confirmPrompt string
+		resultValue   int64
+		wantStatus    string
+	}{
+		{
+			name:          "set priority",
+			startKey:      'i',
+			helpLabel:     "i set priority",
+			value:         "1000",
+			valuePrompt:   "Set priority — enter a value (1-1000)",
+			reasonPrompt:  "Set priority — reason (required)",
+			confirmPrompt: "Set priority to 1000 for task-1? [y/N]",
+			resultValue:   1000,
+			wantStatus:    "priority set to 1000 for topic-1",
+		},
+		{
+			name:          "move to front",
+			startKey:      'w',
+			helpLabel:     "w move to front",
+			reasonPrompt:  "Move to front — reason (required)",
+			confirmPrompt: "Move task-1 to front? [y/N]",
+			resultValue:   1001,
+			wantStatus:    "1001",
+		},
+		{
+			name:          "reset priority",
+			startKey:      'e',
+			helpLabel:     "e reset priority",
+			reasonPrompt:  "Reset priority to 500 — reason (required)",
+			confirmPrompt: "Reset priority to 500 for task-1? [y/N]",
+			resultValue:   500,
+			wantStatus:    "500",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			priorityChange := tuiclient.PriorityChange{TopicAnchorID: "topic-1", Priority: tt.resultValue, OldPriority: 750}
+			mockClient := &tuiclient.MockClient{
+				SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+					return priorityChange, nil
+				},
+				MoveTaskToFrontFunc: func(ctx context.Context, taskID string, req tuiclient.MoveTaskToFrontRequest) (tuiclient.PriorityChange, error) {
+					return priorityChange, nil
+				},
+				ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+					return []tuiclient.Task{
+						{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(tt.resultValue)},
+					}, nil
+				},
+				GetTaskFunc: func(ctx context.Context, taskID string) (tuiclient.TaskDetail, error) {
+					return tuiclient.TaskDetail{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(750)}, nil
+				},
+			}
+
+			enterDetail := func() *BoardModel {
+				model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+					{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(750)},
+				})
+				m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+				model = m.(*BoardModel)
+				if cmd != nil {
+					model = executeCmd(t, model, cmd)
+				}
+				if model.mode != modeDetail {
+					t.Fatalf("Expected modeDetail, got %d", model.mode)
+				}
+				return model
+			}
+			typeText := func(model *BoardModel, text string) *BoardModel {
+				for _, ch := range text {
+					m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+					model = m.(*BoardModel)
+				}
+				m, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+				return m.(*BoardModel)
+			}
+			assertView := func(model *BoardModel, want string) {
+				t.Helper()
+				output := model.View()
+				if strings.TrimSpace(output) == "" {
+					t.Fatalf("Expected non-empty view while expecting %q", want)
+				}
+				if !strings.Contains(output, want) {
+					t.Errorf("Expected %q in view, got:\n%s", want, output)
+				}
+			}
+
+			model := enterDetail()
+			assertView(model, tt.helpLabel)
+			assertView(model, "Priority: 750")
+
+			// Walk the flow, asserting each overlay.
+			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{tt.startKey}})
+			model = m.(*BoardModel)
+			if tt.valuePrompt != "" {
+				assertView(model, tt.valuePrompt)
+				model = typeText(model, tt.value)
+			}
+			assertView(model, tt.reasonPrompt)
+			model = typeText(model, "operator request")
+			assertView(model, tt.confirmPrompt)
+			assertView(model, "(y to confirm, n/esc to cancel)")
+
+			// Declining returns to the detail view with its content visible.
+			m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+			model = m.(*BoardModel)
+			if model.mode != modeDetail {
+				t.Fatalf("Expected modeDetail after declining, got %d", model.mode)
+			}
+			assertView(model, "Priority: 750")
+			assertView(model, tt.helpLabel)
+
+			// Run the flow again and confirm: the refreshed board shows status and the new value.
+			model = enterDetail()
+			m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{tt.startKey}})
+			model = m.(*BoardModel)
+			if tt.valuePrompt != "" {
+				model = typeText(model, tt.value)
+			}
+			model = typeText(model, "operator request")
+			m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+			model = m.(*BoardModel)
+			model = executeReviewCmd(t, model, cmd)
+			if model.mode != modeNormal {
+				t.Fatalf("Expected modeNormal after confirmed detail action, got %d", model.mode)
+			}
+			assertView(model, tt.wantStatus)
+			assertView(model, fmt.Sprintf("P:%d", tt.resultValue))
+			if strings.Contains(model.View(), "Error:") {
+				t.Errorf("Expected no error screen after successful detail action, got:\n%s", model.View())
+			}
+		})
 	}
 }
 
