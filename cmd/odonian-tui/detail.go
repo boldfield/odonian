@@ -211,6 +211,22 @@ func (m *BoardModel) buildDetailContent(task tuiclient.TaskDetail) string {
 		b.WriteString(fmt.Sprintf("Lease: %s\n", m.formatLeaseCountdown(*task.LeaseExpiresAt)))
 	}
 
+	// Priority
+	priorityStr := "500"
+	if task.Priority != nil {
+		priorityStr = fmt.Sprintf("%d", *task.Priority)
+	}
+	if task.Held {
+		b.WriteString(fmt.Sprintf("Priority: %s [HELD]\n", priorityStr))
+	} else {
+		b.WriteString(fmt.Sprintf("Priority: %s\n", priorityStr))
+	}
+
+	// Topic anchor
+	if task.TopicAnchorID != nil {
+		b.WriteString(fmt.Sprintf("Topic Anchor: %s\n", *task.TopicAnchorID))
+	}
+
 	// Timestamps
 	b.WriteString(fmt.Sprintf("Created: %s\n", m.formatAbsTime(task.CreatedAt)))
 	b.WriteString(fmt.Sprintf("Updated: %s\n", m.formatAbsTime(task.UpdatedAt)))

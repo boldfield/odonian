@@ -4843,14 +4843,14 @@ func TestBoardModel_HeldMarkerRendering(t *testing.T) {
 
 	output := model.View()
 
-	// Assert selected held row format: "▸ ready-ta [haiku] [HELD]  Held Task"
-	if !strings.Contains(output, "▸ ready-ta [haiku] [HELD]  Held Task") {
-		t.Errorf("Expected selected held row format '▸ ready-ta [haiku] [HELD]  Held Task' not found.\nOutput:\n%s", output)
+	// Assert selected held row format: "▸ ready-ta [haiku] [HELD] P:500  Held Task"
+	if !strings.Contains(output, "▸ ready-ta [haiku] [HELD] P:500  Held Task") {
+		t.Errorf("Expected selected held row format '▸ ready-ta [haiku] [HELD] P:500  Held Task' not found.\nOutput:\n%s", output)
 	}
 
-	// Assert unselected normal row format: "  ready-tb [haiku]  Normal Task" (no [HELD])
-	if !strings.Contains(output, "  ready-tb [haiku]  Normal Task") {
-		t.Errorf("Expected unselected normal row format '  ready-tb [haiku]  Normal Task' not found.\nOutput:\n%s", output)
+	// Assert unselected normal row format: "  ready-tb [haiku] P:500  Normal Task" (no [HELD])
+	if !strings.Contains(output, "  ready-tb [haiku] P:500  Normal Task") {
+		t.Errorf("Expected unselected normal row format '  ready-tb [haiku] P:500  Normal Task' not found.\nOutput:\n%s", output)
 	}
 
 	// Verify exactly one [HELD] marker
