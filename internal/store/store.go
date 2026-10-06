@@ -2640,9 +2640,9 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 
 				reviewModelsJSON := (*string)(nil) // review tasks don't have review_models
 				_, err := tx.ExecContext(ctx, `
-					INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, track, created_at, updated_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				`, reviewTaskID, t.ProjectID, t.DocumentID, reviewTitle, reviewSpec, "ready", reviewerModel, "review", reviewModelsJSON, newReviewRound, &t.ID, false, t.Track, now, now)
+					INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, track, priority, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				`, reviewTaskID, t.ProjectID, t.DocumentID, reviewTitle, reviewSpec, "ready", reviewerModel, "review", reviewModelsJSON, newReviewRound, &t.ID, false, t.Track, t.Priority, now, now)
 				if err != nil {
 					return TaskWithDepsAndLinks{}, fmt.Errorf("failed to create review task: %w", err)
 				}
@@ -2810,12 +2810,17 @@ func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, paren
 		newParentState = "done"
 	} else if parentAgentMerge && hasPR {
 		// Spawn merge task if approved with agent_merge && pr (not the no_op case)
+		parentPriority, err := effectiveTaskPriority(ctx, tx, parentID)
+		if err != nil {
+			return "", fmt.Errorf("failed to read parent priority for merge task: %w", err)
+		}
+
 		mergeTaskID := GenerateID()
 		mergeTitle := "Merge: " + parentTitle
-		_, err := tx.ExecContext(ctx, `
-			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, now, now)
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, target_task_id, agent_merge, track, priority, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, mergeTaskID, parentProjectID, parentDocumentID, mergeTitle, "", "ready", parentModel, "merge", parentID, false, parentTrack, parentPriority, now, now)
 		if err != nil {
 			return "", fmt.Errorf("failed to create merge task: %w", err)
 		}
@@ -3215,6 +3220,11 @@ func (s *sqliteStore) spawnAdjudicationTask(ctx context.Context, tx *sql.Tx, par
 		return fmt.Errorf("malformed dispute lineage %q", anchor.Lineage)
 	}
 
+	parentPriority, err := effectiveTaskPriority(ctx, tx, parentID)
+	if err != nil {
+		return fmt.Errorf("failed to read parent priority: %w", err)
+	}
+
 	taskID := GenerateID()
 	title := fmt.Sprintf("Adjudicate disputed finding %s [%s]", finding.ID, finding.Severity)
 	spec := adjudicationTaskSpec(parentID, finding, anchor.Evidence)
@@ -3223,11 +3233,11 @@ func (s *sqliteStore) spawnAdjudicationTask(ctx context.Context, tx *sql.Tx, par
 		INSERT INTO task (
 			id, project_id, document_id, title, spec, state, model, kind, review_round, target_task_id,
 			agent_merge, track, adjudicate_finding_round, adjudicate_finding_reviewer_model,
-			adjudicate_finding_reviewer_slot, adjudicate_finding_id, created_at, updated_at
+			adjudicate_finding_reviewer_slot, adjudicate_finding_id, priority, created_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, ?, 'ready', ?, 'review', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, 'ready', ?, 'review', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, taskID, parentProjectID, parentDocumentID, title, spec, s.researchAdjudicator, round, parentID,
-		parentTrack, anchor.Round, model, slot, anchor.FindingID, now, now)
+		parentTrack, anchor.Round, model, slot, anchor.FindingID, parentPriority, now, now)
 	if err != nil {
 		return fmt.Errorf("failed to spawn adjudication task: %w", err)
 	}
@@ -4024,6 +4034,10 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 		}
 		return nil, fmt.Errorf("failed to load parent task: %w", err)
 	}
+	parentPriority, err := effectiveTaskPriority(ctx, tx, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load parent priority: %w", err)
+	}
 
 	// Verify the parent belongs to the expected project and document
 	if actualProjectID != parentProjectID || actualDocumentID != parentDocumentID {
@@ -4153,9 +4167,9 @@ func (s *sqliteStore) InsertManifestChildren(ctx context.Context, tx *sql.Tx, m 
 
 		// Insert the child task
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, track, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, 'implement', ?, 0, ?, ?, ?, ?, ?)
-		`, taskID, parentProjectID, parentDocumentID, child.Title, child.Spec, state, model, reviewModelsJSON, agentMerge, escalate, child.Track, now, now)
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, track, priority, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 'implement', ?, 0, ?, ?, ?, ?, ?, ?)
+		`, taskID, parentProjectID, parentDocumentID, child.Title, child.Spec, state, model, reviewModelsJSON, agentMerge, escalate, child.Track, parentPriority, now, now)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert child task: %w", err)
 		}
@@ -5126,9 +5140,9 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 	}
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, track, branch, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, newTaskID, oldTask.ProjectID, oldTask.DocumentID, oldTask.Title, oldTask.Spec, "backlog", model, oldTask.Kind, newReviewModelsJSON, 0, oldTask.AgentMerge, oldTask.Escalate, oldTask.Track, oldTask.Branch, now, now)
+		INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, agent_merge, escalate, track, branch, priority, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, newTaskID, oldTask.ProjectID, oldTask.DocumentID, oldTask.Title, oldTask.Spec, "backlog", model, oldTask.Kind, newReviewModelsJSON, 0, oldTask.AgentMerge, oldTask.Escalate, oldTask.Track, oldTask.Branch, oldTask.Priority, now, now)
 	if err != nil {
 		return "", fmt.Errorf("failed to insert replacement task: %w", err)
 	}
