@@ -59,10 +59,10 @@ else
   test_fail "multi-project task dispatch structure incorrect"
 fi
 
-# Test 5: Sort order is numeric descending for priority
+# Test 5: Sort order is numeric descending for priority (with bounded key)
 echo "Test 5: sort uses numeric descending for priority"
-if grep -q 'sort.*-k1nr' "$SCRIPT_TO_TEST"; then
-  test_pass "sort uses -k1nr for numeric descending priority"
+if grep -q 'sort.*-k1,1nr' "$SCRIPT_TO_TEST"; then
+  test_pass "sort uses bounded -k1,1nr for numeric descending priority"
 else
   test_fail "sort does not use numeric descending for priority"
 fi
@@ -77,10 +77,10 @@ else
   test_fail "merger path still uses sort -R for projects"
 fi
 
-# Test 7: Both single and multi-project pass selected task for non-research
+# Test 7: Both single and multi-project claim selected task for non-research
 echo "Test 7: single and multi-project pass task for non-research dispatch"
-_count=$(grep -c 'For non-research tasks, pass the selected task' "$SCRIPT_TO_TEST")
-if [ "$_count" -eq 2 ] && grep -A 1 'For non-research tasks, pass the selected task' "$SCRIPT_TO_TEST" | grep -q 'P_TASK='; then
+_count=$(grep -c 'if ! claim_non_research_task' "$SCRIPT_TO_TEST")
+if [ "$_count" -eq 2 ]; then
   test_pass "single and multi-project pass selected task for non-research dispatch"
 else
   test_fail "single/multi-project does not pass task to non-research dispatch"

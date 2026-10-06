@@ -756,12 +756,6 @@ dispatch() {
 
 nap() { sleep "$1" & wait $! 2>/dev/null; }
 
-# Check if a project has claimable tasks for THIS agent's kind (any model).
-# Returns 0 if claimable work exists, 1 if not.
-has_claimable_work() {
-  odonian next --project "$1" --kind "$KIND" >/dev/null 2>&1
-}
-
 # Cleanup: drop ALL of this slot's worktrees (single wt-$SLOT and multi wt-$SLOT-*), prune clones.
 cleanup() {
   # Backstop: if a claude dispatch is still tracked when we exit (force-quit, error), KILL its
@@ -816,15 +810,14 @@ if [ "$MULTI" = 0 ]; then
   while true; do
     [ "$STOP" -eq 1 ] && break
     prune_deferred
-    if has_claimable_work "$ODONIAN_PROJECT"; then
-      # Pick the highest-priority claimable task whose model isn't in a failure backoff window
-      # (skipping past any head task pinned to an unavailable model — see pick_claimable_task).
-      sel=$(pick_claimable_task "$ODONIAN_PROJECT" "$KIND")
-      if [ -z "$sel" ]; then
-        _idle="$(idle_nap 30)"
-        echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND) with an available model; sleeping ${_idle}s"; nap "$_idle"; continue
-      fi
-      task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
+    # Pick the highest-priority claimable task whose model isn't in a failure backoff window
+    # (skipping past any head task pinned to an unavailable model — see pick_claimable_task).
+    sel=$(pick_claimable_task "$ODONIAN_PROJECT" "$KIND")
+    if [ -z "$sel" ]; then
+      _idle="$(idle_nap 30)"
+      echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND) with an available model; sleeping ${_idle}s"; nap "$_idle"; continue
+    fi
+    task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
       # Read track from task, default to 'build' if absent
       task_track=$(odonian show "$task_id" --json 2>/dev/null | jq -r '.track // "build"')
       # An unreadable task must not default to a build prompt: a research task would then reach a
@@ -857,9 +850,6 @@ if [ "$MULTI" = 0 ]; then
       [ -n "$WT" ] && git -C "$WT" fetch origin --quiet 2>/dev/null || true
       [ -n "$WT" ] && git -C "$WT" checkout --detach --force origin/main --quiet 2>/dev/null || true
       [ "$STOP" -eq 1 ] && break
-    else
-      echo "[$AGENT_ID] $(date '+%H:%M:%S') nothing claimable ($KIND); sleeping 30s"; nap 30
-    fi
   done
   exit 0
 fi

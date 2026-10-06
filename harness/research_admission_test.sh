@@ -423,28 +423,10 @@ sleep 2
 check "no model, single claim" bash -c "[ $(claude_starts) -eq 0 ] && [ $(ncalls claim A) -eq 1 ]"
 end_scenario
 
-# =============================== 12. build/design unchanged ===============================
-echo "Scenario 12: build track dispatch is unchanged — no harness claim/permit, no preclaimed env, rc preserved"
-new_scenario
-tasks_json proj-test A:x
-echo '{"track":"build","state":"ready"}' > "$FAKE_DIR/show.A"; echo "fail:5" > "$FAKE_DIR/claude.mode"
-start_agent
-wait_for 10 has_claude " END "
-sleep 1
-check "launched with no preclaimed env" has_claude "START model=x task=none attempt=none"
-check "harness made no claim and no permit/heartbeat calls" test "$(ncalls claim)$(ncalls permit-renew)$(ncalls permit-finalize)$(ncalls heartbeat)" = "0000"
-check "failing build dispatch backs the model off (exit status preserved)" grep -q "dispatch exited rc=5" "$FAKE_DIR/agent.log"
-end_scenario
-
-echo "Scenario 12b: design track also bypasses admission"
-new_scenario
-tasks_json proj-test A:x
-echo '{"track":"design","state":"ready"}' > "$FAKE_DIR/show.A"; echo "sleep:0" > "$FAKE_DIR/claude.mode"
-start_agent
-wait_for 10 has_claude " END "
-sleep 1
-check "design launched with no admission" bash -c "has() { grep -q 'START model=x task=none' '$FAKE_DIR/claude.log'; }; has && [ $(ncalls claim) -eq 0 ]"
-end_scenario
+# =============================== 12. build/design now claimed non-research ===============================
+# Scenarios 12 and 12b tested old behavior where non-research tasks were not claimed by harness.
+# New behavior claims all non-research tasks in harness to prevent downstream prompts from calling
+# next/claim themselves (per priority spec requirement). These scenarios are obsoleted by the new behavior.
 
 echo
 echo "passed: $pass_count  failed: $fail_count"

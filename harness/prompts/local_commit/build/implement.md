@@ -33,17 +33,25 @@ squashes your commits into that one and says so.)
 
 ## Your iteration
 
-**Claim before you work.** Steps 1–2 (find + claim) are your VERY FIRST actions. Do NOT read the
-spec in depth, explore the repo, run `wt-ensure`, or edit a single file before the claim succeeds.
-The claim flips the task to `in_progress` so the human watching the board sees it being worked, and
-it is your lock + lease — without it, another worker can grab the same task. Working first and
-claiming at the end is wrong.
+**Preclaimed tasks.** If `ODONIAN_PRECLAIMED_TASK_ID` is set, you are working a preclaimed task that
+has been claimed by the harness and is ready for work. Skip steps 1–2 entirely and go directly to 
+step 3: use the preclaimed task ID as-is. You must not call `odonian next` or `odonian claim` again, 
+and never work any task other than `ODONIAN_PRECLAIMED_TASK_ID`.
+
+**Ordinary (non-preclaimed) mode.** If `ODONIAN_PRECLAIMED_TASK_ID` is NOT set, follow steps 1–2 
+below as written (`odonian next`, then `odonian claim`).
+
+**Claim before you work.** Steps 1–2 (find + claim) are your VERY FIRST actions (only if not preclaimed). 
+Do NOT read the spec in depth, explore the repo, run `wt-ensure`, or edit a single file before the 
+claim succeeds. The claim flips the task to `in_progress` so the human watching the board sees it being 
+worked, and it is your lock + lease — without it, another worker can grab the same task. Working first 
+and claiming at the end is wrong.
 
 **Keep your lease alive.** A lease lapses if you go quiet too long, and a lapsed lease lets another
-worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — right after you claim, and
-again immediately **before and after** every slow step: each `make check`, each `make test`, and
-any build or command you expect to take more than a minute. Pin heartbeats to those points; do not
-rely on sensing elapsed time.
+worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — right after you claim (or right 
+after validating a preclaimed task), and again immediately **before and after** every slow step: each 
+`make check`, each `make test`, and any build or command you expect to take more than a minute. Pin 
+heartbeats to those points; do not rely on sensing elapsed time.
 
 1. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.
    It prints the id of the first claimable `implement`-kind task for your model tier — `--kind implement`
