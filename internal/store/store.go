@@ -78,7 +78,7 @@ type Store interface {
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	SetTaskPriority(ctx context.Context, taskID string, priority int, actor, reason string) (Task, error)
-	MoveTaskToFront(ctx context.Context, taskID, actor, reason string) (Task, error)
+	MoveTaskToFront(ctx context.Context, taskID, actionKey, actor, reason string) (Task, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
 	BeginLanding(ctx context.Context, taskID string, reviewRound int, commit, attempt string) error
 	CancelLanding(ctx context.Context, taskID, attempt string) error
@@ -5329,6 +5329,10 @@ func (s *sqliteStore) SetTaskPriority(ctx context.Context, taskID string, priori
 		return Task{}, conflict("TERMINAL_STATE", fmt.Sprintf("cannot set priority on task in terminal state %q", t.State))
 	}
 
+	if t.ArchivedAt != nil {
+		return Task{}, conflict("ARCHIVED", "cannot set priority on an archived task")
+	}
+
 	if t.Priority == priority {
 		if err := tx.Commit(); err != nil {
 			return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
@@ -5360,18 +5364,20 @@ func (s *sqliteStore) SetTaskPriority(ctx context.Context, taskID string, priori
 // max(1000, max(P_queued)) + 1 where P_queued is the maximum priority across
 // all outstanding non-archived topics (held, backlog, blocked, waiting, in-flight).
 // Uses a serialized transaction for idempotency and records an audit event.
-// Idempotency is stable: replaying with the same parameters returns the original result;
-// replaying with different parameters is rejected with a mismatch error.
-func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason string) (Task, error) {
+// The actionKey is a caller-supplied unique identifier for this action; replaying
+// with the same key and parameters returns the original result, while the same key
+// with different parameters is rejected with a mismatch error.
+func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actionKey, actor, reason string) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// 0. Check action idempotency - use task_id as the action key, hash the request
-	actionKey := taskID + ":front"
-	requestHash := hex.EncodeToString(sha256.New().Sum([]byte(actor + reason)))[:16] // use first 16 chars of hash
+	// 0. Check action idempotency - use the supplied action key and hash the request
+	payloadBytes, _ := json.Marshal(map[string]string{"actor": actor, "reason": reason})
+	hashBytes := sha256.Sum256(payloadBytes)
+	requestHash := hex.EncodeToString(hashBytes[:])
 
 	// Check if this action already exists
 	var existingResult int
@@ -5388,20 +5394,24 @@ func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason
 				fmt.Sprintf("action %q was already executed with different parameters (mismatch: %s vs %s)",
 					actionKey, existingHash, requestHash))
 		}
-		// Same request hash - return the original result
-		// Reconstruct the task with the original priority
+		// Same request hash - return the original result by reconstructing the task
+		// with the stored result_priority, not the current task row priority
 		var t Task
 		var reviewModelsJSON *string
 		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, priority, created_at, updated_at, archived_at, superseded_by
+			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, created_at, updated_at, archived_at, superseded_by
 			FROM task WHERE id = ?
-		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.Priority, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 		if err == nil {
 			t.ReviewModels = []string{}
 			if reviewModelsJSON != nil {
 				json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels)
 			}
-			tx.Commit()
+			// Return the stored result priority from the idempotency entry
+			t.Priority = existingResult
+			if err := tx.Commit(); err != nil {
+				return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+			}
 			return t, nil
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -5442,7 +5452,8 @@ func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason
 	// Outstanding = non-archived (archived_at IS NULL) and non-terminal
 	// (state NOT IN ('done', 'failed', 'abandoned', 'superseded'))
 	// This includes: held, backlog, blocked, waiting, in_progress, ready
-	// Note: Topic identity/anchor and lifecycle inheritance are deferred to Q2.
+	// Note: Topic identity (roots with active descendants) and lifecycle inheritance
+	// (priority propagation to spawned review/merge/continuation tasks) are deferred to Q2.
 	var maxPriority int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(priority), 0)
@@ -5456,7 +5467,7 @@ func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason
 
 	// 4. Compute new priority: max(1000, maxPriority) + 1
 	// Check for overflow BEFORE incrementing
-	if maxPriority >= 9223372036854775806 { // math.MaxInt64 - 1
+	if maxPriority == math.MaxInt64 {
 		return Task{}, conflict("OVERFLOW", "priority computation would overflow")
 	}
 

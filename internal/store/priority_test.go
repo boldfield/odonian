@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestSetTaskPriority(t *testing.T) {
@@ -164,7 +166,7 @@ func TestMoveTaskToFront(t *testing.T) {
 	}
 
 	// Test 1: Move task 1 (P=500) to front - should be max(1000, 730) + 1 = 1001
-	moved, err := store.MoveTaskToFront(ctx, tasks[0].ID, "test-actor", "test reason")
+	moved, err := store.MoveTaskToFront(ctx, tasks[0].ID, uuid.NewString(), "test-actor", "test reason")
 	if err != nil {
 		t.Fatalf("failed to move to front: %v", err)
 	}
@@ -173,7 +175,7 @@ func TestMoveTaskToFront(t *testing.T) {
 	}
 
 	// Test 2: Move task 3 (P=730) to front - should be max(1000, 1001) + 1 = 1002
-	moved, err = store.MoveTaskToFront(ctx, tasks[2].ID, "test-actor", "test reason")
+	moved, err = store.MoveTaskToFront(ctx, tasks[2].ID, uuid.NewString(), "test-actor", "test reason")
 	if err != nil {
 		t.Fatalf("failed to move task 3 to front: %v", err)
 	}
@@ -182,7 +184,7 @@ func TestMoveTaskToFront(t *testing.T) {
 	}
 
 	// Test 3: Move task 4 (P=1000) to front - should be max(1000, 1002) + 1 = 1003
-	moved, err = store.MoveTaskToFront(ctx, tasks[3].ID, "test-actor", "test reason")
+	moved, err = store.MoveTaskToFront(ctx, tasks[3].ID, uuid.NewString(), "test-actor", "test reason")
 	if err != nil {
 		t.Fatalf("failed to move task 4 to front: %v", err)
 	}
@@ -200,7 +202,7 @@ func TestMoveTaskToFront(t *testing.T) {
 	}
 
 	// Task 2 should still be behind task 4 (which is at 1003)
-	front, err := store.MoveTaskToFront(ctx, tasks[1].ID, "test-actor", "test reason")
+	front, err := store.MoveTaskToFront(ctx, tasks[1].ID, uuid.NewString(), "test-actor", "test reason")
 	if err != nil {
 		t.Fatalf("failed to move task 2 to front: %v", err)
 	}
@@ -246,7 +248,7 @@ func TestMoveTaskToFront(t *testing.T) {
 	}
 
 	// Move the new task to front - should calculate based on archived tasks being excluded
-	movedNew, err := store.MoveTaskToFront(ctx, newTaskID, "test-actor", "test reason")
+	movedNew, err := store.MoveTaskToFront(ctx, newTaskID, uuid.NewString(), "test-actor", "test reason")
 	if err != nil {
 		t.Fatalf("failed to move new task to front: %v", err)
 	}
@@ -366,7 +368,7 @@ func TestPriorityWithHolds(t *testing.T) {
 	}
 
 	// Check that held task is included in max calculation for move-to-front
-	moved, err := store.MoveTaskToFront(ctx, taskID, "test-actor", "test reason")
+	moved, err := store.MoveTaskToFront(ctx, taskID, uuid.NewString(), "test-actor", "test reason")
 	if err != nil {
 		t.Fatalf("failed to move held task to front: %v", err)
 	}
@@ -408,15 +410,16 @@ func TestMoveTaskToFrontIdempotency(t *testing.T) {
 	}
 	taskID := tasks[0].ID
 
-	// First call to move to front
-	moved1, err := store.MoveTaskToFront(ctx, taskID, "actor1", "reason1")
+	// First call to move to front with actionKey1 and (actor1, reason1)
+	actionKey1 := uuid.NewString()
+	moved1, err := store.MoveTaskToFront(ctx, taskID, actionKey1, "actor1", "reason1")
 	if err != nil {
 		t.Fatalf("first move to front failed: %v", err)
 	}
 	priority1 := moved1.Priority
 
-	// Replay with same parameters - should return same result
-	moved2, err := store.MoveTaskToFront(ctx, taskID, "actor1", "reason1")
+	// Replay with same actionKey1 and same parameters - should return same result (idempotent)
+	moved2, err := store.MoveTaskToFront(ctx, taskID, actionKey1, "actor1", "reason1")
 	if err != nil {
 		t.Fatalf("replay move to front failed: %v", err)
 	}
@@ -424,13 +427,23 @@ func TestMoveTaskToFrontIdempotency(t *testing.T) {
 		t.Errorf("replay returned different priority: expected %d, got %d", priority1, moved2.Priority)
 	}
 
-	// Call with different parameters - should be rejected with mismatch error
-	_, err = store.MoveTaskToFront(ctx, taskID, "actor2", "reason2")
+	// Attempt with same actionKey1 but different parameters - should be rejected with mismatch error
+	_, err = store.MoveTaskToFront(ctx, taskID, actionKey1, "actor2", "reason2")
 	if err == nil {
-		t.Fatal("expected idempotency mismatch error for different parameters")
+		t.Fatal("expected idempotency mismatch error for different parameters on same action key")
 	}
 	if conflictErr, ok := err.(*ConflictError); !ok || conflictErr.Code != "IDEMPOTENCY_MISMATCH" {
 		t.Errorf("expected IDEMPOTENCY_MISMATCH error, got: %v", err)
+	}
+
+	// New action with actionKey2 and (actor2, reason2) - should be a separate independent action
+	actionKey2 := uuid.NewString()
+	moved3, err := store.MoveTaskToFront(ctx, taskID, actionKey2, "actor2", "reason2")
+	if err != nil {
+		t.Fatalf("second move to front with different action key failed: %v", err)
+	}
+	if moved3.Priority <= priority1 {
+		t.Errorf("expected priority > %d for new front action, got %d", priority1, moved3.Priority)
 	}
 }
 
@@ -474,7 +487,7 @@ func TestMoveTaskToFrontArchivedRejection(t *testing.T) {
 	}
 
 	// Try to move archived task to front - should fail
-	_, err = store.MoveTaskToFront(ctx, taskID, "actor", "reason")
+	_, err = store.MoveTaskToFront(ctx, taskID, uuid.NewString(), "actor", "reason")
 	if err == nil {
 		t.Fatal("expected error when moving archived task to front")
 	}
@@ -583,7 +596,7 @@ func TestConcurrentMoveTaskToFront(t *testing.T) {
 	var previousPriority int
 	var movedTasks []*Task
 	for i, task := range tasks {
-		moved, err := store.MoveTaskToFront(ctx, task.ID, "actor", "reason")
+		moved, err := store.MoveTaskToFront(ctx, task.ID, uuid.NewString(), "actor", "reason")
 		if err != nil {
 			t.Fatalf("task %d: failed to move to front: %v", i, err)
 		}
