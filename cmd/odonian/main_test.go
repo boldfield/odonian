@@ -6273,70 +6273,83 @@ func TestExecuteNextNotBeforeOnlyDenial(t *testing.T) {
 }
 
 func TestExecuteNextPriorityOrdering(t *testing.T) {
-	// Test that executeNext respects priority ordering: higher priority wins, then oldest by created_at
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/projects/proj-1/tasks" && r.URL.Query().Get("claimable") == "true" {
-			w.Header().Set("Content-Type", "application/json")
-			// Server returns tasks in priority order (this is what the store should return)
-			// Higher priority first, then oldest created_at
-			priority800 := int64(800)
-			priority600 := int64(600)
-			priority600_2 := int64(600)
-
-			json.NewEncoder(w).Encode([]tuiclient.Task{
-				{
-					ID:        "task-800",
-					State:     "ready",
-					Model:     "haiku",
-					Kind:      "implement",
-					Title:     "High Priority Task",
-					Priority:  &priority800,
-					CreatedAt: "2026-01-01T10:00:00Z",
-				},
-				{
-					ID:        "task-600-old",
-					State:     "ready",
-					Model:     "haiku",
-					Kind:      "implement",
-					Title:     "Equal Priority Older",
-					Priority:  &priority600,
-					CreatedAt: "2026-01-01T09:00:00Z",
-				},
-				{
-					ID:        "task-600-new",
-					State:     "ready",
-					Model:     "haiku",
-					Kind:      "implement",
-					Title:     "Equal Priority Newer",
-					Priority:  &priority600_2,
-					CreatedAt: "2026-01-01T11:00:00Z",
-				},
-			})
-		}
-	}))
-	defer server.Close()
-
-	// executeNext should pick task-800 (highest priority)
-	// Capture stdout to verify the selected task
-	output := captureStdout(t, func() {
-		err := executeNext(context.Background(), server.URL, "test-token", false, []string{
-			"--project", "proj-1",
-			"--model", "haiku",
-			"--kind", "implement",
-		})
-		if err != nil {
-			t.Fatalf("executeNext failed: %v", err)
-		}
-	})
-
-	// Verify that task-800 was selected (highest priority)
-	if !strings.Contains(output, "task-800") {
-		t.Errorf("expected output to contain 'task-800' (highest priority), got: %s", output)
+	priorityOf := func(value int64) *int64 { return &value }
+	testCases := []struct {
+		name     string
+		tasks    []tuiclient.Task
+		wantTask string
+	}{
+		{
+			name: "higher priority wins over older lower priority",
+			tasks: []tuiclient.Task{
+				{ID: "task-old-500", Priority: priorityOf(500), CreatedAt: "2026-01-01T08:00:00Z"},
+				{ID: "task-new-800", Priority: priorityOf(800), CreatedAt: "2026-01-01T10:00:00Z"},
+			},
+			wantTask: "task-new-800",
+		},
+		{
+			name: "value above 1000 beats 1000",
+			tasks: []tuiclient.Task{
+				{ID: "task-1000", Priority: priorityOf(1000), CreatedAt: "2026-01-01T08:00:00Z"},
+				{ID: "task-1001", Priority: priorityOf(1001), CreatedAt: "2026-01-01T10:00:00Z"},
+			},
+			wantTask: "task-1001",
+		},
+		{
+			name: "equal priority picks oldest created_at",
+			tasks: []tuiclient.Task{
+				{ID: "task-600-new", Priority: priorityOf(600), CreatedAt: "2026-01-01T11:00:00Z"},
+				{ID: "task-600-old", Priority: priorityOf(600), CreatedAt: "2026-01-01T09:00:00Z"},
+			},
+			wantTask: "task-600-old",
+		},
+		{
+			name: "equal priority and created_at picks lowest id",
+			tasks: []tuiclient.Task{
+				{ID: "task-b", Priority: priorityOf(600), CreatedAt: "2026-01-01T09:00:00Z"},
+				{ID: "task-a", Priority: priorityOf(600), CreatedAt: "2026-01-01T09:00:00Z"},
+			},
+			wantTask: "task-a",
+		},
+		{
+			name: "unset priority counts as default 500",
+			tasks: []tuiclient.Task{
+				{ID: "task-499", Priority: priorityOf(499), CreatedAt: "2026-01-01T08:00:00Z"},
+				{ID: "task-unset", CreatedAt: "2026-01-01T10:00:00Z"},
+			},
+			wantTask: "task-unset",
+		},
 	}
 
-	// Also verify that lower priority tasks were not selected
-	if strings.Contains(output, "task-600-old") || strings.Contains(output, "task-600-new") {
-		t.Errorf("expected task-800 to be selected, but output contains: %s", output)
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			// The fake server deliberately returns the list in the wrong order so the
+			// test proves the CLI applies the comparator rather than trusting list order.
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				tasks := make([]tuiclient.Task, len(testCase.tasks))
+				copy(tasks, testCase.tasks)
+				for index := range tasks {
+					tasks[index].State = "ready"
+					tasks[index].Model = "haiku"
+					tasks[index].Kind = "implement"
+				}
+				json.NewEncoder(w).Encode(tasks)
+			}))
+			defer server.Close()
+
+			output := captureStdout(t, func() {
+				err := executeNext(context.Background(), server.URL, "test-token", false, []string{
+					"--project", "proj-1", "--model", "haiku", "--kind", "implement",
+				})
+				if err != nil {
+					t.Fatalf("executeNext failed: %v", err)
+				}
+			})
+			if strings.TrimSpace(output) != testCase.wantTask {
+				t.Errorf("executeNext selected %q, want %q", strings.TrimSpace(output), testCase.wantTask)
+			}
+		})
 	}
 }
 
@@ -6924,5 +6937,84 @@ func TestExecutePriorityRetryIdentity(t *testing.T) {
 
 	if key1 == key2 {
 		t.Errorf("Expected distinct keys for separate invocations, but got same key: %s", key1)
+	}
+}
+
+func TestExecutePriorityHelpWithoutEnvironment(t *testing.T) {
+	for _, helpFlag := range []string{"-h", "--help"} {
+		buf := &bytes.Buffer{}
+		if err := executePriority(context.Background(), "", "", false, []string{helpFlag}, buf); err != nil {
+			t.Fatalf("executePriority %s returned error: %v", helpFlag, err)
+		}
+		usage := buf.String()
+		for _, want := range []string{"1..1000", "max(1000, max queued priority) + 1", "do not scope the global Front maximum", "does\nnot release holds or promote"} {
+			if !strings.Contains(usage, want) {
+				t.Errorf("usage for %s missing %q:\n%s", helpFlag, want, usage)
+			}
+		}
+	}
+}
+
+func TestExecutePriorityRetryAfterFailureReusesKey(t *testing.T) {
+	var receivedKeys []string
+	var mu sync.Mutex
+	attempts := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/tasks/task-123/priority/front" || r.Method != "POST" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req tuiclient.MoveTaskToFrontRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		receivedKeys = append(receivedKeys, req.ActionKey)
+		attempts++
+		attempt := attempts
+		mu.Unlock()
+		if attempt == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "boom"})
+			return
+		}
+		json.NewEncoder(w).Encode(tuiclient.PriorityChange{
+			Action: "front", TaskID: "task-123", TopicAnchorID: "topic-123",
+			ActionKey: req.ActionKey, OldPriority: 500, Priority: 1001, Replayed: attempt > 2,
+		})
+	}))
+	defer server.Close()
+
+	firstErr := executePriority(context.Background(), server.URL, "test-token", false,
+		[]string{"task-123", "--front", "--reason", "retry test"}, &bytes.Buffer{})
+	if firstErr == nil {
+		t.Fatal("expected first attempt to fail")
+	}
+	const keyMarker = "action key "
+	messageText := firstErr.Error()
+	markerIndex := strings.Index(messageText, keyMarker)
+	if markerIndex < 0 {
+		t.Fatalf("error does not report the action key: %v", firstErr)
+	}
+	reportedKey := messageText[markerIndex+len(keyMarker):]
+	reportedKey = reportedKey[:strings.Index(reportedKey, ")")]
+	if reportedKey == "" || reportedKey != receivedKeys[0] {
+		t.Fatalf("reported key %q does not match key sent %q", reportedKey, receivedKeys[0])
+	}
+
+	buf := &bytes.Buffer{}
+	if err := executePriority(context.Background(), server.URL, "test-token", true,
+		[]string{"task-123", "--front", "--reason", "retry test", "--action-key", reportedKey}, buf); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if len(receivedKeys) != 2 || receivedKeys[1] != reportedKey {
+		t.Errorf("retry sent keys %v, want both %q", receivedKeys, reportedKey)
+	}
+	var result tuiclient.PriorityChange
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON output: %v", err)
+	}
+	if result.ActionKey != reportedKey || result.Priority != 1001 {
+		t.Errorf("unexpected JSON result: %+v", result)
 	}
 }

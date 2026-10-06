@@ -657,7 +657,7 @@ odonian priority <task-id> --set <N> --action-key "<key>" --reason "<reason>"  #
 ```
 
 - `--set <N>`: Set priority to N (1–1000); returns `INVALID_PRIORITY` if outside range
-- `--front`: Move task to front with server-calculated priority (>1000)
+- `--front`: Move task to front; the server atomically assigns `max(1000, max queued priority) + 1` (always >1000)
 - `--reset`: Reset priority to default value (500)
 - `--reason`: Why the priority is being changed (required)
 - `--action-key`: Optional action key for idempotent retries; if omitted, generates a new UUID per invocation
