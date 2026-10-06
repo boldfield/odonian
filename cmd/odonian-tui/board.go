@@ -1108,7 +1108,9 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "i":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
-				m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+				if m.pendingActionKey == "" {
+					m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+				}
 				m.reviewInput.Placeholder = "priority (1-1000)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1123,7 +1125,9 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "w":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
-				m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+				if m.pendingActionKey == "" {
+					m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+				}
 				m.reviewInput.Placeholder = "reason for moving to front (required)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1138,7 +1142,9 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
-				m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+				if m.pendingActionKey == "" {
+					m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+				}
 				m.reviewInput.Placeholder = "reason for resetting priority (required)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1218,16 +1224,22 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case reviewActionMsg:
-		if msg.err != "" {
-			m.error = msg.err
-		} else {
-			m.error = ""
-		}
 		if msg.tasks != nil {
 			m.loading = false
 			m.tasks = msg.tasks
 			m.lastRefresh = time.Now()
 			m.ensureSelectionInColumn()
+		}
+		if msg.err != "" {
+			m.error = msg.err
+		} else {
+			m.error = ""
+		}
+		// Clear priority action state after successful completion (msg.tasks != nil means tasks were fetched).
+		// This allows the next action to generate a new key while preserving
+		// the current key if the user wants to retry on error.
+		if msg.tasks != nil && m.pendingActionKey != "" {
+			m.clearPriorityActionState()
 		}
 		// When the action originated from the detail view, the task has left "review"
 		// (or a race was detected). Return to the board so m.error and the refreshed
@@ -1413,7 +1425,9 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Set Priority: set priority for the task (detail view)
 	case "i":
 		m.pendingTaskID = m.detailTask.ID
-		m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		if m.pendingActionKey == "" {
+			m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		}
 		m.reviewInput.Placeholder = "priority (1-1000)"
 		m.reviewInput.SetValue("")
 		m.reviewInput.Focus()
@@ -1427,7 +1441,9 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Move to Front: move task to front (server-calculated priority, detail view)
 	case "w":
 		m.pendingTaskID = m.detailTask.ID
-		m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		if m.pendingActionKey == "" {
+			m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		}
 		m.reviewInput.Placeholder = "reason for moving to front (required)"
 		m.reviewInput.SetValue("")
 		m.reviewInput.Focus()
@@ -1441,7 +1457,9 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Reset Priority: reset task priority to 500 (detail view)
 	case "e":
 		m.pendingTaskID = m.detailTask.ID
-		m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		if m.pendingActionKey == "" {
+			m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		}
 		m.reviewInput.Placeholder = "reason for resetting priority (required)"
 		m.reviewInput.SetValue("")
 		m.reviewInput.Focus()
@@ -1954,6 +1972,16 @@ func (m *BoardModel) cancelReviewMode() {
 	m.inputHint = ""
 	m.reviewInput.SetValue("")
 	m.reviewInput.Blur()
+	// Do NOT clear pendingActionKey, pendingPriority, or pendingPriorityReason here
+	// so that retries after errors can reuse the action key and preserve the user's input.
+	// These are cleared by clearPriorityActionState() after successful completion.
+}
+
+// clearPriorityActionState clears the pending state for priority actions after successful completion.
+func (m *BoardModel) clearPriorityActionState() {
+	m.pendingActionKey = ""
+	m.pendingPriority = 0
+	m.pendingPriorityReason = ""
 }
 
 // getTasksInSelectedColumn returns the tasks in the currently selected column.

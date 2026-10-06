@@ -405,7 +405,7 @@ func (m *BoardModel) initDetailViewport(task tuiclient.TaskDetail) {
 
 // renderDetailHelpBar returns the help bar text appropriate for detail view.
 func (m *BoardModel) renderDetailHelpBar() string {
-	base := "esc back   ↑/↓/pgup/pgdn scroll spec   o open PR   s source doc   d design doc   P switch project"
+	base := "esc back   ↑/↓/pgup/pgdn scroll spec   o open PR   s source doc   d design doc   P switch project   i set priority   w move to front   e reset priority"
 	if m.detailTask.State == stateReview {
 		base += "   a approve   x reject"
 	}

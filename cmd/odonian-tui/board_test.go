@@ -4958,3 +4958,445 @@ func TestBoardModel_HeldMarkerNonReadyState(t *testing.T) {
 		t.Errorf("Expected task ID 'in-prog-' (truncated from in-prog-1) in output.\nOutput:\n%s", output)
 	}
 }
+
+// TestSetPriorityFlow tests the complete set priority flow from board mode.
+func TestBoardModel_SetPriorityFlow_ValidInput(t *testing.T) {
+	var capturedSetReq tuiclient.SetTaskPriorityRequest
+	var capturedTaskID string
+
+	mockClient := &tuiclient.MockClient{
+		SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+			capturedTaskID = taskID
+			capturedSetReq = req
+			return tuiclient.PriorityChange{
+				TopicAnchorID: "topic-1",
+				Priority:      req.Priority,
+				OldPriority:   500,
+			}, nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(750)},
+			}, nil
+		},
+	}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task", State: "ready"},
+	})
+
+	// Press 'i' to enter set priority input mode
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	model = m.(*BoardModel)
+
+	if model.mode != modeSetPriorityInput {
+		t.Fatalf("Expected modeSetPriorityInput, got %d", model.mode)
+	}
+
+	// Verify view shows input prompt
+	output := model.View()
+	if !strings.Contains(output, "Set priority — enter a value (1-1000)") {
+		t.Errorf("Expected set priority prompt in view, got:\n%s", output)
+	}
+
+	// Type priority 750
+	for _, ch := range "750" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	// Press enter to move to reason input
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	if model.mode != modeSetPriorityReason {
+		t.Fatalf("Expected modeSetPriorityReason, got %d", model.mode)
+	}
+
+	// Verify view shows reason prompt
+	output = model.View()
+	if !strings.Contains(output, "reason (required)") {
+		t.Errorf("Expected reason prompt in view, got:\n%s", output)
+	}
+
+	// Type reason
+	for _, ch := range "important feature" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	// Press enter to move to confirmation
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	if model.mode != modeSetPriorityConfirm {
+		t.Fatalf("Expected modeSetPriorityConfirm, got %d", model.mode)
+	}
+
+	// Verify confirm view shows the priority value
+	output = model.View()
+	if !strings.Contains(output, "Set priority to 750") {
+		t.Errorf("Expected priority value 750 in confirm view, got:\n%s", output)
+	}
+
+	// Confirm with 'y'
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = m.(*BoardModel)
+
+	// Mode should be back to normal after confirmation
+	if model.mode != modeNormal {
+		t.Fatalf("Expected modeNormal after confirm, got %d", model.mode)
+	}
+
+	// Execute the command
+	model = executeReviewCmd(t, model, cmd)
+
+	// Verify API call arguments
+	if capturedTaskID != "task-1" {
+		t.Errorf("Expected task ID task-1, got %q", capturedTaskID)
+	}
+	if capturedSetReq.Priority != 750 {
+		t.Errorf("Expected priority 750, got %d", capturedSetReq.Priority)
+	}
+	if capturedSetReq.Reason != "important feature" {
+		t.Errorf("Expected reason 'important feature', got %q", capturedSetReq.Reason)
+	}
+	if capturedSetReq.ActionKey == "" {
+		t.Errorf("Expected non-empty ActionKey, got empty string")
+	}
+	if capturedSetReq.Actor != "tui-worker" {
+		t.Errorf("Expected actor 'tui-worker', got %q", capturedSetReq.Actor)
+	}
+
+	// Verify success message shows new priority
+	if !strings.Contains(model.error, "priority set to 750") {
+		t.Errorf("Expected success message in error field containing 'priority set to 750', got %q", model.error)
+	}
+
+	// Verify priority state was cleared after success
+	if model.pendingActionKey != "" {
+		t.Errorf("Expected pendingActionKey cleared after success, got %q", model.pendingActionKey)
+	}
+	if model.pendingPriority != 0 {
+		t.Errorf("Expected pendingPriority cleared after success, got %d", model.pendingPriority)
+	}
+}
+
+// TestSetPriorityFlow tests invalid priority inputs.
+func TestBoardModel_SetPriorityFlow_InvalidInputs(t *testing.T) {
+	mockClient := &tuiclient.MockClient{}
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task", State: "ready"},
+	})
+
+	tests := []struct {
+		input   string
+		wantErr string
+	}{
+		{"", "priority value required"},
+		{"0", "priority must be an integer between 1 and 1000"},
+		{"1001", "priority must be an integer between 1 and 1000"},
+		{"-5", "priority must be an integer between 1 and 1000"},
+		{"abc", "priority must be an integer between 1 and 1000"},
+		{"5.5", "priority must be an integer between 1 and 1000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("input_%s", tt.input), func(t *testing.T) {
+			// Reset for each test
+			model = buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready"},
+			})
+
+			// Press 'i' to enter set priority mode
+			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+			model = m.(*BoardModel)
+
+			// Type the invalid input
+			for _, ch := range tt.input {
+				m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+				model = m.(*BoardModel)
+			}
+
+			// Press enter (should reject)
+			m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			model = m.(*BoardModel)
+
+			// Should still be in input mode with error hint
+			if model.mode != modeSetPriorityInput {
+				t.Errorf("Expected to stay in modeSetPriorityInput, got %d", model.mode)
+			}
+			if model.inputHint != tt.wantErr {
+				t.Errorf("Expected hint %q, got %q", tt.wantErr, model.inputHint)
+			}
+
+			// Verify error is visible in view
+			output := model.View()
+			if !strings.Contains(output, tt.wantErr) {
+				t.Errorf("Expected error %q in view output, got:\n%s", tt.wantErr, output)
+			}
+		})
+	}
+}
+
+// TestMoveToFrontFlow tests the move to front flow.
+func TestBoardModel_MoveToFrontFlow(t *testing.T) {
+	var capturedReq tuiclient.MoveTaskToFrontRequest
+	var capturedTaskID string
+
+	mockClient := &tuiclient.MockClient{
+		MoveTaskToFrontFunc: func(ctx context.Context, taskID string, req tuiclient.MoveTaskToFrontRequest) (tuiclient.PriorityChange, error) {
+			capturedTaskID = taskID
+			capturedReq = req
+			return tuiclient.PriorityChange{
+				TopicAnchorID: "topic-1",
+				Priority:      1500, // Server assigns a value > 1000
+				OldPriority:   500,
+			}, nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(1500)},
+			}, nil
+		},
+	}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task", State: "ready"},
+	})
+
+	// Press 'w' to enter move to front reason mode
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	model = m.(*BoardModel)
+
+	if model.mode != modeMoveToFrontReason {
+		t.Fatalf("Expected modeMoveToFrontReason, got %d", model.mode)
+	}
+
+	// Verify view shows reason prompt
+	output := model.View()
+	if !strings.Contains(output, "Move to front — reason (required)") {
+		t.Errorf("Expected move to front prompt in view, got:\n%s", output)
+	}
+
+	// Type reason
+	for _, ch := range "blocking other tasks" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	// Press enter to move to confirmation
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	if model.mode != modeMoveToFrontConfirm {
+		t.Fatalf("Expected modeMoveToFrontConfirm, got %d", model.mode)
+	}
+
+	// Verify confirm view
+	output = model.View()
+	if !strings.Contains(output, "Move") || !strings.Contains(output, "to front?") {
+		t.Errorf("Expected move to front confirm prompt in view, got:\n%s", output)
+	}
+
+	// Confirm with 'y'
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = m.(*BoardModel)
+
+	// Mode should be back to normal
+	if model.mode != modeNormal {
+		t.Fatalf("Expected modeNormal after confirm, got %d", model.mode)
+	}
+
+	// Execute the command
+	model = executeReviewCmd(t, model, cmd)
+
+	// Verify API call
+	if capturedTaskID != "task-1" {
+		t.Errorf("Expected task ID task-1, got %q", capturedTaskID)
+	}
+	if capturedReq.Reason != "blocking other tasks" {
+		t.Errorf("Expected reason 'blocking other tasks', got %q", capturedReq.Reason)
+	}
+	if capturedReq.ActionKey == "" {
+		t.Errorf("Expected non-empty ActionKey, got empty string")
+	}
+
+	// Verify success shows priority > 1000
+	if !strings.Contains(model.error, "priority 1500") {
+		t.Errorf("Expected priority 1500 in success message, got error: %q", model.error)
+	}
+}
+
+// TestPriorityDisplay tests that priorities are displayed correctly in list and detail views.
+func TestBoardModel_PriorityDisplay(t *testing.T) {
+	mockClient := &tuiclient.MockClient{}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-500", Title: "Default priority", State: "ready"},                         // P:500
+		{ID: "task-1000", Title: "Max manual", State: "ready", Priority: intPtr(1000)},      // P:1000
+		{ID: "task-1500", Title: "Server assigned", State: "ready", Priority: intPtr(1500)}, // P:1500
+	})
+
+	output := model.View()
+
+	// Verify default priority display
+	if !strings.Contains(output, "P:500") {
+		t.Errorf("Expected P:500 for default priority in view:\n%s", output)
+	}
+
+	// Verify max manual priority display
+	if !strings.Contains(output, "P:1000") {
+		t.Errorf("Expected P:1000 for max manual priority in view:\n%s", output)
+	}
+
+	// Verify server-assigned priority display (>1000)
+	if !strings.Contains(output, "P:1500") {
+		t.Errorf("Expected P:1500 for server-assigned priority in view:\n%s", output)
+	}
+}
+
+// TestActionKeyPreservation tests that action keys are preserved across retries.
+func TestBoardModel_ActionKeyPreservation(t *testing.T) {
+	var keys []string
+
+	mockClient := &tuiclient.MockClient{
+		SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+			keys = append(keys, req.ActionKey)
+			return tuiclient.PriorityChange{
+				Priority:    req.Priority,
+				OldPriority: 500,
+			}, nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready"},
+			}, nil
+		},
+	}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task", State: "ready"},
+	})
+
+	// First attempt: press 'i' and go through the flow
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	model = m.(*BoardModel)
+
+	// Type priority
+	for _, ch := range "750" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	// Move to reason
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	// Capture the key
+	firstKey := model.pendingActionKey
+
+	if firstKey == "" {
+		t.Fatalf("Expected pendingActionKey to be set, got empty")
+	}
+
+	// Type reason and confirm
+	for _, ch := range "test" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	// Confirm
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = m.(*BoardModel)
+
+	// Execute
+	model = executeReviewCmd(t, model, cmd)
+
+	// Verify key was used
+	if len(keys) == 0 {
+		t.Fatalf("Expected action key to be sent to API")
+	}
+	if keys[0] != firstKey {
+		t.Errorf("Expected API to receive key %q, got %q", firstKey, keys[0])
+	}
+}
+
+// TestDetailViewKeyboardHelp tests that priority action keys are listed in detail view help.
+func TestBoardModel_DetailViewKeyboardHelp(t *testing.T) {
+	mockClient := &tuiclient.MockClient{}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task", State: "ready"},
+	})
+
+	// Navigate to detail view
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	if model.mode != modeDetail {
+		t.Fatalf("Expected modeDetail, got %d", model.mode)
+	}
+
+	// Get the help bar
+	output := model.View()
+
+	// Verify priority action keys are listed
+	if !strings.Contains(output, "i set priority") {
+		t.Errorf("Expected 'i set priority' in detail help, got:\n%s", output)
+	}
+	if !strings.Contains(output, "w move to front") {
+		t.Errorf("Expected 'w move to front' in detail help, got:\n%s", output)
+	}
+	if !strings.Contains(output, "e reset priority") {
+		t.Errorf("Expected 'e reset priority' in detail help, got:\n%s", output)
+	}
+}
+
+// Helper function to build a board model with specific tasks
+func buildBoardModelWithTasks(t *testing.T, client *tuiclient.MockClient, tasks []tuiclient.Task) *BoardModel {
+	t.Helper()
+
+	config := &tuiconfig.Config{
+		URL:          "http://test",
+		Token:        "test",
+		Actor:        "test-actor",
+		PollInterval: 100 * time.Millisecond,
+	}
+	project := tuiclient.Project{ID: "project-1", Name: "Test"}
+
+	model := NewBoardModel(client, config, project)
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = m.(*BoardModel)
+
+	// Bucket tasks by state
+	bucketed := make(map[string][]tuiclient.Task)
+	for _, state := range []string{"backlog", "ready", "in_progress", "review", "approved", "done", "blocked", "failed", "abandoned"} {
+		bucketed[state] = []tuiclient.Task{}
+	}
+
+	for _, task := range tasks {
+		bucketed[task.State] = append(bucketed[task.State], task)
+	}
+
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+
+	// Select the first available task
+	for _, state := range []string{"backlog", "ready", "in_progress", "review"} {
+		if len(bucketed[state]) > 0 {
+			model.selectedTaskID = bucketed[state][0].ID
+			model.selectedColumn = findColumnIndex(state)
+			break
+		}
+	}
+
+	return model
+}
+
+// intPtr returns a pointer to an int64
+func intPtr(v int64) *int64 {
+	return &v
+}
