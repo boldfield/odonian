@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
 )
 
 // boardMode identifies the current interaction mode of the board.
@@ -575,22 +576,23 @@ func (m *BoardModel) releaseTaskCmd(taskID string, fromDetail bool) tea.Cmd {
 }
 
 // setTaskPriorityCmd creates a command that sets a task's priority.
-func (m *BoardModel) setTaskPriorityCmd(taskID string, priority int64, reason string, fromDetail bool) tea.Cmd {
+func (m *BoardModel) setTaskPriorityCmd(taskID string, priority int64, reason string, actionKey string, fromDetail bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		req := tuiclient.SetTaskPriorityRequest{
-			Priority: priority,
-			Actor:    "tui-worker",
-			Reason:   reason,
+			ActionKey: actionKey,
+			Priority:  priority,
+			Actor:     "tui-worker",
+			Reason:    reason,
 		}
 
-		_, err := m.client.SetTaskPriority(ctx, taskID, req)
+		change, err := m.client.SetTaskPriority(ctx, taskID, req)
 		if err != nil {
 			var apiErr *tuiclient.APIError
 			if errors.As(err, &apiErr) {
-				msg := m.fetchTasksInline(ctx, fmt.Sprintf("set priority 409: %s", apiErr.Message))
+				msg := m.fetchTasksInline(ctx, fmt.Sprintf("set priority %d: %s", apiErr.StatusCode, apiErr.Message))
 				msg.fromDetail = fromDetail
 				return msg
 			}
@@ -599,28 +601,30 @@ func (m *BoardModel) setTaskPriorityCmd(taskID string, priority int64, reason st
 			return msg
 		}
 
-		msg := m.fetchTasksInline(ctx, "")
+		statusMsg := fmt.Sprintf("priority set to %d for %s", change.Priority, change.TopicAnchorID)
+		msg := m.fetchTasksInline(ctx, statusMsg)
 		msg.fromDetail = fromDetail
 		return msg
 	}
 }
 
 // moveTaskToFrontCmd creates a command that moves a task to the front of the queue.
-func (m *BoardModel) moveTaskToFrontCmd(taskID string, reason string, fromDetail bool) tea.Cmd {
+func (m *BoardModel) moveTaskToFrontCmd(taskID string, reason string, actionKey string, fromDetail bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		req := tuiclient.MoveTaskToFrontRequest{
-			Actor:  "tui-worker",
-			Reason: reason,
+			ActionKey: actionKey,
+			Actor:     "tui-worker",
+			Reason:    reason,
 		}
 
-		_, err := m.client.MoveTaskToFront(ctx, taskID, req)
+		change, err := m.client.MoveTaskToFront(ctx, taskID, req)
 		if err != nil {
 			var apiErr *tuiclient.APIError
 			if errors.As(err, &apiErr) {
-				msg := m.fetchTasksInline(ctx, fmt.Sprintf("move to front 409: %s", apiErr.Message))
+				msg := m.fetchTasksInline(ctx, fmt.Sprintf("move to front %d: %s", apiErr.StatusCode, apiErr.Message))
 				msg.fromDetail = fromDetail
 				return msg
 			}
@@ -629,29 +633,31 @@ func (m *BoardModel) moveTaskToFrontCmd(taskID string, reason string, fromDetail
 			return msg
 		}
 
-		msg := m.fetchTasksInline(ctx, "")
+		statusMsg := fmt.Sprintf("moved to front with priority %d for %s", change.Priority, change.TopicAnchorID)
+		msg := m.fetchTasksInline(ctx, statusMsg)
 		msg.fromDetail = fromDetail
 		return msg
 	}
 }
 
 // resetTaskPriorityCmd creates a command that resets a task's priority to 500.
-func (m *BoardModel) resetTaskPriorityCmd(taskID string, reason string, fromDetail bool) tea.Cmd {
+func (m *BoardModel) resetTaskPriorityCmd(taskID string, reason string, actionKey string, fromDetail bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		req := tuiclient.SetTaskPriorityRequest{
-			Priority: 500,
-			Actor:    "tui-worker",
-			Reason:   reason,
+			ActionKey: actionKey,
+			Priority:  500,
+			Actor:     "tui-worker",
+			Reason:    reason,
 		}
 
-		_, err := m.client.SetTaskPriority(ctx, taskID, req)
+		change, err := m.client.SetTaskPriority(ctx, taskID, req)
 		if err != nil {
 			var apiErr *tuiclient.APIError
 			if errors.As(err, &apiErr) {
-				msg := m.fetchTasksInline(ctx, fmt.Sprintf("reset priority 409: %s", apiErr.Message))
+				msg := m.fetchTasksInline(ctx, fmt.Sprintf("reset priority %d: %s", apiErr.StatusCode, apiErr.Message))
 				msg.fromDetail = fromDetail
 				return msg
 			}
@@ -660,7 +666,8 @@ func (m *BoardModel) resetTaskPriorityCmd(taskID string, reason string, fromDeta
 			return msg
 		}
 
-		msg := m.fetchTasksInline(ctx, "")
+		statusMsg := fmt.Sprintf("priority reset to %d for %s", change.Priority, change.TopicAnchorID)
+		msg := m.fetchTasksInline(ctx, statusMsg)
 		msg.fromDetail = fromDetail
 		return msg
 	}
@@ -1101,6 +1108,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "i":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
+				m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
 				m.reviewInput.Placeholder = "priority (1-1000)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1115,6 +1123,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "w":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
+				m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
 				m.reviewInput.Placeholder = "reason for moving to front (required)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1129,6 +1138,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e":
 			if m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
+				m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
 				m.reviewInput.Placeholder = "reason for resetting priority (required)"
 				m.reviewInput.SetValue("")
 				m.reviewInput.Focus()
@@ -1399,6 +1409,48 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.reviewInput, cmd = m.reviewInput.Update(nil)
 			return m, cmd
 		}
+
+	// Set Priority: set priority for the task (detail view)
+	case "i":
+		m.pendingTaskID = m.detailTask.ID
+		m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		m.reviewInput.Placeholder = "priority (1-1000)"
+		m.reviewInput.SetValue("")
+		m.reviewInput.Focus()
+		m.inputHint = ""
+		m.mode = modeSetPriorityInput
+		m.reviewFromDetail = true
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(nil)
+		return m, cmd
+
+	// Move to Front: move task to front (server-calculated priority, detail view)
+	case "w":
+		m.pendingTaskID = m.detailTask.ID
+		m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		m.reviewInput.Placeholder = "reason for moving to front (required)"
+		m.reviewInput.SetValue("")
+		m.reviewInput.Focus()
+		m.inputHint = ""
+		m.mode = modeMoveToFrontReason
+		m.reviewFromDetail = true
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(nil)
+		return m, cmd
+
+	// Reset Priority: reset task priority to 500 (detail view)
+	case "e":
+		m.pendingTaskID = m.detailTask.ID
+		m.pendingActionKey = fmt.Sprintf("odonian-tui-%s", uuid.New().String())
+		m.reviewInput.Placeholder = "reason for resetting priority (required)"
+		m.reviewInput.SetValue("")
+		m.reviewInput.Focus()
+		m.inputHint = ""
+		m.mode = modeResetPriorityReason
+		m.reviewFromDetail = true
+		var cmd tea.Cmd
+		m.reviewInput, cmd = m.reviewInput.Update(nil)
+		return m, cmd
 
 	// Switch project from detail view
 	case "P":
@@ -1790,9 +1842,10 @@ func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			taskID := m.pendingTaskID
 			priority := m.pendingPriority
 			reason := m.pendingPriorityReason
+			actionKey := m.pendingActionKey
 			originFromDetail := m.reviewFromDetail
 			m.cancelReviewMode()
-			return m, m.setTaskPriorityCmd(taskID, priority, reason, originFromDetail)
+			return m, m.setTaskPriorityCmd(taskID, priority, reason, actionKey, originFromDetail)
 		}
 		return m, nil
 
@@ -1824,9 +1877,10 @@ func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "y", "Y":
 			taskID := m.pendingTaskID
 			reason := m.pendingPriorityReason
+			actionKey := m.pendingActionKey
 			originFromDetail := m.reviewFromDetail
 			m.cancelReviewMode()
-			return m, m.moveTaskToFrontCmd(taskID, reason, originFromDetail)
+			return m, m.moveTaskToFrontCmd(taskID, reason, actionKey, originFromDetail)
 		}
 		return m, nil
 
@@ -1858,9 +1912,10 @@ func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "y", "Y":
 			taskID := m.pendingTaskID
 			reason := m.pendingPriorityReason
+			actionKey := m.pendingActionKey
 			originFromDetail := m.reviewFromDetail
 			m.cancelReviewMode()
-			return m, m.resetTaskPriorityCmd(taskID, reason, originFromDetail)
+			return m, m.resetTaskPriorityCmd(taskID, reason, actionKey, originFromDetail)
 		}
 		return m, nil
 
