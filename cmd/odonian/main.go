@@ -170,7 +170,7 @@ func run(args []string) error {
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
-	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize":
+	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize", "priority":
 		return runClient(args[1], args[2:])
 	default:
 		if evaluationVerbs[args[1]] {
@@ -214,6 +214,7 @@ Commands:
   research-status        Get current research pool status
   permit-renew           Renew a research permit
   permit-finalize        Finalize a research permit
+  priority               Set task priority or move to front
   evaluation-*           Isolated reviewer-comparison campaigns (see AGENT-API.md)
   help, -h, --help       Show this help message
 `, version)
@@ -529,6 +530,8 @@ func runClient(verb string, args []string) error {
 		return executePermitRenew(ctx, baseURL, token, args, os.Stdout)
 	case "permit-finalize":
 		return executePermitFinalize(ctx, baseURL, token, args, os.Stdout)
+	case "priority":
+		return executePriority(ctx, baseURL, token, jsonOutput, args, os.Stdout)
 	default:
 		if evaluationVerbs[verb] {
 			return executeEvaluation(ctx, verb, baseURL, token, args, os.Stdout)
@@ -1235,6 +1238,121 @@ func executeHeartbeat(ctx context.Context, baseURL, token string, args []string)
 	}
 
 	return nil
+}
+
+func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool, args []string, out io.Writer) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	fs := flag.NewFlagSet("priority", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	setFlag := fs.Int64("set", 0, "set priority to N (1-1000)")
+	frontFlag := fs.Bool("front", false, "move to front")
+	resetFlag := fs.Bool("reset", false, "reset to default priority (500)")
+	reasonFlag := fs.String("reason", "", "reason for the priority change (required)")
+	positionals, err := parseFlagsWithPositionals(fs, args)
+	if err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	if len(positionals) < 1 {
+		return fmt.Errorf("task ID is required")
+	}
+	taskID := positionals[0]
+
+	if *reasonFlag == "" {
+		return fmt.Errorf("--reason flag is required")
+	}
+
+	// Count how many operations are specified (should be exactly one)
+	numOps := 0
+	if *setFlag != 0 {
+		numOps++
+	}
+	if *frontFlag {
+		numOps++
+	}
+	if *resetFlag {
+		numOps++
+	}
+
+	if numOps != 1 {
+		return fmt.Errorf("exactly one of --set, --front, or --reset must be specified")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+
+	var result tuiclient.PriorityChange
+	if *setFlag != 0 {
+		// Validate priority is in range 1-1000
+		if *setFlag < 1 || *setFlag > 1000 {
+			return fmt.Errorf("priority must be an integer between 1 and 1000")
+		}
+		req := tuiclient.SetTaskPriorityRequest{
+			ActionKey: generateActionKey(),
+			Priority:  *setFlag,
+			Actor:     "odonian-cli",
+			Reason:    *reasonFlag,
+		}
+		result, err = client.SetTaskPriority(ctx, taskID, req)
+		if err != nil {
+			return fmt.Errorf("failed to set priority: %w", err)
+		}
+	} else if *frontFlag {
+		req := tuiclient.MoveTaskToFrontRequest{
+			ActionKey: generateActionKey(),
+			Actor:     "odonian-cli",
+			Reason:    *reasonFlag,
+		}
+		result, err = client.MoveTaskToFront(ctx, taskID, req)
+		if err != nil {
+			return fmt.Errorf("failed to move to front: %w", err)
+		}
+	} else if *resetFlag {
+		req := tuiclient.SetTaskPriorityRequest{
+			ActionKey: generateActionKey(),
+			Priority:  500,
+			Actor:     "odonian-cli",
+			Reason:    *reasonFlag,
+		}
+		result, err = client.SetTaskPriority(ctx, taskID, req)
+		if err != nil {
+			return fmt.Errorf("failed to reset priority: %w", err)
+		}
+	}
+
+	// Output result
+	if jsonOutput {
+		if err := json.NewEncoder(out).Encode(result); err != nil {
+			return fmt.Errorf("failed to encode JSON: %w", err)
+		}
+	} else {
+		fmt.Fprintf(out, "Action: %s\n", result.Action)
+		fmt.Fprintf(out, "Task ID: %s\n", result.TaskID)
+		fmt.Fprintf(out, "Topic Anchor ID: %s\n", result.TopicAnchorID)
+		fmt.Fprintf(out, "Old Priority: %d\n", result.OldPriority)
+		fmt.Fprintf(out, "New Priority: %d\n", result.Priority)
+		if result.QueueMaxPriority != nil {
+			fmt.Fprintf(out, "Queue Max Priority: %d\n", *result.QueueMaxPriority)
+		}
+		if result.Replayed {
+			fmt.Fprintf(out, "Status: Replayed (idempotent)\n")
+		}
+	}
+
+	return nil
+}
+
+// generateActionKey creates a stable action key for idempotency.
+// For CLI use, we generate a deterministic key based on the task ID and timestamp.
+func generateActionKey() string {
+	// For now, use a simple UUID-like approach. In production, this should be
+	// stable across retries for the same operation.
+	return fmt.Sprintf("odonian-cli-%d", time.Now().UnixNano())
 }
 
 // parseSlowRequestThreshold parses ODONIAN_SLOW_REQUEST_MS.

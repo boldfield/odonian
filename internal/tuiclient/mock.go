@@ -31,6 +31,8 @@ type MockClient struct {
 	GetResearchStatusFunc             func(ctx context.Context) (ResearchStatus, error)
 	RenewResearchPermitFunc           func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID string) (json.RawMessage, error)
 	FinalizeResearchPermitFunc        func(ctx context.Context, permitID, taskID, model, agentID, requestID, attemptID, exitClass string, usageTokens *int64) (json.RawMessage, error)
+	SetTaskPriorityFunc               func(ctx context.Context, taskID string, req SetTaskPriorityRequest) (PriorityChange, error)
+	MoveTaskToFrontFunc               func(ctx context.Context, taskID string, req MoveTaskToFrontRequest) (PriorityChange, error)
 	Tasks                             []Task // for simple test data
 }
 
@@ -191,4 +193,18 @@ func (m *MockClient) FinalizeResearchPermit(ctx context.Context, permitID, taskI
 		return m.FinalizeResearchPermitFunc(ctx, permitID, taskID, model, agentID, requestID, attemptID, exitClass, usageTokens)
 	}
 	return nil, nil
+}
+
+func (m *MockClient) SetTaskPriority(ctx context.Context, taskID string, req SetTaskPriorityRequest) (PriorityChange, error) {
+	if m.SetTaskPriorityFunc != nil {
+		return m.SetTaskPriorityFunc(ctx, taskID, req)
+	}
+	return PriorityChange{}, nil
+}
+
+func (m *MockClient) MoveTaskToFront(ctx context.Context, taskID string, req MoveTaskToFrontRequest) (PriorityChange, error) {
+	if m.MoveTaskToFrontFunc != nil {
+		return m.MoveTaskToFrontFunc(ctx, taskID, req)
+	}
+	return PriorityChange{}, nil
 }
