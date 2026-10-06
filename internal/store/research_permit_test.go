@@ -97,8 +97,8 @@ func TestResearchMigrationAndReopen(t *testing.T) {
 
 	s2 := openPermitStore(t, path)
 	var migrations int
-	if err := s2.Conn().QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&migrations); err != nil || migrations != 31 {
-		t.Fatalf("migrations = %d, %v; want 31", migrations, err)
+	if err := s2.Conn().QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&migrations); err != nil || migrations != 32 {
+		t.Fatalf("migrations = %d, %v; want 32", migrations, err)
 	}
 	st := poolState(t, s2, rtAt(1))
 	if st.Tokens >= 1 {
