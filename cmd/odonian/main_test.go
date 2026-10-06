@@ -25,6 +25,27 @@ import (
 	"github.com/boldfield/odonian/internal/tuiclient"
 )
 
+// TestMain clears the fleet harness pin, which dispatched agent sessions export and every child
+// process (including `go test`) inherits; tests that exercise it set it explicitly.
+func TestMain(m *testing.M) {
+	os.Unsetenv(selectedTaskEnv)
+	os.Exit(m.Run())
+}
+
+func TestExecuteNextIgnoresInheritedPinInSuite(t *testing.T) {
+	if os.Getenv("ODONIAN_TEST_PIN_CHILD") == "1" {
+		if got := os.Getenv(selectedTaskEnv); got != "" {
+			t.Fatalf("TestMain left %s=%q set for the suite", selectedTaskEnv, got)
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestExecuteNextIgnoresInheritedPinInSuite$")
+	cmd.Env = append(os.Environ(), selectedTaskEnv+"=pre-set-task", "ODONIAN_TEST_PIN_CHILD=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("suite must be isolated from an inherited %s: %v\n%s", selectedTaskEnv, err, out)
+	}
+}
+
 func TestRunNoArgs(t *testing.T) {
 	err := run([]string{"odonian"})
 	if err != nil {
@@ -2278,6 +2299,48 @@ func TestExecuteNextWithClaim(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("executeNext with claim failed: %v", err)
+	}
+}
+
+func TestExecuteNextPinnedToSelectedTask(t *testing.T) {
+	high := int64(1001)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/proj-1/tasks" && r.URL.Query().Get("claimable") == "true" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Task{
+				{ID: "task-low", State: "ready", Model: "haiku", Kind: "implement", Title: "Low"},
+				{ID: "task-high", State: "ready", Model: "haiku", Kind: "implement", Title: "High", Priority: &high},
+			})
+		}
+	}))
+	defer server.Close()
+	args := []string{"--project", "proj-1", "--model", "haiku", "--kind", "implement"}
+
+	t.Setenv(selectedTaskEnv, "task-low")
+	out := captureStdout(t, func() {
+		if err := executeNext(context.Background(), server.URL, "test-token", false, args); err != nil {
+			t.Fatalf("executeNext pinned: %v", err)
+		}
+	})
+	if strings.TrimSpace(out) != "task-low" {
+		t.Fatalf("pinned next printed %q, want the selected task-low", out)
+	}
+
+	t.Setenv(selectedTaskEnv, "task-gone")
+	err := executeNext(context.Background(), server.URL, "test-token", false, args)
+	var claimErr *claimError
+	if !errors.As(err, &claimErr) || claimErr.code != 2 {
+		t.Fatalf("pinned to a task that is no longer claimable: got %v, want exit-2 claimError", err)
+	}
+
+	t.Setenv(selectedTaskEnv, "")
+	out = captureStdout(t, func() {
+		if err := executeNext(context.Background(), server.URL, "test-token", false, args); err != nil {
+			t.Fatalf("executeNext unpinned: %v", err)
+		}
+	})
+	if strings.TrimSpace(out) != "task-high" {
+		t.Fatalf("unpinned next printed %q, want the highest-priority task-high", out)
 	}
 }
 
