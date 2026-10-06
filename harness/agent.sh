@@ -848,35 +848,48 @@ AGENT_MODEL_STR="${MODEL:+$MODEL/}$KIND"
 echo "[$AGENT_ID] $ROLE ($AGENT_MODEL_STR) MULTI @ $ODONIAN_URL${ALLOW:+ (allow: $ALLOW)}; discovering work across projects"
 while true; do
   [ "$STOP" -eq 1 ] && break
-  # Discover projects holding my kind claimable work (any model) — one call (v0.4.0 filter).
-  # (while-read, not mapfile: macOS ships bash 3.2.) sort -R shuffles so projects drain fairly.
-  rows=()
-  while IFS= read -r _row; do rows+=("$_row"); done < <(odonian projects --claimable --kind "$KIND" --json \
-      | jq -r '.[] | select(.repo != null and .repo != "") | "\(.id)\t\(.repo)"' 2>/dev/null \
-      | sort -R)
-  if [ "${#rows[@]}" -eq 0 ]; then
+  # Discover projects holding my kind claimable work and collect all claimable tasks globally.
+  # Collect (project_id, repo, task_id, model, priority, created_at) for all claimable tasks
+  # across all allowed projects, then sort by priority DESC, created_at ASC, id ASC.
+  # This replaces per-project randomization with a uniform global comparator.
+  task_rows=()
+  projects_json=$(odonian projects --claimable --kind "$KIND" --json 2>/dev/null)
+
+  # For each project, fetch claimable tasks and collect them
+  while IFS=$'\t' read -r pid prepo; do
+    [ -z "$pid" ] && continue
+    in_allow "$pid" || continue
+    # Re-check claimable work exists in this project
+    has_claimable_work "$pid" || continue
+    # Get all claimable tasks for this project
+    tasks_json=$(odonian tasks --project "$pid" --claimable --kind "$KIND" --json 2>/dev/null) || continue
+    # Extract (task_id, model, priority, created_at, project_id, repo) tuples
+    while IFS=$'\t' read -r tid model priority created_at; do
+      [ -n "$tid" ] && task_rows+=("$priority$'\t'$created_at$'\t'$tid$'\t'$model$'\t'$pid$'\t'$prepo")
+    done < <(printf '%s' "$tasks_json" | jq -r '.[]? | "\(.id)\t\(.model)\t(\(.priority // 500))\t\(.created_at)"' 2>/dev/null)
+  done < <(printf '%s' "$projects_json" | jq -r '.[] | select(.repo != null and .repo != "") | "\(.id)\t\(.repo)"' 2>/dev/null)
+
+  if [ "${#task_rows[@]}" -eq 0 ]; then
     echo "[$AGENT_ID] $(date '+%H:%M:%S') no claimable $KIND work in any project; sleeping 30s"; nap 30; continue
   fi
+
+  # Sort globally by priority DESC, created_at ASC, id ASC
+  # Entries are: priority<TAB>created_at<TAB>task_id<TAB>model<TAB>project_id<TAB>repo
+  sorted_tasks=($(printf '%s\n' "${task_rows[@]}" | sort -t$'\t' -k1nr -k2 -k3))
 
   worked=0
   deferred_this_pass=0
   prune_deferred
-  for row in "${rows[@]}"; do
+  for row in "${sorted_tasks[@]}"; do
     [ "$STOP" -eq 1 ] && break
-    pid="${row%%$'\t'*}"; prepo="${row#*$'\t'}"
-    [ -z "$pid" ] && continue
-    in_allow "$pid" || continue
-    # Re-check claimable (the listing can race another worker); skip if it emptied out.
-    has_claimable_work "$pid" || continue
-    # Pick the highest-priority claimable task whose model isn't in a failure backoff window
-    # (skipping past any head task pinned to an unavailable model — see pick_claimable_task).
-    # Done before cloning so a project whose only claimable work is on a down backend doesn't
-    # cost a clone/worktree setup — try the next project instead.
-    sel=$(pick_claimable_task "$pid" "$KIND")
-    if [ -z "$sel" ]; then
-      continue   # raced away, or every claimable task's model is unavailable — try next project
-    fi
-    task_id="${sel%%$'\t'*}"; task_model="${sel#*$'\t'}"
+    # Parse: priority<TAB>created_at<TAB>task_id<TAB>model<TAB>project_id<TAB>repo
+    IFS=$'\t' read -r _priority _created_at task_id task_model pid prepo <<< "$row"
+    [ -z "$task_id" ] && continue
+
+    # Skip deferred and unavailable models
+    task_deferred "$task_id" && continue
+    model_unavailable "$task_model" && continue
+
     apply_owner_token "$(norm_repo "$prepo" | cut -d/ -f1)"   # auth as the repo's owner (default auth if unmapped)
     prune_repos_cache "$REPOS_DIR/$(repo_slug "$prepo")"
     clone="$(ensure_clone "$prepo")" || continue
@@ -892,7 +905,7 @@ while true; do
       echo "[$AGENT_ID] $(date '+%H:%M:%S') prompt not found: $PROMPT_FILE; blocking task $task_id"; nap 30; continue
     fi
     # Research is paced: get admitted for THIS task before any model process exists. A denial leaves
-    # the task untouched, launches nothing, and defers it; move on to the next project/task.
+    # the task untouched, launches nothing, and defers it; move on to the next task.
     if [ "$task_track" = "research" ]; then
       if ! admit_research_task "$task_id" "$task_model"; then
         [ "$STOP" -eq 1 ] && break
@@ -906,13 +919,11 @@ while true; do
     [ -n "$MODEL" ] && export AGENT_MODEL="$MODEL"   # restore original model for slot identity (if initially provided)
     git -C "$wt" checkout --detach --force origin/main --quiet 2>/dev/null || true
     worked=1
-    break   # one task per discovery pass, then re-poll fresh (keeps the shuffle honest)
+    break   # one task per discovery pass, then re-poll fresh
   done
   [ "$STOP" -eq 1 ] && break
-  # rows existed but every candidate raced away / failed setup — brief sleep, then re-poll.
-  # A research deferral this pass means other candidates (same project, next task) may still be
-  # eligible: re-poll straight away, skipping the deferred task. Otherwise wait, but no longer than
-  # the earliest deferral expiry.
+  # All tasks either raced away, were deferred, or had unavailable models — brief sleep, then re-poll.
+  # A research deferral means other candidates may still be eligible: re-poll straight away.
   if [ "$worked" -eq 0 ]; then
     if [ "$deferred_this_pass" -eq 1 ]; then _idle=1; else _idle="$(idle_nap 10)"; fi
     echo "[$AGENT_ID] $(date '+%H:%M:%S') no dispatchable candidate this pass; sleeping ${_idle}s"; nap "$_idle"
