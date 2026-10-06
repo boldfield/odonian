@@ -2810,12 +2810,9 @@ func (s *sqliteStore) handleApprovedRound(ctx context.Context, tx *sql.Tx, paren
 		newParentState = "done"
 	} else if parentAgentMerge && hasPR {
 		// Spawn merge task if approved with agent_merge && pr (not the no_op case)
-		var parentPriority int64
+		parentPriority := DefaultPriority
 		if err := tx.QueryRowContext(ctx, `SELECT priority FROM task WHERE id = ?`, parentID).Scan(&parentPriority); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return "", fmt.Errorf("failed to read parent priority for merge task: %w", err)
-		}
-		if err != nil {
-			parentPriority = DefaultPriority
 		}
 
 		mergeTaskID := GenerateID()
@@ -3973,7 +3970,7 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, track, priority, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, 'backlog', ?, 'implement', ?, 'research', ?, ?, ?)
-		`, followUpID, parentProjectID, parentDocumentID, title, spec, model, followUpReviewModelsJSON, parentPriority, now, now); err != nil {
+		`, followUpID, parentProjectID, parentDocumentID, title, spec, model, followUpReviewModelsJSON, DefaultPriority, now, now); err != nil {
 			return nil, fmt.Errorf("failed to create follow-up task: %w", err)
 		}
 

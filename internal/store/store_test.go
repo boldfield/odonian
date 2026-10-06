@@ -46,6 +46,10 @@ func ptrString(s string) *string {
 	return &s
 }
 
+func ptrInt64(i int64) *int64 {
+	return &i
+}
+
 // createTestFSWithBadMigration creates a test filesystem with the standard migrations
 // plus a bad migration (0003_bad.sql) that leaves a dangling foreign key.
 // It wraps the embedded migrations and adds the bad migration on top.
@@ -18660,6 +18664,374 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		}
 		if parent.State != "approved" {
 			t.Errorf("expected approved state (not auto-merged), got %s", parent.State)
+		}
+	})
+}
+
+// TestTopicPriorityInheritance tests numeric priority inheritance through topic lineages
+func TestTopicPriorityInheritance(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Test 1: Research follow-ups retain default priority (500) instead of inheriting parent priority
+	t.Run("research_follow_ups_retain_default_priority", func(t *testing.T) {
+		// Create a research task with custom priority 900 (valid explicit value)
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{
+				Title:        "High priority research",
+				Spec:         "Test research task",
+				DocumentID:   doc.ID,
+				Model:        "haiku",
+				ReviewModels: []string{"opus"},
+				Track:        "research",
+				Priority:     ptrInt64(900),
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create task: %v", err)
+		}
+		parentID := tasks[0].ID
+
+		// Promote and claim
+		if _, err = store.PromoteTask(ctx, parentID); err != nil {
+			t.Fatalf("failed to promote task: %v", err)
+		}
+		if _, err = store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim task: %v", err)
+		}
+
+		// Submit implementation
+		if _, err = store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+			t.Fatalf("failed to submit implement task: %v", err)
+		}
+
+		// Get review task
+		allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var reviewTask *Task
+		for i := range allTasks {
+			if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == parentID {
+				reviewTask = &allTasks[i]
+				break
+			}
+		}
+
+		if reviewTask == nil {
+			t.Fatalf("expected review task to be created")
+		}
+
+		// Claim and submit review with a P3 finding (non-blocking) that creates follow-up
+		if _, err = store.ClaimTask(ctx, reviewTask.ID, "opus-agent", "opus", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim review task: %v", err)
+		}
+
+		findings := json.RawMessage(`[{
+			"id": "f1",
+			"severity": "P3",
+			"status": "new",
+			"summary": "Test finding",
+			"file": "test.go",
+			"line": 10,
+			"in_changed_text": false
+		}]`)
+
+		verdict := "approve"
+		if _, err = store.SubmitTask(ctx, reviewTask.ID, "opus-agent", "review notes", &verdict, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget, findings); err != nil {
+			t.Fatalf("failed to submit review task: %v", err)
+		}
+
+		// Check that follow-up tasks have default priority (500), not parent's (1002)
+		allTasks, err = store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var followUpFound bool
+		for _, tk := range allTasks {
+			if tk.Kind == "implement" && tk.ID != parentID {
+				// Check if this is a follow-up by looking for research_parent link
+				tkDetail, err := store.GetTask(ctx, tk.ID)
+				if err != nil {
+					t.Fatalf("failed to get task: %v", err)
+				}
+				for _, link := range tkDetail.Links {
+					if link.Kind == "research_parent" {
+						followUpFound = true
+						if tkDetail.Priority != DefaultPriority {
+							t.Errorf("expected follow-up priority to be %d (default), got %d", DefaultPriority, tkDetail.Priority)
+						}
+						break
+					}
+				}
+			}
+		}
+
+		if !followUpFound {
+			t.Fatalf("expected to find a research follow-up task")
+		}
+	})
+
+	// Test 2: Merge task inherits parent priority
+	t.Run("merge_task_inherits_parent_priority", func(t *testing.T) {
+		// Create a build task with agent_merge=true and custom priority
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{
+				Title:        "Implement feature",
+				Spec:         "Feature implementation",
+				DocumentID:   doc.ID,
+				Model:        "haiku",
+				Track:        "build",
+				Priority:     ptrInt64(850),
+				AgentMerge:   true,
+				ReviewModels: []string{"opus"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create task: %v", err)
+		}
+		parentID := tasks[0].ID
+
+		// Promote, claim and submit
+		if _, err = store.PromoteTask(ctx, parentID); err != nil {
+			t.Fatalf("failed to promote task: %v", err)
+		}
+		if _, err = store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim task: %v", err)
+		}
+		if _, err = store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#101"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+			t.Fatalf("failed to submit implement task: %v", err)
+		}
+
+		// Get review task and approve
+		allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var reviewTask *Task
+		for i := range allTasks {
+			if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == parentID {
+				reviewTask = &allTasks[i]
+				break
+			}
+		}
+
+		if reviewTask != nil {
+			if _, err = store.ClaimTask(ctx, reviewTask.ID, "opus-agent", "opus", 5*time.Minute); err != nil {
+				t.Fatalf("failed to claim review task: %v", err)
+			}
+			verdict := "approve"
+			if _, err = store.SubmitTask(ctx, reviewTask.ID, "opus-agent", "review notes", &verdict, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+				t.Fatalf("failed to submit review task: %v", err)
+			}
+		}
+
+		// Check that merge task was created with parent's priority
+		allTasks, err = store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks: %v", err)
+		}
+
+		var mergeTask *Task
+		for i := range allTasks {
+			if allTasks[i].Kind == "merge" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == parentID {
+				mergeTask = &allTasks[i]
+				break
+			}
+		}
+
+		if mergeTask == nil {
+			t.Fatalf("expected merge task to be created")
+		}
+
+		if mergeTask.Priority != 850 {
+			t.Errorf("expected merge task priority to be 850 (inherited from parent), got %d", mergeTask.Priority)
+		}
+	})
+
+	// Test 3: Supersede inherits parent priority
+	t.Run("supersede_inherits_parent_priority", func(t *testing.T) {
+		// Create initial task
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{
+				Title:        "Initial task",
+				Spec:         "Initial spec",
+				DocumentID:   doc.ID,
+				Model:        "haiku",
+				Track:        "build",
+				Priority:     ptrInt64(750),
+				ReviewModels: []string{"opus"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create task: %v", err)
+		}
+		parentID := tasks[0].ID
+
+		// Promote, claim and submit
+		if _, err = store.PromoteTask(ctx, parentID); err != nil {
+			t.Fatalf("failed to promote task: %v", err)
+		}
+		if _, err = store.ClaimTask(ctx, parentID, "agent-1", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim task: %v", err)
+		}
+		if _, err = store.SubmitTask(ctx, parentID, "agent-1", "Implemented", nil, []LinkInput{{Kind: "pr", Value: "#102"}}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+			t.Fatalf("failed to submit task: %v", err)
+		}
+
+		// Supersede the task
+		result, err := store.SupersedeTask(ctx, parentID, nil)
+		if err != nil {
+			t.Fatalf("failed to supersede task: %v", err)
+		}
+
+		// Check that superseding task inherits priority from parent
+		if result.Priority != 750 {
+			t.Errorf("expected superseding task priority to be 750 (inherited from parent), got %d", result.Priority)
+		}
+	})
+
+	// Test 4: Independent tasks unchanged
+	t.Run("independent_tasks_unchanged", func(t *testing.T) {
+		// Create independent tasks with different priorities
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{
+				Title:      "Independent task 1",
+				Spec:       "Task 1",
+				DocumentID: doc.ID,
+				Model:      "haiku",
+				Track:      "build",
+				Priority:   ptrInt64(500),
+			},
+			{
+				Title:      "Independent task 2",
+				Spec:       "Task 2",
+				DocumentID: doc.ID,
+				Model:      "haiku",
+				Track:      "build",
+				Priority:   ptrInt64(750),
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create tasks: %v", err)
+		}
+
+		task1ID := tasks[0].ID
+		task2ID := tasks[1].ID
+
+		// Verify priorities are preserved
+		t1, err := store.GetTask(ctx, task1ID)
+		if err != nil {
+			t.Fatalf("failed to get task 1: %v", err)
+		}
+		if t1.Priority != 500 {
+			t.Errorf("expected task 1 priority to be 500, got %d", t1.Priority)
+		}
+
+		t2, err := store.GetTask(ctx, task2ID)
+		if err != nil {
+			t.Fatalf("failed to get task 2: %v", err)
+		}
+		if t2.Priority != 750 {
+			t.Errorf("expected task 2 priority to be 750, got %d", t2.Priority)
+		}
+	})
+
+	// Test 5: Task state, lease, hold, result are unchanged by priority operations
+	t.Run("task_state_lease_hold_result_unchanged", func(t *testing.T) {
+		// Create a task
+		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{
+				Title:      "State test task",
+				Spec:       "Test task",
+				DocumentID: doc.ID,
+				Model:      "haiku",
+				Track:      "build",
+				Priority:   ptrInt64(800),
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create task: %v", err)
+		}
+		taskID := tasks[0].ID
+
+		// Get initial state
+		initial, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get initial task: %v", err)
+		}
+
+		initialState := initial.State
+		initialHold := initial.Held
+
+		// Promote and verify state changes only from promotion
+		if _, err = store.PromoteTask(ctx, taskID); err != nil {
+			t.Fatalf("failed to promote task: %v", err)
+		}
+
+		promoted, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get promoted task: %v", err)
+		}
+
+		// Verify only state changed from promotion, not lease/hold
+		if promoted.State == initialState {
+			t.Errorf("expected state to change after promotion")
+		}
+
+		// Claim the task
+		if _, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+			t.Fatalf("failed to claim task: %v", err)
+		}
+
+		claimed, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get claimed task: %v", err)
+		}
+
+		// Verify the task's lease is set (claimed at a time)
+		if claimed.LeaseExpiresAt == nil {
+			t.Errorf("expected lease_expires_at to be set after claim")
+		}
+
+		// Submit the task
+		if _, err = store.SubmitTask(ctx, taskID, "agent-1", "Completed work", nil, []LinkInput{}, 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+			t.Fatalf("failed to submit task: %v", err)
+		}
+
+		submitted, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get submitted task: %v", err)
+		}
+
+		// Verify result is set, state is review, lease is preserved
+		if submitted.Result == nil {
+			t.Errorf("expected result to be set after submit")
+		}
+		if submitted.State != "review" {
+			t.Errorf("expected state to be review after submit, got %s", submitted.State)
+		}
+
+		// Verify held status is still the same (unchanged by submission)
+		if submitted.Held != initialHold {
+			t.Errorf("expected held to be unchanged by submission")
 		}
 	})
 }
