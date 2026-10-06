@@ -3899,13 +3899,9 @@ func (s *sqliteStore) createResearchFollowUpTasks(ctx context.Context, tx *sql.T
 
 	var parentReviewModels []string
 	var parentReviewModelsJSON *string
-	var parentPriority int64
-	err = tx.QueryRowContext(ctx, `SELECT review_models, priority FROM task WHERE id = ?`, parentID).Scan(&parentReviewModelsJSON, &parentPriority)
+	err = tx.QueryRowContext(ctx, `SELECT review_models FROM task WHERE id = ?`, parentID).Scan(&parentReviewModelsJSON)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("failed to read parent review_models and priority: %w", err)
-	}
-	if err != nil {
-		parentPriority = DefaultPriority
+		return nil, fmt.Errorf("failed to read parent review_models: %w", err)
 	}
 	if parentReviewModelsJSON != nil {
 		if err := json.Unmarshal([]byte(*parentReviewModelsJSON), &parentReviewModels); err != nil {
