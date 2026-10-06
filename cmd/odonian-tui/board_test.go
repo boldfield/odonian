@@ -5355,6 +5355,372 @@ func TestBoardModel_DetailViewKeyboardHelp(t *testing.T) {
 	}
 }
 
+// TestBoardModel_ResetPriorityFlow tests the full reset priority flow.
+func TestBoardModel_ResetPriorityFlow(t *testing.T) {
+	var capturedReq tuiclient.SetTaskPriorityRequest
+	var capturedTaskID string
+
+	mockClient := &tuiclient.MockClient{
+		SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+			capturedTaskID = taskID
+			capturedReq = req
+			return tuiclient.PriorityChange{
+				TopicAnchorID: "topic-1",
+				Priority:      500,
+				OldPriority:   750,
+			}, nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(500)},
+			}, nil
+		},
+	}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(750)},
+	})
+
+	// Press 'e' to enter reset priority reason mode
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	model = m.(*BoardModel)
+
+	if model.mode != modeResetPriorityReason {
+		t.Fatalf("Expected modeResetPriorityReason, got %d", model.mode)
+	}
+
+	// Type reason
+	for _, ch := range "no longer urgent" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	// Press enter to move to confirmation
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	if model.mode != modeResetPriorityConfirm {
+		t.Fatalf("Expected modeResetPriorityConfirm, got %d", model.mode)
+	}
+
+	// Confirm with 'y'
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = m.(*BoardModel)
+
+	// Mode should be back to normal
+	if model.mode != modeNormal {
+		t.Fatalf("Expected modeNormal after confirm, got %d", model.mode)
+	}
+
+	// Execute the command
+	model = executeReviewCmd(t, model, cmd)
+
+	// Verify API call
+	if capturedTaskID != "task-1" {
+		t.Errorf("Expected task ID task-1, got %q", capturedTaskID)
+	}
+	if capturedReq.Priority != 500 {
+		t.Errorf("Expected priority 500, got %d", capturedReq.Priority)
+	}
+	if capturedReq.Reason != "no longer urgent" {
+		t.Errorf("Expected reason 'no longer urgent', got %q", capturedReq.Reason)
+	}
+	if capturedReq.ActionKey == "" {
+		t.Errorf("Expected non-empty ActionKey, got empty string")
+	}
+}
+
+// TestDetailView_ResetPriorityFlow tests reset priority from detail view.
+func TestDetailView_ResetPriorityFlow(t *testing.T) {
+	var capturedReq tuiclient.SetTaskPriorityRequest
+
+	mockClient := &tuiclient.MockClient{
+		SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+			capturedReq = req
+			return tuiclient.PriorityChange{
+				Priority:    500,
+				OldPriority: 750,
+			}, nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(500)},
+			}, nil
+		},
+		GetTaskFunc: func(ctx context.Context, taskID string) (tuiclient.TaskDetail, error) {
+			return tuiclient.TaskDetail{
+				ID:    "task-1",
+				Title: "Task",
+				State: "ready",
+			}, nil
+		},
+	}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(750)},
+	})
+
+	// Enter detail view
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	// Press 'e' for reset priority from detail
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	model = m.(*BoardModel)
+
+	if model.mode != modeResetPriorityReason {
+		t.Fatalf("Expected modeResetPriorityReason, got %d", model.mode)
+	}
+
+	// Type reason
+	for _, ch := range "test" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	// Confirm
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = m.(*BoardModel)
+
+	// Execute
+	model = executeReviewCmd(t, model, cmd)
+
+	// Verify
+	if capturedReq.Priority != 500 {
+		t.Errorf("Expected priority 500, got %d", capturedReq.Priority)
+	}
+}
+
+// TestBoardModel_ManualInputErrors tests validation of manual priority input.
+func TestBoardModel_ManualInputErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantError bool
+		errorHint string
+	}{
+		{"empty", "", true, "required"},
+		{"zero", "0", true, "1-1000"},
+		{"too high", "1001", true, "1-1000"},
+		{"non-integer", "abc", true, "integer"},
+		{"float", "5.5", true, "integer"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockClient := &tuiclient.MockClient{}
+			model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready"},
+			})
+
+			// Start set priority
+			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+			model = m.(*BoardModel)
+
+			// Type invalid input
+			for _, ch := range tt.input {
+				m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+				model = m.(*BoardModel)
+			}
+
+			// Try to proceed
+			m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			model = m.(*BoardModel)
+
+			// Should still be in input mode (not moved to reason)
+			if model.mode != modeSetPriorityInput {
+				t.Fatalf("Expected to remain in modeSetPriorityInput for invalid input %q", tt.input)
+			}
+
+			// Check error hint is shown
+			output := model.View()
+			if tt.wantError && !strings.Contains(output, tt.errorHint) {
+				t.Errorf("Expected error hint %q in output for input %q, got:\n%s", tt.errorHint, tt.input, output)
+			}
+		})
+	}
+}
+
+// TestBoardModel_PriorityDisplayWithTopicAnchor tests display of topic anchor in list rows.
+func TestBoardModel_PriorityDisplayWithTopicAnchor(t *testing.T) {
+	mockClient := &tuiclient.MockClient{}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task with anchor", State: "ready", Priority: intPtr(750), TopicAnchorID: strPtr("api-feature")},
+		{ID: "task-2", Title: "Task without anchor", State: "ready", Priority: intPtr(500)},
+	})
+
+	output := model.View()
+
+	// Verify topic anchor is displayed
+	if !strings.Contains(output, "[api-feature]") {
+		t.Errorf("Expected topic anchor [api-feature] in view:\n%s", output)
+	}
+
+	// Verify priority is still displayed
+	if !strings.Contains(output, "P:750") {
+		t.Errorf("Expected P:750 in view:\n%s", output)
+	}
+}
+
+// TestDetailView_HeldPlusPriority tests display of [HELD] with priority in detail view.
+func TestDetailView_HeldPlusPriority(t *testing.T) {
+	mockClient := &tuiclient.MockClient{
+		GetTaskFunc: func(ctx context.Context, taskID string) (tuiclient.TaskDetail, error) {
+			return tuiclient.TaskDetail{
+				ID:       "task-1",
+				Title:    "Held Task",
+				State:    "ready",
+				Held:     true,
+				Priority: intPtr(750),
+			}, nil
+		},
+	}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Held Task", State: "ready", Held: true, Priority: intPtr(750)},
+	})
+
+	// Enter detail view
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	// Execute the fetch command
+	if cmd != nil {
+		model = executeCmd(t, model, cmd)
+	}
+
+	output := model.View()
+
+	// Verify both priority and held status are shown
+	if !strings.Contains(output, "Priority: 750") {
+		t.Errorf("Expected Priority: 750 in detail view:\n%s", output)
+	}
+	if !strings.Contains(output, "[HELD]") {
+		t.Errorf("Expected [HELD] marker in detail view:\n%s", output)
+	}
+}
+
+// TestBoardModel_ActionFailureKeepsPendingKey tests that action key is preserved after failure.
+func TestBoardModel_ActionFailureKeepsPendingKey(t *testing.T) {
+	var callCount int
+	mockClient := &tuiclient.MockClient{
+		SetTaskPriorityFunc: func(ctx context.Context, taskID string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
+			callCount++
+			if callCount == 1 {
+				// First call fails
+				return tuiclient.PriorityChange{}, fmt.Errorf("timeout")
+			}
+			// Second call succeeds
+			return tuiclient.PriorityChange{
+				Priority:    750,
+				OldPriority: 500,
+			}, nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			return []tuiclient.Task{
+				{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(750)},
+			}, nil
+		},
+	}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task", State: "ready"},
+	})
+
+	// Start set priority flow
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	model = m.(*BoardModel)
+
+	// Type priority
+	for _, ch := range "750" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	// Type reason
+	for _, ch := range "test" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = m.(*BoardModel)
+
+	// Capture key before first attempt
+	firstKey := model.pendingActionKey
+	if firstKey == "" {
+		t.Fatalf("Expected pendingActionKey to be set")
+	}
+
+	// Confirm (first attempt fails)
+	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	model = m.(*BoardModel)
+
+	// Execute command (will fail)
+	model = executeReviewCmd(t, model, cmd)
+
+	// After failure, key should still be there for retry
+	if model.pendingActionKey != firstKey {
+		t.Errorf("Expected key to be preserved after failure, was %q, now %q", firstKey, model.pendingActionKey)
+	}
+}
+
+// TestBoardModel_ActionKeyTiedToTaskAndAction tests that keys are tied to (task, action) tuple.
+func TestBoardModel_ActionKeyTiedToTaskAndAction(t *testing.T) {
+	mockClient := &tuiclient.MockClient{}
+
+	model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
+		{ID: "task-1", Title: "Task 1", State: "ready"},
+		{ID: "task-2", Title: "Task 2", State: "ready"},
+	})
+
+	// Start set priority on task-1
+	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	model = m.(*BoardModel)
+
+	// Type priority
+	for _, ch := range "750" {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		model = m.(*BoardModel)
+	}
+
+	key1 := model.pendingActionKey
+	_ = model.pendingActionTaskID // saved for verification of state changes
+	_ = model.pendingActionType   // saved for verification of state changes
+
+	// Cancel the flow
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = m.(*BoardModel)
+
+	// After cancel, key should be cleared
+	if model.pendingActionKey != "" {
+		t.Errorf("Expected pendingActionKey to be cleared on cancel, got %q", model.pendingActionKey)
+	}
+
+	// Now start front action on task-2
+	// First, move to task-2
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = m.(*BoardModel)
+
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	model = m.(*BoardModel)
+
+	if model.pendingTaskID != "task-2" {
+		t.Errorf("Expected pendingTaskID to be task-2, got %q", model.pendingTaskID)
+	}
+
+	// New action should get a new key, not reuse the old one
+	if model.pendingActionKey == key1 || model.pendingActionType != "front" {
+		t.Errorf("Expected new key for different action on different task, reused old key or wrong action type")
+	}
+}
+
 // Helper function to build a board model with specific tasks
 func buildBoardModelWithTasks(t *testing.T, client *tuiclient.MockClient, tasks []tuiclient.Task) *BoardModel {
 	t.Helper()
@@ -5398,5 +5764,10 @@ func buildBoardModelWithTasks(t *testing.T, client *tuiclient.MockClient, tasks 
 
 // intPtr returns a pointer to an int64
 func intPtr(v int64) *int64 {
+	return &v
+}
+
+// strPtr returns a pointer to a string
+func strPtr(v string) *string {
 	return &v
 }
