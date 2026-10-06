@@ -72,6 +72,7 @@ type PriorityChange struct {
 	Action           string `json:"action"`
 	TaskID           string `json:"task_id"`
 	TopicAnchorID    string `json:"topic_anchor_id"`
+	ActionKey        string `json:"action_key"`
 	OldPriority      int64  `json:"old_priority"`
 	Priority         int64  `json:"priority"`
 	QueueMaxPriority *int64 `json:"queue_max_priority,omitempty"`

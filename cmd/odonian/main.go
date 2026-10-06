@@ -1269,11 +1269,29 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 	actionKeyFlag := fs.String("action-key", "", "optional action key for idempotent retries")
 	positionals, err := parseFlagsWithPositionals(fs, args)
 	if err != nil {
+		// Print usage on parse error
+		fmt.Fprintf(os.Stderr, "usage: odonian priority <task-id> [--set N | --front | --reset] --reason <reason> [--action-key <key>]\n")
+		fmt.Fprintf(os.Stderr, "  --set N:      Set priority to N (1-1000); values above 1000 are server-computed\n")
+		fmt.Fprintf(os.Stderr, "  --front:      Move to front (priority computed by server as max queued + 1)\n")
+		fmt.Fprintf(os.Stderr, "  --reset:      Reset to default priority (500)\n")
+		fmt.Fprintf(os.Stderr, "  --reason:     Required; the reason for this change\n")
+		fmt.Fprintf(os.Stderr, "  --action-key: Optional; action key for retry idempotency\n")
+		fmt.Fprintf(os.Stderr, "Note: Filters do not limit the global front maximum. Priority changes do not release or promote held work.\n")
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
 
 	if len(positionals) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: odonian priority <task-id> [--set N | --front | --reset] --reason <reason> [--action-key <key>]\n")
+		fmt.Fprintf(os.Stderr, "  --set N:      Set priority to N (1-1000); values above 1000 are server-computed\n")
+		fmt.Fprintf(os.Stderr, "  --front:      Move to front (priority computed by server as max queued + 1)\n")
+		fmt.Fprintf(os.Stderr, "  --reset:      Reset to default priority (500)\n")
+		fmt.Fprintf(os.Stderr, "  --reason:     Required; the reason for this change\n")
+		fmt.Fprintf(os.Stderr, "  --action-key: Optional; action key for retry idempotency\n")
+		fmt.Fprintf(os.Stderr, "Note: Filters do not limit the global front maximum. Priority changes do not release or promote held work.\n")
 		return fmt.Errorf("task ID is required")
+	}
+	if len(positionals) > 1 {
+		return fmt.Errorf("exactly one task ID required; got %d positional arguments", len(positionals))
 	}
 	taskID := positionals[0]
 
@@ -1322,6 +1340,9 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		actionKey = generateActionKey()
 	}
 
+	// Print action key to stderr before sending request so operator has it even on failure
+	fmt.Fprintf(os.Stderr, "Action Key: %s\n", actionKey)
+
 	var result tuiclient.PriorityChange
 	if setFlagProvided {
 		req := tuiclient.SetTaskPriorityRequest{
@@ -1332,7 +1353,7 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		}
 		result, err = client.SetTaskPriority(ctx, taskID, req)
 		if err != nil {
-			return fmt.Errorf("failed to set priority: %w", err)
+			return fmt.Errorf("failed to set priority (action key %s): %w", actionKey, err)
 		}
 	} else if *frontFlag {
 		req := tuiclient.MoveTaskToFrontRequest{
@@ -1342,7 +1363,7 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		}
 		result, err = client.MoveTaskToFront(ctx, taskID, req)
 		if err != nil {
-			return fmt.Errorf("failed to move to front: %w", err)
+			return fmt.Errorf("failed to move to front (action key %s): %w", actionKey, err)
 		}
 	} else if *resetFlag {
 		req := tuiclient.SetTaskPriorityRequest{
@@ -1353,9 +1374,12 @@ func executePriority(ctx context.Context, baseURL, token string, jsonOutput bool
 		}
 		result, err = client.SetTaskPriority(ctx, taskID, req)
 		if err != nil {
-			return fmt.Errorf("failed to reset priority: %w", err)
+			return fmt.Errorf("failed to reset priority (action key %s): %w", actionKey, err)
 		}
 	}
+
+	// Ensure the result includes the action key
+	result.ActionKey = actionKey
 
 	// Output result
 	if jsonOutput {
