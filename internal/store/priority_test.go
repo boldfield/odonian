@@ -550,6 +550,200 @@ func TestSetTaskPriorityBoundaries(t *testing.T) {
 	}
 }
 
+func TestConcurrentMoveTaskToFront(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "https://example.com/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "test-doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create multiple tasks
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{DocumentID: doc.ID, Title: "task 1", Spec: "spec", Model: "haiku", Priority: intPtr(500)},
+		{DocumentID: doc.ID, Title: "task 2", Spec: "spec", Model: "haiku", Priority: intPtr(500)},
+		{DocumentID: doc.ID, Title: "task 3", Spec: "spec", Model: "haiku", Priority: intPtr(500)},
+	})
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	// Move tasks to front sequentially and verify strictly increasing priorities
+	var previousPriority int
+	var movedTasks []*Task
+	for i, task := range tasks {
+		moved, err := store.MoveTaskToFront(ctx, task.ID, "actor", "reason")
+		if err != nil {
+			t.Fatalf("task %d: failed to move to front: %v", i, err)
+		}
+
+		if i > 0 && moved.Priority <= previousPriority {
+			t.Errorf("task %d: expected priority > %d, got %d", i, previousPriority, moved.Priority)
+		}
+		previousPriority = moved.Priority
+		movedTasks = append(movedTasks, &moved)
+	}
+
+	// Verify final priorities are strictly increasing
+	if len(movedTasks) >= 3 && (movedTasks[0].Priority >= movedTasks[1].Priority || movedTasks[1].Priority >= movedTasks[2].Priority) {
+		t.Errorf("priorities not strictly increasing: %d, %d, %d",
+			movedTasks[0].Priority, movedTasks[1].Priority, movedTasks[2].Priority)
+	}
+}
+
+func TestDefaultPriority(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "https://example.com/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "test-doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create task without explicit priority - should default to 500
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{DocumentID: doc.ID, Title: "test task", Spec: "spec", Model: "haiku"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	if tasks[0].Priority != 500 {
+		t.Errorf("expected default priority 500, got %d", tasks[0].Priority)
+	}
+}
+
+func TestCreateTasksInvalidPriority(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "https://example.com/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "test-doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Test that CreateTasks rejects invalid priorities
+	testCases := []struct {
+		priority int
+		wantErr  bool
+	}{
+		{0, true},
+		{-1, true},
+		{1001, true},
+		{2000, true},
+		{1, false},
+		{500, false},
+		{1000, false},
+	}
+
+	for _, tc := range testCases {
+		_, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+			{
+				DocumentID: doc.ID,
+				Title:      "test task",
+				Spec:       "spec",
+				Model:      "haiku",
+				Priority:   intPtr(tc.priority),
+			},
+		})
+
+		if tc.wantErr && err == nil {
+			t.Errorf("priority %d: expected error but got none", tc.priority)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("priority %d: expected no error but got %v", tc.priority, err)
+		}
+	}
+}
+
+func TestPriorityUnchangedByLeaseUpdate(t *testing.T) {
+	ctx := context.Background()
+
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "test-proj", "https://example.com/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "test-doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create task
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{DocumentID: doc.ID, Title: "test task", Spec: "spec", Model: "haiku", Priority: intPtr(750)},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Update priority
+	updated, err := store.SetTaskPriority(ctx, taskID, 900, "actor", "reason")
+	if err != nil {
+		t.Fatalf("failed to set priority: %v", err)
+	}
+
+	newPriority := updated.Priority
+
+	// Verify priority changed
+	if newPriority != 900 {
+		t.Errorf("expected priority 900, got %d", newPriority)
+	}
+
+	// Fetch the task again and verify priority is persisted
+	fetched, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to fetch task: %v", err)
+	}
+
+	if fetched.Priority != 900 {
+		t.Errorf("priority not persisted: expected 900, got %d", fetched.Priority)
+	}
+
+	// Verify state is unchanged (new tasks start in 'backlog')
+	if fetched.State != "backlog" {
+		t.Errorf("state changed: expected 'backlog', got %q", fetched.State)
+	}
+}
+
 // Helper functions
 func intPtr(i int) *int {
 	return &i

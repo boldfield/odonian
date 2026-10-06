@@ -5438,9 +5438,11 @@ func (s *sqliteStore) MoveTaskToFront(ctx context.Context, taskID, actor, reason
 		return Task{}, conflict("ARCHIVED", "cannot move to front an archived task")
 	}
 
-	// 3. Compute max(P_queued) across all outstanding non-archived topics
-	// Outstanding = not archived (archived_at IS NULL)
+	// 3. Compute max(P_queued) across all outstanding tasks
+	// Outstanding = non-archived (archived_at IS NULL) and non-terminal
+	// (state NOT IN ('done', 'failed', 'abandoned', 'superseded'))
 	// This includes: held, backlog, blocked, waiting, in_progress, ready
+	// Note: Topic identity/anchor and lifecycle inheritance are deferred to Q2.
 	var maxPriority int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(priority), 0)
