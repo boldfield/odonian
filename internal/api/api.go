@@ -327,7 +327,9 @@ func (s *Server) decodeJSONStrict(w http.ResponseWriter, r *http.Request, v inte
 		return err
 	}
 
-	if decoder.More() {
+	// Ensure no trailing data after the JSON object by attempting a second decode
+	// If decoder.More() returns true, there's trailing content. Also verify EOF after decode.
+	if err := decoder.Decode(new(interface{})); err != io.EOF {
 		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Trailing data after JSON object")
 		return errors.New("trailing data in request body")
 	}

@@ -646,10 +646,11 @@ curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/priority/front" \
 priority is always >1000 and strictly increases on subsequent calls with different keys.
 
 Both priority endpoints:
-- Return `404 NOT_FOUND` if the task does not exist or is archived
+- Return `404 NOT_FOUND` if the task does not exist
 - Return `409 ARCHIVED` if the task has been archived
 - Return `400 INVALID_ACTION_KEY` if `action_key` is empty or >200 characters
 - Return `400 JSON_DECODE_ERROR` if the JSON is malformed or contains unknown fields
+- Support required idempotency key (`action_key`); same key replayed returns the same result with `"replayed": true`
 - Preserve the task's `held` status and all merge gates
 
 ## Rules

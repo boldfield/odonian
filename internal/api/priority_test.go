@@ -861,3 +861,152 @@ func TestHeldTopicStaysHeldAfterFront(t *testing.T) {
 		t.Errorf("expected task to remain held after Front, got held=%v", result["held"])
 	}
 }
+
+// TestCreateTaskWithPriority verifies the create endpoint accepts and validates priority.
+func TestCreateTaskWithPriority(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+
+	testCases := []struct {
+		name           string
+		priority       interface{}
+		expectedStatus int
+	}{
+		{"default (missing)", nil, http.StatusCreated},
+		{"valid min", int64(1), http.StatusCreated},
+		{"valid max", int64(1000), http.StatusCreated},
+		{"valid mid", int64(500), http.StatusCreated},
+		{"out of range low", int64(0), http.StatusBadRequest},
+		{"out of range high", int64(1001), http.StatusBadRequest},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := map[string]interface{}{
+				"title":       fmt.Sprintf("Task %s", tc.name),
+				"spec":        "Test spec",
+				"document_id": docID,
+			}
+			if tc.priority != nil {
+				payload["priority"] = tc.priority
+			}
+
+			body, _ := json.Marshal([]interface{}{payload})
+			req := httptest.NewRequest("POST", fmt.Sprintf("/projects/%s/tasks", projectID), bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer test-token")
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+
+			if w.Code != tc.expectedStatus {
+				t.Fatalf("expected status %d, got %d: %s", tc.expectedStatus, w.Code, w.Body.String())
+			}
+
+			if tc.expectedStatus == http.StatusBadRequest {
+				var result map[string]interface{}
+				json.NewDecoder(w.Body).Decode(&result)
+				if errObj, ok := result["error"].(map[string]interface{}); ok {
+					if code, ok := errObj["code"].(string); !ok || code != "INVALID_PRIORITY" {
+						t.Errorf("expected error code INVALID_PRIORITY, got %v", errObj["code"])
+					}
+				} else {
+					t.Errorf("expected error field in response, got %v", result)
+				}
+			}
+		})
+	}
+}
+
+// TestSetPriorityOverflow verifies overflow values are rejected.
+func TestSetPriorityOverflow(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	// Send raw JSON with a priority larger than int64 max
+	body := []byte(`{"action_key":"overflow-key","priority":9223372036854775808,"actor":"testactor","reason":"overflow"}`)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/tasks/%s/priority/set", task.ID), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for overflow, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var result map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&result)
+
+	if errObj, ok := result["error"].(map[string]interface{}); ok {
+		if code, ok := errObj["code"].(string); !ok || code != "JSON_DECODE_ERROR" {
+			t.Errorf("expected JSON_DECODE_ERROR for overflow, got %v", errObj["code"])
+		}
+	}
+}
+
+// TestStrayClosingToken verifies trailing close brackets are rejected.
+func TestStrayClosingToken(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+	task := createTestTask(t, server, projectID, docID)
+
+	// Send JSON with stray closing brace
+	body := []byte(`{"action_key":"key1","priority":500,"actor":"op","reason":"test"}}`)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/tasks/%s/priority/set", task.ID), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for stray closing token, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var result map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&result)
+
+	if errObj, ok := result["error"].(map[string]interface{}); ok {
+		if code, ok := errObj["code"].(string); !ok || code != "JSON_DECODE_ERROR" {
+			t.Errorf("expected JSON_DECODE_ERROR, got %v", errObj["code"])
+		}
+	} else {
+		t.Errorf("expected error field in response, got %v", result)
+	}
+}
+
+// TestFrontIncreasesOnSuccessiveCalls verifies each Front call returns a higher priority.
+func TestFrontIncreasesOnSuccessiveCalls(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	projectID, docID := setupProjectAndDocumentForTest(t, server)
+
+	// Create tasks
+	task1 := createTestTask(t, server, projectID, docID)
+	task2 := createTestTask(t, server, projectID, docID)
+
+	// Move task1 to front
+	frontReq1 := makeFrontRequest(task1.ID, "front-call-1", "testactor", "first front", nil)
+	frontW1 := httptest.NewRecorder()
+	server.mux.ServeHTTP(frontW1, frontReq1)
+	var frontResult1 map[string]interface{}
+	json.NewDecoder(frontW1.Body).Decode(&frontResult1)
+	priority1 := int64(frontResult1["priority"].(float64))
+
+	// Priority should be > 1000
+	if priority1 <= 1000 {
+		t.Errorf("expected front priority > 1000, got %d", priority1)
+	}
+
+	// Move task2 to front
+	frontReq2 := makeFrontRequest(task2.ID, "front-call-2", "testactor", "second front", nil)
+	frontW2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(frontW2, frontReq2)
+	var frontResult2 map[string]interface{}
+	json.NewDecoder(frontW2.Body).Decode(&frontResult2)
+	priority2 := int64(frontResult2["priority"].(float64))
+
+	// Second front call should return higher priority
+	if priority2 <= priority1 {
+		t.Errorf("second front should have priority > %d, got %d", priority1, priority2)
+	}
+}
