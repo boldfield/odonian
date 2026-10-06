@@ -25,6 +25,27 @@ import (
 	"github.com/boldfield/odonian/internal/tuiclient"
 )
 
+// TestMain clears the fleet harness pin, which dispatched agent sessions export and every child
+// process (including `go test`) inherits; tests that exercise it set it explicitly.
+func TestMain(m *testing.M) {
+	os.Unsetenv(selectedTaskEnv)
+	os.Exit(m.Run())
+}
+
+func TestExecuteNextIgnoresInheritedPinInSuite(t *testing.T) {
+	if os.Getenv("ODONIAN_TEST_PIN_CHILD") == "1" {
+		if got := os.Getenv(selectedTaskEnv); got != "" {
+			t.Fatalf("TestMain left %s=%q set for the suite", selectedTaskEnv, got)
+		}
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestExecuteNextIgnoresInheritedPinInSuite$")
+	cmd.Env = append(os.Environ(), selectedTaskEnv+"=pre-set-task", "ODONIAN_TEST_PIN_CHILD=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("suite must be isolated from an inherited %s: %v\n%s", selectedTaskEnv, err, out)
+	}
+}
+
 func TestRunNoArgs(t *testing.T) {
 	err := run([]string{"odonian"})
 	if err != nil {
