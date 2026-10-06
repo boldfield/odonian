@@ -109,7 +109,7 @@ if [ "$KIND" = "merge" ]; then
       # Discover projects holding claimable merge work
       rows=()
       while IFS= read -r _row; do rows+=("$_row"); done < <(odonian projects --claimable --kind merge --json \
-          | jq -r '.[] | .id' 2>/dev/null | sort -R)
+          | jq -r '.[] | .id' 2>/dev/null | sort)
       if [ "${#rows[@]}" -eq 0 ]; then
         echo "[$AGENT_ID] $(date '+%H:%M:%S') no claimable merge work in any project; sleeping 30s"; nap 30; continue
       fi
@@ -819,6 +819,9 @@ if [ "$MULTI" = 0 ]; then
           [ "$STOP" -eq 1 ] && break
           continue
         fi
+      else
+        # For non-research tasks, pass the selected task through so the prompt doesn't claim a different one
+        P_TASK="$task_id"
       fi
       echo "[$AGENT_ID] $(date '+%H:%M:%S') claimable $KIND; dispatching ($task_model/$task_track)…"
       export AGENT_MODEL="$task_model"
@@ -865,8 +868,8 @@ while true; do
     tasks_json=$(odonian tasks --project "$pid" --claimable --kind "$KIND" --json 2>/dev/null) || continue
     # Extract (task_id, model, priority, created_at, project_id, repo) tuples
     while IFS=$'\t' read -r tid model priority created_at; do
-      [ -n "$tid" ] && task_rows+=("$priority$'\t'$created_at$'\t'$tid$'\t'$model$'\t'$pid$'\t'$prepo")
-    done < <(printf '%s' "$tasks_json" | jq -r '.[]? | "\(.id)\t\(.model)\t(\(.priority // 500))\t\(.created_at)"' 2>/dev/null)
+      [ -n "$tid" ] && task_rows+=("$priority"$'\t'"$created_at"$'\t'"$tid"$'\t'"$model"$'\t'"$pid"$'\t'"$prepo")
+    done < <(printf '%s' "$tasks_json" | jq -r '.[]? | "\(.id)\t\(.model)\t\(.priority // 500)\t\(.created_at)"' 2>/dev/null)
   done < <(printf '%s' "$projects_json" | jq -r '.[] | select(.repo != null and .repo != "") | "\(.id)\t\(.repo)"' 2>/dev/null)
 
   if [ "${#task_rows[@]}" -eq 0 ]; then
@@ -875,15 +878,11 @@ while true; do
 
   # Sort globally by priority DESC, created_at ASC, id ASC
   # Entries are: priority<TAB>created_at<TAB>task_id<TAB>model<TAB>project_id<TAB>repo
-  sorted_tasks=($(printf '%s\n' "${task_rows[@]}" | sort -t$'\t' -k1nr -k2 -k3))
-
   worked=0
   deferred_this_pass=0
   prune_deferred
-  for row in "${sorted_tasks[@]}"; do
+  while IFS=$'\t' read -r _priority _created_at task_id task_model pid prepo; do
     [ "$STOP" -eq 1 ] && break
-    # Parse: priority<TAB>created_at<TAB>task_id<TAB>model<TAB>project_id<TAB>repo
-    IFS=$'\t' read -r _priority _created_at task_id task_model pid prepo <<< "$row"
     [ -z "$task_id" ] && continue
 
     # Skip deferred and unavailable models
@@ -912,6 +911,9 @@ while true; do
         deferred_this_pass=1
         continue
       fi
+    else
+      # For non-research tasks, pass the selected task through so the prompt doesn't claim a different one
+      P_TASK="$task_id"
     fi
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatching ($task_model/$task_track/$KIND) on $(norm_repo "$prepo") [${pid:0:8}]…"
     export AGENT_MODEL="$task_model"
@@ -920,7 +922,7 @@ while true; do
     git -C "$wt" checkout --detach --force origin/main --quiet 2>/dev/null || true
     worked=1
     break   # one task per discovery pass, then re-poll fresh
-  done
+  done < <(printf '%s\n' "${task_rows[@]}" | sort -t$'\t' -k1nr -k2,2 -k3,3)
   [ "$STOP" -eq 1 ] && break
   # All tasks either raced away, were deferred, or had unavailable models — brief sleep, then re-poll.
   # A research deferral means other candidates may still be eligible: re-poll straight away.
