@@ -138,8 +138,23 @@ const topicAnchorSQL = `COALESCE((
 // (the anchor's priority, which Set and Front write across the topic and which descendants
 // born later inherit by lineage) and the anchor id. Every Task read selects them in this
 // order, after the row's own columns, so all views agree.
-const taskTopicColumns = `COALESCE((SELECT a.priority FROM task a WHERE a.id = ` + topicAnchorSQL + `), task.priority) AS topic_priority,
+const taskTopicColumnPriority = `COALESCE((SELECT a.priority FROM task a WHERE a.id = ` + topicAnchorSQL + `), task.priority)`
+
+const taskTopicColumns = taskTopicColumnPriority + ` AS topic_priority,
 		` + topicAnchorSQL + ` AS topic_anchor_id`
+
+// effectiveTaskPriority reads the priority a task's topic currently carries, so work
+// spawned from it inherits the topic value whether or not the task's own row was ever
+// rewritten. The value is generated or inherited, never operator input, so it is not
+// range-checked.
+func effectiveTaskPriority(ctx context.Context, tx *sql.Tx, taskID string) (int64, error) {
+	var priority int64
+	err := tx.QueryRowContext(ctx, `SELECT `+taskTopicColumnPriority+` FROM task WHERE id = ?`, taskID).Scan(&priority)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DefaultPriority, nil
+	}
+	return priority, err
+}
 
 func loadTopicGraph(ctx context.Context, q queryer) (*topicGraph, error) {
 	g := &topicGraph{
