@@ -20,3 +20,6 @@ vendor/
 # Env / local
 .env
 .DS_Store
+
+# Python
+__pycache__/

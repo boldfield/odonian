@@ -1,4 +1,5 @@
 .PHONY: build run test tidy tui check release deploy fleet-builder merger-image fleet-image verify-fleet-tags fleet-deploy diff-fleet merger-deploy versions codex-auth codex-auth-check sbx-codex-auth
+.PHONY: claude-auth claude-auth-check claude-auth-test
 
 VERSION ?= $(shell git describe --tags --always --dirty)
 
@@ -35,6 +36,7 @@ run: build
 
 test:
 	go test ./...
+	$(MAKE) claude-auth-test
 
 tidy:
 	go mod tidy
@@ -94,6 +96,17 @@ verify-fleet-tags fleet-deploy diff-fleet merger-deploy:
 	@echo "Fleet deployment moved to https://github.com/boldfield/manifests (cp/odonian-fleet, lab/odonian-fleet)."
 	@echo "Build/push images here, then update image pins there and merge the reviewed PR."
 	@exit 1
+
+# Read the token inside the helper, never through Make expansion or argv.
+# Generate it first with `claude setup-token`. See deploy/fleet/README.md.
+claude-auth:
+	@python3 deploy/fleet/claude_auth.py update --context "$(CP_CONTEXT)" --namespace "$(FLEET_NAMESPACE)"
+
+claude-auth-check:
+	@python3 deploy/fleet/claude_auth.py check --context "$(CP_CONTEXT)" --namespace "$(FLEET_NAMESPACE)"
+
+claude-auth-test:
+	python3 -m unittest discover -s deploy/fleet -p 'claude_auth_test.py'
 
 # --- codex (gpt-5.5, gpt-6.1-sol) reviewer auth ---
 #
