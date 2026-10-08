@@ -72,15 +72,42 @@ make fleet-image     # builds linux/amd64, pushes to the internal registry
 
 ### 2. Subscription auth secret (token never goes through git/logs)
 
-Each worker/reviewer authenticates claude with a long-lived **`claude setup-token`** value (a
-subscription OAuth token, NOT an API key). Generate it on your laptop and create the secret directly
-so the value never transits anything else:
+Each worker/reviewer authenticates Claude with a **`claude setup-token`** subscription OAuth
+token. Generate it on your laptop, then run the update target (requires Python 3 and kubectl):
 
 ```sh
-claude setup-token   # prints a token; copy it
-kubectl --context admin@summercamp-cp -n odonian-fleet \
-  create secret generic claude-oauth --from-literal=token='<paste-token>'
+claude setup-token       # complete browser login and copy the printed token
+make claude-auth         # paste at the hidden prompt; updates Secret and restarts both deployments
+make claude-auth-check   # read-only: checks stored token and every worker/reviewer pod
 ```
+
+`claude-auth` updates `claude-oauth/token`, restarts **worker and reviewer**, waits for both
+rollouts, then checks synchronization. Pod replacement can interrupt in-flight work; choose an
+appropriate window. A failed Secret update prevents any restart. A later failure reports partial
+completion; inspect the rollout state before retrying. The server and merger are not restarted.
+
+For noninteractive use, supply `CLAUDE_AUTH_TOKEN_FILE` pointing to a protected token file, or
+inherit `CLAUDE_CODE_OAUTH_TOKEN` from your environment. File input takes precedence; an invalid
+file does not fall back to another credential. Do not put the token in a Make command-line
+assignment. Tokens are never printed, included in subprocess arguments, or written to temporary
+files by these commands. An existing Secret is patched without replacing unrelated keys/metadata.
+
+```sh
+CLAUDE_AUTH_TOKEN_FILE="$HOME/.config/odonian/claude-token" make claude-auth
+make claude-auth-check CP_CONTEXT=admin@summercamp-cp FLEET_NAMESPACE=odonian-fleet
+```
+
+The check uses no model calls and changes no cluster state. It compares the injected token in
+every non-terminating worker/reviewer pod with the Secret, and optionally compares a supplied
+file/environment token. It prints only match/mismatch/unknown, never tokens or fingerprints.
+Missing resources, incomplete rollouts, zero replicas, mismatches and unverifiable pods return
+nonzero. It requires permission to get Secrets/deployments/pods and exec into the fleet containers
+(which must provide `sh` and `sha256sum`). The update additionally needs Secret create/patch and
+deployment patch/watch access. Both targets honor `CP_CONTEXT` and `FLEET_NAMESPACE`.
+
+**Synchronized does not mean accepted by Claude or within subscription limits.** The check does
+not infer token expiry or use `claude auth status` as a live authentication test. Confirm provider
+acceptance on the next real Claude dispatch. These targets do not change Codex credentials.
 
 The `odonian-fleet` (server API token) and `odonian-forge-tokens` secrets from the merger setup are
 reused — create them in this namespace on the cp cluster too if they aren't there yet.
