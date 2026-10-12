@@ -39,11 +39,9 @@ The claim flips the task to `in_progress` so the human watching the board sees i
 it is your lock + lease — without it, another worker can grab the same task. Working first and
 claiming at the end is wrong.
 
-**Keep your lease alive.** A lease lapses if you go quiet too long, and a lapsed lease lets another
-worker reclaim your task mid-flight. Run `odonian heartbeat <id>` — right after you claim, and
-again immediately **before and after** every slow step: each `make check`, each `make test`, and
-any build or command you expect to take more than a minute. Pin heartbeats to those points; do not
-rely on sensing elapsed time.
+**Your lease is renewed for you.** The harness renews your lease while your session runs; explicit
+`odonian heartbeat` calls are optional and harmless. Never start a background heartbeat loop or any
+process meant to outlive your session.
 
 1. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.
    It prints the id of the first claimable `implement`-kind task for your model tier — `--kind implement`

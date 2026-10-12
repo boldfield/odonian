@@ -229,7 +229,7 @@ case "${ODONIAN_PROJECT:-}" in ""|all|ALL) MULTI=1 ;; esac
 # --- graceful stop ---
 STOP=0
 CLAUDE_PID=""   # pid (== pgid, via `set -m`) of the in-flight `claude -p`, if any
-MON_PID=""      # pid (== pgid) of the in-flight research renewal monitor, if any
+MON_PID=""      # pid (== pgid) of the in-flight lease-renewal monitor, if any
 request_stop() {
   [ "$STOP" -eq 1 ] && return
   STOP=1
@@ -670,6 +670,62 @@ monitor_dispatch() {
   exit 0
 }
 
+# Lease renewal for one legacy (build/design/review) dispatch; a background subshell next to the
+# model process that ends when that process does. The model claims the harness-selected task inside
+# its own session, so this watches exactly that id: it reads the task each interval until it is
+# in_progress under $AGENT_ID, then heartbeats it (no --attempt) each interval. It stops renewing —
+# but never kills the model, and keeps polling only so it exits with the process — when the task is
+# raced away (in_progress under another agent), leaves ready/in_progress before we own it, or stops
+# being ours after a failed heartbeat (submitted, transitioned, reassigned). Calls go to the Odonian
+# server only; reads happen only before the claim and after a failed heartbeat.
+monitor_legacy_lease() {
+  local pid="$1" task="$2" poll interval last now phase=waiting err json state assignee
+  trap - EXIT INT TERM
+  poll="${ODONIAN_RENEW_POLL_SECS:-1}"; interval="${ODONIAN_RENEW_INTERVAL_SECS:-20}"
+  last=$(date +%s)
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$poll"
+    kill -0 "$pid" 2>/dev/null || break
+    now=$(date +%s)
+    [ $((now - last)) -lt "$interval" ] && continue
+    last=$now
+    case "$phase" in
+      waiting)
+        if json="$(odonian show "$task" --json 2>/dev/null)" && [ -n "$json" ]; then
+          state="$(printf '%s' "$json" | jq -r '.state // empty' 2>/dev/null)"
+          assignee="$(printf '%s' "$json" | jq -r '.assignee // empty' 2>/dev/null)"
+          if [ "$state" = "in_progress" ] && [ "$assignee" = "$AGENT_ID" ]; then
+            phase=owned
+          elif [ "$state" = "in_progress" ] && [ -n "$assignee" ]; then
+            phase=stopped
+            echo "[$AGENT_ID] task ${task:0:8} was claimed by $assignee; lease renewal not started" >&2
+          elif [ -n "$state" ] && [ "$state" != "ready" ] && [ "$state" != "in_progress" ]; then
+            phase=stopped
+            echo "[$AGENT_ID] task ${task:0:8} is $state and was never ours; lease renewal not started" >&2
+          fi
+        else
+          echo "[$AGENT_ID] task ${task:0:8} lookup failed before claim; retrying" >&2
+        fi ;;
+      owned)
+        if ! err="$(odonian heartbeat "$task" --agent "$AGENT_ID" 2>&1 >/dev/null)"; then
+          if json="$(odonian show "$task" --json 2>/dev/null)" && [ -n "$json" ]; then
+            state="$(printf '%s' "$json" | jq -r '.state // empty' 2>/dev/null)"
+            assignee="$(printf '%s' "$json" | jq -r '.assignee // empty' 2>/dev/null)"
+            if [ "$state" = "in_progress" ] && [ "$assignee" = "$AGENT_ID" ]; then
+              echo "[$AGENT_ID] heartbeat for ${task:0:8} failed transiently: $err" >&2
+            else
+              phase=stopped
+              echo "[$AGENT_ID] task ${task:0:8} no longer ours (state=${state:-?} assignee=${assignee:-none}); lease renewal stopped" >&2
+            fi
+          else
+            echo "[$AGENT_ID] heartbeat for ${task:0:8} failed and task lookup failed: $err" >&2
+          fi
+        fi ;;
+    esac
+  done
+  exit 0
+}
+
 # Select the first claimable task of kind $2 in project $1 under the shared comparator (priority
 # desc, created_at asc, id asc) whose model is not currently in a failure backoff window and which
 # is not locally deferred, skipping past any head task(s) that are. Echoes "id<TAB>model" of the
@@ -743,6 +799,10 @@ dispatch() {
     ctl="$(mktemp -d "${TMPDIR:-/tmp}/odonian-dispatch.XXXXXX")"
     monitor_dispatch "$pid" "$ctl" &
     MON_PID=$!
+  elif [ -n "${SELECTED_TASK_ID:-}" ]; then
+    # Legacy dispatch: renew the selected task's lease once the model has claimed it (never fences).
+    monitor_legacy_lease "$pid" "$SELECTED_TASK_ID" &
+    MON_PID=$!
   fi
   # Wait unconditionally first: the child may already be gone, and wait still yields its status. The
   # loop re-waits when a trapped signal interrupts wait while the child is still alive.
@@ -753,8 +813,10 @@ dispatch() {
     kill -TERM "-$MON_PID" 2>/dev/null || true
     wait "$MON_PID" 2>/dev/null || true
     MON_PID=""
-    [ -e "$ctl/fenced" ] && fenced=1
-    rm -rf "$ctl"
+    if [ -n "$ctl" ]; then
+      [ -e "$ctl/fenced" ] && fenced=1
+      rm -rf "$ctl"
+    fi
   fi
   unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_SELECTED_TASK_ID
   # Finalize the research permit exactly once, now that the process is truly gone (never earlier:
