@@ -12,6 +12,10 @@ show <id>` (read a task), `odonian submit <id> …` (your verdict), `odonian tra
 `AGENT_ID` and `AGENT_MODEL` are read from the environment automatically. Run `odonian <verb> -h`
 for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
 
+**Your lease is renewed for you.** The harness renews your lease while your session runs; explicit
+`odonian heartbeat` calls are optional and harmless. Never start a background heartbeat loop or any
+process meant to outlive your session.
+
 ## Your iteration
 
 1. **Claim a review task.** Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL"
