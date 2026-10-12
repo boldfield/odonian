@@ -12,7 +12,8 @@
 #   bash harness/sbx.sh stop   [--port P]    # stop the running stack cleanly (no Ctrl-C needed)
 #   bash harness/sbx.sh status [--port P]    # report server + fleet state
 #
-#   --project <uuid|name|all>  what the fleet drains (default: the demo). A name is resolved to its UUID.
+#   --project <uuid|name|all>  what the fleet drains (default: the demo). A name is resolved to its UUID
+#                          (local_commit: an unknown name is created, pointing at --repo).
 #   --repo <path>          local git repo the CLI commits into (required for local_commit / pull_request single).
 #   --seed-demo            create+use a throwaway local repo + project + board (no GitHub), with ONE example
 #                          task already posted (harness/seed-demo.sh) — the guided first run in docs/demo.md.
@@ -465,7 +466,18 @@ else
         MATCHES="$(jq -r --arg n "$PROJECT_ID" '.[] | select(.name == $n) | .id' <<<"$PROJECTS_JSON" 2>/dev/null)"
         case "$(printf '%s' "$MATCHES" | grep -c .)" in
           1) say "resolved project name '$PROJECT_ID' -> $MATCHES"; PROJECT_ID="$MATCHES" ;;
-          0) die "--project '$PROJECT_ID' is not a UUID and no project has that name (known: $(jq -r '[.[].name] | join(", ")' <<<"$PROJECTS_JSON" 2>/dev/null))" ;;
+          0)
+            # local_commit against a local --repo: the name is all we need, so create the project
+            # (same as the demo path) rather than making the caller pre-create it on a fresh DB.
+            # pull_request projects carry a GitHub repo we can't infer from a local checkout.
+            [ "$DELIVERY_MODE" = "local_commit" ] \
+              || die "--project '$PROJECT_ID' is not a UUID and no project has that name (known: $(jq -r '[.[].name] | join(", ")' <<<"$PROJECTS_JSON" 2>/dev/null))"
+            say "creating project '$PROJECT_ID' (repo: $REPO_ARG)…"
+            NEW_ID="$(curl -fsS "${AUTH[@]}" -X POST "$ODONIAN_URL/projects" \
+              -d "$(jq -n --arg name "$PROJECT_ID" --arg repo "$REPO_ARG" '{name:$name, repo:$repo}')" \
+              | jq -r '.id')"
+            [ -n "$NEW_ID" ] && [ "$NEW_ID" != "null" ] || die "failed to create project '$PROJECT_ID'"
+            PROJECT_ID="$NEW_ID" ;;
           *) die "--project '$PROJECT_ID' matches more than one project by name — pass the UUID: $(printf '%s' "$MATCHES" | tr '\n' ' ')" ;;
         esac
       fi ;;
