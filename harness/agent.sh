@@ -743,6 +743,100 @@ pick_claimable_task() {
   return 0
 }
 
+# --- headless session recovery (legacy dispatches only) ---
+# A model that ends its turn while its task is still in_progress under this agent (typically
+# "waiting for a notification" that never reaches a headless session) is resumed in the same session,
+# up to ODONIAN_MAX_RESUMES times; if it still owns the task after that, or the session cannot be
+# resumed, the task is moved to blocked instead of waiting for its lease to lapse.
+# ODONIAN_MAX_RESUMES=0 means zero resumes: the task is blocked as soon as the first session ends
+# with it still owned. ODONIAN_SESSION_RECOVERY=off bypasses the whole mechanism (the dispatch
+# behaves as it did before it existed); lease_renewal_test.sh and priority_scheduling_smoke_test.sh
+# export it themselves, because their fake models exit 0 leaving their task owned.
+
+# A random (v4) UUID without uuidgen; claude's --session-id needs one.
+new_uuid() {
+  local h v
+  h="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  v="$(printf '%x' $(( (0x${h:16:1} & 3) | 8 )))"
+  printf '%s-%s-4%s-%s%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$v" "${h:17:3}" "${h:20:12}"
+}
+
+# Mask credentials in $1: the values of well-known secret env vars, token-shaped strings, and the
+# value after a secret-looking key. Output is the whole text, redacted (truncate AFTER redacting so
+# a secret cut by the window can't leak its tail).
+redact_secrets() {
+  local s="$1" name val
+  for name in ODONIAN_TOKEN GH_TOKEN GITHUB_TOKEN GITLAB_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY \
+              OPENAI_API_KEY CODEX_API_KEY FORGE_TOKENS; do
+    val="${!name:-}"
+    [ "${#val}" -ge 8 ] && s="${s//"$val"/[REDACTED]}"
+  done
+  printf '%s' "$s" | sed -E \
+    -e 's/(sk-ant-|sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-)[A-Za-z0-9_-]{8,}/[REDACTED]/g' \
+    -e 's/AKIA[0-9A-Z]{16}/[REDACTED]/g' \
+    -e 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/[REDACTED]/g' \
+    -e 's#([Bb]earer|[Bb]asic)[[:space:]]+[A-Za-z0-9._~+/=-]{8,}#\1 [REDACTED]#g' \
+    -e 's/([A-Za-z0-9_-]*([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy])[A-Za-z0-9_-]*[[:space:]]*[=:][[:space:]]*)[^[:space:]"'"'"',;]+/\1[REDACTED]/g'
+}
+
+# 0 = $1 is in_progress under this agent; 1 = it is not (submitted, blocked, raced away, ...);
+# 2 = the lookup failed twice, so ownership is unknown.
+task_still_owned() {
+  local json state assignee try
+  for try in 1 2; do
+    if json="$(odonian show "$1" --json 2>/dev/null)" && [ -n "$json" ]; then
+      state="$(printf '%s' "$json" | jq -r '.state // empty' 2>/dev/null)"
+      assignee="$(printf '%s' "$json" | jq -r '.assignee // empty' 2>/dev/null)"
+      [ "$state" = "in_progress" ] && [ "$assignee" = "$AGENT_ID" ] && return 0
+      return 1
+    fi
+    [ "$try" -eq 1 ] && sleep 1
+  done
+  return 2
+}
+
+# Run the model once in the foreground (the caller backgrounds it). Args: use_codex(0|1)
+# mode(start|resume) session_id text. start: $3 is the Claude session id to create (may be empty),
+# $4 the task prompt. resume: $3 is the session to continue, $4 the resume prompt.
+_model_cmd() {
+  local use_codex="$1" mode="$2" sid="$3" text="$4"
+  if [ "$use_codex" -eq 1 ]; then
+    # Everything but the subcommand goes before `resume`: `codex exec resume` takes no --sandbox.
+    # shellcheck disable=SC2086
+    if [ "$mode" = resume ]; then
+      exec codex exec -m "$AGENT_MODEL" --sandbox danger-full-access -c model_reasoning_effort=high ${AGENT_CODEX_FLAGS:-} resume "$sid" "$text"
+    fi
+    # shellcheck disable=SC2086
+    exec codex exec -m "$AGENT_MODEL" --sandbox danger-full-access -c model_reasoning_effort=high ${AGENT_CODEX_FLAGS:-} "$text"
+  fi
+  # >>> remove --dangerously-skip-permissions if you want interactive permission prompts <<<
+  # AGENT_CLAUDE_FLAGS appends extra flags to the nested claude (default empty, so the normal fleet
+  # is unchanged). sbx.sh sets it to --allow-dangerously-skip-permissions, which a NESTED `claude -p`
+  # requires inside an sbx sandbox; it is unquoted on purpose so multiple flags word-split.
+  if [ "$mode" = resume ]; then
+    # shellcheck disable=SC2086
+    exec claude -p --dangerously-skip-permissions ${AGENT_CLAUDE_FLAGS:-} --resume "$sid" "$text" --model "$AGENT_MODEL"
+  fi
+  if [ -n "$sid" ]; then
+    # shellcheck disable=SC2086
+    exec claude -p --dangerously-skip-permissions ${AGENT_CLAUDE_FLAGS:-} --session-id "$sid" "$text" --model "$AGENT_MODEL"
+  fi
+  # shellcheck disable=SC2086
+  exec claude -p --dangerously-skip-permissions ${AGENT_CLAUDE_FLAGS:-} "$text" --model "$AGENT_MODEL"
+}
+
+# Move task $1 to blocked, with a note naming this agent, the session count ($2), why ($3) and the
+# last 500 characters (secrets redacted) of the model's final message ($4).
+block_unfinished_task() {
+  local task="$1" sessions="$2" why="$3" last note
+  last="$(redact_secrets "$4")"
+  last="${last: -500}"
+  note="agent $AGENT_ID: model session(s) ended with the task still in_progress ($sessions session(s) run; $why). Last model message (final 500 chars): ${last:-<none>}"
+  echo "[$AGENT_ID] $(date '+%H:%M:%S') blocking task ${task:0:8}: $why after $sessions session(s)" >&2
+  odonian transition "$task" --to blocked --note "$note" >/dev/null 2>&1 \
+    || echo "[$AGENT_ID] could not move task ${task:0:8} to blocked" >&2
+}
+
 # Run one claude task, shielded from Ctrl-C, waiting until it truly finishes. Captures claude's
 # exit code: a non-zero exit means claude could not run (out of credits, auth, missing binary) —
 # NOT that the task is bad. On failure this marks $AGENT_MODEL's backend unavailable (see above)
@@ -780,44 +874,87 @@ dispatch() {
     esac
   fi
 
-  if [ "$use_codex" -eq 1 ]; then
-    # shellcheck disable=SC2086
-    codex exec -m "$AGENT_MODEL" --sandbox danger-full-access -c model_reasoning_effort=high ${AGENT_CODEX_FLAGS:-} "$prompt" &
-  else
-    # >>> remove --dangerously-skip-permissions if you want interactive permission prompts <<<
-    # AGENT_CLAUDE_FLAGS appends extra flags to the nested claude (default empty, so the normal fleet
-    # is unchanged). sbx.sh sets it to --allow-dangerously-skip-permissions, which a NESTED `claude -p`
-    # requires inside an sbx sandbox; it is unquoted on purpose so multiple flags word-split.
-    # shellcheck disable=SC2086
-    claude -p --dangerously-skip-permissions ${AGENT_CLAUDE_FLAGS:-} "$prompt" --model "$AGENT_MODEL" &
-  fi
-
-  CLAUDE_PID=$!   # tracked so request_stop()/cleanup() can tear down this claude's process group
-  local pid=$CLAUDE_PID rc=0 ctl="" fenced=0
-  # Preclaimed research: a sibling monitor renews the permit/task lease for the life of the process.
-  if [ -n "$P_TASK" ]; then
-    ctl="$(mktemp -d "${TMPDIR:-/tmp}/odonian-dispatch.XXXXXX")"
-    monitor_dispatch "$pid" "$ctl" &
-    MON_PID=$!
-  elif [ -n "${SELECTED_TASK_ID:-}" ]; then
-    # Legacy dispatch: renew the selected task's lease once the model has claimed it (never fences).
-    monitor_legacy_lease "$pid" "$SELECTED_TASK_ID" &
-    MON_PID=$!
-  fi
-  # Wait unconditionally first: the child may already be gone, and wait still yields its status. The
-  # loop re-waits when a trapped signal interrupts wait while the child is still alive.
-  wait "$pid"; rc=$?
-  while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
-  CLAUDE_PID=""
-  if [ -n "$MON_PID" ]; then
-    kill -TERM "-$MON_PID" 2>/dev/null || true
-    wait "$MON_PID" 2>/dev/null || true
-    MON_PID=""
-    if [ -n "$ctl" ]; then
-      [ -e "$ctl/fenced" ] && fenced=1
-      rm -rf "$ctl"
+  # Legacy (build/design/review) dispatches record the model's output so a session that ends with
+  # its task still owned can be resumed (Claude gets a known --session-id; Codex's id is read from
+  # its stderr header) and the blocked fallback can quote the final message. Research is untouched.
+  local legacy=0 recover=0 task="" max_resumes sessions=0 resumes=0 mode=start text="$prompt" session_id=""
+  local rcdir="" out="" err="" last_msg="" own
+  local rc=0 ctl="" fenced=0 pid
+  if [ -z "$P_TASK" ] && [ -n "${SELECTED_TASK_ID:-}" ]; then
+    legacy=1; task="$SELECTED_TASK_ID"
+    if [ "${ODONIAN_SESSION_RECOVERY:-on}" != off ]; then
+      recover=1
+      max_resumes="${ODONIAN_MAX_RESUMES:-3}"
+      case "$max_resumes" in ""|*[!0-9]*) max_resumes=3 ;; esac
+      rcdir="$(mktemp -d "${TMPDIR:-/tmp}/odonian-session.XXXXXX")"
+      out="$rcdir/out"; err="$rcdir/err"
+      [ "$use_codex" -eq 1 ] || session_id="$(new_uuid)"
     fi
   fi
+
+  while :; do
+    sessions=$((sessions + 1))
+    if [ "$recover" -eq 1 ]; then
+      _model_cmd "$use_codex" "$mode" "$session_id" "$text" >"$out" 2>"$err" &
+    else
+      _model_cmd "$use_codex" start "" "$text" &
+    fi
+    CLAUDE_PID=$!   # tracked so request_stop()/cleanup() can tear down this claude's process group
+    pid=$CLAUDE_PID
+    # Preclaimed research: a sibling monitor renews the permit/task lease for the life of the process.
+    if [ -n "$P_TASK" ]; then
+      ctl="$(mktemp -d "${TMPDIR:-/tmp}/odonian-dispatch.XXXXXX")"
+      monitor_dispatch "$pid" "$ctl" &
+      MON_PID=$!
+    elif [ "$legacy" -eq 1 ]; then
+      # Legacy dispatch: renew the selected task's lease once the model has claimed it (never fences).
+      # One monitor per model process, each gone before the next session starts.
+      monitor_legacy_lease "$pid" "$task" &
+      MON_PID=$!
+    fi
+    # Wait unconditionally first: the child may already be gone, and wait still yields its status. The
+    # loop re-waits when a trapped signal interrupts wait while the child is still alive.
+    wait "$pid"; rc=$?
+    while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
+    CLAUDE_PID=""
+    if [ -n "$MON_PID" ]; then
+      kill -TERM "-$MON_PID" 2>/dev/null || true
+      wait "$MON_PID" 2>/dev/null || true
+      MON_PID=""
+      if [ -n "$ctl" ]; then
+        [ -e "$ctl/fenced" ] && fenced=1
+        rm -rf "$ctl"
+      fi
+    fi
+    [ "$recover" -eq 1 ] || break
+
+    [ -s "$out" ] && cat "$out"
+    [ -s "$err" ] && cat "$err" >&2
+    last_msg="$(cat "$out" 2>/dev/null)"
+    if [ "$use_codex" -eq 1 ] && [ -z "$session_id" ]; then
+      session_id="$(sed -n 's/^session id: *\([0-9A-Fa-f-]\{36\}\).*/\1/p' "$err" 2>/dev/null | head -1)"
+    fi
+
+    # Only a clean exit with the task still ours is resumed; non-zero exits and stops keep their
+    # handling below, and a task that was submitted, blocked or claimed elsewhere is left alone.
+    [ "$rc" -eq 0 ] && [ "$STOP" -ne 1 ] || break
+    task_still_owned "$task"; own=$?
+    [ "$own" -eq 2 ] && echo "[$AGENT_ID] $(date '+%H:%M:%S') could not read task ${task:0:8} after the model exited; not resuming" >&2
+    [ "$own" -eq 0 ] || break
+    if [ "$resumes" -ge "$max_resumes" ]; then
+      block_unfinished_task "$task" "$sessions" "still not finished after $resumes resume(s) (ODONIAN_MAX_RESUMES=$max_resumes)" "$last_msg"
+      break
+    fi
+    if [ -z "$session_id" ]; then
+      block_unfinished_task "$task" "$sessions" "the model session cannot be resumed (no session id)" "$last_msg"
+      break
+    fi
+    resumes=$((resumes + 1))
+    mode=resume
+    text="You are running headless: ending your turn ends your session, and no notification, wakeup or monitor will resume you. Your task $task is still in_progress and assigned to you. Check the state of whatever you were waiting on, wait for it in the foreground, then submit it, or block it with a reason. Do not end your turn while the task is in_progress."
+    echo "[$AGENT_ID] $(date '+%H:%M:%S') task ${task:0:8} still in_progress after session $sessions; resuming ($resumes/$max_resumes)" >&2
+  done
+  [ -n "$rcdir" ] && rm -rf "$rcdir"
   unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_SELECTED_TASK_ID
   # Finalize the research permit exactly once, now that the process is truly gone (never earlier:
   # a submit ends task ownership, not the dispatch). rc 126/127 = the model binary could not be

@@ -6,6 +6,9 @@
 # rebuilt from symlinks to a fixed set of system tools, so no real claude/codex/gh/Odonian server can
 # be reached and no paid model is ever called.
 set -uo pipefail
+# These fakes' models exit 0 while their task is still owned, which headless session recovery would
+# resume or block; recovery has its own suite (session_resume_test.sh), so bypass it here.
+export ODONIAN_SESSION_RECOVERY=off
 
 HARNESS_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
