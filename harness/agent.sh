@@ -750,8 +750,8 @@ pick_claimable_task() {
 # resumed, the task is moved to blocked instead of waiting for its lease to lapse.
 # ODONIAN_MAX_RESUMES=0 means zero resumes: the task is blocked as soon as the first session ends
 # with it still owned. ODONIAN_SESSION_RECOVERY=off bypasses the whole mechanism (the dispatch
-# behaves as it did before it existed); the Go test runner sets it for the older harness scripts,
-# whose fake models exit 0 leaving their task owned.
+# behaves as it did before it existed); lease_renewal_test.sh and priority_scheduling_smoke_test.sh
+# export it themselves, because their fake models exit 0 leaving their task owned.
 
 # A random (v4) UUID without uuidgen; claude's --session-id needs one.
 new_uuid() {

@@ -8,7 +8,6 @@ import (
 // The fleet launcher's scheduling logic lives in shell, so these suites drive the real agent.sh
 // against fake odonian/claude binaries. Running them from `go test` keeps CI from letting a
 // scheduler regression through. These suites SKIP (exit 0) when jq or git is missing.
-
 func TestHarnessScripts(t *testing.T) {
 	if testing.Short() {
 		t.Skip("harness shell suites are skipped in -short mode")
