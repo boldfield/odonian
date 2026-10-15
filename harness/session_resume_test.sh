@@ -179,7 +179,7 @@ new_scenario() {
   FAKE_DIR="$TMP/s$((++SCN))"; mkdir -p "$FAKE_DIR"; export FAKE_DIR
   : > "$FAKE_DIR/calls.log"; : > "$FAKE_DIR/claude.log"
   export ODONIAN_HOME="$TMP/home$SCN"; mkdir -p "$ODONIAN_HOME"
-  unset ODONIAN_MAX_RESUMES AGENT_CODEX_MODELS FAKE_TRACK
+  unset ODONIAN_MAX_RESUMES ODONIAN_SESSION_RECOVERY AGENT_CODEX_MODELS FAKE_TRACK
   echo '[{"id":"A","model":"x","kind":"implement","state":"ready"}]' > "$FAKE_DIR/tasks.json"
   echo '{"track":"build","state":"ready"}' > "$FAKE_DIR/show.A"
 }
@@ -281,17 +281,31 @@ check "then the task was blocked, once" test "$(calls transition | grep -c ' A t
 check "the note names the agent" grep -q "agent $(start_line 1 | field agent):" "$FAKE_DIR/transition.note"
 end_scenario
 
-# ============ 4. ODONIAN_MAX_RESUMES=0 turns the mechanism off ============
-echo "Scenario 4: ODONIAN_MAX_RESUMES=0 disables resuming: an owned task is left as it was (no resume, no block, no lookup)"
+# ============ 4. ODONIAN_MAX_RESUMES=0 means zero resumes, then blocked ============
+echo "Scenario 4: ODONIAN_MAX_RESUMES=0 allows no resumes: an owned task is blocked right after the first session"
 new_scenario
 export ODONIAN_MAX_RESUMES=0
+printf 'claim,run=0.3\n' > "$FAKE_DIR/claude.seq"
+start_agent; finish
+check "the model ran once" test "$(starts)" -eq 1
+check "the task was moved to blocked exactly once" test "$(calls transition | grep -c ' A to=blocked$')" -eq 1
+check "the note names the agent and the single session" bash -c "grep -q 'agent $(start_line 1 | field agent):' '$FAKE_DIR/transition.note' && grep -q '1 session(s)' '$FAKE_DIR/transition.note'"
+check "the task is blocked on the board" test "$(jq -r .state "$FAKE_DIR/show.A")" = blocked
+monitor_lifecycle 1
+end_scenario
+unset ODONIAN_MAX_RESUMES
+
+# ============ 4b. ODONIAN_SESSION_RECOVERY=off bypasses recovery entirely ============
+echo "Scenario 4b: ODONIAN_SESSION_RECOVERY=off leaves an owned task alone: no resume, no block, no lookup"
+new_scenario
+export ODONIAN_SESSION_RECOVERY=off
 printf 'claim,run=0.3\n' > "$FAKE_DIR/claude.seq"
 start_agent; finish
 check "the model ran once" test "$(starts)" -eq 1
 check "the task was not blocked" test "$(ncalls transition)" -eq 0
 check "the task is still in_progress under the agent" test "$(jq -r .state "$FAKE_DIR/show.A")" = in_progress
 end_scenario
-unset ODONIAN_MAX_RESUMES
+unset ODONIAN_SESSION_RECOVERY
 
 # ============ 5. tasks that are not owned are never resumed ============
 for variant in submitted blocked raced never; do

@@ -748,8 +748,10 @@ pick_claimable_task() {
 # "waiting for a notification" that never reaches a headless session) is resumed in the same session,
 # up to ODONIAN_MAX_RESUMES times; if it still owns the task after that, or the session cannot be
 # resumed, the task is moved to blocked instead of waiting for its lease to lapse.
-# ODONIAN_MAX_RESUMES=0 turns the whole mechanism off (no ownership check, no resume, no blocking),
-# which is what a dispatch did before it existed.
+# ODONIAN_MAX_RESUMES=0 means zero resumes: the task is blocked as soon as the first session ends
+# with it still owned. ODONIAN_SESSION_RECOVERY=off bypasses the whole mechanism (the dispatch
+# behaves as it did before it existed); the Go test runner sets it for the older harness scripts,
+# whose fake models exit 0 leaving their task owned.
 
 # A random (v4) UUID without uuidgen; claude's --session-id needs one.
 new_uuid() {
@@ -875,21 +877,24 @@ dispatch() {
   # Legacy (build/design/review) dispatches record the model's output so a session that ends with
   # its task still owned can be resumed (Claude gets a known --session-id; Codex's id is read from
   # its stderr header) and the blocked fallback can quote the final message. Research is untouched.
-  local legacy=0 task="" max_resumes sessions=0 resumes=0 mode=start text="$prompt" session_id=""
+  local legacy=0 recover=0 task="" max_resumes sessions=0 resumes=0 mode=start text="$prompt" session_id=""
   local rcdir="" out="" err="" last_msg="" own
   local rc=0 ctl="" fenced=0 pid
   if [ -z "$P_TASK" ] && [ -n "${SELECTED_TASK_ID:-}" ]; then
     legacy=1; task="$SELECTED_TASK_ID"
-    max_resumes="${ODONIAN_MAX_RESUMES:-3}"
-    case "$max_resumes" in ""|*[!0-9]*) max_resumes=3 ;; esac
-    rcdir="$(mktemp -d "${TMPDIR:-/tmp}/odonian-session.XXXXXX")"
-    out="$rcdir/out"; err="$rcdir/err"
-    [ "$use_codex" -eq 1 ] || session_id="$(new_uuid)"
+    if [ "${ODONIAN_SESSION_RECOVERY:-on}" != off ]; then
+      recover=1
+      max_resumes="${ODONIAN_MAX_RESUMES:-3}"
+      case "$max_resumes" in ""|*[!0-9]*) max_resumes=3 ;; esac
+      rcdir="$(mktemp -d "${TMPDIR:-/tmp}/odonian-session.XXXXXX")"
+      out="$rcdir/out"; err="$rcdir/err"
+      [ "$use_codex" -eq 1 ] || session_id="$(new_uuid)"
+    fi
   fi
 
   while :; do
     sessions=$((sessions + 1))
-    if [ "$legacy" -eq 1 ]; then
+    if [ "$recover" -eq 1 ]; then
       _model_cmd "$use_codex" "$mode" "$session_id" "$text" >"$out" 2>"$err" &
     else
       _model_cmd "$use_codex" start "" "$text" &
@@ -921,7 +926,7 @@ dispatch() {
         rm -rf "$ctl"
       fi
     fi
-    [ "$legacy" -eq 1 ] || break
+    [ "$recover" -eq 1 ] || break
 
     [ -s "$out" ] && cat "$out"
     [ -s "$err" ] && cat "$err" >&2
@@ -932,7 +937,7 @@ dispatch() {
 
     # Only a clean exit with the task still ours is resumed; non-zero exits and stops keep their
     # handling below, and a task that was submitted, blocked or claimed elsewhere is left alone.
-    [ "$rc" -eq 0 ] && [ "$STOP" -ne 1 ] && [ "$max_resumes" -gt 0 ] || break
+    [ "$rc" -eq 0 ] && [ "$STOP" -ne 1 ] || break
     task_still_owned "$task"; own=$?
     [ "$own" -eq 2 ] && echo "[$AGENT_ID] $(date '+%H:%M:%S') could not read task ${task:0:8} after the model exited; not resuming" >&2
     [ "$own" -eq 0 ] || break
