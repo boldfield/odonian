@@ -131,6 +131,8 @@ export FAKE_DIR="$FAKE"
 # --- server lifecycle: every world gets its own DB; the port is random and checked free ---
 export ODONIAN_TOKEN="smoke-token" ODONIAN_STATE_DIR="$TMP/cli-state" AGENT_ID="smoke-operator"
 export ODONIAN_MODELS="opus,fable,sonnet,haiku" ODONIAN_LEASE_TTL=30m
+# This test pins scheduling, not session recovery: its fake models exit 0 leaving their task owned.
+export ODONIAN_MAX_RESUMES=0
 export ODONIAN_RESEARCH_POLICY_MODE="enforce"
 # Illustrative test pools (not production recommendations). alpha: a single start of burst and a negligible
 # refill, so one admitted start exhausts it ("quota unavailable"). beta: a roomy burst, two dispatch slots,

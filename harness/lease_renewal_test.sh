@@ -148,6 +148,7 @@ new_scenario() {
 start_agent() {
   export ODONIAN_URL="http://127.0.0.1:0" ODONIAN_TOKEN=t ODONIAN_MAIN_REPO="$MAIN_REPO" ODONIAN_REPO="$MAIN_REPO"
   export ODONIAN_RENEW_INTERVAL_SECS=1 ODONIAN_RENEW_POLL_SECS=0.2 ODONIAN_PROJECT=proj-test
+  export ODONIAN_MAX_RESUMES=0   # these scenarios leave the task owned on purpose; session recovery has its own test
   "$HARNESS_DIR/agent.sh" --model x --kind implement "slot-$SCN" > "$FAKE_DIR/agent.log" 2>&1 &
   AGENT_PID=$!
   ps -o pgid= -p "$AGENT_PID" | tr -d ' ' > "$FAKE_DIR/agent.pgid"
