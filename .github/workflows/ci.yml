@@ -56,3 +56,35 @@ jobs:
           docker logs odonian_ci
           docker rm -f odonian_ci
           test -n "$ok" || { echo "healthz did not return 200"; exit 1; }
+
+  fleet-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build fleet image
+        run: docker build -f deploy/fleet/Dockerfile.fleet -t odonian-fleet:ci .
+
+      - name: Verify pinned CLI versions
+        run: |
+          claude_pin="$(sed -n 's/.*@anthropic-ai\/claude-code@\([0-9][0-9.]*\).*/\1/p' deploy/fleet/Dockerfile.fleet | head -n1)"
+          codex_pin="$(sed -n 's/.*@openai\/codex@\([0-9][0-9.]*\).*/\1/p' deploy/fleet/Dockerfile.fleet | head -n1)"
+          test -n "$claude_pin" && test -n "$codex_pin" || { echo "could not parse pins from Dockerfile.fleet"; exit 1; }
+          claude_out="$(docker run --rm --entrypoint claude odonian-fleet:ci --version)"
+          codex_out="$(docker run --rm --entrypoint codex odonian-fleet:ci --version)"
+          echo "claude --version: $claude_out (pin $claude_pin)"
+          echo "codex --version: $codex_out (pin $codex_pin)"
+          case "$claude_out" in "$claude_pin "*) ;; *) echo "claude version mismatch"; exit 1;; esac
+          case "$codex_out" in *" $codex_pin") ;; *) echo "codex version mismatch"; exit 1;; esac
+
+      - name: Default Claude models are not unknown to the pinned CLI
+        run: |
+          # No credentials in CI: `claude -p` stops at "Not logged in" before any API call, but the
+          # model catalog check runs first, so an unknown id surfaces as an unrecognized-model message.
+          for m in claude-haiku-4-5-20251001 claude-sonnet-5 claude-sonnet-5-5 claude-opus-5-5 claude-fable-5-1; do
+            out="$(docker run --rm --entrypoint claude -e HOME=/tmp odonian-fleet:ci -p --model "$m" hi 2>&1 || true)"
+            echo "--- $m: $out"
+            if echo "$out" | grep -Eqi "unrecognized_model|doesn't recognize|isn't described"; then
+              echo "unknown-model warning for $m"; exit 1
+            fi
+          done
