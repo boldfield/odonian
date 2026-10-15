@@ -33,6 +33,9 @@
 #
 # Usage: bash harness/priority_scheduling_smoke_test.sh   (needs go, jq, git, curl; SMOKE_VERBOSE=1 adds ids/ports)
 set -uo pipefail
+# These fakes' models exit 0 while their task is still owned, which headless session recovery would
+# resume or block; recovery has its own suite (session_resume_test.sh), so bypass it here.
+export ODONIAN_SESSION_RECOVERY=off
 
 HARNESS_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HARNESS_DIR/.." && pwd)"
