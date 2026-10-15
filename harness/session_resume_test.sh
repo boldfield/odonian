@@ -285,7 +285,7 @@ end_scenario
 echo "Scenario 4: ODONIAN_MAX_RESUMES=0 allows no resumes: an owned task is blocked right after the first session"
 new_scenario
 export ODONIAN_MAX_RESUMES=0
-printf 'claim,run=0.3\n' > "$FAKE_DIR/claude.seq"
+printf 'claim,run=3\n' > "$FAKE_DIR/claude.seq"
 start_agent; finish
 check "the model ran once" test "$(starts)" -eq 1
 check "the task was moved to blocked exactly once" test "$(calls transition | grep -c ' A to=blocked$')" -eq 1
