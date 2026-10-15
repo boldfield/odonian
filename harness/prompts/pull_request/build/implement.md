@@ -26,6 +26,12 @@ first and claiming at the end is wrong.
 `odonian heartbeat` calls are optional and harmless. Never start a background heartbeat loop or any
 process meant to outlive your session.
 
+You are running headless. Your session ends when you end your turn, and no background notification,
+scheduled wakeup or monitor will resume it. Never end your turn while your task is `in_progress`. To
+wait for CI or a long command, wait in the foreground: for example, `gh run watch <id> --exit-status
+--interval 60` or a polling loop, each call kept under the tool timeout and repeated until done. Then
+submit, or block with a reason. Anything you start in the background is killed when your session ends.
+
 1. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.
    It prints the id of the first claimable `implement`-kind task for your model tier — `--kind implement`
    excludes `review`-kind tasks (a reviewer's job; never claim one). Exit code 2 / "nothing claimable"
