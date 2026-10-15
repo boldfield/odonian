@@ -49,14 +49,17 @@ RUN set -eux; \
 COPY --from=golang:1.25-bookworm /usr/local/go /usr/local/go
 
 # claude CLI (subscription auth comes at runtime via CLAUDE_CODE_OAUTH_TOKEN env).
-# Pinned to 2.1.281: supports claude-opus-5-5 model (requires >= 2.1.280).
+# Pinned to 2.1.301: its model catalog describes every Claude model on the default allowlist
+# (claude-haiku-4-5-20251001, claude-sonnet-5, claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1),
+# so it prints no unknown-model warning and uses each model's real context window for auto-compaction
+# (2.1.281 did not know claude-sonnet-5-5 and capped auto-compaction at 200k tokens).
 # See: https://www.npmjs.com/package/@anthropic-ai/claude-code
-RUN npm install -g @anthropic-ai/claude-code@2.1.281
+RUN npm install -g @anthropic-ai/claude-code@2.1.301
 
 # Codex CLI (OpenAI Codex tool).
-# Pinned to 0.156.1: supports gpt-6-astra model (0.149.0 rejected it).
+# Pinned to 0.162.1 (current release; still supports gpt-6-astra, which 0.149.0 rejected).
 # See: https://www.npmjs.com/package/@openai/codex
-RUN npm install -g @openai/codex@0.156.1
+RUN npm install -g @openai/codex@0.162.1
 
 # odonian CLI + harness + the shared fleet entrypoint.
 COPY --from=odonian-builder /out/odonian /usr/local/bin/odonian
