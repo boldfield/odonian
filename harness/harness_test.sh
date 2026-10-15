@@ -92,6 +92,27 @@ else
   test_fail "a delivery-mode build prompt is missing"
 fi
 
+# Test 7a: every build prompt tells the model it runs headless and carries no
+# language implying a later notification or wakeup.
+echo "Test 7a: build prompts carry the headless paragraph"
+_headless_bad=0
+for _f in prompts/pull_request/build/implement.md prompts/pull_request/build/review.md \
+          prompts/local_commit/build/implement.md prompts/local_commit/build/review.md; do
+  _flat="$(tr '\n' ' ' < "$HARNESS_DIR/$_f" | tr -s ' ')"
+  case "$_flat" in
+    *"You are running headless. Your session ends when you end your turn, and no background notification, scheduled wakeup or monitor will resume it. Never end your turn while your task is \`in_progress\`."*"Anything you start in the background is killed when your session ends."*) ;;
+    *) echo "  headless paragraph missing: $_f"; _headless_bad=1 ;;
+  esac
+  if grep -qiE "you will be (notified|woken)|I'll be notified|until (you are|you're) (notified|woken)" "$HARNESS_DIR/$_f"; then
+    echo "  implies later notification: $_f"; _headless_bad=1
+  fi
+done
+if [ "$_headless_bad" -eq 0 ]; then
+  test_pass "all four build prompts contain the headless paragraph"
+else
+  test_fail "a build prompt lacks the headless paragraph or implies later notification"
+fi
+
 # Test 7b: get_prompt_file (extracted verbatim from agent.sh) actually resolves
 # research/implement and research/review to real files under pull_request.
 echo "Test 7b: get_prompt_file resolves research/implement and research/review under pull_request"
