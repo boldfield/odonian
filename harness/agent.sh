@@ -800,6 +800,9 @@ task_still_owned() {
 # $4 the task prompt. resume: $3 is the session to continue, $4 the resume prompt.
 _model_cmd() {
   local use_codex="$1" mode="$2" sid="$3" text="$4"
+  # Runs only in the model's own backgrounded subshell, so the marker reaches the model and every
+  # descendant but never the harness, its monitors or anything else it starts.
+  [ -n "$DISPATCH_ID" ] && export ODONIAN_DISPATCH_ID="$DISPATCH_ID"
   if [ "$use_codex" -eq 1 ]; then
     # Everything but the subcommand goes before `resume`: `codex exec resume` takes no --sandbox.
     # shellcheck disable=SC2086
@@ -835,6 +838,88 @@ block_unfinished_task() {
   echo "[$AGENT_ID] $(date '+%H:%M:%S') blocking task ${task:0:8}: $why after $sessions session(s)" >&2
   odonian transition "$task" --to blocked --note "$note" >/dev/null 2>&1 \
     || echo "[$AGENT_ID] could not move task ${task:0:8} to blocked" >&2
+}
+
+# --- dispatch process reaping ---
+# The model's Bash tool runs commands in their own process groups (and a model can setsid), so
+# background work outlives the model process and a group-kill never reaches it. dispatch() therefore
+# stamps the model's environment with a unique ODONIAN_DISPATCH_ID; every descendant inherits it,
+# whatever its process group or session. After the model (and any resume) has exited the harness
+# kills exactly the processes carrying that marker: TERM, a short grace, then KILL. Unmarked
+# processes, the harness and its monitors are never signalled, and there is no kill-everything-
+# reparented-to-PID-1 shortcut, so this is safe on a developer machine.
+DISPATCH_ID=""   # marker of the in-flight dispatch, if any; cleanup() reaps it too
+
+# Succeeds if the NUL-separated environment file $2 holds the marker $1. Pure bash: no fork per process.
+_environ_has_marker() {
+  local kv
+  while IFS= read -r -d '' kv; do
+    [ "$kv" = "ODONIAN_DISPATCH_ID=$1" ] && return 0
+  done 2>/dev/null <"$2"
+  return 1
+}
+
+# Pids (one per line) of every process whose environment carries marker $1, never this shell.
+# Linux reads /proc/<pid>/environ; macOS/BSD fall back to `ps -E`, which appends the environment to
+# the command line (matched here, never logged).
+list_dispatch_pids() {
+  local id="$1" p pid line
+  [ -n "$id" ] || return 0
+  if [ -r /proc/self/environ ]; then
+    for p in /proc/[0-9]*; do
+      pid="${p#/proc/}"
+      if [ "$pid" = "$$" ] || [ "$pid" = "$BASHPID" ]; then continue; fi
+      _environ_has_marker "$id" "$p/environ" && echo "$pid"
+    done
+  else
+    ps -Eww -A -o pid= -o command= 2>/dev/null | while IFS= read -r line; do
+      case "$line" in *"ODONIAN_DISPATCH_ID=$id"*) ;; *) continue ;; esac
+      line="${line#"${line%%[![:space:]]*}"}"; pid="${line%%[[:space:]]*}"
+      if [ "$pid" = "$$" ] || [ "$pid" = "$BASHPID" ]; then continue; fi
+      echo "$pid"
+    done
+  fi
+  return 0
+}
+
+# First 120 characters of process $1's command line, secrets redacted (never its environment).
+_proc_cmd() {
+  local cmd
+  if [ -r "/proc/$1/cmdline" ]; then cmd="$(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null)"
+  else cmd="$(ps -ww -p "$1" -o command= 2>/dev/null)"
+  fi
+  cmd="$(redact_secrets "$cmd")"
+  printf '%s' "${cmd:0:120}"
+}
+
+# Kill every process carrying dispatch marker $1 and log what was reaped. Always returns 0.
+reap_dispatch_procs() {
+  local id="$1" pids pid n i round
+  local -a found
+  [ -n "$id" ] || return 0
+  pids="$(list_dispatch_pids "$id")"
+  [ -n "$pids" ] || return 0
+  # shellcheck disable=SC2206
+  found=($pids)
+  n=${#found[@]}
+  echo "[$AGENT_ID] $(date '+%H:%M:%S') reaping $n process(es) left behind by the dispatch:" >&2
+  for pid in "${found[@]}"; do echo "[$AGENT_ID]   pid $pid: $(_proc_cmd "$pid")" >&2; done
+  kill -TERM "${found[@]}" 2>/dev/null || true
+  for ((i = 0; i < 20; i++)); do
+    pids="$(list_dispatch_pids "$id")"
+    [ -n "$pids" ] || return 0
+    sleep 0.1
+  done
+  for round in 1 2 3 4 5; do
+    pids="$(list_dispatch_pids "$id")"
+    [ -n "$pids" ] || return 0
+    # shellcheck disable=SC2086
+    kill -KILL $pids 2>/dev/null || true
+    sleep 0.2
+  done
+  pids="$(list_dispatch_pids "$id")"
+  [ -z "$pids" ] || echo "[$AGENT_ID] $(date '+%H:%M:%S') could not reap: $(echo $pids)" >&2
+  return 0
 }
 
 # Run one claude task, shielded from Ctrl-C, waiting until it truly finishes. Captures claude's
@@ -892,6 +977,7 @@ dispatch() {
     fi
   fi
 
+  DISPATCH_ID="$(new_uuid)"
   while :; do
     sessions=$((sessions + 1))
     if [ "$recover" -eq 1 ]; then
@@ -955,6 +1041,10 @@ dispatch() {
     echo "[$AGENT_ID] $(date '+%H:%M:%S') task ${task:0:8} still in_progress after session $sessions; resuming ($resumes/$max_resumes)" >&2
   done
   [ -n "$rcdir" ] && rm -rf "$rcdir"
+  # The model and every resume are done: nothing the dispatch started may outlive it (success,
+  # failure, stop request alike) or the next dispatch inherits its CPU load and its heartbeat loops.
+  reap_dispatch_procs "$DISPATCH_ID"
+  DISPATCH_ID=""
   unset ODONIAN_PRECLAIMED_TASK_ID ODONIAN_PRECLAIMED_ATTEMPT_ID ODONIAN_SELECTED_TASK_ID
   # Finalize the research permit exactly once, now that the process is truly gone (never earlier:
   # a submit ends task ownership, not the dispatch). rc 126/127 = the model binary could not be
@@ -992,6 +1082,9 @@ cleanup() {
   # request_stop TERMs it on the graceful path.)
   [ -n "$CLAUDE_PID" ] && kill -KILL "-$CLAUDE_PID" 2>/dev/null || true
   [ -n "$MON_PID" ] && kill -KILL "-$MON_PID" 2>/dev/null || true
+  # ...and whatever else the in-flight dispatch started (a SIGKILL of the model's group misses
+  # background work in other process groups).
+  [ -n "$DISPATCH_ID" ] && reap_dispatch_procs "$DISPATCH_ID"
   # Same backstop for an admitted research permit that never reached its normal finalization (an exit
   # between admission and dispatch, or mid-dispatch): the process is gone/killed, so release the slot.
   [ -n "$P_TASK" ] && finalize_permit cancelled
