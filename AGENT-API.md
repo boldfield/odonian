@@ -572,6 +572,25 @@ transient admission deferral (which may succeed on retry) from fatal conflicts:
 - `agent_merge` defaults to `false` and is immutable.
 - Review tasks are auto-spawned only — never create them directly.
 
+## Updating a task: `PATCH /tasks/{id}`
+
+A partial update. Present fields are applied, absent fields are left unchanged, and fields that
+cannot be changed here are rejected, so a `200` always means every field you sent took effect.
+
+```bash
+curl -X PATCH -H "Authorization: Bearer $ODONIAN_TOKEN" -H 'Content-Type: application/json' \
+  "$ODONIAN_URL/tasks/<id>" -d '{"depends_on":["<dep-id>"]}'
+```
+
+- `depends_on` absent: edges unchanged. `depends_on` an array of full task ids: replaces the whole
+  list (`[]` clears it, intentionally). `depends_on: null` or a non-array: `400` (null never means clear).
+- Any other field (`spec`, `title`, `state`, unknown names): `400 FIELD_NOT_UPDATABLE` naming the
+  field; nothing is changed, even if `depends_on` was sent alongside. Specs are immutable after
+  creation; state changes go through `/transition`.
+- `{}` is a `200` no-op that returns the task unchanged.
+- Response: `200` with the updated task, including `depends_on`.
+- Other errors: `400 SELF_DEPENDENCY`, `409 CYCLE_DETECTED`, `404 NOT_FOUND`.
+
 ## Blocked or failed
 
 If the spec is ambiguous/wrong, a dependency is broken, or the task can't be done as specified,
