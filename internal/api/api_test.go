@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -10709,5 +10710,121 @@ func TestRenewResearchPermitWithExpiredLease(t *testing.T) {
 				t.Errorf("expected error code ATTEMPT_EXPIRED, got %s", code)
 			}
 		}
+	}
+}
+
+// patchTestTasks creates n tasks in a fresh project and returns their ids.
+func patchTestTasks(t *testing.T, server *Server, authHeader string, n int) []string {
+	t.Helper()
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+	var inputs []store.TaskInput
+	for i := 0; i < n; i++ {
+		inputs = append(inputs, store.TaskInput{Title: fmt.Sprintf("Task %d", i), Spec: fmt.Sprintf("spec %d", i), DocumentID: docID})
+	}
+	body, _ := json.Marshal(inputs)
+	req := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	var created []store.Task
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil || len(created) != n {
+		t.Fatalf("failed to create tasks: %v (%d)", err, len(created))
+	}
+	ids := make([]string, n)
+	for i, c := range created {
+		ids[i] = c.ID
+	}
+	return ids
+}
+
+func patchTask(server *Server, authHeader, id, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("PATCH", "/tasks/"+id, strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	return w
+}
+
+func storedTask(t *testing.T, server *Server, id string) store.TaskWithDepsAndLinks {
+	t.Helper()
+	task, err := server.store.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	return task
+}
+
+// TestPatchTaskPartialUpdateContract verifies absent fields are unchanged and unsupported fields are rejected.
+func TestPatchTaskPartialUpdateContract(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	auth := "Bearer test-token"
+	ids := patchTestTasks(t, server, auth, 3)
+	a, b, c := ids[0], ids[1], ids[2]
+
+	w := patchTask(server, auth, c, fmt.Sprintf(`{"depends_on":[%q,%q]}`, a, b))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(resp.DependsOn, []string{a, b}) && !reflect.DeepEqual(resp.DependsOn, []string{b, a}) {
+		t.Fatalf("response depends_on = %v, want [a b]", resp.DependsOn)
+	}
+	before := storedTask(t, server, c)
+	if len(before.DependsOn) != 2 {
+		t.Fatalf("stored depends_on = %v, want 2 edges", before.DependsOn)
+	}
+
+	cases := []struct {
+		name, body, wantField string
+		wantStatus            int
+	}{
+		{"empty object is a no-op", `{}`, "", http.StatusOK},
+		{"spec rejected", `{"spec":"x"}`, "spec", http.StatusBadRequest},
+		{"spec with depends_on rejected", fmt.Sprintf(`{"depends_on":[%q],"spec":"x"}`, a), "spec", http.StatusBadRequest},
+		{"title rejected", `{"title":"x"}`, "title", http.StatusBadRequest},
+		{"state rejected", `{"state":"done"}`, "state", http.StatusBadRequest},
+		{"unknown field rejected", `{"bogus":1}`, "bogus", http.StatusBadRequest},
+		{"null depends_on rejected", `{"depends_on":null}`, "", http.StatusBadRequest},
+		{"non-array depends_on rejected", `{"depends_on":"x"}`, "", http.StatusBadRequest},
+		{"non-object body rejected", `null`, "", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := patchTask(server, auth, c, tc.body)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("expected %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			if tc.wantField != "" && !strings.Contains(w.Body.String(), tc.wantField) {
+				t.Errorf("error does not name %q: %s", tc.wantField, w.Body.String())
+			}
+			after := storedTask(t, server, c)
+			if !reflect.DeepEqual(after.DependsOn, before.DependsOn) {
+				t.Errorf("edges changed: before %v after %v", before.DependsOn, after.DependsOn)
+			}
+			if after.Spec != before.Spec || after.Title != before.Title || after.State != before.State {
+				t.Errorf("task fields changed: before %+v after %+v", before, after)
+			}
+			if tc.wantStatus == http.StatusOK {
+				var got store.TaskWithDepsAndLinks
+				json.NewDecoder(w.Body).Decode(&got)
+				if got.ID != c || len(got.DependsOn) != 2 {
+					t.Errorf("no-op response = id %q depends_on %v", got.ID, got.DependsOn)
+				}
+			}
+		})
+	}
+
+	// Empty array clears the list.
+	w = patchTask(server, auth, c, `{"depends_on":[]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := storedTask(t, server, c).DependsOn; len(got) != 0 {
+		t.Errorf("depends_on not cleared: %v", got)
 	}
 }

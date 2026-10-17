@@ -1398,8 +1398,9 @@ See [event retention configuration](./configuration.md#server-odonian-server).
 
 #### `PATCH /tasks/{id}`
 
-Replace the task's complete dependency list. This endpoint currently updates only dependencies;
-it does not edit the title, spec, model, or other task fields.
+Partial update of a task. Present fields are applied and absent fields are left unchanged. Only
+`depends_on` is updatable; any other field (`spec`, `title`, `state`, unknown names) returns
+`400 FIELD_NOT_UPDATABLE` naming it and changes nothing.
 
 ```bash
 curl -X PATCH -H "Authorization: Bearer token" -H 'Content-Type: application/json' \
@@ -1408,15 +1409,12 @@ curl -X PATCH -H "Authorization: Bearer token" -H 'Content-Type: application/jso
 ```
 
 Use full existing task UUIDs inside `depends_on`; the URL's task ID can be a unique prefix.
-`{"depends_on":[]}` clears dependencies; omitting `depends_on`
-or setting it to `null` also clears the list. Unknown JSON fields are ignored, so sending only
-an unsupported field would clear dependencies too. Send an explicit `depends_on` array.
+An array replaces the whole list and `[]` clears it. Omitting `depends_on` leaves edges unchanged,
+`{}` is a no-op, and `depends_on: null` (or a non-array) returns `400 INVALID_DEPENDS_ON`.
 
-**Response:** `200 OK` with the task object. Fetch `GET /tasks/{id}` to read back `depends_on`;
-the PATCH response does not include the dependency list. Errors include `400 SELF_DEPENDENCY`,
-`400 JSON_DECODE_ERROR`, `409 CYCLE_DETECTED`, and `404 NOT_FOUND` for a missing task with an
-empty replacement list. Invalid dependency IDs, duplicates, or other storage failures currently
-return `500 UPDATE_ERROR`.
+**Response:** `200 OK` with the updated task, including `depends_on`. Errors include
+`400 SELF_DEPENDENCY`, `400 JSON_DECODE_ERROR`, `409 CYCLE_DETECTED`, and `404 NOT_FOUND`. Invalid
+dependency IDs, duplicates, or other storage failures currently return `500 UPDATE_ERROR`.
 
 #### `PATCH /tasks/{id}/escalation`
 

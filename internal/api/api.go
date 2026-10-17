@@ -1130,50 +1130,101 @@ func (s *Server) handleSupersede(w http.ResponseWriter, r *http.Request) {
 	s.encodeJSON(w, http.StatusCreated, task)
 }
 
-// handleUpdateTask handles PATCH /tasks/{id} to update a task's dependencies.
+// handleUpdateTask handles PATCH /tasks/{id} as a partial update. Present fields are applied,
+// absent fields are left unchanged, and any field this endpoint cannot change is rejected with a
+// 400 naming it (nothing is applied), so a 200 always means every sent field took effect.
+// To make another field patchable, add it to patchableTaskFields and apply it below only when present.
 func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	taskID, ok := s.resolveTaskID(w, r)
 	if !ok {
 		return
 	}
 
-	var payload struct {
-		DependsOn []string `json:"depends_on"`
-	}
-
-	if err := s.decodeJSON(w, r, &payload); err != nil {
-		return // decodeJSON already wrote error response
-	}
-
-	// Update the task's dependencies
-	task, err := s.store.UpdateTaskDependsOn(r.Context(), taskID, payload.DependsOn)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		// Check if it's a ValidationError
-		var validationErr *store.ValidationError
-		if errors.As(err, &validationErr) {
-			s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
+		s.errorResponse(w, http.StatusBadRequest, "READ_ERROR", "Failed to read request body")
+		return
+	}
+	// Decode into raw values so absent, null and [] stay distinguishable.
+	var fields map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&fields); err != nil || fields == nil {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Request body must be a JSON object")
+		return
+	}
+	if dec.Decode(new(interface{})) != io.EOF {
+		s.errorResponse(w, http.StatusBadRequest, "JSON_DECODE_ERROR", "Trailing data after JSON object")
+		return
+	}
+
+	var unsupported []string
+	for name := range fields {
+		if !patchableTaskFields[name] {
+			unsupported = append(unsupported, name)
+		}
+	}
+	if len(unsupported) > 0 {
+		sort.Strings(unsupported)
+		s.errorResponse(w, http.StatusBadRequest, "FIELD_NOT_UPDATABLE",
+			"Field(s) cannot be changed through PATCH /tasks/{id}: "+strings.Join(unsupported, ", ")+
+				" (only depends_on is updatable; task specs are immutable and state changes use /transition)")
+		return
+	}
+
+	if raw, present := fields["depends_on"]; present {
+		var deps []string
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_DEPENDS_ON", "depends_on must be an array; null does not clear dependencies (send [])")
 			return
 		}
-		// Check for ConflictError with specific code
-		var conflictErr *store.ConflictError
-		if errors.As(err, &conflictErr) {
-			s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+		if err := json.Unmarshal(raw, &deps); err != nil {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_DEPENDS_ON", "depends_on must be an array of task ids")
 			return
 		}
+		if deps == nil {
+			deps = []string{}
+		}
+		if _, err := s.store.UpdateTaskDependsOn(r.Context(), taskID, deps); err != nil {
+			// Check if it's a ValidationError
+			var validationErr *store.ValidationError
+			if errors.As(err, &validationErr) {
+				s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
+				return
+			}
+			// Check for ConflictError with specific code
+			var conflictErr *store.ConflictError
+			if errors.As(err, &conflictErr) {
+				s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+				return
+			}
+			if errors.Is(err, store.ErrNotFound) {
+				s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+				return
+			}
+			if errors.Is(err, store.ErrConflict) {
+				s.errorResponse(w, http.StatusConflict, "CONFLICT", "Failed to update dependencies")
+				return
+			}
+			s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
+			return
+		}
+	}
+
+	// Respond with the task as stored (including depends_on) so callers can confirm the write.
+	task, err := s.store.GetTask(r.Context(), taskID)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 			return
 		}
-		if errors.Is(err, store.ErrConflict) {
-			s.errorResponse(w, http.StatusConflict, "CONFLICT", "Failed to update dependencies")
-			return
-		}
-		s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
+		s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to load updated task")
 		return
 	}
-
 	s.encodeJSON(w, http.StatusOK, task)
 }
+
+// patchableTaskFields is the set of body fields PATCH /tasks/{id} accepts.
+var patchableTaskFields = map[string]bool{"depends_on": true}
 
 // handleUpdateEscalation handles PATCH /tasks/{id}/escalation to update a task's escalation policy.
 func (s *Server) handleUpdateEscalation(w http.ResponseWriter, r *http.Request) {
