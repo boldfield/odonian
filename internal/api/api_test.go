@@ -10711,3 +10711,80 @@ func TestRenewResearchPermitWithExpiredLease(t *testing.T) {
 		}
 	}
 }
+
+// TestUpdateTaskRejectsBodiesWithoutDependsOn verifies PATCH /tasks/{id} never silently clears edges.
+func TestUpdateTaskRejectsBodiesWithoutDependsOn(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	tasks, _ := json.Marshal([]store.TaskInput{
+		{Title: "A", Spec: "a", DocumentID: docID},
+		{Title: "B", Spec: "b", DocumentID: docID},
+		{Title: "C", Spec: "c", DocumentID: docID},
+	})
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(tasks))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	var created []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil || len(created) != 3 {
+		t.Fatalf("create failed: %v %s", err, createW.Body.String())
+	}
+	a, b, c := created[0].ID, created[1].ID, created[2].ID
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("PATCH", "/tasks/"+c, bytes.NewReader([]byte(body)))
+		req.Header.Set("Authorization", authHeader)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+		return w
+	}
+	read := func() store.TaskWithDepsAndLinks {
+		got, err := server.store.GetTask(context.Background(), c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	w := patch(`{"depends_on":["` + a + `","` + b + `"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		DependsOn []string `json:"depends_on"`
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if len(resp.DependsOn) != 2 {
+		t.Fatalf("expected response depends_on of 2, got %v", resp.DependsOn)
+	}
+
+	before := read()
+	if len(before.DependsOn) != 2 {
+		t.Fatalf("expected 2 edges, got %v", before.DependsOn)
+	}
+	for _, body := range []string{
+		`{"spec":"x"}`,
+		`{}`,
+		`{"depends_on":["` + a + `"],"spec":"x"}`,
+	} {
+		if w := patch(body); w.Code != http.StatusBadRequest {
+			t.Errorf("body %s: expected 400, got %d: %s", body, w.Code, w.Body.String())
+		}
+		after := read()
+		if len(after.DependsOn) != 2 || after.Spec != before.Spec {
+			t.Errorf("body %s changed task: deps=%v spec=%q", body, after.DependsOn, after.Spec)
+		}
+	}
+
+	w = patch(`{"depends_on":[]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on clear, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := read(); len(got.DependsOn) != 0 {
+		t.Errorf("expected edges cleared, got %v", got.DependsOn)
+	}
+}
