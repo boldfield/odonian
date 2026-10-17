@@ -572,6 +572,20 @@ transient admission deferral (which may succeed on retry) from fatal conflicts:
 - `agent_merge` defaults to `false` and is immutable.
 - Review tasks are auto-spawned only — never create them directly.
 
+## Updating task dependencies (`PATCH /tasks/{id}`)
+
+```json
+{ "depends_on": ["<task-id>", "..."] }
+```
+
+- `depends_on` is the only accepted field and is required. It **replaces the full list** of
+  dependency edges; `"depends_on": []` clears them. Send the complete desired list, not a delta.
+- Any other field (`spec`, `title`, ...) or a body without `depends_on` is rejected with `400`
+  (`JSON_DECODE_ERROR` / `MISSING_DEPENDS_ON`) and nothing changes.
+- A self-dependency returns `400 SELF_DEPENDENCY`; a cycle returns `409 CYCLE_DETECTED`.
+- The `200` response is the updated task including `depends_on`.
+- Task specs are immutable after creation. To amend instructions, add a transition note.
+
 ## Blocked or failed
 
 If the spec is ambiguous/wrong, a dependency is broken, or the task can't be done as specified,

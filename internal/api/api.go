@@ -1130,7 +1130,8 @@ func (s *Server) handleSupersede(w http.ResponseWriter, r *http.Request) {
 	s.encodeJSON(w, http.StatusCreated, task)
 }
 
-// handleUpdateTask handles PATCH /tasks/{id} to update a task's dependencies.
+// handleUpdateTask handles PATCH /tasks/{id} to replace a task's dependencies. depends_on is the
+// only accepted field and is required: omitting it would otherwise silently clear every edge.
 func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	taskID, ok := s.resolveTaskID(w, r)
 	if !ok {
@@ -1138,15 +1139,23 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload struct {
-		DependsOn []string `json:"depends_on"`
+		DependsOn *[]string `json:"depends_on"`
 	}
 
-	if err := s.decodeJSON(w, r, &payload); err != nil {
-		return // decodeJSON already wrote error response
+	if err := s.decodeJSONStrict(w, r, &payload); err != nil {
+		return // decodeJSONStrict already wrote error response
+	}
+	if payload.DependsOn == nil {
+		s.errorResponse(w, http.StatusBadRequest, "MISSING_DEPENDS_ON", "depends_on is required; send [] to clear dependencies")
+		return
+	}
+	depIDs := *payload.DependsOn
+	if depIDs == nil {
+		depIDs = []string{}
 	}
 
 	// Update the task's dependencies
-	task, err := s.store.UpdateTaskDependsOn(r.Context(), taskID, payload.DependsOn)
+	_, err := s.store.UpdateTaskDependsOn(r.Context(), taskID, depIDs)
 	if err != nil {
 		// Check if it's a ValidationError
 		var validationErr *store.ValidationError
@@ -1172,6 +1181,12 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Return the task including depends_on so callers can confirm the write.
+	task, err := s.store.GetTask(r.Context(), taskID)
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to load updated task")
+		return
+	}
 	s.encodeJSON(w, http.StatusOK, task)
 }
 
