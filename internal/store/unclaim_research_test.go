@@ -69,3 +69,25 @@ func TestUnclaimResearchFinalizesLiveAttempt(t *testing.T) {
 	// the freed slot is claimable at once (concurrency limit is 1)
 	f.mustClaim("r2", id, "agent-b")
 }
+
+func TestUnclaimResearchRequiresLiveAttemptID(t *testing.T) {
+	f := newClaimFixture(t, claimPolicy(policy.ModeEnforce, 5, 5, 0))
+	id := f.research()
+	res := f.mustClaim("r1", id, "agent-a")
+
+	_, err := f.s.UnclaimTask(f.ctx, id, "agent-a", "no attempt")
+	var ce *ConflictError
+	if !errors.As(err, &ce) || ce.Code != "ATTEMPT_FENCED" {
+		t.Fatalf("omitted attempt: %v, want ATTEMPT_FENCED", err)
+	}
+	_, err = f.s.UnclaimTask(WithResearchAttempt(f.ctx, "not-an-attempt"), id, "agent-a", "bogus")
+	if !errors.As(err, &ce) || ce.Code != "ATTEMPT_FENCED" {
+		t.Fatalf("non-live attempt: %v, want ATTEMPT_FENCED", err)
+	}
+	if tk := f.get(id); tk.State != "in_progress" || tk.Assignee == nil {
+		t.Fatalf("task changed: %+v", tk)
+	}
+	if n := f.count(`SELECT COUNT(*) FROM research_attempt WHERE id = ? AND state = 'active'`, res.Grant.Attempt.ID); n != 1 {
+		t.Fatalf("live attempt no longer active")
+	}
+}

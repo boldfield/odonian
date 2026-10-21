@@ -960,7 +960,7 @@ Hand a claimed task back to `ready`, for example when a dispatch fails before an
 }
 ```
 
-`agent_id` must match the assignee, `reason` is required, and for a research task `attempt_id` must be the live attempt (else `409 ATTEMPT_FENCED`). The `odonian unclaim <id> [--attempt <id>] --reason <text>` CLI sends the attempt saved by `claim`.
+`agent_id` must match the assignee, `reason` is required, and for a research task `attempt_id` is required and must be the live attempt (else `409 ATTEMPT_FENCED`, nothing changes). Implement, review and merge tasks can all be unclaimed; a task with an open PR link, or a non-review task with a submitted round, cannot (a review task's `review_round` labels the round it reviews and does not block it). The `odonian unclaim <id> [--attempt <id>] --reason <text>` CLI sends the attempt saved by `claim`.
 
 **Effect (one transaction):** state becomes `ready`; assignee and lease are cleared; a `claim_released` event records agent, attempt and reason. Dependencies, review round, priority, `escalate` and `agent_merge` are unchanged, and no review, rework or escalation counter moves. A live research attempt is finalized as `cancelled` in the same transaction; the pool debit follows the existing rule that uncertain outcomes are never refunded.
 

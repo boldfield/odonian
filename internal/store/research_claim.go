@@ -520,8 +520,10 @@ func (s *sqliteStore) GetResearchAdmissionDiagnostic(ctx context.Context, taskID
 // recording agent, attempt and reason. Review round, priority, dependencies,
 // escalate and agent_merge are untouched. A finalized attempt is never
 // refunded: the pool debit follows the existing rule for uncertain outcomes.
-// A research attempt ID in ctx (WithResearchAttempt) must be the task's
-// current attempt for this agent (ATTEMPT_FENCED otherwise).
+// For a task with a research permit the attempt ID in ctx (WithResearchAttempt)
+// is required and must be the task's current attempt for this agent
+// (ATTEMPT_FENCED otherwise). Review and merge tasks can be unclaimed;
+// a task with a PR link, or a non-review task with a submitted round, cannot.
 // Returns ErrNotFound if the task doesn't exist, and ErrConflict if it is not
 // in_progress under agentID, or already has a submitted round or a PR.
 func (s *sqliteStore) UnclaimTask(ctx context.Context, taskID, agentID, reason string) (Task, error) {
@@ -535,7 +537,8 @@ func (s *sqliteStore) UnclaimTask(ctx context.Context, taskID, agentID, reason s
 	var state string
 	var assignee *string
 	var round int
-	err = tx.QueryRowContext(ctx, `SELECT state, assignee, review_round FROM task WHERE id = ?`, taskID).Scan(&state, &assignee, &round)
+	var kind string
+	err = tx.QueryRowContext(ctx, `SELECT state, assignee, review_round, kind FROM task WHERE id = ?`, taskID).Scan(&state, &assignee, &round, &kind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Task{}, ErrNotFound
 	}
@@ -549,7 +552,9 @@ func (s *sqliteStore) UnclaimTask(ctx context.Context, taskID, agentID, reason s
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_link WHERE task_id = ? AND kind = 'pr' AND tombstoned_at IS NULL`, taskID).Scan(&prs); err != nil {
 		return Task{}, fmt.Errorf("failed to check task links: %w", err)
 	}
-	if prs > 0 || round > 0 {
+	// A review task's review_round labels the round it reviews, not a
+	// submission by the task itself, so only other kinds are refused on it.
+	if prs > 0 || (round > 0 && kind != "review") {
 		return Task{}, conflict("HAS_SUBMISSION", "task has a submitted round or an open PR and cannot be unclaimed")
 	}
 
@@ -563,6 +568,9 @@ func (s *sqliteStore) UnclaimTask(ctx context.Context, taskID, agentID, reason s
 	}
 	var recorded *string
 	if found && permit.AgentID == agentID {
+		if attemptID == "" {
+			return Task{}, conflict("ATTEMPT_FENCED", "a research task can only be unclaimed with its live attempt ID")
+		}
 		recorded = &attempt.ID
 		if attempt.State == AttemptActive {
 			started, err := parseTS(attempt.StartedAt)

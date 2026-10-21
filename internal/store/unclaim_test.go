@@ -94,3 +94,36 @@ func TestUnclaimTaskRefusedInReview(t *testing.T) {
 		t.Fatalf("task in review: want ErrConflict, got %v", err)
 	}
 }
+
+func TestUnclaimReviewTask(t *testing.T) {
+	st, id := unclaimFixture(t)
+	ctx := context.Background()
+	if _, err := st.Conn().ExecContext(ctx, `UPDATE task SET kind = 'review', review_round = 1, target_task_id = ? WHERE id = ?`, id, id); err != nil {
+		t.Fatalf("set kind: %v", err)
+	}
+	if _, err := st.ClaimTask(ctx, id, "rev-1", "haiku", time.Minute); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	task, err := st.UnclaimTask(ctx, id, "rev-1", "session limit")
+	if err != nil {
+		t.Fatalf("unclaim: %v", err)
+	}
+	if task.State != "ready" || task.Assignee != nil || task.ReviewRound != 1 || task.TargetTaskID == nil || *task.TargetTaskID != id {
+		t.Fatalf("unexpected review task after unclaim: %+v", task)
+	}
+}
+
+func TestUnclaimMergeTaskWithoutRound(t *testing.T) {
+	st, id := unclaimFixture(t)
+	ctx := context.Background()
+	if _, err := st.Conn().ExecContext(ctx, `UPDATE task SET kind = 'merge' WHERE id = ?`, id); err != nil {
+		t.Fatalf("set kind: %v", err)
+	}
+	if _, err := st.ClaimTask(ctx, id, "m-1", "haiku", time.Minute); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	task, err := st.UnclaimTask(ctx, id, "m-1", "r")
+	if err != nil || task.State != "ready" {
+		t.Fatalf("merge unclaim: %+v %v", task, err)
+	}
+}

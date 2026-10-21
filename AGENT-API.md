@@ -90,7 +90,7 @@ If you claimed but cannot do the work (for example the model account hit a limit
 instead of letting the lease run out: `odonian unclaim "$TASK_ID" --reason "<why>"`
 (`POST /tasks/$TASK_ID/unclaim` with `agent_id`, `attempt_id` for research, and `reason`). Only the owner
 may; the task returns to `ready` with nothing counted against it. A task with a submitted round or open PR
-answers 409.
+answers 409. Review and merge tasks can be handed back too; a research task requires its live `attempt_id`.
 
 ### 6. Sync with main, then verify
 
