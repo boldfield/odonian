@@ -420,13 +420,13 @@ model_unavailable() {
 }
 
 # Classify CLI output (file $1): echo "limit", "signin" or "other". Never echoes the output itself.
-# Only the CLI's own terminal message counts: the last few lines, with each pattern anchored to the
-# captured message forms (optional "Error:"/"ERROR:" prefix). Transcript lines that merely quote such
-# text (tool output, a grep of this repo) are not at a line start and are not in the tail.
+# Only the CLI's own terminal message counts: the last non-empty line, with each pattern anchored to
+# the captured message forms (optional "Error:"/"ERROR:" prefix). Earlier transcript lines, even ones
+# that quote such text verbatim (tool output, a grep of this repo), never classify the failure.
 classify_dispatch_failure() {
   local f="$1" tailf
   [ -s "$f" ] || { echo other; return 0; }
-  tailf="$(tail -n 6 "$f" 2>/dev/null)"
+  tailf="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 1)"
   local pre='^[[:space:]]*((API )?Error:?|ERROR:?)?[[:space:]]*'
   if printf '%s\n' "$tailf" | grep -Eiq "${pre}(you'?ve|you have) hit your ([a-z0-9-]+ )?(usage |session |weekly )?limit"; then
     echo limit
@@ -1065,6 +1065,7 @@ dispatch() {
   # classified: usage limit / sign-in failure / other.
   rcdir="$(mktemp -d "${TMPDIR:-/tmp}/odonian-session.XXXXXX")"
   out="$rcdir/out"; err="$rcdir/err"
+  : >"$out"; : >"$err"   # exist before tail -f opens them, or a fast tail loses the session's output
   DISPATCH_ID="$(new_uuid)"
   while :; do
     sessions=$((sessions + 1))
@@ -1139,7 +1140,7 @@ dispatch() {
   done
   local fail_class=other fail_reset=""
   if [ "$rc" -ne 0 ]; then
-    cat "$out" "$err" 2>/dev/null | tail -n 6 > "$rcdir/all"
+    cat "$out" "$err" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1 > "$rcdir/all"
     fail_class="$(classify_dispatch_failure "$rcdir/all")"
     [ "$fail_class" = limit ] && fail_reset="$(parse_reset_epoch "$rcdir/all")"
   fi

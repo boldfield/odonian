@@ -110,15 +110,18 @@ check "logged as a sign-in failure, not a usage limit" '! grep -q "account opena
 echo "Unparseable limit falls back to escalating backoff"
 run_scenario "$TMP/unparseable" - 4
 check "backoff window of tens of seconds, not a reset" 'grep -q "usage limit with no parseable reset" "$TMP/agent.log"'
+printf 'You have hit your usage limit. Upgrade or try again at Dec 28th, 2099 6:32 AM.\nERROR: stream disconnected\n' > "$TMP/quoted_exact"
 
 echo "Quoted text in the transcript is not a classification"
 run_scenario - "$TMP/quoted_401" 4 "$CODEX_TASKS"
 check "quoted 401 is not a sign-in failure" '! grep -q "SIGN-IN FAILED" "$TMP/agent.log" && grep -q "dispatch failure (consecutive" "$TMP/agent.log"'
 run_scenario - "$TMP/quoted_limit" 4 "$CODEX_TASKS"
 check "quoted limit line is not a usage limit" '! grep -q "usage limit" "$TMP/agent.log" && grep -q "dispatch failure (consecutive" "$TMP/agent.log"'
+run_scenario - "$TMP/quoted_exact" 4 "$CODEX_TASKS"
+check "verbatim limit text in tool output is not a usage limit" '! grep -q "account openai unavailable (usage limit" "$TMP/agent.log" && grep -q "account openai unavailable (dispatch failure" "$TMP/agent.log"'
 
 echo "Non-recover dispatch output reaches the log"
-run_scenario "$TMP/claude_limit" - 3
+ODONIAN_SESSION_RECOVERY=off run_scenario "$TMP/claude_limit" - 3
 check "the model's message is in the agent log" 'grep -q "hit your session limit" "$TMP/agent.log"'
 
 echo
