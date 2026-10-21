@@ -10846,6 +10846,16 @@ func TestUnclaimHandsTaskBackToReady(t *testing.T) {
 
 	if w := postUnclaim(server, authHeader, taskID, map[string]string{"agent_id": "other-agent", "reason": "x"}); w.Code != http.StatusConflict {
 		t.Fatalf("non-owner: expected 409, got %d", w.Code)
+	} else {
+		var e struct {
+			Error struct {
+				State string `json:"state"`
+			} `json:"error"`
+		}
+		json.NewDecoder(w.Body).Decode(&e)
+		if e.Error.State != "in_progress" {
+			t.Fatalf("non-owner 409 should carry current state in_progress, got %q", e.Error.State)
+		}
 	}
 	if w := postUnclaim(server, authHeader, taskID, map[string]string{"agent_id": "agent-1"}); w.Code != http.StatusBadRequest {
 		t.Fatalf("missing reason: expected 400, got %d", w.Code)
@@ -10875,5 +10885,15 @@ func TestUnclaimHandsTaskBackToReady(t *testing.T) {
 	}
 	if w := postUnclaim(server, authHeader, taskID, map[string]string{"agent_id": task.Assignee, "reason": "again"}); w.Code != http.StatusConflict {
 		t.Fatalf("repeat: expected 409, got %d", w.Code)
+	} else {
+		var e struct {
+			Error struct {
+				State string `json:"state"`
+			} `json:"error"`
+		}
+		json.NewDecoder(w.Body).Decode(&e)
+		if e.Error.State != "ready" {
+			t.Fatalf("repeat 409 should carry current state ready, got %q", e.Error.State)
+		}
 	}
 }

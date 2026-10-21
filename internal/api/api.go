@@ -944,11 +944,22 @@ func (s *Server) handleUnclaimTask(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
 		return
 	}
-	if s.attemptConflict(w, err) {
-		return
-	}
-	if errors.Is(err, store.ErrConflict) {
-		s.errorResponse(w, http.StatusConflict, "CONFLICT", "Task is not in_progress or not assigned to this agent")
+	var conflictErr *store.ConflictError
+	if errors.As(err, &conflictErr) || errors.Is(err, store.ErrConflict) {
+		code, msg := "CONFLICT", "Task is not in_progress or not assigned to this agent"
+		if conflictErr != nil {
+			code, msg = conflictErr.Code, conflictErr.Message
+		}
+		// Report where the task stands now so the caller can tell "already handed back"
+		// from "someone else owns it" from "in review".
+		resp := map[string]any{"code": code, "message": msg}
+		if cur, gerr := s.store.GetTask(r.Context(), taskID); gerr == nil {
+			resp["state"] = cur.State
+			resp["assignee"] = cur.Assignee
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{"error": resp})
 		return
 	}
 	if err != nil {

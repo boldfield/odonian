@@ -970,7 +970,7 @@ Hand a claimed task back to `ready`, for example when a dispatch fails before an
 - `200 OK`: the claim was handed back
 - `400 Bad Request`: empty `agent_id` or `reason`
 - `404 Not Found`: no such task
-- `409 Conflict`: the task is not `in_progress` under this agent (this includes a repeat unclaim), the attempt is not current, or the task has a submitted round or an open PR (`review` state); nothing changes
+- `409 Conflict`: the task is not `in_progress` under this agent (this includes a repeat unclaim), the attempt is not current, or the task has a submitted round or an open PR (`review` state); nothing changes. The error body also carries the task's current `state` and `assignee`, so the caller can tell "already handed back" (`ready`) from "someone else owns it" (`in_progress`) from "in review"
 
 ---
 

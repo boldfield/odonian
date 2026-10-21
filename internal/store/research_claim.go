@@ -569,11 +569,22 @@ func (s *sqliteStore) UnclaimTask(ctx context.Context, taskID, agentID, reason s
 			if err != nil {
 				return Task{}, fmt.Errorf("invalid attempt timestamp: %w", err)
 			}
-			dur := max(nowT.Sub(started).Milliseconds(), 0)
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE research_attempt SET state='finalized', ended_at=?, exit_class=?, duration_ms=?
-				WHERE id = ? AND state = 'active'`, formatTS(nowT), ExitCancelled, dur, attempt.ID); err != nil {
-				return Task{}, fmt.Errorf("failed to finalize research attempt: %w", err)
+			expires, err := parseTS(attempt.ExpiresAt)
+			if err != nil {
+				return Task{}, fmt.Errorf("invalid attempt timestamp: %w", err)
+			}
+			if !expires.After(nowT) {
+				// Overdue: account for it as lease expiry, as FinalizeResearchAttempt does.
+				if err := expireAttempt(ctx, tx, attempt); err != nil {
+					return Task{}, err
+				}
+			} else {
+				dur := max(nowT.Sub(started).Milliseconds(), 0)
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE research_attempt SET state='finalized', ended_at=?, exit_class=?, duration_ms=?
+					WHERE id = ? AND state = 'active'`, formatTS(nowT), ExitCancelled, dur, attempt.ID); err != nil {
+					return Task{}, fmt.Errorf("failed to finalize research attempt: %w", err)
+				}
 			}
 		}
 	}
