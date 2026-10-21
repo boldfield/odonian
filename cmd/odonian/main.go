@@ -173,7 +173,7 @@ func run(args []string) error {
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
-	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize", "priority":
+	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "unclaim", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize", "priority":
 		return runClient(args[1], args[2:])
 	default:
 		if evaluationVerbs[args[1]] {
@@ -207,6 +207,7 @@ Commands:
   claim                  Claim a task
   submit                 Submit a task for review
   heartbeat              Extend task lease
+  unclaim                Hand a claimed task back to ready
   next                   Find and optionally claim next claimable task
   promote                Promote a task from backlog to ready
   transition             Transition a task to a new state
@@ -501,6 +502,8 @@ func runClient(verb string, args []string) error {
 		return executeSubmit(ctx, baseURL, token, args)
 	case "heartbeat":
 		return executeHeartbeat(ctx, baseURL, token, args)
+	case "unclaim":
+		return executeUnclaim(ctx, baseURL, token, args)
 	case "next":
 		err := executeNext(ctx, baseURL, token, jsonOutput, args)
 		if err != nil {
@@ -1250,6 +1253,47 @@ func executeHeartbeat(ctx context.Context, baseURL, token string, args []string)
 		return fmt.Errorf("failed to heartbeat task: %w", err)
 	}
 
+	return nil
+}
+
+func executeUnclaim(ctx context.Context, baseURL, token string, args []string) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	fs := flag.NewFlagSet("unclaim", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	agentFlag := fs.String("agent", "", "agent ID")
+	attemptFlag := fs.String("attempt", "", "research attempt ID (default: the one saved by claim)")
+	reasonFlag := fs.String("reason", "", "why the claim is being handed back (required)")
+	positionals, err := parseFlagsWithPositionals(fs, args)
+	if err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+	if len(positionals) < 1 {
+		return fmt.Errorf("task ID is required")
+	}
+	taskID := positionals[0]
+	if strings.TrimSpace(*reasonFlag) == "" {
+		return fmt.Errorf("--reason is required")
+	}
+
+	agentID := *agentFlag
+	if agentID == "" {
+		agentID = os.Getenv("AGENT_ID")
+	}
+	if agentID == "" {
+		return fmt.Errorf("agent ID is required (set --agent flag or AGENT_ID environment variable)")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	loadAttempt(client, taskID, *attemptFlag)
+	if err := client.UnclaimTask(ctx, taskID, agentID, *reasonFlag); err != nil {
+		return fmt.Errorf("failed to unclaim task: %w", err)
+	}
 	return nil
 }
 

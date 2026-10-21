@@ -947,6 +947,33 @@ A submit ends task ownership but not the dispatch: the research attempt stays ac
 
 ---
 
+#### `POST /tasks/{id}/unclaim`
+
+Hand a claimed task back to `ready`, for example when a dispatch fails before any work (an account limit, a sign-in failure). Only the current owner may unclaim.
+
+**Request:**
+```json
+{
+  "agent_id": "agent-1",
+  "attempt_id": "optional research attempt from the claim response",
+  "reason": "session limit"
+}
+```
+
+`agent_id` must match the assignee, `reason` is required, and for a research task `attempt_id` must be the live attempt (else `409 ATTEMPT_FENCED`). The `odonian unclaim <id> [--attempt <id>] --reason <text>` CLI sends the attempt saved by `claim`.
+
+**Effect (one transaction):** state becomes `ready`; assignee and lease are cleared; a `claim_released` event records agent, attempt and reason. Dependencies, review round, priority, `escalate` and `agent_merge` are unchanged, and no review, rework or escalation counter moves. A live research attempt is finalized as `cancelled` in the same transaction; the pool debit follows the existing rule that uncertain outcomes are never refunded.
+
+**Response (200 OK):** the updated task.
+
+**Status Codes:**
+- `200 OK`: the claim was handed back
+- `400 Bad Request`: empty `agent_id` or `reason`
+- `404 Not Found`: no such task
+- `409 Conflict`: the task is not `in_progress` under this agent (this includes a repeat unclaim), the attempt is not current, or the task has a submitted round or an open PR (`review` state); nothing changes
+
+---
+
 #### `POST /tasks/{id}/heartbeat`
 
 Extend the lease on a task claimed by an agent.

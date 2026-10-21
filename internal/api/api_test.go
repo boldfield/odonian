@@ -10828,3 +10828,52 @@ func TestPatchTaskPartialUpdateContract(t *testing.T) {
 		t.Errorf("depends_on not cleared: %v", got)
 	}
 }
+
+func postUnclaim(server *Server, authHeader, taskID string, payload map[string]string) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest("POST", "/tasks/"+taskID+"/unclaim", bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	return w
+}
+
+func TestUnclaimHandsTaskBackToReady(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	taskID, _ := setupClaimedTask(t, server, authHeader)
+
+	if w := postUnclaim(server, authHeader, taskID, map[string]string{"agent_id": "other-agent", "reason": "x"}); w.Code != http.StatusConflict {
+		t.Fatalf("non-owner: expected 409, got %d", w.Code)
+	}
+	if w := postUnclaim(server, authHeader, taskID, map[string]string{"agent_id": "agent-1"}); w.Code != http.StatusBadRequest {
+		t.Fatalf("missing reason: expected 400, got %d", w.Code)
+	}
+
+	// setupClaimedTask's owner is whoever it claimed as; read it from the task.
+	req := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	req.Header.Set("Authorization", authHeader)
+	gw := httptest.NewRecorder()
+	server.mux.ServeHTTP(gw, req)
+	var task struct {
+		Assignee string `json:"assignee"`
+	}
+	json.NewDecoder(gw.Body).Decode(&task)
+
+	w := postUnclaim(server, authHeader, taskID, map[string]string{"agent_id": task.Assignee, "reason": "session limit"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("owner: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		State    string  `json:"state"`
+		Assignee *string `json:"assignee"`
+	}
+	json.NewDecoder(w.Body).Decode(&got)
+	if got.State != "ready" || got.Assignee != nil {
+		t.Fatalf("expected ready and unassigned, got %+v", got)
+	}
+	if w := postUnclaim(server, authHeader, taskID, map[string]string{"agent_id": task.Assignee, "reason": "again"}); w.Code != http.StatusConflict {
+		t.Fatalf("repeat: expected 409, got %d", w.Code)
+	}
+}
