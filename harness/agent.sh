@@ -420,12 +420,17 @@ model_unavailable() {
 }
 
 # Classify CLI output (file $1): echo "limit", "signin" or "other". Never echoes the output itself.
+# Only the CLI's own terminal message counts: the last few lines, with each pattern anchored to the
+# captured message forms (optional "Error:"/"ERROR:" prefix). Transcript lines that merely quote such
+# text (tool output, a grep of this repo) are not at a line start and are not in the tail.
 classify_dispatch_failure() {
-  local f="$1"
+  local f="$1" tailf
   [ -s "$f" ] || { echo other; return 0; }
-  if grep -Eiq "hit your (session |usage |weekly |5-hour |five-hour )?limit|(usage|session|weekly) limit" "$f"; then
+  tailf="$(tail -n 6 "$f" 2>/dev/null)"
+  local pre='^[[:space:]]*((API )?Error:?|ERROR:?)?[[:space:]]*'
+  if printf '%s\n' "$tailf" | grep -Eiq "${pre}(you'?ve|you have) hit your ([a-z0-9-]+ )?(usage |session |weekly )?limit"; then
     echo limit
-  elif grep -Eiq 'refresh_token_reused|refresh token has already been used|try signing in again|sign in again|not logged in|please run /login|invalid api key|authentication_error|invalid authentication credentials|credentials? (are |is )?(missing|expired|invalid)|token (has )?expired|\b401\b|unauthorized' "$f"; then
+  elif printf '%s\n' "$tailf" | grep -Eiq "${pre}(refresh_token_reused|your refresh token has already been used|failed to authenticate|not logged in|please run /login|invalid api key|(api error: )?401 |.*\(refresh_token_reused\)|.*authentication_error)"; then
     echo signin
   else
     echo other
@@ -1045,7 +1050,7 @@ dispatch() {
   # its stderr header) and the blocked fallback can quote the final message. Research is untouched.
   local legacy=0 recover=0 task="" max_resumes sessions=0 resumes=0 mode=start text="$prompt" session_id=""
   local rcdir="" out="" err="" last_msg="" own
-  local rc=0 ctl="" fenced=0 pid
+  local rc=0 ctl="" fenced=0 pid tail_pids=""
   if [ -z "$P_TASK" ] && [ -n "${SELECTED_TASK_ID:-}" ]; then
     legacy=1; task="$SELECTED_TASK_ID"
     if [ "${ODONIAN_SESSION_RECOVERY:-on}" != off ]; then
@@ -1070,6 +1075,13 @@ dispatch() {
     fi
     CLAUDE_PID=$!   # tracked so request_stop()/cleanup() can tear down this claude's process group
     pid=$CLAUDE_PID
+    # Non-recover dispatches stream live: tail the recorded files until the model exits (it still
+    # lets a non-zero exit be classified afterwards).
+    tail_pids=""
+    if [ "$recover" -ne 1 ]; then
+      tail -n +1 -f -s 0.2 --pid="$pid" "$out" 2>/dev/null & tail_pids="$!"
+      tail -n +1 -f -s 0.2 --pid="$pid" "$err" >&2 2>/dev/null & tail_pids="$tail_pids $!"
+    fi
     # Preclaimed research: a sibling monitor renews the permit/task lease for the life of the process.
     if [ -n "$P_TASK" ]; then
       ctl="$(mktemp -d "${TMPDIR:-/tmp}/odonian-dispatch.XXXXXX")"
@@ -1086,6 +1098,8 @@ dispatch() {
     wait "$pid"; rc=$?
     while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
     CLAUDE_PID=""
+    # shellcheck disable=SC2086
+    [ -z "$tail_pids" ] || wait $tail_pids 2>/dev/null
     if [ -n "$MON_PID" ]; then
       kill -TERM "-$MON_PID" 2>/dev/null || true
       wait "$MON_PID" 2>/dev/null || true
@@ -1095,9 +1109,9 @@ dispatch() {
         rm -rf "$ctl"
       fi
     fi
+    [ "$recover" -eq 1 ] || break
     [ -s "$out" ] && cat "$out"
     [ -s "$err" ] && cat "$err" >&2
-    [ "$recover" -eq 1 ] || break
 
     last_msg="$(cat "$out" 2>/dev/null)"
     if [ "$use_codex" -eq 1 ] && [ -z "$session_id" ]; then
@@ -1125,7 +1139,7 @@ dispatch() {
   done
   local fail_class=other fail_reset=""
   if [ "$rc" -ne 0 ]; then
-    cat "$out" "$err" > "$rcdir/all" 2>/dev/null
+    cat "$out" "$err" 2>/dev/null | tail -n 6 > "$rcdir/all"
     fail_class="$(classify_dispatch_failure "$rcdir/all")"
     [ "$fail_class" = limit ] && fail_reset="$(parse_reset_epoch "$rcdir/all")"
   fi

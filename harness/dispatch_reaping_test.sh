@@ -8,6 +8,7 @@
 # was alive when it exited so "dead afterwards" cannot be vacuous. PATH is rebuilt from symlinks to a
 # fixed set of system tools, so no real claude/codex/gh/Odonian server is reachable.
 set -uo pipefail
+unset ODONIAN_DISPATCH_ID   # an inherited marker would make the harness itself look like a reap target
 
 HARNESS_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"

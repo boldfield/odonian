@@ -51,8 +51,11 @@ check "claude reset is 19:50 UTC" '[ "$(date -u -d "@$ts" +%H:%M)" = 19:50 ]'
 printf "hit your session limit · resets Dec 31, 11pm (America/New_York)\n" > "$TMP/dated"
 ts="$(parse_reset_epoch "$TMP/dated")"
 check "dated claude reset honours the time zone" '[ -n "$ts" ] && [ "$(date -u -d "@$ts" +%H)" -eq "$(( (23 + 5) % 24 ))" ]'
-ts="$(parse_reset_epoch "$TMP/codex_limit")"
-check "codex reset parses date with ordinal" '[ -n "$ts" ] && [ "$ts" = "$(date -d "Oct 27 2026 6:32 AM" +%s)" ] || [ "$(date +%s)" -gt "$(date -d "Oct 27 2026 6:32 AM" +%s)" ]'
+fmon="$(date -d '+20 days' +%b)"; fday="$(date -d '+20 days' +%-d)"; fyr="$(date -d '+20 days' +%Y)"
+case "$fday" in 1|21|31) ord=st ;; 2|22) ord=nd ;; 3|23) ord=rd ;; *) ord=th ;; esac
+printf "Error: You've hit your usage limit. Upgrade or try again at %s %s%s, %s 6:32 AM.\n" "$fmon" "$fday" "$ord" "$fyr" > "$TMP/codex_future"
+ts="$(parse_reset_epoch "$TMP/codex_future")"
+check "codex reset parses date with ordinal" '[ -n "$ts" ] && [ "$ts" = "$(date -d "$fmon $fday $fyr 6:32 AM" +%s)" ]'
 check "unparseable reset yields nothing" '! parse_reset_epoch "$TMP/unparseable" >/dev/null'
 
 echo "Limits hold the whole account"
