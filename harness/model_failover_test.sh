@@ -11,7 +11,7 @@ HARNESS_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
 LOG="$TMP/dispatch.log"
 FAIL_MODEL="opus"
-OK_MODEL="sonnet"
+OK_MODEL="other-provider-model"   # a different account: same-account models now share the backoff
 
 pass_count=0; fail_count=0
 pass() { ((pass_count++)); echo "✓ $1"; }
