@@ -332,6 +332,15 @@ start_agent; finish
 check "the model ran once" test "$(starts)" -eq 1
 check "the failure was handled as before (rc=7 reported)" grep -q "dispatch exited rc=7" "$FAKE_DIR/agent.log"
 check "the harness did not transition the task" test "$(ncalls transition)" -eq 0
+check "the claim the dead session left behind was handed back with the backend reason" bash -c "grep -q '^[0-9.]* unclaim A --agent .* --reason backend_unavailable: .*: other\$' '$FAKE_DIR/calls.log'"
+end_scenario
+
+echo "Scenario 6b: a task the model submitted before a non-zero exit is not handed back"
+new_scenario
+printf 'claim,submit,run=0.5,rc=7\n' > "$FAKE_DIR/claude.seq"
+start_agent; finish
+check "the failure was handled as before (rc=7 reported)" grep -q "dispatch exited rc=7" "$FAKE_DIR/agent.log"
+check "no unclaim for a submitted task" test "$(ncalls unclaim)" -eq 0
 end_scenario
 
 # ============ 7. a resumed session that fails ============

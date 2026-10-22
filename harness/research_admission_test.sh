@@ -89,9 +89,13 @@ case "$verb" in
   project) echo "{\"repo\":\"$BARE_REPO\"}"; exit 0 ;;
   show)
     id="$1"; log show "$id"
-    if [ -f "$FAKE_DIR/show.$id" ]; then cat "$FAKE_DIR/show.$id"; else echo '{"track":"research","state":"ready"}'; fi
+    if [ -f "$FAKE_DIR/show.$id" ]; then sed "s/__ME__/$AGENT_ID/" "$FAKE_DIR/show.$id"; else echo '{"track":"research","state":"ready"}'; fi
     exit 0 ;;
   transition) log transition "$@"; exit 0 ;;
+  unclaim)
+    id="$1"; shift; log unclaim "$id" "agent=$(flag --agent "$@")" "attempt=$(flag --attempt "$@")" "reason=$(flag --reason "$@")"
+    echo '{"track":"research","state":"ready","assignee":""}' > "$FAKE_DIR/show.$id"; rm -f "$FAKE_DIR/claimed-$id"
+    exit 0 ;;
   claim)
     id="$1"; shift
     req="$(flag --request-id "$@")"
@@ -373,6 +377,40 @@ kill -TERM "$AGENT_PID"
 wait_for 10 ncalls_ge permit-finalize 1
 check "the in-flight model was stopped" has_claude " TERM task=A"
 check "permit finalized cancelled on shutdown" test "$(calls permit-finalize | grep -c 'class=cancelled')" -eq 1
+end_scenario
+
+echo "Scenario 7b: a limit exit hands the preclaimed task back after the permit is finalized; it is claimable again"
+new_scenario
+tasks_json proj-test A:x
+echo grant > "$FAKE_DIR/claim.A"; echo "fail:7" > "$FAKE_DIR/claude.mode"
+echo '{"track":"research","state":"in_progress","assignee":"__ME__"}' > "$FAKE_DIR/show.A"
+start_agent
+wait_for 10 ncalls_ge unclaim 1
+check "task handed back once with the attempt and a backend reason" bash -c "[ $(ncalls unclaim A) -eq 1 ] && grep -q 'unclaim A agent=.* attempt=attempt-A-1 reason=backend_unavailable: .*: other' '$FAKE_DIR/calls.log'"
+check "permit finalized before the unclaim" bash -c "[ \$(grep -n ' permit-finalize ' '$FAKE_DIR/calls.log' | head -1 | cut -d: -f1) -lt \$(grep -n ' unclaim ' '$FAKE_DIR/calls.log' | head -1 | cut -d: -f1) ]"
+check "task is ready and unclaimed again" test "$(jq -r .state "$FAKE_DIR/show.A")" = ready
+end_scenario
+
+echo "Scenario 7c: a task already submitted when the model fails is left alone"
+new_scenario
+tasks_json proj-test A:x
+echo grant > "$FAKE_DIR/claim.A"; echo "fail:7" > "$FAKE_DIR/claude.mode"
+echo '{"track":"research","state":"review","assignee":""}' > "$FAKE_DIR/show.A"
+start_agent
+wait_for 10 ncalls_ge permit-finalize 1
+sleep 1
+check "no unclaim for a submitted task" test "$(ncalls unclaim)" -eq 0
+end_scenario
+
+echo "Scenario 7d: a fenced stop is not handed back"
+new_scenario
+tasks_json proj-test A:x
+echo grant > "$FAKE_DIR/claim.A"; echo "sleep:30" > "$FAKE_DIR/claude.mode"; echo attempt-fenced > "$FAKE_DIR/hb.mode"
+echo '{"track":"research","state":"in_progress","assignee":"__ME__"}' > "$FAKE_DIR/show.A"
+start_agent
+wait_for 10 has_claude " TERM "
+sleep 2
+check "no unclaim after a fenced stop" test "$(ncalls unclaim)" -eq 0
 end_scenario
 
 # =============================== 10. no grant / observe ===============================
