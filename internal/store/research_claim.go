@@ -513,3 +513,124 @@ func (s *sqliteStore) GetResearchAdmissionDiagnostic(ctx context.Context, taskID
 	}
 	return d, nil
 }
+
+// UnclaimTask hands an in_progress task back to ready for its current owner.
+// In one transaction it clears assignee and lease, finalizes the task's live
+// research attempt (if any) as cancelled, and appends a claim_released event
+// recording agent, attempt and reason. Review round, priority, dependencies,
+// escalate and agent_merge are untouched. A finalized attempt is never
+// refunded: the pool debit follows the existing rule for uncertain outcomes.
+// For a task with a research permit the attempt ID in ctx (WithResearchAttempt)
+// is required and must be the task's current attempt for this agent
+// (ATTEMPT_FENCED otherwise). Review and merge tasks can be unclaimed;
+// a task with a PR link, or a non-review task with a submitted round, cannot.
+// Returns ErrNotFound if the task doesn't exist, and ErrConflict if it is not
+// in_progress under agentID, or already has a submitted round or a PR.
+func (s *sqliteStore) UnclaimTask(ctx context.Context, taskID, agentID, reason string) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	nowT := s.nowTime()
+	var state string
+	var assignee *string
+	var round int
+	var kind string
+	err = tx.QueryRowContext(ctx, `SELECT state, assignee, review_round, kind FROM task WHERE id = ?`, taskID).Scan(&state, &assignee, &round, &kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, ErrNotFound
+	}
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to load task: %w", err)
+	}
+	if state != "in_progress" || assignee == nil || *assignee != agentID {
+		return Task{}, ErrConflict
+	}
+	var prs int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_link WHERE task_id = ? AND kind = 'pr' AND tombstoned_at IS NULL`, taskID).Scan(&prs); err != nil {
+		return Task{}, fmt.Errorf("failed to check task links: %w", err)
+	}
+	// A review task's review_round labels the round it reviews, not a
+	// submission by the task itself, so only other kinds are refused on it.
+	if prs > 0 || (round > 0 && kind != "review") {
+		return Task{}, conflict("HAS_SUBMISSION", "task has a submitted round or an open PR and cannot be unclaimed")
+	}
+
+	attemptID := researchAttemptFromContext(ctx)
+	if err := fenceResearchAttempt(ctx, tx, nowT, taskID, agentID, attemptID, 0); err != nil {
+		return Task{}, err
+	}
+	permit, attempt, found, err := latestTaskAttempt(ctx, tx, taskID)
+	if err != nil {
+		return Task{}, err
+	}
+	var recorded *string
+	if found && permit.AgentID == agentID {
+		if attemptID == "" {
+			return Task{}, conflict("ATTEMPT_FENCED", "a research task can only be unclaimed with its live attempt ID")
+		}
+		recorded = &attempt.ID
+		if attempt.State == AttemptActive {
+			started, err := parseTS(attempt.StartedAt)
+			if err != nil {
+				return Task{}, fmt.Errorf("invalid attempt timestamp: %w", err)
+			}
+			expires, err := parseTS(attempt.ExpiresAt)
+			if err != nil {
+				return Task{}, fmt.Errorf("invalid attempt timestamp: %w", err)
+			}
+			if !expires.After(nowT) {
+				// Overdue: account for it as lease expiry, as FinalizeResearchAttempt does.
+				if err := expireAttempt(ctx, tx, attempt); err != nil {
+					return Task{}, err
+				}
+			} else {
+				dur := max(nowT.Sub(started).Milliseconds(), 0)
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE research_attempt SET state='finalized', ended_at=?, exit_class=?, duration_ms=?
+					WHERE id = ? AND state = 'active'`, formatTS(nowT), ExitCancelled, dur, attempt.ID); err != nil {
+					return Task{}, fmt.Errorf("failed to finalize research attempt: %w", err)
+				}
+			}
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE task SET state='ready', assignee=NULL, lease_expires_at=NULL, updated_at=?
+		WHERE id=? AND state='in_progress' AND assignee=?`, formatTS(nowT), taskID, agentID); err != nil {
+		return Task{}, fmt.Errorf("failed to unclaim task: %w", err)
+	}
+	note := fmt.Sprintf("agent=%s attempt=%s reason=%s", agentID, deref(recorded), reason)
+	if _, err := s.AppendEvent(ctx, tx, taskID, agentID, "claim_released", nil, &note, nil); err != nil {
+		return Task{}, fmt.Errorf("failed to append claim_released event: %w", err)
+	}
+
+	var t Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch unclaimed task: %w", err)
+	}
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return t, nil
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}

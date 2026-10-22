@@ -132,6 +132,7 @@ func New(s store.Store, authToken string, leaseTTL time.Duration, maxReviewRound
 	mux.HandleFunc("GET /tasks/{id}/events", wrapProtected("GET /tasks/{id}/events", server.handleGetTaskEvents))
 	mux.HandleFunc("POST /tasks/{id}/claim", wrapProtected("POST /tasks/{id}/claim", server.handleClaimTask))
 	mux.HandleFunc("POST /tasks/{id}/heartbeat", wrapProtected("POST /tasks/{id}/heartbeat", server.handleHeartbeat))
+	mux.HandleFunc("POST /tasks/{id}/unclaim", wrapProtected("POST /tasks/{id}/unclaim", server.handleUnclaimTask))
 	mux.HandleFunc("POST /tasks/{id}/promote", wrapProtected("POST /tasks/{id}/promote", server.handlePromoteTask))
 	mux.HandleFunc("POST /tasks/{id}/submit", wrapProtected("POST /tasks/{id}/submit", server.handleSubmit))
 	mux.HandleFunc("POST /tasks/{id}/review", wrapProtected("POST /tasks/{id}/review", server.handleReview))
@@ -909,6 +910,62 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.encodeJSON(w, http.StatusOK, task)
+}
+
+// handleUnclaimTask handles POST /tasks/{id}/unclaim to hand a claimed task back
+// to ready. Only the current owner (agent, and attempt for research) may do so;
+// anything else is a 409 that changes nothing, and a repeat is a 409 too.
+func (s *Server) handleUnclaimTask(w http.ResponseWriter, r *http.Request) {
+	taskID, ok := s.resolveTaskID(w, r)
+	if !ok {
+		return
+	}
+
+	var payload struct {
+		AgentID   string `json:"agent_id"`
+		AttemptID string `json:"attempt_id"`
+		Reason    string `json:"reason"`
+	}
+	if err := s.decodeJSON(w, r, &payload); err != nil {
+		return
+	}
+	if payload.AgentID == "" {
+		s.errorResponse(w, http.StatusBadRequest, "EMPTY_AGENT_ID", "agent_id cannot be empty")
+		return
+	}
+	if strings.TrimSpace(payload.Reason) == "" {
+		s.errorResponse(w, http.StatusBadRequest, "EMPTY_REASON", "reason cannot be empty")
+		return
+	}
+
+	task, err := s.store.UnclaimTask(store.WithResearchAttempt(r.Context(), payload.AttemptID), taskID, payload.AgentID, payload.Reason)
+	if errors.Is(err, store.ErrNotFound) {
+		s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+		return
+	}
+	var conflictErr *store.ConflictError
+	if errors.As(err, &conflictErr) || errors.Is(err, store.ErrConflict) {
+		code, msg := "CONFLICT", "Task is not in_progress or not assigned to this agent"
+		if conflictErr != nil {
+			code, msg = conflictErr.Code, conflictErr.Message
+		}
+		// Report where the task stands now so the caller can tell "already handed back"
+		// from "someone else owns it" from "in review".
+		resp := map[string]any{"code": code, "message": msg}
+		if cur, gerr := s.store.GetTask(r.Context(), taskID); gerr == nil {
+			resp["state"] = cur.State
+			resp["assignee"] = cur.Assignee
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{"error": resp})
+		return
+	}
+	if err != nil {
+		s.errorResponse(w, http.StatusInternalServerError, "UNCLAIM_ERROR", "Failed to unclaim task")
+		return
+	}
 	s.encodeJSON(w, http.StatusOK, task)
 }
 
