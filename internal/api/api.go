@@ -1151,15 +1151,25 @@ func (s *Server) handleSupersede(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload struct {
-		Model *string `json:"model"`
+		Model        *string         `json:"model"`
+		ReviewModels json.RawMessage `json:"review_models"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
 		return // decodeJSON already wrote error response
 	}
 
+	// review_models is optional; when present it replaces the copied list and must be a non-empty array.
+	var reviewModels []string
+	if len(payload.ReviewModels) > 0 {
+		if err := json.Unmarshal(payload.ReviewModels, &reviewModels); err != nil || len(reviewModels) == 0 {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_REVIEW_MODELS", "review_models must be a non-empty array of models")
+			return
+		}
+	}
+
 	// Supersede the task
-	task, err := s.store.SupersedeTask(r.Context(), taskID, payload.Model)
+	task, err := s.store.SupersedeTask(r.Context(), taskID, payload.Model, reviewModels)
 	if err != nil {
 		// Check if it's a ValidationError
 		var validationErr *store.ValidationError
@@ -1224,8 +1234,42 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		sort.Strings(unsupported)
 		s.errorResponse(w, http.StatusBadRequest, "FIELD_NOT_UPDATABLE",
 			"Field(s) cannot be changed through PATCH /tasks/{id}: "+strings.Join(unsupported, ", ")+
-				" (only depends_on is updatable; task specs are immutable and state changes use /transition)")
+				" (only depends_on and review_models are updatable; task specs are immutable and state changes use /transition)")
 		return
+	}
+
+	// review_models is applied first: it has the most refusal modes, and a refusal leaves nothing changed.
+	if raw, present := fields["review_models"]; present {
+		var models []string
+		if err := json.Unmarshal(raw, &models); err != nil || len(models) == 0 {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_REVIEW_MODELS", "review_models must be a non-empty array of models (null and [] do not reset to the defaults)")
+			return
+		}
+		var actor string
+		if rawActor, ok := fields["actor"]; ok {
+			if err := json.Unmarshal(rawActor, &actor); err != nil {
+				s.errorResponse(w, http.StatusBadRequest, "INVALID_ACTOR", "actor must be a string")
+				return
+			}
+		}
+		if _, err := s.store.UpdateTaskReviewModels(r.Context(), taskID, models, actor, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget); err != nil {
+			var validationErr *store.ValidationError
+			if errors.As(err, &validationErr) {
+				s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
+				return
+			}
+			var conflictErr *store.ConflictError
+			if errors.As(err, &conflictErr) {
+				s.errorResponse(w, http.StatusConflict, conflictErr.Code, conflictErr.Message)
+				return
+			}
+			if errors.Is(err, store.ErrNotFound) {
+				s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+				return
+			}
+			s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
+			return
+		}
 	}
 
 	if raw, present := fields["depends_on"]; present {
@@ -1281,7 +1325,7 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 }
 
 // patchableTaskFields is the set of body fields PATCH /tasks/{id} accepts.
-var patchableTaskFields = map[string]bool{"depends_on": true}
+var patchableTaskFields = map[string]bool{"depends_on": true, "review_models": true, "actor": true}
 
 // handleUpdateEscalation handles PATCH /tasks/{id}/escalation to update a task's escalation policy.
 func (s *Server) handleUpdateEscalation(w http.ResponseWriter, r *http.Request) {

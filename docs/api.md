@@ -1426,7 +1426,8 @@ See [event retention configuration](./configuration.md#server-odonian-server).
 #### `PATCH /tasks/{id}`
 
 Partial update of a task. Present fields are applied and absent fields are left unchanged. Only
-`depends_on` is updatable; any other field (`spec`, `title`, `state`, unknown names) returns
+`depends_on` and `review_models` are updatable (`actor` is also accepted, naming who made the change in
+the event); any other field (`spec`, `title`, `state`, unknown names) returns
 `400 FIELD_NOT_UPDATABLE` naming it and changes nothing.
 
 ```bash
@@ -1439,8 +1440,25 @@ Use full existing task UUIDs inside `depends_on`; the URL's task ID can be a uni
 An array replaces the whole list and `[]` clears it. Omitting `depends_on` leaves edges unchanged,
 `{}` is a no-op, and `depends_on: null` (or a non-array) returns `400 INVALID_DEPENDS_ON`.
 
+`review_models` replaces the whole reviewer list. It is validated like task creation (`400 UNKNOWN_MODEL`
+for a model outside the allowlist); `null` and `[]` return `400 INVALID_REVIEW_MODELS`, so a list is never
+silently reset to the default. It is accepted on tasks that carry reviewers in `backlog`, `ready`,
+`in_progress`, `blocked` and `review`; a `review` or `merge` task returns `400 FIELD_NOT_UPDATABLE`, and an
+`approved` task (landing may be under way) or a terminal task returns `409`. Nothing changes when it is
+refused. The CLI wrapper is `odonian update <id> --review-models a,b`. A `review_models_changed` event
+records the old list, the new list and the actor.
+
+When the task is in `review`, the open round is reshaped so it can finish. A review child of this round
+with no recorded verdict whose model left the list is retired (state `abandoned`, with a note naming the
+change); if it was claimed, its agent's later submit is refused with `409`. Each entry of the new list
+without a live or finished child in the round gets a replacement child in the same round, with the same
+spec the round's other children received. Children that already recorded a verdict stay and count. The
+round then aggregates over the new list (immediately, if every remaining child is already done).
+Research dispute lineage is keyed by reviewer model and slot, so a replaced reviewer starts with no
+lineage and its earlier disputes do not carry over.
+
 **Response:** `200 OK` with the updated task, including `depends_on`. Errors include
-`400 SELF_DEPENDENCY`, `400 JSON_DECODE_ERROR`, `409 CYCLE_DETECTED`, and `404 NOT_FOUND`. Invalid
+`400 INVALID_REVIEW_MODELS`, `400 SELF_DEPENDENCY`, `400 JSON_DECODE_ERROR`, `409 CYCLE_DETECTED`, and `404 NOT_FOUND`. Invalid
 dependency IDs, duplicates, or other storage failures currently return `500 UPDATE_ERROR`.
 
 #### `PATCH /tasks/{id}/escalation`
@@ -1500,7 +1518,9 @@ curl -X POST -H "Authorization: Bearer token" -H 'Content-Type: application/json
   -d '{"model":"sonnet"}'
 ```
 
-`model` is optional and must be in the server's allowlist. Send `{}` to keep the current model;
+`model` is optional and must be in the server's allowlist. `review_models` is optional too: a non-empty
+array, validated like task creation, that the replacement uses instead of the copied list (`null` or
+`[]` returns `400 INVALID_REVIEW_MODELS`). Send `{}` to keep the current model and reviewers;
 a JSON body is required. The replacement must be promoted separately. This operator endpoint
 differs from circuit-breaker escalation, which automatically promotes its replacement.
 

@@ -831,6 +831,17 @@ func (c *HTTPClient) TransitionTask(ctx context.Context, id, to string, note *st
 	return nil
 }
 
+// UpdateTaskReviewModels replaces a task's review_models via PATCH /tasks/{id}.
+func (c *HTTPClient) UpdateTaskReviewModels(ctx context.Context, id string, models []string) error {
+	resp, err := c.do(ctx, "PATCH", fmt.Sprintf("/tasks/%s", id), map[string]interface{}{"review_models": models})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return nil
+}
+
 // heartbeatTaskRequest is the request body for HeartbeatTask.
 type heartbeatTaskRequest struct {
 	AgentID   string `json:"agent_id"`

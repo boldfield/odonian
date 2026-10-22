@@ -96,7 +96,7 @@ func TestLandingReservationOnlyAllowsDone(t *testing.T) {
 			t.Errorf("transition to %s while landing: expected LANDING_IN_PROGRESS, got %v", target, err)
 		}
 	}
-	if _, err := store.SupersedeTask(ctx, taskID, nil); conflictCode(err) != "LANDING_IN_PROGRESS" {
+	if _, err := store.SupersedeTask(ctx, taskID, nil, nil); conflictCode(err) != "LANDING_IN_PROGRESS" {
 		t.Errorf("supersede while landing: expected LANDING_IN_PROGRESS, got %v", err)
 	}
 

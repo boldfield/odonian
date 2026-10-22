@@ -590,6 +590,14 @@ curl -X PATCH -H "Authorization: Bearer $ODONIAN_TOKEN" -H 'Content-Type: applic
 
 - `depends_on` absent: edges unchanged. `depends_on` an array of full task ids: replaces the whole
   list (`[]` clears it, intentionally). `depends_on: null` or a non-array: `400` (null never means clear).
+- `review_models` an array of models: replaces the whole reviewer list (validated like creation:
+  `400 UNKNOWN_MODEL`; `null` and `[]` are `400 INVALID_REVIEW_MODELS`). Accepted in `backlog`, `ready`,
+  `in_progress`, `blocked` and `review`; `400 FIELD_NOT_UPDATABLE` on a `review`/`merge` task, `409` on
+  `approved` and terminal tasks. In `review`, children without a verdict whose model left the list are
+  retired (a claimed one's later submit is refused), missing reviewers are spawned in the same round, and
+  the round aggregates over the new list. A replaced research reviewer starts with no dispute lineage.
+  CLI: `odonian update <id> --review-models a,b`. `POST /tasks/{id}/supersede` takes the same optional
+  `review_models` for the replacement.
 - Any other field (`spec`, `title`, `state`, unknown names): `400 FIELD_NOT_UPDATABLE` naming the
   field; nothing is changed, even if `depends_on` was sent alongside. Specs are immutable after
   creation; state changes go through `/transition`.

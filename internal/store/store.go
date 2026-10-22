@@ -63,6 +63,7 @@ type Store interface {
 	ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error)
 	ListDependents(ctx context.Context, taskID string) ([]string, error)
 	UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string) (Task, error)
+	UpdateTaskReviewModels(ctx context.Context, taskID string, models []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error)
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	ClaimResearchTask(ctx context.Context, req ResearchClaim) (ResearchClaimResult, error)
 	SetResearchPolicy(ctx context.Context, now time.Time, cfg policy.Config) error
@@ -76,7 +77,7 @@ type Store interface {
 	SubmitTaskWithManifest(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
-	SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error)
+	SupersedeTask(ctx context.Context, taskID string, modelOverride *string, reviewModelsOverride []string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	SetTaskPriority(ctx context.Context, req SetPriorityRequest) (PriorityChange, error)
 	MoveTaskToFront(ctx context.Context, req FrontPriorityRequest) (PriorityChange, error)
@@ -2872,7 +2873,7 @@ func isBlockingResearchFinding(f Finding, round int) bool {
 func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql.Tx, parentID string, round int) (bool, []Finding, []string, error) {
 	taskRows, err := tx.QueryContext(ctx, `
 		SELECT id, model FROM task
-		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding_id IS NULL
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding_id IS NULL AND state != 'abandoned'
 		ORDER BY rowid
 	`, parentID, round)
 	if err != nil {
@@ -3485,7 +3486,7 @@ func (s *sqliteStore) applyRoundCircuitBreaker(ctx context.Context, tx *sql.Tx, 
 		return "blocked", nil
 	}
 
-	escalatedTaskID, err := s.supersedeTaskTx(ctx, tx, parentID, &nextModel)
+	escalatedTaskID, err := s.supersedeTaskTx(ctx, tx, parentID, &nextModel, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to escalate task: %w", err)
 	}
@@ -4374,7 +4375,7 @@ func (s *sqliteStore) aggregateReviewRound(ctx context.Context, tx *sql.Tx, pare
 			SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done,
 			SUM(CASE WHEN state='done' AND verdict='approve' THEN 1 ELSE 0 END) as approve
 		FROM task
-		WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding_id IS NULL
+		WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding_id IS NULL AND state != 'abandoned'
 	`, parentID, parentReviewRound).Scan(&totalReviewTasks, &doneReviewTasks, &approveReviewTasks)
 	if err != nil {
 		return "", fmt.Errorf("failed to tally review tasks: %w", err)
@@ -5032,7 +5033,7 @@ func (s *sqliteStore) buildResearchSupersessionSpec(ctx context.Context, tx *sql
 // re-points all dependents, and marks the old task as superseded.
 // The transaction is NOT committed by this function.
 // Returns the new task ID or an error.
-func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID string, modelOverride *string) (string, error) {
+func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID string, modelOverride *string, reviewModelsOverride []string) (string, error) {
 	// 1. Load old task
 	var oldTask Task
 	var reviewModelsJSON *string
@@ -5130,6 +5131,12 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 		return "", invalid("UNKNOWN_MODEL", fmt.Sprintf("unknown model: %s", model))
 	}
 
+	if reviewModelsOverride != nil {
+		if err := s.validateReviewModels(reviewModelsOverride); err != nil {
+			return "", err
+		}
+		oldTask.ReviewModels = reviewModelsOverride
+	}
 	var newReviewModelsJSON *string
 	if len(oldTask.ReviewModels) > 0 {
 		data, err := json.Marshal(oldTask.ReviewModels)
@@ -5188,14 +5195,14 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 // After the transaction commits, it best-effort closes the old task's recorded pull
 // request (if any) and deletes its head branch — see closeSupersededPR.
 // Returns the new Task or ErrNotFound if the old task doesn't exist.
-func (s *sqliteStore) SupersedeTask(ctx context.Context, taskID string, modelOverride *string) (Task, error) {
+func (s *sqliteStore) SupersedeTask(ctx context.Context, taskID string, modelOverride *string, reviewModelsOverride []string) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	newTaskID, err := s.supersedeTaskTx(ctx, tx, taskID, modelOverride)
+	newTaskID, err := s.supersedeTaskTx(ctx, tx, taskID, modelOverride, reviewModelsOverride)
 	if err != nil {
 		return Task{}, err
 	}
@@ -5937,7 +5944,7 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 				COUNT(*) as total,
 				SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) as done
 			FROM task
-			WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding_id IS NULL
+			WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding_id IS NULL AND state != 'abandoned'
 		`, taskID, t.ReviewRound).Scan(&totalReviewTasks, &doneReviewTasks)
 		if err != nil {
 			return Task{}, fmt.Errorf("failed to tally review tasks: %w", err)
@@ -6049,6 +6056,221 @@ func (s *sqliteStore) UpdateTaskDependsOn(ctx context.Context, taskID string, de
 	}
 
 	return t, nil
+}
+
+// validateReviewModels checks a replacement review_models list: non-empty and every
+// entry on the allowlist.
+func (s *sqliteStore) validateReviewModels(models []string) error {
+	if len(models) == 0 {
+		return invalid("INVALID_REVIEW_MODELS", "review_models must be a non-empty array of models")
+	}
+	for _, m := range models {
+		if !s.allowedModelsM[m] {
+			return invalid("UNKNOWN_MODEL", fmt.Sprintf("unknown review model: %s", m))
+		}
+	}
+	return nil
+}
+
+// UpdateTaskReviewModels replaces a task's review_models list. It is refused on review and
+// merge tasks (400 FIELD_NOT_UPDATABLE) and on approved or terminal tasks (409), and
+// leaves everything unchanged when refused. When the task is in review, the open round is
+// reshaped so it can still finish: children without a verdict whose model left the list are
+// retired (state abandoned, so a claimed child's later submit is fenced), a replacement child
+// is spawned in the same round for each new entry with no live or finished child, and the
+// round is re-aggregated if every remaining child is already done. Children that recorded a
+// verdict stay and count. Research dispute lineage is keyed by reviewer model and slot, so a
+// replacement reviewer starts with no lineage and earlier disputes do not carry over.
+func (s *sqliteStore) UpdateTaskReviewModels(ctx context.Context, taskID string, models []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error) {
+	if err := s.validateReviewModels(models); err != nil {
+		return Task{}, err
+	}
+	if actor == "" {
+		actor = "system"
+	}
+
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var kind, state, projectID, documentID, title, track string
+	var priority, reviewRound int
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT kind, state, project_id, document_id, title, track, priority, review_round, review_models FROM task WHERE id = ?
+	`, taskID).Scan(&kind, &state, &projectID, &documentID, &title, &track, &priority, &reviewRound, &reviewModelsJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, ErrNotFound
+	}
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch task: %w", err)
+	}
+	if kind == "review" || kind == "merge" {
+		return Task{}, invalid("FIELD_NOT_UPDATABLE", fmt.Sprintf("review_models cannot be changed on a %s task", kind))
+	}
+	switch state {
+	case "backlog", "ready", "in_progress", "blocked", "review":
+	case "approved":
+		return Task{}, conflict("INVALID_STATE", "cannot change review_models on an approved task (landing may be under way)")
+	default:
+		return Task{}, conflict("TERMINAL_STATE", fmt.Sprintf("cannot change review_models on task in terminal state %q", state))
+	}
+
+	oldModels := []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &oldModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	now := nowTimestamp()
+	data, err := json.Marshal(models)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to marshal review_models: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE task SET review_models = ?, updated_at = ? WHERE id = ?`, string(data), now, taskID); err != nil {
+		return Task{}, fmt.Errorf("failed to update review_models: %w", err)
+	}
+	oldJSON, _ := json.Marshal(oldModels)
+	note := fmt.Sprintf("review_models changed by %s: %s -> %s", actor, oldJSON, data)
+	if _, err := s.AppendEvent(ctx, tx, taskID, actor, "review_models_changed", nil, &note); err != nil {
+		return Task{}, fmt.Errorf("failed to append review_models_changed event: %w", err)
+	}
+
+	if state == "review" {
+		if err := s.reshapeOpenReviewRound(ctx, tx, taskID, title, projectID, documentID, track, priority, reviewRound, models, note, now); err != nil {
+			return Task{}, err
+		}
+		var open int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM task
+			WHERE target_task_id = ? AND review_round = ? AND adjudicate_finding_id IS NULL AND state NOT IN ('done', 'abandoned')
+		`, taskID, reviewRound).Scan(&open); err != nil {
+			return Task{}, fmt.Errorf("failed to count open review tasks: %w", err)
+		}
+		if open == 0 {
+			if _, err := s.aggregateReviewRound(ctx, tx, taskID, maxReviewRounds, escalationThresholds, s.researchEscalationLadder, researchEscalationThresholds, researchRoundBudget); err != nil {
+				return Task{}, err
+			}
+		}
+	}
+
+	var t Task
+	var rmJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &rmJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch updated task: %w", err)
+	}
+	t.ReviewModels = []string{}
+	if rmJSON != nil {
+		if err := json.Unmarshal([]byte(*rmJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return t, nil
+}
+
+// reshapeOpenReviewRound makes the parent's current review round match models: see
+// UpdateTaskReviewModels. changeNote names the change in the retired children's events.
+func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, parentID, parentTitle, projectID, documentID, track string, priority, round int, models []string, changeNote, now string) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, model, state, spec FROM task
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding_id IS NULL AND state != 'abandoned'
+		ORDER BY rowid
+	`, parentID, round)
+	if err != nil {
+		return fmt.Errorf("failed to list round review tasks: %w", err)
+	}
+	type child struct{ id, model, state, spec string }
+	var children []child
+	for rows.Next() {
+		var c child
+		if err := rows.Scan(&c.id, &c.model, &c.state, &c.spec); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan review task: %w", err)
+		}
+		children = append(children, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("failed to iterate review tasks: %w", err)
+	}
+	rows.Close()
+
+	// Match each entry of the new list to a child of that model, finished children first.
+	matched := make(map[string]bool)
+	take := func(model string, done bool) bool {
+		for _, c := range children {
+			if !matched[c.id] && c.model == model && (c.state == "done") == done {
+				matched[c.id] = true
+				return true
+			}
+		}
+		return false
+	}
+	need := append([]string(nil), models...)
+	for _, done := range []bool{true, false} {
+		var rest []string
+		for _, m := range need {
+			if !take(m, done) {
+				rest = append(rest, m)
+			}
+		}
+		need = rest
+	}
+	missing := need
+
+	var template string
+	for _, c := range children {
+		template = c.spec
+		break
+	}
+
+	for _, c := range children {
+		if matched[c.id] || c.state == "done" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE task SET state = 'abandoned', assignee = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?
+		`, now, c.id); err != nil {
+			return fmt.Errorf("failed to retire review task: %w", err)
+		}
+		retireNote := "retired: " + changeNote
+		if _, err := s.AppendEvent(ctx, tx, c.id, "system", "transition", nil, &retireNote); err != nil {
+			return fmt.Errorf("failed to append retire event: %w", err)
+		}
+	}
+
+	if len(missing) > 0 && template == "" {
+		return conflict("INVALID_STATE", "review round has no review tasks to copy a spec from")
+	}
+	// A replacement starts with no research dispute lineage: drop any disputed-finding
+	// block the copied spec carried for the other reviewer.
+	spec := template
+	if i := strings.Index(spec, "## Prior Review Round: Disputed Finding(s)"); i >= 0 {
+		if j := strings.Index(spec[i:], "## Instructions"); j >= 0 {
+			spec = spec[:i] + spec[i+j:]
+		}
+	}
+	for _, m := range missing {
+		id := GenerateID()
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, track, priority, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'ready', ?, 'review', NULL, ?, ?, 0, ?, ?, ?, ?)
+		`, id, projectID, documentID, "Review: "+parentTitle+" ["+m+"]", spec, m, round, parentID, track, priority, now, now); err != nil {
+			return fmt.Errorf("failed to create replacement review task: %w", err)
+		}
+	}
+	return nil
 }
 
 // PruneEvents removes old events according to retention policy.

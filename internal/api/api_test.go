@@ -10897,3 +10897,97 @@ func TestUnclaimHandsTaskBackToReady(t *testing.T) {
 		}
 	}
 }
+
+func patchReviewModels(t *testing.T, server *Server, authHeader, taskID string, payload map[string]interface{}) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest("PATCH", "/tasks/"+taskID, bytes.NewReader(body))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	return w
+}
+
+func errorCode(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var resp map[string]map[string]interface{}
+	json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&resp)
+	code, _ := resp["error"]["code"].(string)
+	return code
+}
+
+func TestPatchTaskReviewModels(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	taskID := setupTaskInReview(t, server, authHeader)
+
+	// The task is in review with a default (opus) reviewer; replace it with sonnet.
+	w := patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{"review_models": []string{"sonnet"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var got store.Task
+	json.NewDecoder(w.Body).Decode(&got)
+	if len(got.ReviewModels) != 1 || got.ReviewModels[0] != "sonnet" {
+		t.Errorf("review_models = %v", got.ReviewModels)
+	}
+
+	for name, tc := range map[string]struct {
+		payload map[string]interface{}
+		status  int
+		code    string
+	}{
+		"null":    {map[string]interface{}{"review_models": nil}, 400, "INVALID_REVIEW_MODELS"},
+		"empty":   {map[string]interface{}{"review_models": []string{}}, 400, "INVALID_REVIEW_MODELS"},
+		"unknown": {map[string]interface{}{"review_models": []string{"nope"}}, 400, "UNKNOWN_MODEL"},
+	} {
+		w := patchReviewModels(t, server, authHeader, taskID, tc.payload)
+		if w.Code != tc.status || errorCode(t, w) != tc.code {
+			t.Errorf("%s: got %d %q, want %d %s", name, w.Code, errorCode(t, w), tc.status, tc.code)
+		}
+	}
+}
+
+func TestSupersedeWithReviewModels(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	taskID := setupTaskInReview(t, server, authHeader)
+
+	supersede := func(id string, payload map[string]interface{}) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(payload)
+		req := httptest.NewRequest("POST", "/tasks/"+id+"/supersede", bytes.NewReader(body))
+		req.Header.Set("Authorization", authHeader)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := supersede(taskID, map[string]interface{}{"review_models": []string{}}); w.Code != 400 || errorCode(t, w) != "INVALID_REVIEW_MODELS" {
+		t.Errorf("empty list: %d %q", w.Code, errorCode(t, w))
+	}
+	if w := supersede(taskID, map[string]interface{}{"review_models": []string{"nope"}}); w.Code != 400 || errorCode(t, w) != "UNKNOWN_MODEL" {
+		t.Errorf("unknown model: %d %q", w.Code, errorCode(t, w))
+	}
+	w := supersede(taskID, map[string]interface{}{"review_models": []string{"sonnet", "haiku"}})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var replacement store.Task
+	json.NewDecoder(w.Body).Decode(&replacement)
+	if len(replacement.ReviewModels) != 2 || replacement.ReviewModels[0] != "sonnet" || replacement.ReviewModels[1] != "haiku" {
+		t.Errorf("replacement review_models = %v", replacement.ReviewModels)
+	}
+
+	// Without review_models the replacement copies the list.
+	w = supersede(replacement.ID, map[string]interface{}{})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var copied store.Task
+	json.NewDecoder(w.Body).Decode(&copied)
+	if len(copied.ReviewModels) != 2 || copied.ReviewModels[0] != "sonnet" {
+		t.Errorf("copied review_models = %v", copied.ReviewModels)
+	}
+}

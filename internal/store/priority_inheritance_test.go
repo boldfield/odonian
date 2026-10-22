@@ -235,7 +235,7 @@ func TestInheritedPrioritySupersedeReplacement(t *testing.T) {
 	task := f.buildTask("build", false)
 	f.frontTo1002(task)
 
-	replacement, err := f.store.SupersedeTask(f.ctx, task, nil)
+	replacement, err := f.store.SupersedeTask(f.ctx, task, nil, nil)
 	if err != nil {
 		t.Fatalf("supersede: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestInheritedPrioritySupersedeReplacement(t *testing.T) {
 		t.Fatalf("replacement anchor=%s priority=%d, want %s and %d", got.TopicAnchorID, got.Priority, task, generatedTopicPriority)
 	}
 
-	second, err := f.store.SupersedeTask(f.ctx, replacement.ID, nil)
+	second, err := f.store.SupersedeTask(f.ctx, replacement.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("supersede replacement: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestResetViaDescendantUpdatesWholeTopicAndFutureWork(t *testing.T) {
 	f.frontTo1002(root)
 	child := f.insertContinuation(root, "gen1", "")
 	grandchild := f.insertContinuation(child, "gen2", "")
-	replacement, err := f.store.SupersedeTask(f.ctx, grandchild, nil)
+	replacement, err := f.store.SupersedeTask(f.ctx, grandchild, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
