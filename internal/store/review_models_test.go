@@ -338,3 +338,42 @@ func TestSupersedeTaskReviewModelsOverride(t *testing.T) {
 		t.Errorf("refused supersede still superseded the task")
 	}
 }
+
+// A terminal failed review child has no verdict and is not live: the reshape must retire it
+// and spawn a replacement instead of counting it as open.
+func TestUpdateTaskReviewModelsReplacesFailedChild(t *testing.T) {
+	f := newReviewModelsFixture(t, []string{"opus", "sonnet"})
+	f.toReview(t)
+	opus := f.childIn(t, 1, "opus", "ready")
+	if opus == nil {
+		t.Fatalf("expected opus child")
+	}
+	if _, err := f.store.ClaimTask(f.ctx, opus.ID, "rev-opus", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("claim opus: %v", err)
+	}
+	if _, err := f.store.TransitionTask(f.ctx, opus.ID, "failed", nil); err != nil {
+		t.Fatalf("fail opus child: %v", err)
+	}
+	if _, err := f.update([]string{"opus", "haiku"}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if f.childIn(t, 1, "opus", "ready") == nil {
+		t.Errorf("no replacement opus child spawned")
+	}
+	haiku := f.childIn(t, 1, "haiku", "ready")
+	if haiku == nil {
+		t.Fatalf("no haiku child spawned")
+	}
+	if err := f.review(t, haiku, "approve"); err != nil {
+		t.Fatalf("haiku review: %v", err)
+	}
+	if st := f.get(t).State; st != "review" {
+		t.Errorf("parent state = %s, want review while replacement opus is open", st)
+	}
+	if err := f.review(t, f.childIn(t, 1, "opus", "ready"), "approve"); err != nil {
+		t.Fatalf("opus review: %v", err)
+	}
+	if st := f.get(t).State; st != "approved" {
+		t.Errorf("parent state = %s, want approved", st)
+	}
+}

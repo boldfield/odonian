@@ -6225,7 +6225,7 @@ func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, pa
 	matched := make(map[string]bool)
 	take := func(model string, done bool) bool {
 		for _, c := range children {
-			if !matched[c.id] && c.model == model && (c.state == "done") == done {
+			if !matched[c.id] && c.model == model && (c.state == "done") == done && (done || (c.state != "failed" && c.state != "archived")) {
 				matched[c.id] = true
 				return true
 			}
