@@ -881,6 +881,23 @@ task_still_owned() {
   return 2
 }
 
+# Hand a task back to ready after a failed dispatch: $1 task id, $2 attempt id (research, may be
+# empty), $3 model, $4 failure class. Only when the task is still in_progress and assigned to this
+# agent; anything else (submitted, blocked, superseded, owned by someone else) is left alone.
+handback_claim() {
+  local task="$1" attempt="$2" model="$3" class="$4" acct
+  [ -n "$task" ] || return 0
+  task_still_owned "$task" || return 0
+  acct="$(account_of "$model")"
+  if odonian unclaim "$task" --agent "$AGENT_ID" ${attempt:+--attempt "$attempt"} \
+       --reason "backend_unavailable: $acct: $class" >/dev/null 2>&1; then
+    echo "[$AGENT_ID] $(date '+%H:%M:%S') handed task ${task:0:8} back to ready (backend_unavailable: $acct: $class)" >&2
+  else
+    echo "[$AGENT_ID] $(date '+%H:%M:%S') could not hand task ${task:0:8} back; it will lapse at lease expiry" >&2
+  fi
+  return 0
+}
+
 # Run the model once in the foreground (the caller backgrounds it). Args: use_codex(0|1)
 # mode(start|resume) session_id text. start: $3 is the Claude session id to create (may be empty),
 # $4 the task prompt. resume: $3 is the session to continue, $4 the resume prompt.
@@ -1153,7 +1170,9 @@ dispatch() {
   # Finalize the research permit exactly once, now that the process is truly gone (never earlier:
   # a submit ends task ownership, not the dispatch). rc 126/127 = the model binary could not be
   # launched at all; that and any non-zero exit are `failed`, a fenced/stopped run `cancelled`.
+  local hb_task="$task" hb_attempt=""
   if [ -n "$P_TASK" ]; then
+    hb_task="$P_TASK"; hb_attempt="$P_ATTEMPT"
     local exit_class=failed
     if [ "$fenced" -eq 1 ]; then exit_class=cancelled
     elif [ "$rc" -eq 0 ]; then exit_class=completed
@@ -1169,6 +1188,7 @@ dispatch() {
   [ "$STOP" -eq 1 ] && return "$rc"
   [ "$fenced" -eq 1 ] && return "$rc"
   if [ "$rc" -ne 0 ]; then
+    handback_claim "$hb_task" "$hb_attempt" "$AGENT_MODEL" "$fail_class"
     echo "[$AGENT_ID] $(date '+%H:%M:%S') dispatch exited rc=$rc (likely out of credits/auth) for model $AGENT_MODEL" >&2
     mark_model_unavailable "$AGENT_MODEL" "$fail_class" "$fail_reset"
   else
