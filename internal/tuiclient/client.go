@@ -853,6 +853,23 @@ func (c *HTTPClient) HeartbeatTask(ctx context.Context, id, agentID string) erro
 	return nil
 }
 
+type unclaimTaskRequest struct {
+	AgentID   string `json:"agent_id"`
+	AttemptID string `json:"attempt_id,omitempty"`
+	Reason    string `json:"reason"`
+}
+
+// UnclaimTask hands a claimed task back to ready.
+func (c *HTTPClient) UnclaimTask(ctx context.Context, id, agentID, reason string) error {
+	body := unclaimTaskRequest{AgentID: agentID, AttemptID: c.AttemptID(id), Reason: reason}
+	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/unclaim", id), body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
 // submitTaskRequest is the request body for SubmitTask.
 type submitTaskRequest struct {
 	AgentID   string          `json:"agent_id"`

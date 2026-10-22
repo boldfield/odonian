@@ -86,6 +86,12 @@ curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/heartbeat" -d "{\"agent_i
 
 Only the current assignee may heartbeat, only while `in_progress`.
 
+If you claimed but cannot do the work (for example the model account hit a limit), hand the claim back
+instead of letting the lease run out: `odonian unclaim "$TASK_ID" --reason "<why>"`
+(`POST /tasks/$TASK_ID/unclaim` with `agent_id`, `attempt_id` for research, and `reason`). Only the owner
+may; the task returns to `ready` with nothing counted against it. A task with a submitted round or open PR
+answers 409. Review and merge tasks can be handed back too; a research task requires its live `attempt_id`.
+
 ### 6. Sync with main, then verify
 
 Bring your branch up to date so it merges cleanly, then verify the **merged** result:
