@@ -153,6 +153,8 @@ echo "$(date +%s.%N) START model=$model task=${t:-none} attempt=${ODONIAN_PRECLA
 trap 'echo "$(date +%s.%N) TERM task=${t:-none}" >> "$FAKE_DIR/claude.log"; exit 143' TERM
 mode="$(cat "$FAKE_DIR/claude.mode" 2>/dev/null || echo ok)"
 case "$mode" in
+  limit:*) echo "You've hit your session limit · resets 7:50pm (UTC)" >&2
+    echo "$(date +%s.%N) END rc=${mode#limit:} task=${t:-none}" >> "$FAKE_DIR/claude.log"; exit "${mode#limit:}" ;;
   fail:*) echo "$(date +%s.%N) END rc=${mode#fail:} task=${t:-none}" >> "$FAKE_DIR/claude.log"; exit "${mode#fail:}" ;;
   sleep:*|submit-sleep:*)
     n="${mode#*:}"
@@ -382,11 +384,11 @@ end_scenario
 echo "Scenario 7b: a limit exit hands the preclaimed task back after the permit is finalized; it is claimable again"
 new_scenario
 tasks_json proj-test A:x
-echo grant > "$FAKE_DIR/claim.A"; echo "fail:7" > "$FAKE_DIR/claude.mode"
+echo grant > "$FAKE_DIR/claim.A"; echo "limit:7" > "$FAKE_DIR/claude.mode"
 echo '{"track":"research","state":"in_progress","assignee":"__ME__"}' > "$FAKE_DIR/show.A"
 start_agent
 wait_for 10 ncalls_ge unclaim 1
-check "task handed back once with the attempt and a backend reason" bash -c "[ $(ncalls unclaim A) -eq 1 ] && grep -q 'unclaim A agent=.* attempt=attempt-A-1 reason=backend_unavailable: .*: other' '$FAKE_DIR/calls.log'"
+check "task handed back once with the attempt and a backend reason" bash -c "[ $(ncalls unclaim A) -eq 1 ] && grep -q 'unclaim A agent=.* attempt=attempt-A-1 reason=backend_unavailable: model:x: limit' '$FAKE_DIR/calls.log'"
 check "permit finalized before the unclaim" bash -c "[ \$(grep -n ' permit-finalize ' '$FAKE_DIR/calls.log' | head -1 | cut -d: -f1) -lt \$(grep -n ' unclaim ' '$FAKE_DIR/calls.log' | head -1 | cut -d: -f1) ]"
 check "task is ready and unclaimed again" test "$(jq -r .state "$FAKE_DIR/show.A")" = ready
 end_scenario
