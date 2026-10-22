@@ -1,6 +1,6 @@
 # Dispatch failure handling: hand claims back, back off per account
 
-Status: specification, 2026-10-21. Three tasks implement it (D1–D3 below).
+Status: specification, 2026-10-21. D1–D3 implement the original design and merged as #502–#504. D4 and D5 were added on 2026-10-22, after the incident described in "What went wrong, again".
 
 ## What went wrong
 
@@ -68,7 +68,71 @@ Depends on nothing. D3 depends on D2, because both edit `harness/agent.sh`.
 
 Depends on D1 (the endpoint) and D2 (the shared file and the classifier).
 
+## What went wrong, again (2026-10-22)
+
+Two failures that only affect one model ran for most of a day.
+
+- **Fable ran out of credits** at about 00:18 UTC while Opus and Sonnet on the same Anthropic account kept working. Every Fable dispatch ended with `You're out of usage credits. Switch to another model to continue.`, about 300 failures an hour. Tasks escalated to Fable by the circuit breaker stalled.
+- **gpt-5.5 stopped working on the fleet's ChatGPT sign-in.** Codex returns `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."}}`. gpt-5.6-sol and gpt-6-astra on the same account work. That was another 300 failures an hour. manifests #203 removed gpt-5.5 from `AGENT_CODEX_MODELS` and the server allowlist. That list decides only whether a run uses Codex or Claude Code, so the reviewers kept claiming gpt-5.5 reviews and sent them to Claude Code. There they fail with `There's an issue with the selected model (gpt-5.5). It may not exist or you may not have access to it. Run --model to pick a different model.`
+
+Two defects follow.
+
+**3. D2 pauses the whole account for errors that affect only one model.** `classify_dispatch_failure` knows usage limits and sign-in failures. Everything else is `other`, and `mark_model_unavailable` records every class under `account_of(model)`. Released as it stands, one Fable or gpt-5.5 failure would pause every Claude or every Codex model on that pod for 30 s, rising to 300 s. Other boards always have Fable tasks ready, so each pod would keep failing on Fable and pausing Opus and Sonnet. With gpt-5.5 still in `AGENT_CODEX_MODELS`, gpt-5.6-sol would be paused too, and gpt-5.6-sol reviews every ohand task.
+
+**4. A task's reviewers cannot be changed.** `review_models` is set at creation. `PATCH /tasks/{id}` accepts only `depends_on`, and `/supersede` copies the list. On 2026-10-22, about 86 open tasks on three boards still named gpt-5.5 as a reviewer. Every review they spawn fails, and nothing can redirect it.
+
+## D4 — Back off a single model for model-specific failures (harness)
+
+Pausing the whole account stays the rule for failures that really belong to the account: a stated usage or session limit, and a sign-in failure. Everything else backs off only the model that failed.
+
+- **New class `model_unavailable`.** `classify_dispatch_failure` returns it when the CLI says that this model, not the account, cannot be served. At least these three verbatim tails must classify as `model_unavailable`:
+  - Claude Code: `You're out of usage credits. Switch to another model to continue.`
+  - Codex: `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."}}`
+  - Claude Code: `There's an issue with the selected model (gpt-5.5). It may not exist or you may not have access to it. Run --model to pick a different model.`
+
+  The model error can come before trailing warning lines (`[claude-code:unrecognized_model] {...}`, `Claude Code doesn't recognize the model ...`), so it is not always on the last non-blank line. Keep D2's protection against quoted text: only match a line that starts with the error, optionally prefixed by `Error:`, `ERROR:` or `API Error:`. Search only the last few non-blank lines of output, and say in a comment how many and why.
+- **Scope by class.** `limit` and `signin` are still recorded under `account_of(model)`. `model_unavailable` and `other` are recorded under a model key. `model_unavailable` holds that model for `ODONIAN_MODEL_UNAVAILABLE_WINDOW` (default 1800 s) and then probes once. `other` keeps the escalating 30–300 s backoff, now per model. A model whose own window is open is skipped, and so is a model whose account's window is open. Success clears the model's record. A success on another model of the same account does not clear it.
+- **Aliases share one key.** Use the canonical name for the model key: `fable`, `opus`, `sonnet` and `haiku` resolve through the `ANTHROPIC_DEFAULT_*_MODEL` pins, so `fable` and `claude-fable-5-1` share one window. A model without a pin is its own key.
+- **Hand back.** `model_unavailable` is a backend reason for D3, so the claim is handed back with reason `backend_unavailable: model:<name>: model_unavailable`.
+- **Log lines** name the scope: `model <name> unavailable (...)` or `account <name> unavailable (...)`.
+- **Tests** (shell, fake CLI), each using the verbatim tails above:
+  - after a Fable credits failure, the next Opus task on the same pod dispatches at once and Fable tasks are skipped for the window;
+  - after the gpt-5.5 400 with gpt-5.5 still in `AGENT_CODEX_MODELS`, a gpt-5.6-sol review dispatches at once;
+  - the Claude Code "issue with the selected model" output followed by the two warning lines classifies as `model_unavailable`;
+  - an `other` failure on one model does not hold its account's other models;
+  - `fable` and `claude-fable-5-1` share a window;
+  - a session limit and a sign-in failure still hold every model of the account (D2 regression);
+  - the error text quoted inside tool output earlier in the transcript does not classify.
+
+Owned paths: `harness/agent.sh` and its tests. Depends on nothing; D2 and D3 have merged. Release v0.24.0 only after D4 lands.
+
+## D5 — Change a task's reviewers (server, CLI)
+
+- **PATCH.** `PATCH /tasks/{id}` also accepts `review_models`, a non-empty array that replaces the whole list. Validate it exactly like task creation, including the allowlist (`400 UNKNOWN_MODEL`). `null` and `[]` return `400 INVALID_REVIEW_MODELS`, so a list is never cleared to the defaults silently. It is accepted on tasks that carry reviewers (not on `review` or `merge` tasks: `400 FIELD_NOT_UPDATABLE`) in `backlog`, `ready`, `in_progress`, `blocked` and `review`. It returns `409` on `approved` (landing may be under way) and on terminal states. `depends_on` keeps its current behavior, and both fields may be sent together.
+- **The open round.** When the task is in `review`, the current round must still be able to finish:
+  - a review child of this round that has not recorded a verdict and whose model is no longer in the list is retired with a note naming the change;
+  - a child that is claimed is retired too, and its agent's later submit is refused by the existing fence;
+  - for each entry in the new list without a live or finished child in this round, a replacement child is spawned in the same round, with the same spec the round's other children received;
+  - children that already recorded a verdict stay and count;
+  - the round then aggregates over exactly the new list.
+
+  Research dispute lineage is keyed by reviewer model and slot. A replaced reviewer starts with no lineage, so its disputes do not carry over. Document that limit; do not invent a mapping.
+- **Event.** Append `review_models_changed` to the task, with the old list, the new list and the actor. Retired and spawned children get their usual events.
+- **Supersede.** `POST /tasks/{id}/supersede` also takes an optional `review_models`, with the same validation. Without it the replacement copies the list as today.
+- **CLI.** Expose it through the command that already wraps `PATCH /tasks/{id}`, or add `odonian update <id> --review-models a,b` if none exists.
+- **Docs.** Update `docs/api.md` (PATCH and supersede) and `AGENT-API.md`.
+- **Tests:**
+  - PATCH on `backlog`, `ready` and `blocked` tasks changes the list, and the next round spawns the new models;
+  - PATCH on a task in `review` with one verdict in and one open child for a removed model retires that child, spawns the replacement in the same round, and the round approves or rejects on the new pair;
+  - a claimed child that is retired cannot submit;
+  - `null`, `[]`, an unknown model, a `review` task, an `approved` task and a terminal task are each refused with the stated code, and nothing changes;
+  - supersede with and without `review_models`;
+  - the CLI round trip.
+
+Owned paths: `internal/api/`, `internal/store/`, `cmd/odonian/` (the CLI command), `docs/api.md`, `AGENT-API.md` and their tests. Depends on nothing.
+
 ## Out of scope
 
 - The fleet sharing one Codex refresh token across pods. That is a deployment concern, recorded separately: give each pod its own sign-in or use an API key.
 - Server-side lease reaping. Expired leases are already claimable.
+- A claim-side model filter in the reviewer, so it never claims a model it cannot run. With D4, an unsupported model costs one probe every 30 minutes per pod, which is not worth another switch.
