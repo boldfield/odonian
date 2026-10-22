@@ -463,7 +463,7 @@ classify_dispatch_failure() {
     echo limit
   elif printf '%s\n' "$lastf" | grep -Eiq "${pre}(refresh_token_reused|your refresh token has already been used|failed to authenticate|not logged in|please run /login|invalid api key|(api error: )?401 |.*\(refresh_token_reused\)|.*authentication_error)"; then
     echo signin
-  elif printf '%s\n' "$tailf" | grep -Eiq "${pre}(you'?re out of usage credits|there'?s an issue with the selected model|.*\"message\":\"the '[^']+' model is not supported when using codex)"; then
+  elif printf '%s\n' "$tailf" | grep -Eiq "${pre}(you'?re out of usage credits|there'?s an issue with the selected model|\{.*\"message\":\"the '[^']+' model is not supported when using codex)"; then
     echo model_unavailable
   else
     echo other
@@ -1210,7 +1210,7 @@ dispatch() {
   if [ "$rc" -ne 0 ]; then
     cat "$out" "$err" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 5 > "$rcdir/all"
     fail_class="$(classify_dispatch_failure "$rcdir/all")"
-    [ "$fail_class" = limit ] && fail_reset="$(parse_reset_epoch "$rcdir/all")"
+    if [ "$fail_class" = limit ]; then tail -n 1 "$rcdir/all" > "$rcdir/last"; fail_reset="$(parse_reset_epoch "$rcdir/last")"; fi
   fi
   rm -rf "$rcdir"
   # The model and every resume are done: nothing the dispatch started may outlive it (success,

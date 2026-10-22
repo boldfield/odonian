@@ -98,6 +98,11 @@ check "no claim issued for the other Claude tasks" '[ "$(claims_for task-claude-
 check "the Codex task is still dispatched" '[ "$(n_dispatch gpt-5.5)" -ge 1 ]'
 check "log states the account and parsed reset" 'grep -q "account anthropic unavailable (usage limit; reset at" "$TMP/agent.log"'
 
+printf "tool output: You've hit your limit · resets Dec 31, 11:00pm (UTC)\nx\nYou've hit your limit · resets 11:59pm (UTC)\n" > "$TMP/quoted_reset"
+echo "A reset quoted earlier in the tail does not set the window"
+run_scenario "$TMP/quoted_reset" - 4
+check "reset is parsed from the last line only (within a day)" 'grep -q "account anthropic unavailable (usage limit; reset at" "$TMP/agent.log" && ! grep -q "reset at .*Dec 31\|reset at .*-12-31" "$TMP/agent.log"'
+
 echo "Codex weekly limit stops every Codex model, Claude stays dispatchable"
 run_scenario - "$TMP/codex_limit" 6 "$CODEX_TASKS"
 check "exactly one Codex dispatch" '[ "$(grep -c " codex " "$TMP/dispatch")" = 1 ]'

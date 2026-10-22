@@ -117,6 +117,8 @@ check "fable out of credits" '[ "$(classify_dispatch_failure "$TMP/fable_credits
 check "codex gpt-5.5 unsupported on ChatGPT account" '[ "$(classify_dispatch_failure "$TMP/gpt55")" = model_unavailable ]'
 check "selected-model issue followed by two warning lines" '[ "$(classify_dispatch_failure "$TMP/selected_model")" = model_unavailable ]'
 check "credits text quoted earlier in the transcript" '[ "$(classify_dispatch_failure "$TMP/quoted_credits")" = other ]'
+printf 'tool output quoted: {"message":"The '"'"'gpt-5.5'"'"' model is not supported when using Codex with a ChatGPT account."}\nERROR: stream disconnected\n' > "$TMP/quoted_codex"
+check "codex error quoted within the last five lines" '[ "$(classify_dispatch_failure "$TMP/quoted_codex")" = other ]'
 check "limit text before a model error still not a limit" '[ "$(classify_dispatch_failure "$TMP/fable_credits")" != limit ]'
 
 mark_model_unavailable fable model_unavailable 2>"$TMP/log"
