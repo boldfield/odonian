@@ -10991,3 +10991,63 @@ func TestSupersedeWithReviewModels(t *testing.T) {
 		t.Errorf("copied review_models = %v", copied.ReviewModels)
 	}
 }
+
+func TestPatchTaskReviewModelsAndDependsOnIsAtomic(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	taskID := setupTaskInReview(t, server, authHeader)
+
+	children := func() int {
+		var n int
+		for _, tk := range mustListTasks(t, server, authHeader, taskID) {
+			if tk.TargetTaskID != nil && *tk.TargetTaskID == taskID && tk.State != "abandoned" {
+				n++
+			}
+		}
+		return n
+	}
+	before := children()
+	var initial []string
+	{
+		var got store.Task
+		json.NewDecoder(patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{}).Body).Decode(&got)
+		initial = got.ReviewModels
+	}
+	if before == 0 {
+		t.Fatalf("expected an open review child before the PATCH")
+	}
+
+	for name, deps := range map[string]interface{}{"self": []string{taskID}, "null": nil} {
+		w := patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{"review_models": []string{"sonnet"}, "depends_on": deps})
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", name, w.Code, w.Body.String())
+		}
+		gw := patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{})
+		var got store.Task
+		json.NewDecoder(gw.Body).Decode(&got)
+		if len(got.ReviewModels) != len(initial) {
+			t.Errorf("%s: refused PATCH changed review_models to %v", name, got.ReviewModels)
+		}
+		if n := children(); n != before {
+			t.Errorf("%s: refused PATCH changed live review children %d -> %d", name, before, n)
+		}
+	}
+}
+
+// mustListTasks lists the tasks of the project that holds taskID.
+func mustListTasks(t *testing.T, server *Server, authHeader, taskID string) []store.Task {
+	t.Helper()
+	var self store.Task
+	gr := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	gr.Header.Set("Authorization", authHeader)
+	gw := httptest.NewRecorder()
+	server.mux.ServeHTTP(gw, gr)
+	json.NewDecoder(gw.Body).Decode(&self)
+	req := httptest.NewRequest("GET", "/projects/"+self.ProjectID+"/tasks", nil)
+	req.Header.Set("Authorization", authHeader)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	var tasks []store.Task
+	json.NewDecoder(w.Body).Decode(&tasks)
+	return tasks
+}

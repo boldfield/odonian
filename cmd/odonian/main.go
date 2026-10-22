@@ -886,6 +886,7 @@ func executeUpdate(ctx context.Context, baseURL, token string, args []string) er
 
 	taskID := args[0]
 	var reviewModels []string
+	var jsonOut bool
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--review-models":
@@ -899,6 +900,7 @@ func executeUpdate(ctx context.Context, baseURL, token string, args []string) er
 				}
 			}
 		case "--json":
+			jsonOut = true
 		default:
 			return fmt.Errorf("unknown flag: %s", args[i])
 		}
@@ -909,10 +911,14 @@ func executeUpdate(ctx context.Context, baseURL, token string, args []string) er
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	if err := client.UpdateTaskReviewModels(ctx, taskID, reviewModels); err != nil {
+	if err := client.UpdateTaskReviewModels(ctx, taskID, reviewModels, os.Getenv("AGENT_ID")); err != nil {
 		return fmt.Errorf("failed to update task: %w", err)
 	}
 
+	if jsonOut {
+		return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{"id": taskID, "review_models": reviewModels})
+	}
+	fmt.Printf("Updated %s: review_models = %s\n", taskID, strings.Join(reviewModels, ","))
 	return nil
 }
 

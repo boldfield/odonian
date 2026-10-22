@@ -831,9 +831,14 @@ func (c *HTTPClient) TransitionTask(ctx context.Context, id, to string, note *st
 	return nil
 }
 
-// UpdateTaskReviewModels replaces a task's review_models via PATCH /tasks/{id}.
-func (c *HTTPClient) UpdateTaskReviewModels(ctx context.Context, id string, models []string) error {
-	resp, err := c.do(ctx, "PATCH", fmt.Sprintf("/tasks/%s", id), map[string]interface{}{"review_models": models})
+// UpdateTaskReviewModels replaces a task's review_models via PATCH /tasks/{id}. A non-empty
+// actor is recorded on the review_models_changed event.
+func (c *HTTPClient) UpdateTaskReviewModels(ctx context.Context, id string, models []string, actor string) error {
+	body := map[string]interface{}{"review_models": models}
+	if actor != "" {
+		body["actor"] = actor
+	}
+	resp, err := c.do(ctx, "PATCH", fmt.Sprintf("/tasks/%s", id), body)
 	if err != nil {
 		return err
 	}

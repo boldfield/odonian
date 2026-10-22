@@ -64,6 +64,7 @@ type Store interface {
 	ListDependents(ctx context.Context, taskID string) ([]string, error)
 	UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string) (Task, error)
 	UpdateTaskReviewModels(ctx context.Context, taskID string, models []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error)
+	UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID string, models []string, deps []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error)
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	ClaimResearchTask(ctx context.Context, req ResearchClaim) (ResearchClaimResult, error)
 	SetResearchPolicy(ctx context.Context, now time.Time, cfg policy.Config) error
@@ -5982,51 +5983,53 @@ func (s *sqliteStore) ReleaseTask(ctx context.Context, taskID string, maxReviewR
 	return t, nil
 }
 
-// UpdateTaskDependsOn updates the depends_on edges for a task.
-// Returns ValidationError if self-dependency is detected.
-// Returns ConflictError if a cycle would be created.
-func (s *sqliteStore) UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string) (Task, error) {
-	// Check for self-dependency
+// applyDependsOn validates and writes a task's depends_on edges inside tx, so a caller can
+// combine it with other writes and roll the lot back together.
+func (s *sqliteStore) applyDependsOn(ctx context.Context, tx *sql.Tx, taskID string, depIDs []string) error {
 	for _, depID := range depIDs {
 		if depID == taskID {
-			return Task{}, invalid("SELF_DEPENDENCY", "a task cannot depend on itself")
+			return invalid("SELF_DEPENDENCY", "a task cannot depend on itself")
 		}
 	}
 
-	// Load the full dependency graph
-	rows, err := s.conn.QueryContext(ctx, `
+	rows, err := tx.QueryContext(ctx, `
 		SELECT task_id, depends_on_id FROM task_dep
 	`)
 	if err != nil {
-		return Task{}, fmt.Errorf("failed to query dependency graph: %w", err)
+		return fmt.Errorf("failed to query dependency graph: %w", err)
 	}
-	defer rows.Close()
-
 	edges := make(map[string][]string)
 	for rows.Next() {
 		var taskID, depID string
 		if err := rows.Scan(&taskID, &depID); err != nil {
-			return Task{}, fmt.Errorf("failed to scan dependency: %w", err)
+			rows.Close()
+			return fmt.Errorf("failed to scan dependency: %w", err)
 		}
 		edges[taskID] = append(edges[taskID], depID)
 	}
 	if err := rows.Err(); err != nil {
-		return Task{}, fmt.Errorf("error iterating dependency graph: %w", err)
+		rows.Close()
+		return fmt.Errorf("error iterating dependency graph: %w", err)
 	}
+	rows.Close()
 
-	// Check if the update would create a cycle
 	if wouldCreateCycle(edges, taskID, depIDs) {
-		return Task{}, conflict("CYCLE_DETECTED", "updating depends_on would create a cycle")
+		return conflict("CYCLE_DETECTED", "updating depends_on would create a cycle")
 	}
+	return s.setTaskDepends(ctx, tx, taskID, depIDs)
+}
 
-	// Update the dependencies in a transaction
+// UpdateTaskDependsOn updates the depends_on edges for a task.
+// Returns ValidationError if self-dependency is detected.
+// Returns ConflictError if a cycle would be created.
+func (s *sqliteStore) UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	if err := s.setTaskDepends(ctx, tx, taskID, depIDs); err != nil {
+	if err := s.applyDependsOn(ctx, tx, taskID, depIDs); err != nil {
 		return Task{}, err
 	}
 
@@ -6082,6 +6085,12 @@ func (s *sqliteStore) validateReviewModels(models []string) error {
 // verdict stay and count. Research dispute lineage is keyed by reviewer model and slot, so a
 // replacement reviewer starts with no lineage and earlier disputes do not carry over.
 func (s *sqliteStore) UpdateTaskReviewModels(ctx context.Context, taskID string, models []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error) {
+	return s.UpdateTaskReviewModelsAndDeps(ctx, taskID, models, nil, actor, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget)
+}
+
+// UpdateTaskReviewModelsAndDeps is UpdateTaskReviewModels plus, when deps is non-nil, a
+// depends_on replacement in the same transaction: either both take effect or neither does.
+func (s *sqliteStore) UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID string, models []string, deps []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error) {
 	if err := s.validateReviewModels(models); err != nil {
 		return Task{}, err
 	}
@@ -6122,6 +6131,12 @@ func (s *sqliteStore) UpdateTaskReviewModels(ctx context.Context, taskID string,
 	if reviewModelsJSON != nil {
 		if err := json.Unmarshal([]byte(*reviewModelsJSON), &oldModels); err != nil {
 			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	if deps != nil {
+		if err := s.applyDependsOn(ctx, tx, taskID, deps); err != nil {
+			return Task{}, err
 		}
 	}
 
@@ -6259,6 +6274,12 @@ func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, pa
 	if i := strings.Index(spec, "## Prior Review Round: Disputed Finding(s)"); i >= 0 {
 		if j := strings.Index(spec[i:], "## Instructions"); j >= 0 {
 			spec = spec[:i] + spec[i+j:]
+		}
+	}
+	if len(missing) > 0 {
+		spawnNote := fmt.Sprintf("Round %d reshaped, spawned: %s", round, strings.Join(missing, ", "))
+		if _, err := s.AppendEvent(ctx, tx, parentID, "system", "spawn_review", nil, &spawnNote); err != nil {
+			return fmt.Errorf("failed to append spawn_review event: %w", err)
 		}
 	}
 	for _, m := range missing {
