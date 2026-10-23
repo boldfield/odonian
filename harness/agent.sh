@@ -359,7 +359,9 @@ ensure_worktree() {
 # OpenAI account. State is therefore keyed by account (see account_of), so one exhausted account is
 # skipped for all its models while the other account keeps dispatching. A usage/session limit holds
 # the account until the reset the CLI stated; a sign-in failure holds it for a fixed long window and
-# then probes once; anything else keeps the escalating capped backoff. State is local to this pod.
+# then probes once. Failures that belong to one model only (model_unavailable: no credits for that
+# model, model not supported/not found; and anything unclassified) are recorded under a MODEL key
+# (see model_key), so the account's other models keep dispatching. State is local to this pod.
 FAIL_MODEL_NAMES=()   # account keys
 FAIL_MODEL_UNTIL=()   # epoch seconds when the matching account's window ends (0 = elapsed, awaiting probe)
 FAIL_MODEL_COUNTS=()  # consecutive failures for that account, for escalating backoff
@@ -367,6 +369,7 @@ FAIL_MODEL_COUNTS=()  # consecutive failures for that account, for escalating ba
 ACCOUNT_MAX_WINDOW="${ODONIAN_ACCOUNT_MAX_WINDOW:-604800}"     # cap on any single window (7 days)
 ACCOUNT_RESET_MARGIN="${ODONIAN_ACCOUNT_RESET_MARGIN:-60}"     # slack added after a stated reset
 ACCOUNT_SIGNIN_WINDOW="${ODONIAN_ACCOUNT_SIGNIN_WINDOW:-600}"  # sign-in failure window (10 minutes)
+MODEL_UNAVAILABLE_WINDOW="${ODONIAN_MODEL_UNAVAILABLE_WINDOW:-1800}"  # model_unavailable window (30 minutes)
 
 # Echo the provider account key for model $1. Derived from the same configuration that lists the
 # models: AGENT_CODEX_MODELS (OpenAI) and the ANTHROPIC_DEFAULT_*_MODEL pins plus Claude names and
@@ -384,6 +387,23 @@ account_of() {
   esac
   echo "model:$m"
 }
+
+# Echo the canonical model name for $1: a tier alias (fable|opus|sonnet|haiku) resolves through its
+# ANTHROPIC_DEFAULT_*_MODEL pin, so `fable` and `claude-fable-5-1` share one key. A model without a
+# pin is its own key.
+model_key() {
+  local m="$1" pin=""
+  case "$m" in
+    fable) pin="${ANTHROPIC_DEFAULT_FABLE_MODEL:-}" ;;
+    opus) pin="${ANTHROPIC_DEFAULT_OPUS_MODEL:-}" ;;
+    sonnet) pin="${ANTHROPIC_DEFAULT_SONNET_MODEL:-}" ;;
+    haiku) pin="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ;;
+  esac
+  echo "${pin:-$m}"
+}
+
+# Echo the FAIL_MODEL_NAMES key for model $1 (a model-scoped record), distinct from account keys.
+_model_scope_key() { echo "model@$(model_key "$1")"; }
 
 # Echo the index of account $1 in FAIL_MODEL_NAMES, or nothing (rc=1) if not tracked.
 _fail_model_index() {
@@ -406,32 +426,45 @@ _fail_model_drop() {
 # claimable tasks pinned to it. When the window elapses the record is kept (so a failed probe
 # escalates) but no longer blocks, so the next dispatch is the single probe; success clears it.
 model_unavailable() {
-  local m="$1" a i now
-  a="$(account_of "$m")"
-  i="$(_fail_model_index "$a")" || return 1
+  _scope_blocked "$(account_of "$1")" "account $(account_of "$1")" && return 0
+  _scope_blocked "$(_model_scope_key "$1")" "model $(model_key "$1")" && return 0
+  return 1
+}
+
+# True if the record under key $1 (named $2 in logs) is inside its window; see model_unavailable.
+_scope_blocked() {
+  local k="$1" label="$2" i now
+  i="$(_fail_model_index "$k")" || return 1
   now=$(date +%s)
   [ "${FAIL_MODEL_UNTIL[$i]}" -eq 0 ] && return 1
   if [ "$now" -lt "${FAIL_MODEL_UNTIL[$i]}" ]; then
     return 0
   fi
-  echo "[$AGENT_ID] $(date '+%H:%M:%S') account $a backoff window elapsed; probing with the next dispatch" >&2
+  echo "[$AGENT_ID] $(date '+%H:%M:%S') $label backoff window elapsed; probing with the next dispatch" >&2
   FAIL_MODEL_UNTIL[$i]=0
   return 1
 }
 
-# Classify CLI output (file $1): echo "limit", "signin" or "other". Never echoes the output itself.
-# Only the CLI's own terminal message counts: the last non-empty line, with each pattern anchored to
-# the captured message forms (optional "Error:"/"ERROR:" prefix). Earlier transcript lines, even ones
-# that quote such text verbatim (tool output, a grep of this repo), never classify the failure.
+# Classify CLI output (file $1): echo "limit", "signin", "model_unavailable" or "other". Never echoes
+# the output itself. Only the CLI's own terminal message counts, with each pattern anchored to the
+# captured message forms (optional "Error:"/"ERROR:"/"API Error:" prefix). Earlier transcript lines,
+# even ones that quote such text verbatim (tool output, a grep of this repo), never classify the
+# failure. limit and signin match the last non-blank line only. A model error can be followed by
+# trailing warning lines (`[claude-code:unrecognized_model] {...}`, "Claude Code doesn't recognize
+# the model ..."), so model_unavailable searches the last 5 non-blank lines: enough to see past
+# those few warnings, too few to reach quoted tool output earlier in the transcript.
 classify_dispatch_failure() {
-  local f="$1" tailf
+  local f="$1" lastf tailf
   [ -s "$f" ] || { echo other; return 0; }
-  tailf="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 1)"
+  tailf="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 5)"
+  lastf="$(printf '%s\n' "$tailf" | tail -n 1)"
   local pre='^[[:space:]]*((API )?Error:?|ERROR:?)?[[:space:]]*'
-  if printf '%s\n' "$tailf" | grep -Eiq "${pre}(you'?ve|you have) hit your ([a-z0-9-]+ )?(usage |session |weekly )?limit"; then
+  if printf '%s\n' "$lastf" | grep -Eiq "${pre}(you'?ve|you have) hit your ([a-z0-9-]+ )?(usage |session |weekly )?limit"; then
     echo limit
-  elif printf '%s\n' "$tailf" | grep -Eiq "${pre}(refresh_token_reused|your refresh token has already been used|failed to authenticate|not logged in|please run /login|invalid api key|(api error: )?401 |.*\(refresh_token_reused\)|.*authentication_error)"; then
+  elif printf '%s\n' "$lastf" | grep -Eiq "${pre}(refresh_token_reused|your refresh token has already been used|failed to authenticate|not logged in|please run /login|invalid api key|(api error: )?401 |.*\(refresh_token_reused\)|.*authentication_error)"; then
     echo signin
+  elif printf '%s\n' "$tailf" | grep -Eiq "${pre}(you'?re out of usage credits|there'?s an issue with the selected model|\{.*\"message\":\"the '[^']+' model is not supported when using codex)"; then
+    echo model_unavailable
   else
     echo other
   fi
@@ -462,12 +495,16 @@ parse_reset_epoch() {
   echo "$ts"
 }
 
-# Record a dispatch failure attributable to model $1's account. $2 = class (limit|signin|other,
-# default other); $3 = parsed reset epoch for a limit (optional). Windows are capped.
+# Record a dispatch failure. $1 = model, $2 = class (limit|signin|model_unavailable|other, default
+# other); $3 = parsed reset epoch for a limit (optional). limit and signin belong to the model's
+# account; model_unavailable and other to the model alone. Windows are capped.
 mark_model_unavailable() {
-  local m="$1" class="${2:-other}" reset="${3:-}" a i count backoff now what
-  a="$(account_of "$m")"
-  i="$(_fail_model_index "$a")"
+  local m="$1" class="${2:-other}" reset="${3:-}" k scope i count backoff now what
+  case "$class" in
+    limit|signin) k="$(account_of "$m")"; scope="account $k" ;;
+    *) k="$(_model_scope_key "$m")"; scope="model $(model_key "$m")" ;;
+  esac
+  i="$(_fail_model_index "$k")"
   count=1
   [ -n "$i" ] && count=$((${FAIL_MODEL_COUNTS[$i]} + 1))
   now=$(date +%s)
@@ -482,8 +519,11 @@ mark_model_unavailable() {
       fi ;;
     signin)
       backoff="$ACCOUNT_SIGNIN_WINDOW"
-      echo "[$AGENT_ID] $(date '+%H:%M:%S') SIGN-IN FAILED for account $a (model $m); re-authenticate. Holding all its models for ${backoff}s, then probing once" >&2
+      echo "[$AGENT_ID] $(date '+%H:%M:%S') SIGN-IN FAILED for account $k (model $m); re-authenticate. Holding all its models for ${backoff}s, then probing once" >&2
       what="sign-in failure" ;;
+    model_unavailable)
+      backoff="$MODEL_UNAVAILABLE_WINDOW"
+      what="model not available" ;;
     *)
       backoff=$((count * 30)); [ "$backoff" -gt 300 ] && backoff=300
       what="dispatch failure (consecutive failures=$count)" ;;
@@ -493,16 +533,24 @@ mark_model_unavailable() {
   if [ -n "$i" ]; then
     FAIL_MODEL_UNTIL[$i]=$((now + backoff)); FAIL_MODEL_COUNTS[$i]=$count
   else
-    FAIL_MODEL_NAMES+=("$a"); FAIL_MODEL_UNTIL+=("$((now + backoff))"); FAIL_MODEL_COUNTS+=("$count")
+    FAIL_MODEL_NAMES+=("$k"); FAIL_MODEL_UNTIL+=("$((now + backoff))"); FAIL_MODEL_COUNTS+=("$count")
   fi
-  echo "[$AGENT_ID] $(date '+%H:%M:%S') account $a unavailable ($what); skipping tasks of all its models for ${backoff}s" >&2
+  if [ "${scope%% *}" = account ]; then
+    echo "[$AGENT_ID] $(date '+%H:%M:%S') $scope unavailable ($what); skipping tasks of all its models for ${backoff}s" >&2
+  else
+    echo "[$AGENT_ID] $(date '+%H:%M:%S') $scope unavailable ($what); skipping its tasks for ${backoff}s" >&2
+  fi
 }
 
-# Self-heal on a successful dispatch: this model's account works again.
+# Self-heal on a successful dispatch: this model works, so its own record and its account's clear.
+# A success on another model of the same account leaves this model's record alone.
 clear_model_failures() {
-  local i
-  i="$(_fail_model_index "$(account_of "$1")")" || return 0
-  _fail_model_drop "$i"
+  local i k
+  for k in "$(account_of "$1")" "$(_model_scope_key "$1")"; do
+    i="$(_fail_model_index "$k")" || continue
+    _fail_model_drop "$i"
+  done
+  return 0
 }
 
 # --- research admission (P5) -------------------------------------------------------------------
@@ -888,7 +936,10 @@ handback_claim() {
   local task="$1" attempt="$2" model="$3" class="$4" acct
   [ -n "$task" ] || return 0
   task_still_owned "$task" || return 0
-  acct="$(account_of "$model")"
+  case "$class" in
+    limit|signin) acct="$(account_of "$model")" ;;
+    *) acct="model:$(model_key "$model")" ;;
+  esac
   if odonian unclaim "$task" --agent "$AGENT_ID" ${attempt:+--attempt "$attempt"} \
        --reason "backend_unavailable: $acct: $class" >/dev/null 2>&1; then
     echo "[$AGENT_ID] $(date '+%H:%M:%S') handed task ${task:0:8} back to ready (backend_unavailable: $acct: $class)" >&2
@@ -1157,9 +1208,9 @@ dispatch() {
   done
   local fail_class=other fail_reset=""
   if [ "$rc" -ne 0 ]; then
-    cat "$out" "$err" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1 > "$rcdir/all"
+    cat "$out" "$err" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 5 > "$rcdir/all"
     fail_class="$(classify_dispatch_failure "$rcdir/all")"
-    [ "$fail_class" = limit ] && fail_reset="$(parse_reset_epoch "$rcdir/all")"
+    if [ "$fail_class" = limit ]; then tail -n 1 "$rcdir/all" > "$rcdir/last"; fail_reset="$(parse_reset_epoch "$rcdir/last")"; fi
   fi
   rm -rf "$rcdir"
   # The model and every resume are done: nothing the dispatch started may outlive it (success,
