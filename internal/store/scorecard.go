@@ -526,12 +526,13 @@ func (t *findingThread) withdrawnAfterDispute() bool {
 
 // researchReviewTaskLineages maps each of parentID's non-adjudication review tasks to
 // its reviewer lineage, assigning slots exactly as collectResearchReviewReports does
-// (per round and model, in creation order), so an approval's lineage matches the
-// lineage its reviewer's findings were recorded under.
+// (per round and model, in creation order, skipping review children retired by a
+// review_models change), so an approval's lineage matches the lineage its reviewer's
+// findings were recorded under.
 func researchReviewTaskLineages(ctx context.Context, tx *sql.Tx, parentID string) (map[string]string, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, review_round, model FROM task
-		WHERE target_task_id = ? AND kind = 'review' AND review_round >= 1 AND adjudicate_finding_id IS NULL
+		WHERE target_task_id = ? AND kind = 'review' AND review_round >= 1 AND adjudicate_finding_id IS NULL AND state != 'abandoned'
 		ORDER BY review_round, rowid, id
 	`, parentID)
 	if err != nil {

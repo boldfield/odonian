@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"sort"
@@ -434,5 +435,84 @@ func TestUpdateTaskReviewModelsReplacesSupersededChild(t *testing.T) {
 				t.Errorf("parent state = %s, want approved", st)
 			}
 		})
+	}
+}
+
+// When a reshape retires a verdict-less research review child and spawns a same-model
+// replacement in the same round, every slot assignment must give the replacement the
+// retired child's lineage, so its findings stay on one lineage inside the server and
+// into the next round (a dispute of its finding reaches the next round's reviewer).
+func TestUpdateTaskReviewModelsResearchReplacementLineage(t *testing.T) {
+	store, ctx, projID, parentID := newResearchTask(t, false)
+	opus, sonnet := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if opus == nil || sonnet == nil {
+		t.Fatalf("expected both round-1 review tasks")
+	}
+	if _, err := store.ClaimTask(ctx, opus.ID, "rev-opus", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("claim opus: %v", err)
+	}
+	if _, err := store.TransitionTask(ctx, opus.ID, "failed", nil); err != nil {
+		t.Fatalf("fail opus child: %v", err)
+	}
+	if _, err := store.UpdateTaskReviewModels(ctx, parentID, []string{"opus", "sonnet"}, "tester", 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	replacement, _ := findResearchReviewTasks(t, store, ctx, projID, parentID, 1)
+	if replacement == nil || replacement.ID == opus.ID {
+		t.Fatalf("expected a replacement opus child")
+	}
+	finding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"overstates source","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, replacement, "opus-reviewer", "reject", finding)
+	submitResearchReview(t, store, ctx, sonnet, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
+	if p, _ := store.GetTask(ctx, parentID); p.State != "ready" {
+		t.Fatalf("parent state = %s, want ready after the rejected round", p.State)
+	}
+
+	want := researchReviewerLineage("opus", 0)
+	s := store.(*sqliteStore)
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	lineages, err := researchReviewTaskLineages(ctx, tx, parentID)
+	if err != nil {
+		t.Fatalf("researchReviewTaskLineages: %v", err)
+	}
+	if _, ok := lineages[opus.ID]; ok {
+		t.Errorf("retired child was assigned a lineage")
+	}
+	if got := lineages[replacement.ID]; got != want {
+		t.Errorf("researchReviewTaskLineages: replacement lineage = %q, want %q", got, want)
+	}
+	collected, err := s.collectResearchReviewFindings(ctx, tx, parentID, 1)
+	if err != nil {
+		t.Fatalf("collectResearchReviewFindings: %v", err)
+	}
+	if len(collected) != 1 || collected[0].lineage != want {
+		t.Errorf("collectResearchReviewFindings: got %+v, want one finding on lineage %q", collected, want)
+	}
+	_, blocking, blockingLineages, err := s.checkResearchBlockingFindings(ctx, tx, parentID, 1)
+	if err != nil {
+		t.Fatalf("checkResearchBlockingFindings: %v", err)
+	}
+	if len(blocking) != 1 || len(blockingLineages) != 1 || blockingLineages[0] != want {
+		t.Errorf("checkResearchBlockingFindings: lineages = %q, want [%q]", blockingLineages, want)
+	}
+	tx.Rollback()
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"the source supports the claim as written"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("resubmit with dispute: %v", err)
+	}
+	opus2, sonnet2 := findResearchReviewTasks(t, store, ctx, projID, parentID, 2)
+	if opus2 == nil || sonnet2 == nil {
+		t.Fatalf("expected both round-2 review tasks")
+	}
+	if !strings.Contains(opus2.Spec, "Disputed Finding") || !strings.Contains(opus2.Spec, "overstates source") {
+		t.Errorf("round-2 opus spec lacks the dispute of the replacement's finding:\n%s", opus2.Spec)
+	}
+	if strings.Contains(sonnet2.Spec, "Disputed Finding") {
+		t.Errorf("round-2 sonnet spec carries a dispute it did not raise")
 	}
 }

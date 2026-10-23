@@ -3629,9 +3629,13 @@ func (s *sqliteStore) collectResearchReviewReports(ctx context.Context, tx *sql.
 	// adjudicate_finding_id IS NULL excludes section 5 adjudication tasks: their
 	// ruling is binding only for the one finding they adjudicate, so they must never
 	// be assigned a reviewer slot or contribute to a reviewer lineage's findings here.
+	// state != 'abandoned' excludes review children retired by a review_models change
+	// (UpdateTaskReviewModels): they never recorded a verdict, and skipping them gives
+	// a same-model replacement the slot the retired child held, as every other slot
+	// assignment (checkResearchBlockingFindings, researchReviewTaskLineages) does.
 	taskRows, err := tx.QueryContext(ctx, `
 		SELECT id, review_round, model FROM task
-		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ? AND adjudicate_finding_id IS NULL
+		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ? AND adjudicate_finding_id IS NULL AND state != 'abandoned'
 		ORDER BY review_round, rowid, id
 	`, parentID, throughRound)
 	if err != nil {
