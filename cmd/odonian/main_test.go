@@ -7081,3 +7081,30 @@ func TestExecutePriorityRetryAfterFailureReusesKey(t *testing.T) {
 		t.Errorf("unexpected JSON result: %+v", result)
 	}
 }
+
+func TestExecuteUpdateReviewModelsRoundTrip(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	err := executeUpdate(context.Background(), server.URL, "test-token", []string{"task-123", "--review-models", "opus, gpt-5.6-sol"})
+	if err != nil {
+		t.Fatalf("executeUpdate failed: %v", err)
+	}
+	if gotMethod != "PATCH" || gotPath != "/tasks/task-123" {
+		t.Errorf("request = %s %s", gotMethod, gotPath)
+	}
+	if want := []string{"opus", "gpt-5.6-sol"}; !reflect.DeepEqual(gotBody["review_models"], want) {
+		t.Errorf("review_models = %v, want %v", gotBody["review_models"], want)
+	}
+
+	if err := executeUpdate(context.Background(), server.URL, "test-token", []string{"task-123"}); err == nil {
+		t.Error("expected error without --review-models")
+	}
+}

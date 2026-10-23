@@ -82,7 +82,7 @@ func TestSupersedeKeepsBranch(t *testing.T) {
 	// Escalation supersedes the task onto a stronger model; the replacement must keep
 	// targeting the same shared branch.
 	escalatedModel := "sonnet"
-	replacement, err := store.SupersedeTask(ctx, tasks[0].ID, &escalatedModel)
+	replacement, err := store.SupersedeTask(ctx, tasks[0].ID, &escalatedModel, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask: %v", err)
 	}

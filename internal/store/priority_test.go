@@ -447,7 +447,7 @@ func (f *priorityFixture) buildLineage() topicLineage {
 	f.t.Helper()
 	var l topicLineage
 	l.anchor = f.task("ready", 500)
-	replacement, err := f.store.SupersedeTask(f.ctx, l.anchor, nil)
+	replacement, err := f.store.SupersedeTask(f.ctx, l.anchor, nil, nil)
 	if err != nil {
 		f.t.Fatalf("supersede anchor: %v", err)
 	}
@@ -462,7 +462,7 @@ func (f *priorityFixture) buildLineage() topicLineage {
 	f.exec(`INSERT INTO task_link (id, task_id, kind, value) VALUES (?, ?, 'continuation_parent', ?)`, GenerateID(), l.child, l.replacement)
 	l.grandchild = f.task("backlog", 500)
 	f.exec(`INSERT INTO task_link (id, task_id, kind, value) VALUES (?, ?, 'continuation_parent', ?)`, GenerateID(), l.grandchild, l.child)
-	childReplacement, err := f.store.SupersedeTask(f.ctx, l.child, nil)
+	childReplacement, err := f.store.SupersedeTask(f.ctx, l.child, nil, nil)
 	if err != nil {
 		f.t.Fatalf("supersede child: %v", err)
 	}

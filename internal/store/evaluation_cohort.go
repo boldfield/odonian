@@ -307,7 +307,7 @@ func (s *sqliteStore) firstRoundRecord(ctx context.Context, taskID string) (eval
 func (s *sqliteStore) roundOneReviewTasks(ctx context.Context, taskID string) ([]string, error) {
 	rows, err := s.conn.QueryContext(ctx, `
 		SELECT id FROM task
-		WHERE target_task_id = ? AND kind = 'review' AND review_round = 1 AND adjudicate_finding_id IS NULL
+		WHERE target_task_id = ? AND kind = 'review' AND review_round = 1 AND adjudicate_finding_id IS NULL AND state != 'abandoned'
 		ORDER BY rowid`, taskID)
 	if err != nil {
 		return nil, fmt.Errorf("list round-1 review tasks: %w", err)

@@ -571,7 +571,7 @@ func TestGetResearchReviewerScorecards_SupersededChain_NoDoubleCount(t *testing.
 	findingsA := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
 	submitResearchReview(t, store, ctx, opusA, "opus-reviewer", "reject", findingsA)
 
-	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	successor, err := store.SupersedeTask(ctx, parentID, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to supersede: %v", err)
 	}
@@ -646,7 +646,7 @@ func TestGetResearchReviewerScorecards_SupersededChain_UnlinkedFindingStaysUnres
 	findingsA := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":10,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
 	submitResearchReview(t, store, ctx, opusA, "opus-reviewer", "reject", findingsA)
 
-	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	successor, err := store.SupersedeTask(ctx, parentID, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to supersede: %v", err)
 	}
@@ -900,7 +900,7 @@ func TestGetResearchReviewerScorecards_SupersededChain_ApprovalsWithLaterFix(t *
 	blockingFindings := json.RawMessage(`[{"id":"f1","severity":"P2","file":"test.txt","line":1,"summary":"missing info","in_changed_text":true,"status":"new"}]`)
 	submitResearchReview(t, store, ctx, sonnetA, "sonnet-reviewer", "reject", blockingFindings)
 
-	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	successor, err := store.SupersedeTask(ctx, parentID, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to supersede: %v", err)
 	}
@@ -1240,7 +1240,7 @@ func TestGetResearchReviewerScorecards_SupersededChain_ResolvedUnmatchedPriorIDI
 	submitResearchReview(t, store, ctx, sonnetTask1, "sonnet-reviewer", "reject", sonnetFindings)
 
 	// Supersede the task
-	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	successor, err := store.SupersedeTask(ctx, parentID, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to supersede: %v", err)
 	}

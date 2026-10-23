@@ -173,7 +173,7 @@ func run(args []string) error {
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
-	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "unclaim", "next", "promote", "transition", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize", "priority":
+	case "projects", "tasks", "show", "claim", "submit", "heartbeat", "unclaim", "next", "promote", "transition", "update", "project", "merge", "pending", "diff", "approve", "reject", "wt-ensure", "pr-feedback", "research-policy", "research-status", "permit-renew", "permit-finalize", "priority":
 		return runClient(args[1], args[2:])
 	default:
 		if evaluationVerbs[args[1]] {
@@ -210,6 +210,7 @@ Commands:
   unclaim                Hand a claimed task back to ready
   next                   Find and optionally claim next claimable task
   promote                Promote a task from backlog to ready
+  update                 Change a task's review models (update <id> --review-models a,b)
   transition             Transition a task to a new state
   merge                  Merge a pull request and transition tasks
   wt-ensure              Ensure worktree for task (local_commit mode)
@@ -514,6 +515,8 @@ func runClient(verb string, args []string) error {
 			return err
 		}
 		return nil
+	case "update":
+		return executeUpdate(ctx, baseURL, token, args)
 	case "promote":
 		return executePromote(ctx, baseURL, token, args)
 	case "merge":
@@ -864,6 +867,58 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		}
 	}
 
+	return nil
+}
+
+// executeUpdate implements `odonian update <id> --review-models a,b`, a wrapper over
+// PATCH /tasks/{id} that replaces the task's whole review_models list.
+func executeUpdate(ctx context.Context, baseURL, token string, args []string) error {
+	if baseURL == "" {
+		return fmt.Errorf("ODONIAN_URL environment variable not set")
+	}
+	if token == "" {
+		return fmt.Errorf("ODONIAN_TOKEN environment variable not set")
+	}
+
+	if len(args) < 1 {
+		return fmt.Errorf("missing task id")
+	}
+
+	taskID := args[0]
+	var reviewModels []string
+	var jsonOut bool
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--review-models":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--review-models requires a value")
+			}
+			for _, m := range strings.Split(args[i], ",") {
+				if m = strings.TrimSpace(m); m != "" {
+					reviewModels = append(reviewModels, m)
+				}
+			}
+		case "--json":
+			jsonOut = true
+		default:
+			return fmt.Errorf("unknown flag: %s", args[i])
+		}
+	}
+
+	if len(reviewModels) == 0 {
+		return fmt.Errorf("--review-models is required (comma-separated, e.g. opus,gpt-5.6-sol)")
+	}
+
+	client := tuiclient.NewHTTPClient(baseURL, token)
+	if err := client.UpdateTaskReviewModels(ctx, taskID, reviewModels, os.Getenv("AGENT_ID")); err != nil {
+		return fmt.Errorf("failed to update task: %w", err)
+	}
+
+	if jsonOut {
+		return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{"id": taskID, "review_models": reviewModels})
+	}
+	fmt.Printf("Updated %s: review_models = %s\n", taskID, strings.Join(reviewModels, ","))
 	return nil
 }
 

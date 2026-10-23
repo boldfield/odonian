@@ -334,7 +334,7 @@ func (s *sqliteStore) reportRun(ctx context.Context, candidateID, sampleID strin
 func (s *sqliteStore) baselineReviews(ctx context.Context, taskID string, round int) ([]evaluation.BaselineReview, error) {
 	rows, err := s.conn.QueryContext(ctx, `
 		SELECT id, COALESCE(model, '') FROM task
-		WHERE target_task_id = ? AND kind = 'review' AND review_round = ? AND adjudicate_finding_id IS NULL
+		WHERE target_task_id = ? AND kind = 'review' AND review_round = ? AND adjudicate_finding_id IS NULL AND state != 'abandoned'
 		ORDER BY rowid`, taskID, round)
 	if err != nil {
 		return nil, fmt.Errorf("list review tasks: %w", err)

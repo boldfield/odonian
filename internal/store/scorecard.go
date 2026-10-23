@@ -526,11 +526,12 @@ func (t *findingThread) withdrawnAfterDispute() bool {
 
 // researchReviewTaskLineages maps each of parentID's non-adjudication review tasks to
 // its reviewer lineage, assigning slots exactly as collectResearchReviewReports does
-// (per round and model, in creation order), so an approval's lineage matches the
-// lineage its reviewer's findings were recorded under.
+// (researchSlotAssigner; review children retired by a review_models change pass their
+// slots to their replacements and get no lineage themselves), so an approval's lineage
+// matches the lineage its reviewer's findings were recorded under.
 func researchReviewTaskLineages(ctx context.Context, tx *sql.Tx, parentID string) (map[string]string, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, review_round, model FROM task
+		SELECT id, review_round, model, state, replaces_review_task_id FROM task
 		WHERE target_task_id = ? AND kind = 'review' AND review_round >= 1 AND adjudicate_finding_id IS NULL
 		ORDER BY review_round, rowid, id
 	`, parentID)
@@ -539,16 +540,18 @@ func researchReviewTaskLineages(ctx context.Context, tx *sql.Tx, parentID string
 	}
 	defer rows.Close()
 	lineages := make(map[string]string)
-	slotsTaken := make(map[string]int)
+	slots := newResearchSlotAssigner()
 	for rows.Next() {
-		var id, model string
+		var id, model, state string
 		var round int
-		if err := rows.Scan(&id, &round, &model); err != nil {
+		var replaces sql.NullString
+		if err := rows.Scan(&id, &round, &model, &state, &replaces); err != nil {
 			return nil, fmt.Errorf("failed to scan review task for %s: %w", parentID, err)
 		}
-		slotKey := fmt.Sprintf("%d\x00%s", round, model)
-		slot := slotsTaken[slotKey]
-		slotsTaken[slotKey] = slot + 1
+		slot := slots.assign(id, round, model, replaces)
+		if state == "abandoned" {
+			continue
+		}
 		lineages[id] = researchReviewerLineage(model, slot)
 	}
 	if err := rows.Err(); err != nil {

@@ -160,8 +160,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 33 {
-		t.Errorf("expected 33 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 34 {
+		t.Errorf("expected 34 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -171,13 +171,13 @@ func TestMigrations(t *testing.T) {
 	}
 	defer store2.Close()
 
-	// Verify that we still have exactly 33 migrations recorded (idempotency)
+	// Verify that we still have exactly 34 migrations recorded (idempotency)
 	err = store2.Conn().QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount)
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 33 {
-		t.Errorf("expected 33 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 34 {
+		t.Errorf("expected 34 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -273,8 +273,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 33 {
-		t.Errorf("expected 33 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 34 {
+		t.Errorf("expected 34 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -9611,7 +9611,7 @@ func TestSupersededTask(t *testing.T) {
 	}
 
 	// Supersede oldTask
-	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -9727,7 +9727,7 @@ func TestSupersededTaskWithModelOverride(t *testing.T) {
 
 	// Supersede with model override to sonnet
 	newTaskModel := "sonnet"
-	newTask, err := store.SupersedeTask(ctx, oldTask.ID, &newTaskModel)
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, &newTaskModel, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -9745,7 +9745,7 @@ func TestSupersededTaskNotFound(t *testing.T) {
 	}
 	defer store.Close()
 
-	_, err = store.SupersedeTask(ctx, "nonexistent-task-id", nil)
+	_, err = store.SupersedeTask(ctx, "nonexistent-task-id", nil, nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
@@ -9798,7 +9798,7 @@ func TestSupersededTaskTerminalState(t *testing.T) {
 			}
 
 			// Attempt to supersede terminal task should return ErrConflict
-			_, err = store.SupersedeTask(ctx, task.ID, nil)
+			_, err = store.SupersedeTask(ctx, task.ID, nil, nil)
 			if !errors.Is(err, ErrConflict) {
 				t.Errorf("expected ErrConflict for terminal state %s, got %v", terminalState, err)
 			}
@@ -9860,7 +9860,7 @@ func TestSupersededTaskNonTerminal(t *testing.T) {
 	}
 
 	// Supersede non-terminal task should succeed
-	newTask, err := store.SupersedeTask(ctx, task.ID, nil)
+	newTask, err := store.SupersedeTask(ctx, task.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -9936,7 +9936,7 @@ func TestSupersededTaskWithPriorFeedback(t *testing.T) {
 	}
 
 	// Supersede the task
-	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -9996,7 +9996,7 @@ func TestSupersededTaskWithoutFeedback(t *testing.T) {
 	oldTask := tasks[0]
 
 	// Supersede the task (without adding any feedback)
-	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -10082,7 +10082,7 @@ func TestSupersedeDependentClaimability(t *testing.T) {
 	}
 
 	// Supersede oldTask
-	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -10174,7 +10174,7 @@ func TestSupersededTaskExcludedFromListTasks(t *testing.T) {
 	}
 
 	// Supersede oldTask
-	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -10270,7 +10270,7 @@ func TestSupersededLineageTracingWithMultipleDependents(t *testing.T) {
 	}
 
 	// Supersede oldTask
-	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -10577,7 +10577,7 @@ func TestEscalateRoundTrip(t *testing.T) {
 		t.Fatalf("failed to add review: %v", err)
 	}
 
-	supersededTask, err := store.SupersedeTask(ctx, task4ID, nil)
+	supersededTask, err := store.SupersedeTask(ctx, task4ID, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task: %v", err)
 	}
@@ -10630,7 +10630,7 @@ func TestEscalateRoundTrip(t *testing.T) {
 		t.Fatalf("failed to add review to task 5: %v", err)
 	}
 
-	newTask, err := store.SupersedeTask(ctx, task5ID, nil)
+	newTask, err := store.SupersedeTask(ctx, task5ID, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task 5: %v", err)
 	}
@@ -12224,7 +12224,7 @@ func TestSupersedeTaskWithOpenPRLinkClosesIt(t *testing.T) {
 	oldTask := createSupersedableTaskWithPRLink(t, ctx, st, "https://github.com/testowner/testrepo/pull/123")
 
 	waitForClose := armSupersedeCloseSync(t, st)
-	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -12264,7 +12264,7 @@ func TestSupersedeTaskWithMergedPRDoesNotCloseIt(t *testing.T) {
 	oldTask := createSupersedableTaskWithPRLink(t, ctx, st, "https://github.com/testowner/testrepo/pull/123")
 
 	waitForClose := armSupersedeCloseSync(t, st)
-	if _, err := st.SupersedeTask(ctx, oldTask.ID, nil); err != nil {
+	if _, err := st.SupersedeTask(ctx, oldTask.ID, nil, nil); err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
 	waitForClose()
@@ -12299,7 +12299,7 @@ func TestSupersedeTaskWithAlreadyClosedPRIsNotAnError(t *testing.T) {
 	oldTask := createSupersedableTaskWithPRLink(t, ctx, st, "https://github.com/testowner/testrepo/pull/123")
 
 	waitForClose := armSupersedeCloseSync(t, st)
-	if _, err := st.SupersedeTask(ctx, oldTask.ID, nil); err != nil {
+	if _, err := st.SupersedeTask(ctx, oldTask.ID, nil, nil); err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
 	waitForClose()
@@ -12335,7 +12335,7 @@ func TestSupersedeTaskWithNoPRLinkIsCleanNoop(t *testing.T) {
 	oldTask := tasks[0]
 
 	waitForClose := armSupersedeCloseSync(t, st)
-	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed for a task with no pr link: %v", err)
 	}
@@ -12362,7 +12362,7 @@ func TestSupersedeTaskForgeFailureStillSucceeds(t *testing.T) {
 	oldTask := createSupersedableTaskWithPRLink(t, ctx, st, "https://github.com/testowner/testrepo/pull/123")
 
 	waitForClose := armSupersedeCloseSync(t, st)
-	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask should succeed even when the forge call fails: %v", err)
 	}
@@ -12416,7 +12416,7 @@ func TestSupersededTaskPreservesTrack(t *testing.T) {
 	}
 
 	// Supersede the task
-	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := store.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -12594,7 +12594,7 @@ func TestSupersedeTaskWithEmptyForgeTokenSkipsCleanup(t *testing.T) {
 	oldTask := createSupersedableTaskWithPRLink(t, ctx, st, "https://github.com/testowner/testrepo/pull/123")
 
 	waitForClose := armSupersedeCloseSync(t, st)
-	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil)
+	newTask, err := st.SupersedeTask(ctx, oldTask.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("SupersedeTask failed: %v", err)
 	}
@@ -13548,7 +13548,7 @@ func TestResearchBudget_UnresolvedSupersededRoundNotCounted(t *testing.T) {
 	}
 	submitResearchReviewWithBudget(t, store, ctx, opus1, "opus-reviewer", "reject", researchBlockingFinding("partial"), budget)
 
-	successor, err := store.SupersedeTask(ctx, parentID, nil)
+	successor, err := store.SupersedeTask(ctx, parentID, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to supersede: %v", err)
 	}
@@ -13654,7 +13654,7 @@ func TestResearchBudget_MultipleSupersessions(t *testing.T) {
 
 	// Manually supersede the sonnet task (an operator decision, not a
 	// rejection-triggered escalation) and continue on the manual successor.
-	manualSuccessor, err := store.SupersedeTask(ctx, sonnetTaskID, nil)
+	manualSuccessor, err := store.SupersedeTask(ctx, sonnetTaskID, nil, nil)
 	if err != nil {
 		t.Fatalf("failed to manually supersede: %v", err)
 	}
@@ -15271,7 +15271,7 @@ func TestResearchSupersessionSpecCompaction(t *testing.T) {
 
 	// Manually supersede the task to test spec compaction, regardless of current state
 	// (the state machine is secondary to the spec compaction feature under test).
-	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"))
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task: %v", err)
 	}
@@ -15358,7 +15358,7 @@ func TestResearchSupersessionAllFindingsResolved(t *testing.T) {
 		t.Fatalf("expected approved, got %s", parent.State)
 	}
 
-	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("sonnet"))
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("sonnet"), nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task: %v", err)
 	}
@@ -15435,7 +15435,7 @@ func TestBuildTaskSupersessionPrependsFeedback(t *testing.T) {
 		t.Fatalf("expected ready, got %s", buildTask.State)
 	}
 
-	escalated, err := store.SupersedeTask(ctx, buildTaskID, ptrStr("haiku"))
+	escalated, err := store.SupersedeTask(ctx, buildTaskID, ptrStr("haiku"), nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task: %v", err)
 	}
@@ -15518,7 +15518,7 @@ func TestDesignTaskSupersessionPrependsFeedback(t *testing.T) {
 		t.Fatalf("expected ready, got %s", designTask.State)
 	}
 
-	escalated, err := store.SupersedeTask(ctx, designTaskID, ptrStr("haiku"))
+	escalated, err := store.SupersedeTask(ctx, designTaskID, ptrStr("haiku"), nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task: %v", err)
 	}
@@ -15565,7 +15565,7 @@ func TestResearchSpecCompactionHistoryLinks(t *testing.T) {
 	]`)
 	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", findings2)
 
-	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"))
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task: %v", err)
 	}
@@ -15608,7 +15608,7 @@ func TestResearchSupersessionOriginalAssignmentPreserved(t *testing.T) {
 	]`)
 	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
 
-	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"))
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task: %v", err)
 	}
@@ -15641,7 +15641,7 @@ func TestResearchSupersessionPolicyPreservation(t *testing.T) {
 	]`)
 	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
 
-	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"))
+	escalated, err := store.SupersedeTask(ctx, parentID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("failed to supersede task: %v", err)
 	}
@@ -15694,7 +15694,7 @@ func TestResearchSupersessionChainedSpecCompaction(t *testing.T) {
 		{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"finding one","in_changed_text":true,"status":"new"}
 	]`)
 	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
-	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("first supersession failed: %v", err)
 	}
@@ -15714,7 +15714,7 @@ func TestResearchSupersessionChainedSpecCompaction(t *testing.T) {
 		{"id":"f2","severity":"P2","file":"b.md","line":2,"summary":"finding two","in_changed_text":true,"status":"new"}
 	]`)
 	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", findings2)
-	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("second supersession failed: %v", err)
 	}
@@ -15737,7 +15737,7 @@ func TestResearchSupersessionChainedSpecCompaction(t *testing.T) {
 		{"id":"f3","severity":"P3","file":"c.md","line":3,"summary":"finding three","in_changed_text":true,"status":"new"}
 	]`)
 	submitResearchReview(t, store, ctx, opus3, "opus-reviewer", "reject", findings3)
-	taskD, err := store.SupersedeTask(ctx, taskC.ID, ptrStr("opus"))
+	taskD, err := store.SupersedeTask(ctx, taskC.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("third supersession failed: %v", err)
 	}
@@ -15778,7 +15778,7 @@ func TestResearchSupersessionChainedSpecCompaction(t *testing.T) {
 		{"id":"f3","severity":"P3","file":"c.md","line":3,"summary":"finding three","in_changed_text":true,"status":"new"}
 	]`)
 	submitResearchReview(t, store, ctx, opus4, "opus-reviewer", "reject", findings4)
-	taskE, err := store.SupersedeTask(ctx, taskD.ID, ptrStr("opus"))
+	taskE, err := store.SupersedeTask(ctx, taskD.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("fourth supersession failed: %v", err)
 	}
@@ -15849,7 +15849,7 @@ Some more content here.`
 	]`)
 	submitResearchReview(t, store, ctx, opus, "opus-reviewer", "reject", findings)
 
-	replacement, err := store.SupersedeTask(ctx, taskWithMarker, ptrStr("opus"))
+	replacement, err := store.SupersedeTask(ctx, taskWithMarker, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("supersession failed: %v", err)
 	}
@@ -15879,7 +15879,7 @@ Some more content here.`
 	]`)
 	submitResearchReview(t, store, ctx, opus2, "opus-reviewer", "reject", findings2)
 
-	replacement2, err := store.SupersedeTask(ctx, replacement.ID, ptrStr("opus"))
+	replacement2, err := store.SupersedeTask(ctx, replacement.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("second supersession failed: %v", err)
 	}
@@ -15939,7 +15939,7 @@ func TestResearchSupersessionDependencyPreservation(t *testing.T) {
 	]`)
 	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
 
-	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("supersession failed: %v", err)
 	}
@@ -15982,7 +15982,7 @@ func TestResearchSupersessionCarriesUnreviewedFindings(t *testing.T) {
 	]`)
 	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
 
-	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("first supersession failed: %v", err)
 	}
@@ -15991,7 +15991,7 @@ func TestResearchSupersessionCarriesUnreviewedFindings(t *testing.T) {
 	}
 
 	// B is superseded again without ever getting a review round of its own.
-	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("second supersession failed: %v", err)
 	}
@@ -16030,7 +16030,7 @@ func TestResearchSupersessionMidRoundKeepsPriorFindings(t *testing.T) {
 		t.Fatalf("round 2: expected review task to be spawned")
 	}
 
-	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("supersession failed: %v", err)
 	}
@@ -16053,7 +16053,7 @@ func TestResearchSupersessionMidRoundReplacementKeepsCarriedFindings(t *testing.
 	]`)
 	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
 
-	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("first supersession failed: %v", err)
 	}
@@ -16077,7 +16077,7 @@ func TestResearchSupersessionMidRoundReplacementKeepsCarriedFindings(t *testing.
 		t.Fatalf("expected B's round 1 review task to be spawned")
 	}
 
-	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("second supersession failed: %v", err)
 	}
@@ -16134,7 +16134,7 @@ func TestResearchSupersessionCarriedFindingsIgnoreUserContent(t *testing.T) {
 	]`)
 	submitResearchReview(t, store, ctx, opus1, "opus-reviewer", "reject", findings1)
 
-	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("first supersession failed: %v", err)
 	}
@@ -16142,7 +16142,7 @@ func TestResearchSupersessionCarriedFindingsIgnoreUserContent(t *testing.T) {
 	// B is superseded again immediately, with no review round of its own, exercising
 	// extractCarriedFindings against B's spec (which still contains the user's bogus
 	// block ahead of the generated one).
-	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("second supersession failed: %v", err)
 	}
@@ -16200,7 +16200,7 @@ func TestResearchSupersessionPartialRoundKeepsPendingReviewersFindings(t *testin
 			{"id":"f1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"resolved","prior_id":"f1"}
 		]`))
 
-		taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+		taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 		if err != nil {
 			t.Fatalf("supersession failed: %v", err)
 		}
@@ -16221,7 +16221,7 @@ func TestResearchSupersessionPartialRoundKeepsPendingReviewersFindings(t *testin
 		}
 		submitResearchReview(t, store, ctx, sonnet2, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
 
-		taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+		taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 		if err != nil {
 			t.Fatalf("supersession failed: %v", err)
 		}
@@ -16241,7 +16241,7 @@ func TestResearchSupersessionPartialRoundKeepsPendingReviewersFindings(t *testin
 func TestResearchSupersessionPartialRoundReplacementKeepsCarriedFindings(t *testing.T) {
 	store, ctx, projID, taskA := setupTwoReviewerResearchRound1(t)
 
-	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("first supersession failed: %v", err)
 	}
@@ -16269,7 +16269,7 @@ func TestResearchSupersessionPartialRoundReplacementKeepsCarriedFindings(t *test
 	}
 	submitResearchReview(t, store, ctx, bOpus1, "opus-reviewer", "approve", json.RawMessage(`[]`))
 
-	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("second supersession failed: %v", err)
 	}
@@ -16302,7 +16302,7 @@ func TestResearchSupersessionDedupedFindingKeepsAllReviewerLineages(t *testing.T
 		{"id":"g1","severity":"P1","file":"a.md","line":1,"summary":"fabricated source","in_changed_text":true,"status":"new"}
 	]`))
 
-	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"))
+	taskB, err := store.SupersedeTask(ctx, taskA, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("first supersession failed: %v", err)
 	}
@@ -16336,7 +16336,7 @@ func TestResearchSupersessionDedupedFindingKeepsAllReviewerLineages(t *testing.T
 	}
 	submitResearchReview(t, store, ctx, bOpus1, "opus-reviewer", "approve", json.RawMessage(`[]`))
 
-	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"))
+	taskC, err := store.SupersedeTask(ctx, taskB.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("second supersession failed: %v", err)
 	}
@@ -16364,7 +16364,7 @@ func TestResearchSupersessionDedupedFindingKeepsAllReviewerLineages(t *testing.T
 	}
 	submitResearchReview(t, store, ctx, cSonnet1, "sonnet-reviewer", "approve", json.RawMessage(`[]`))
 
-	taskD, err := store.SupersedeTask(ctx, taskC.ID, ptrStr("opus"))
+	taskD, err := store.SupersedeTask(ctx, taskC.ID, ptrStr("opus"), nil)
 	if err != nil {
 		t.Fatalf("third supersession failed: %v", err)
 	}
@@ -18410,7 +18410,7 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		}
 
 		// Now supersede the rejected parent task
-		newTask, err := store.SupersedeTask(ctx, parentID, nil)
+		newTask, err := store.SupersedeTask(ctx, parentID, nil, nil)
 		if err != nil {
 			t.Fatalf("SupersedeTask failed: %v", err)
 		}
