@@ -377,3 +377,62 @@ func TestUpdateTaskReviewModelsReplacesFailedChild(t *testing.T) {
 		t.Errorf("parent state = %s, want approved", st)
 	}
 }
+
+// A superseded review child is terminal and has no verdict, like a failed one: the reshape
+// must not count it as live, so the round still gets a live child for every listed model
+// and can finish.
+func TestUpdateTaskReviewModelsReplacesSupersededChild(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		supersede func(f *reviewModelsFixture, child *Task) error
+	}{
+		{"transition", func(f *reviewModelsFixture, child *Task) error {
+			if _, err := f.store.ClaimTask(f.ctx, child.ID, "rev-opus", "opus", 5*time.Minute); err != nil {
+				return err
+			}
+			_, err := f.store.TransitionTask(f.ctx, child.ID, "superseded", nil)
+			return err
+		}},
+		{"supersede", func(f *reviewModelsFixture, child *Task) error {
+			_, err := f.store.SupersedeTask(f.ctx, child.ID, nil, nil)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReviewModelsFixture(t, []string{"opus", "sonnet"})
+			f.toReview(t)
+			opus := f.childIn(t, 1, "opus", "ready")
+			if opus == nil {
+				t.Fatalf("expected opus child")
+			}
+			if err := tc.supersede(f, opus); err != nil {
+				t.Fatalf("supersede opus child: %v", err)
+			}
+			if _, err := f.update([]string{"opus", "haiku"}); err != nil {
+				t.Fatalf("update: %v", err)
+			}
+			if st, _ := f.store.GetTask(f.ctx, opus.ID); st.State != "abandoned" {
+				t.Errorf("superseded child state = %s, want abandoned (retired)", st.State)
+			}
+			if f.childIn(t, 1, "opus", "ready") == nil {
+				t.Fatalf("no live opus child in round 1")
+			}
+			haiku := f.childIn(t, 1, "haiku", "ready")
+			if haiku == nil {
+				t.Fatalf("no haiku child spawned")
+			}
+			if err := f.review(t, haiku, "approve"); err != nil {
+				t.Fatalf("haiku review: %v", err)
+			}
+			if st := f.get(t).State; st != "review" {
+				t.Errorf("parent state = %s, want review while opus is open", st)
+			}
+			if err := f.review(t, f.childIn(t, 1, "opus", "ready"), "approve"); err != nil {
+				t.Fatalf("opus review: %v", err)
+			}
+			if st := f.get(t).State; st != "approved" {
+				t.Errorf("parent state = %s, want approved", st)
+			}
+		})
+	}
+}

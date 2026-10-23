@@ -6222,10 +6222,20 @@ func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, pa
 	rows.Close()
 
 	// Match each entry of the new list to a child of that model, finished children first.
+	// Only done children (which carry a verdict) and genuinely live ones count; a
+	// terminal verdict-less child (failed, superseded, ...) can never finish the round,
+	// so it is retired below and its model gets a replacement.
+	live := func(state string) bool {
+		switch state {
+		case "backlog", "ready", "in_progress", "blocked":
+			return true
+		}
+		return false
+	}
 	matched := make(map[string]bool)
 	take := func(model string, done bool) bool {
 		for _, c := range children {
-			if !matched[c.id] && c.model == model && (c.state == "done") == done && (done || (c.state != "failed" && c.state != "archived")) {
+			if !matched[c.id] && c.model == model && ((done && c.state == "done") || (!done && live(c.state))) {
 				matched[c.id] = true
 				return true
 			}
