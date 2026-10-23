@@ -516,3 +516,118 @@ func TestUpdateTaskReviewModelsResearchReplacementLineage(t *testing.T) {
 		t.Errorf("round-2 sonnet spec carries a dispute it did not raise")
 	}
 }
+
+// With duplicate same-model reviewers, a replacement for a retired earlier slot must take
+// that slot, and the later slot's finished child must keep its own: no child's lineage
+// shifts in any slot assignment, and a dispute of the later child's finding reaches the
+// same slot in the next round.
+func TestUpdateTaskReviewModelsDuplicateReviewerReplacementKeepsSlots(t *testing.T) {
+	store, ctx, _, parentID := newResearchTaskWithReviewers(t, false, []string{"opus", "opus"})
+	s := store.(*sqliteStore)
+	roundChildren := func(round int) []*Task {
+		t.Helper()
+		rows, err := s.conn.QueryContext(ctx, `SELECT id FROM task WHERE target_task_id = ? AND kind = 'review' AND review_round = ? ORDER BY rowid`, parentID, round)
+		if err != nil {
+			t.Fatalf("list round %d children: %v", round, err)
+		}
+		defer rows.Close()
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			ids = append(ids, id)
+		}
+		var out []*Task
+		for _, id := range ids {
+			tk, err := store.GetTask(ctx, id)
+			if err != nil {
+				t.Fatalf("get child: %v", err)
+			}
+			out = append(out, &Task{ID: tk.ID, Model: tk.Model, State: tk.State, Spec: tk.Spec})
+		}
+		return out
+	}
+	first := roundChildren(1)
+	if len(first) != 2 {
+		t.Fatalf("round 1 children = %d, want 2", len(first))
+	}
+	slot0, slot1 := first[0], first[1]
+	finding := json.RawMessage(`[{"id":"f1","severity":"P2","file":"a.md","line":3,"summary":"overstates source","in_changed_text":true,"status":"new"}]`)
+	submitResearchReview(t, store, ctx, slot1, "opus-reviewer-1", "reject", finding)
+	if _, err := store.ClaimTask(ctx, slot0.ID, "opus-reviewer-0", "opus", 5*time.Minute); err != nil {
+		t.Fatalf("claim slot 0: %v", err)
+	}
+	if _, err := store.TransitionTask(ctx, slot0.ID, "failed", nil); err != nil {
+		t.Fatalf("fail slot 0: %v", err)
+	}
+	if _, err := store.UpdateTaskReviewModels(ctx, parentID, []string{"opus", "opus"}, "tester", 8, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	after := roundChildren(1)
+	if len(after) != 3 || after[0].State != "abandoned" || after[2].State != "ready" {
+		t.Fatalf("round 1 after reshape: want retired slot 0, finished slot 1 and a ready replacement")
+	}
+	replacement := after[2]
+
+	want0, want1 := researchReviewerLineage("opus", 0), researchReviewerLineage("opus", 1)
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	lineages, err := researchReviewTaskLineages(ctx, tx, parentID)
+	if err != nil {
+		t.Fatalf("researchReviewTaskLineages: %v", err)
+	}
+	if _, ok := lineages[slot0.ID]; ok {
+		t.Errorf("retired child was assigned a lineage")
+	}
+	if got := lineages[slot1.ID]; got != want1 {
+		t.Errorf("researchReviewTaskLineages: finished slot-1 child = %q, want %q", got, want1)
+	}
+	if got := lineages[replacement.ID]; got != want0 {
+		t.Errorf("researchReviewTaskLineages: replacement = %q, want %q", got, want0)
+	}
+	collected, err := s.collectResearchReviewFindings(ctx, tx, parentID, 1)
+	if err != nil {
+		t.Fatalf("collectResearchReviewFindings: %v", err)
+	}
+	if len(collected) != 1 || collected[0].lineage != want1 {
+		t.Errorf("collectResearchReviewFindings: got %+v, want one finding on lineage %q", collected, want1)
+	}
+	tx.Rollback()
+
+	submitResearchReview(t, store, ctx, replacement, "opus-reviewer-0", "approve", json.RawMessage(`[]`))
+	if p, _ := store.GetTask(ctx, parentID); p.State != "ready" {
+		t.Fatalf("parent state = %s, want ready after the rejected round", p.State)
+	}
+	tx, err = s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	_, _, blockingLineages, err := s.checkResearchBlockingFindings(ctx, tx, parentID, 1)
+	tx.Rollback()
+	if err != nil {
+		t.Fatalf("checkResearchBlockingFindings: %v", err)
+	}
+	if len(blockingLineages) != 1 || blockingLineages[0] != want1 {
+		t.Errorf("checkResearchBlockingFindings: lineages = %q, want [%q]", blockingLineages, want1)
+	}
+
+	disputes := json.RawMessage(`[{"finding_id":"f1","evidence":"the source supports the claim as written"}]`)
+	if _, err := resubmitResearchImplementTaskWithDisputes(t, store, ctx, parentID, disputes); err != nil {
+		t.Fatalf("resubmit with dispute: %v", err)
+	}
+	second := roundChildren(2)
+	if len(second) != 2 {
+		t.Fatalf("round 2 children = %d, want 2", len(second))
+	}
+	if strings.Contains(second[0].Spec, "Disputed Finding") {
+		t.Errorf("round-2 slot-0 spec carries a dispute it did not raise")
+	}
+	if !strings.Contains(second[1].Spec, "Disputed Finding") || !strings.Contains(second[1].Spec, "overstates source") {
+		t.Errorf("round-2 slot-1 spec lacks the dispute of its own finding:\n%s", second[1].Spec)
+	}
+}

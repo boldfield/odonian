@@ -1454,8 +1454,9 @@ change); if it was claimed, its agent's later submit is refused with `409`. Each
 without a live or finished child in the round gets a replacement child in the same round, with the same
 spec the round's other children received. Children that already recorded a verdict stay and count. The
 round then aggregates over the new list (immediately, if every remaining child is already done).
-Research dispute lineage is keyed by reviewer model and slot, so a replaced reviewer starts with no
-lineage and its earlier disputes do not carry over.
+Research dispute lineage is keyed by reviewer model and slot. A replacement for a retired child of the
+same model takes that child's slot, lineage and spec, so no other reviewer's slot shifts. A reviewer of a
+model new to the list starts with no lineage: the removed reviewer's disputes do not carry over to it.
 
 **Response:** `200 OK` with the updated task, including `depends_on`. Errors include
 `400 INVALID_REVIEW_MODELS`, `400 SELF_DEPENDENCY`, `400 JSON_DECODE_ERROR`, `409 CYCLE_DETECTED`, and `404 NOT_FOUND`. Invalid

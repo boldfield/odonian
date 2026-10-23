@@ -595,7 +595,8 @@ curl -X PATCH -H "Authorization: Bearer $ODONIAN_TOKEN" -H 'Content-Type: applic
   `in_progress`, `blocked` and `review`; `400 FIELD_NOT_UPDATABLE` on a `review`/`merge` task, `409` on
   `approved` and terminal tasks. In `review`, children without a verdict whose model left the list are
   retired (a claimed one's later submit is refused), missing reviewers are spawned in the same round, and
-  the round aggregates over the new list. A replaced research reviewer starts with no dispute lineage.
+  the round aggregates over the new list. A same-model replacement keeps the retired child's research
+  slot; a reviewer of a model new to the list starts with no dispute lineage.
   CLI: `odonian update <id> --review-models a,b`. `POST /tasks/{id}/supersede` takes the same optional
   `review_models` for the replacement.
 - Any other field (`spec`, `title`, `state`, unknown names): `400 FIELD_NOT_UPDATABLE` naming the

@@ -2873,30 +2873,33 @@ func isBlockingResearchFinding(f Finding, round int) bool {
 // be empty in that case, since there's nothing valid to report.
 func (s *sqliteStore) checkResearchBlockingFindings(ctx context.Context, tx *sql.Tx, parentID string, round int) (bool, []Finding, []string, error) {
 	taskRows, err := tx.QueryContext(ctx, `
-		SELECT id, model FROM task
-		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding_id IS NULL AND state != 'abandoned'
+		SELECT id, model, state, replaces_review_task_id FROM task
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding_id IS NULL
 		ORDER BY rowid
 	`, parentID, round)
 	if err != nil {
 		return false, nil, nil, fmt.Errorf("failed to list round review tasks: %w", err)
 	}
 	reviewTaskIDs := make(map[string]bool)
-	// Lineage mirrors researchReviewerLineage's computation in
-	// collectResearchReviewReports: model plus the task's index among this round's
-	// review tasks for that model, in creation order. Slot is round-local (recomputed
-	// fresh per round), so restricting this query to `round` yields the same lineage
-	// collectResearchReviewReports would compute from the full history.
+	// Lineage mirrors collectResearchReviewReports: model plus the slot
+	// researchSlotAssigner gives the task. Slot is round-local (recomputed fresh per
+	// round), so restricting this query to `round` yields the same lineage
+	// collectResearchReviewReports would compute from the full history. Children
+	// retired by a review_models change take part in slot assignment but not in the round.
 	taskLineage := make(map[string]string)
-	slotsTaken := make(map[string]int)
+	slots := newResearchSlotAssigner()
 	for taskRows.Next() {
-		var id, model string
-		if err := taskRows.Scan(&id, &model); err != nil {
+		var id, model, state string
+		var replaces sql.NullString
+		if err := taskRows.Scan(&id, &model, &state, &replaces); err != nil {
 			taskRows.Close()
 			return false, nil, nil, fmt.Errorf("failed to scan review task id: %w", err)
 		}
+		slot := slots.assign(id, round, model, replaces)
+		if state == "abandoned" {
+			continue
+		}
 		reviewTaskIDs[id] = true
-		slot := slotsTaken[model]
-		slotsTaken[model] = slot + 1
 		taskLineage[id] = researchReviewerLineage(model, slot)
 	}
 	if err := taskRows.Err(); err != nil {
@@ -3560,6 +3563,35 @@ func researchReviewerLineage(model string, slot int) string {
 	return fmt.Sprintf("%s\x00%d", model, slot)
 }
 
+// researchSlotAssigner gives each review task its reviewer slot: its index among the same
+// round's review tasks for that model, in creation order. A replacement spawned by a
+// review_models change (replaces_review_task_id set) takes the slot of the retired child it
+// stands in for instead of the next index, so no other child's slot shifts. Tasks must be
+// fed in creation order, retired (abandoned) children included, since they hold the slots
+// their replacements inherit; callers skip abandoned children after assigning.
+type researchSlotAssigner struct {
+	next  map[string]int
+	slots map[string]int
+}
+
+func newResearchSlotAssigner() *researchSlotAssigner {
+	return &researchSlotAssigner{next: make(map[string]int), slots: make(map[string]int)}
+}
+
+func (a *researchSlotAssigner) assign(id string, round int, model string, replaces sql.NullString) int {
+	if replaces.Valid {
+		if slot, ok := a.slots[replaces.String]; ok {
+			a.slots[id] = slot
+			return slot
+		}
+	}
+	key := fmt.Sprintf("%d\x00%s", round, model)
+	slot := a.next[key]
+	a.next[key] = slot + 1
+	a.slots[id] = slot
+	return slot
+}
+
 // splitResearchReviewerLineage reverses researchReviewerLineage, for the one place
 // (spawnAdjudicationTask) that must persist a reviewer identity as SQL columns rather
 // than compare it in memory: task.adjudicate_finding_reviewer_model/_slot are stored
@@ -3629,13 +3661,13 @@ func (s *sqliteStore) collectResearchReviewReports(ctx context.Context, tx *sql.
 	// adjudicate_finding_id IS NULL excludes section 5 adjudication tasks: their
 	// ruling is binding only for the one finding they adjudicate, so they must never
 	// be assigned a reviewer slot or contribute to a reviewer lineage's findings here.
-	// state != 'abandoned' excludes review children retired by a review_models change
-	// (UpdateTaskReviewModels): they never recorded a verdict, and skipping them gives
-	// a same-model replacement the slot the retired child held, as every other slot
+	// Review children retired by a review_models change (UpdateTaskReviewModels, state
+	// abandoned) never recorded a verdict: they are read only so their slots pass to
+	// the replacements that stand in for them, then skipped, as every other slot
 	// assignment (checkResearchBlockingFindings, researchReviewTaskLineages) does.
 	taskRows, err := tx.QueryContext(ctx, `
-		SELECT id, review_round, model FROM task
-		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ? AND adjudicate_finding_id IS NULL AND state != 'abandoned'
+		SELECT id, review_round, model, state, replaces_review_task_id FROM task
+		WHERE target_task_id = ? AND kind = 'review' AND review_round BETWEEN 1 AND ? AND adjudicate_finding_id IS NULL
 		ORDER BY review_round, rowid, id
 	`, parentID, throughRound)
 	if err != nil {
@@ -3648,11 +3680,12 @@ func (s *sqliteStore) collectResearchReviewReports(ctx context.Context, tx *sql.
 		lineage string
 	}
 	reviewTasks := make(map[string]reviewTaskInfo)
-	slotsTaken := make(map[string]int)
+	slots := newResearchSlotAssigner()
 	for taskRows.Next() {
-		var id, model string
+		var id, model, state string
 		var round int
-		if err := taskRows.Scan(&id, &round, &model); err != nil {
+		var replaces sql.NullString
+		if err := taskRows.Scan(&id, &round, &model, &state, &replaces); err != nil {
 			taskRows.Close()
 			return nil, nil, fmt.Errorf("failed to scan review task: %w", err)
 		}
@@ -3663,10 +3696,13 @@ func (s *sqliteStore) collectResearchReviewReports(ctx context.Context, tx *sql.
 		// review_models lists a model more than once. Finding ids (and so
 		// prior_id) are only meaningful within one reviewer's lineage. This assumes
 		// review_models is unchanged between rounds and each round spawns exactly one
-		// review task per entry; otherwise slots shift and lineages mismatch.
-		slotKey := fmt.Sprintf("%d\x00%s", round, model)
-		slot := slotsTaken[slotKey]
-		slotsTaken[slotKey] = slot + 1
+		// review task per entry; otherwise slots shift and lineages mismatch. A
+		// replacement spawned mid-round by a review_models change inherits the slot of
+		// the child it replaces (researchSlotAssigner), so it does not shift them.
+		slot := slots.assign(id, round, model, replaces)
+		if state == "abandoned" {
+			continue
+		}
 		reviewTasks[id] = reviewTaskInfo{round: round, model: model, slot: slot, lineage: researchReviewerLineage(model, slot)}
 	}
 	if err := taskRows.Err(); err != nil {
@@ -6086,8 +6122,10 @@ func (s *sqliteStore) validateReviewModels(models []string) error {
 // retired (state abandoned, so a claimed child's later submit is fenced), a replacement child
 // is spawned in the same round for each new entry with no live or finished child, and the
 // round is re-aggregated if every remaining child is already done. Children that recorded a
-// verdict stay and count. Research dispute lineage is keyed by reviewer model and slot, so a
-// replacement reviewer starts with no lineage and earlier disputes do not carry over.
+// verdict stay and count. Research dispute lineage is keyed by reviewer model and slot: a
+// replacement for a retired child of the same model takes over that child's slot and lineage
+// (replaces_review_task_id), while a reviewer of a model new to the list starts with no
+// lineage, so the removed reviewer's disputes do not carry over to it.
 func (s *sqliteStore) UpdateTaskReviewModels(ctx context.Context, taskID string, models []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error) {
 	return s.UpdateTaskReviewModelsAndDeps(ctx, taskID, models, nil, actor, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget)
 }
@@ -6202,8 +6240,8 @@ func (s *sqliteStore) UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID 
 // UpdateTaskReviewModels. changeNote names the change in the retired children's events.
 func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, parentID, parentTitle, projectID, documentID, track string, priority, round int, models []string, changeNote, now string) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, model, state, spec FROM task
-		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding_id IS NULL AND state != 'abandoned'
+		SELECT id, model, state, spec, replaces_review_task_id FROM task
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND adjudicate_finding_id IS NULL
 		ORDER BY rowid
 	`, parentID, round)
 	if err != nil {
@@ -6211,11 +6249,23 @@ func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, pa
 	}
 	type child struct{ id, model, state, spec string }
 	var children []child
+	// Children retired by an earlier change, in creation order, and the ones a
+	// replacement already stands in for.
+	var retired []child
+	replaced := make(map[string]bool)
 	for rows.Next() {
 		var c child
-		if err := rows.Scan(&c.id, &c.model, &c.state, &c.spec); err != nil {
+		var replaces sql.NullString
+		if err := rows.Scan(&c.id, &c.model, &c.state, &c.spec, &replaces); err != nil {
 			rows.Close()
 			return fmt.Errorf("failed to scan review task: %w", err)
+		}
+		if replaces.Valid {
+			replaced[replaces.String] = true
+		}
+		if c.state == "abandoned" {
+			retired = append(retired, c)
+			continue
 		}
 		children = append(children, c)
 	}
@@ -6264,10 +6314,12 @@ func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, pa
 		break
 	}
 
+	var retiredNow []child
 	for _, c := range children {
 		if matched[c.id] || c.state == "done" {
 			continue
 		}
+		retiredNow = append(retiredNow, c)
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE task SET state = 'abandoned', assignee = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?
 		`, now, c.id); err != nil {
@@ -6279,15 +6331,20 @@ func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, pa
 		}
 	}
 
+	// Every retired child has a spec, so a round with only retired children still has one.
+	retired = append(retired, retiredNow...)
+	if template == "" && len(retired) > 0 {
+		template = retired[0].spec
+	}
 	if len(missing) > 0 && template == "" {
 		return conflict("INVALID_STATE", "review round has no review tasks to copy a spec from")
 	}
-	// A replacement starts with no research dispute lineage: drop any disputed-finding
-	// block the copied spec carried for the other reviewer.
-	spec := template
-	if i := strings.Index(spec, "## Prior Review Round: Disputed Finding(s)"); i >= 0 {
-		if j := strings.Index(spec[i:], "## Instructions"); j >= 0 {
-			spec = spec[:i] + spec[i+j:]
+	// A reviewer of a model new to the round starts with no research dispute lineage: drop
+	// any disputed-finding block the copied spec carried for another reviewer.
+	freshSpec := template
+	if i := strings.Index(freshSpec, "## Prior Review Round: Disputed Finding(s)"); i >= 0 {
+		if j := strings.Index(freshSpec[i:], "## Instructions"); j >= 0 {
+			freshSpec = freshSpec[:i] + freshSpec[i+j:]
 		}
 	}
 	if len(missing) > 0 {
@@ -6297,11 +6354,25 @@ func (s *sqliteStore) reshapeOpenReviewRound(ctx context.Context, tx *sql.Tx, pa
 		}
 	}
 	for _, m := range missing {
+		// A replacement for a retired child of the same model stands in for it: it takes
+		// that child's research slot (researchSlotAssigner), so no other child's lineage
+		// shifts, and its spec, which carries that slot's disputed findings.
+		spec := freshSpec
+		var replaces *string
+		for _, r := range retired {
+			if r.model == m && !replaced[r.id] {
+				replaced[r.id] = true
+				id := r.id
+				replaces = &id
+				spec = r.spec
+				break
+			}
+		}
 		id := GenerateID()
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, track, priority, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, 'ready', ?, 'review', NULL, ?, ?, 0, ?, ?, ?, ?)
-		`, id, projectID, documentID, "Review: "+parentTitle+" ["+m+"]", spec, m, round, parentID, track, priority, now, now); err != nil {
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, track, priority, replaces_review_task_id, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'ready', ?, 'review', NULL, ?, ?, 0, ?, ?, ?, ?, ?)
+		`, id, projectID, documentID, "Review: "+parentTitle+" ["+m+"]", spec, m, round, parentID, track, priority, replaces, now, now); err != nil {
 			return fmt.Errorf("failed to create replacement review task: %w", err)
 		}
 	}
