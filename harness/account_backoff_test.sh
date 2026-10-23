@@ -15,7 +15,7 @@ check() { if eval "$2"; then pass "$1"; else fail "$1"; fi; }
 
 AGENT_ID=test
 export AGENT_CODEX_MODELS="gpt-5.5,gpt-5.6-sol,gpt-6-astra"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5" ANTHROPIC_DEFAULT_HAIKU_MODEL="pinned-haiku-x"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5" ANTHROPIC_DEFAULT_HAIKU_MODEL="pinned-haiku-x" ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5-1" ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5-5"
 sed -n '/^# --- per-account backend availability/,/^# --- research admission/p' "$HARNESS_DIR/agent.sh" > "$TMP/block.sh"
 [ -s "$TMP/block.sh" ] || { echo "cannot extract block"; exit 1; }
 # shellcheck disable=SC1091
@@ -106,6 +106,52 @@ echo "$claims"
 EOS
 mark_model_unavailable opus limit "$((now + 3600))" 2>/dev/null
 check "only the other account's model is claimable" '[ "$(source "$TMP/pick.sh")" = 1 ]'
+
+echo "Model-scoped failures (model_unavailable, other)"
+clear_model_failures opus
+printf "You're out of usage credits. Switch to another model to continue.\n" > "$TMP/fable_credits"
+printf 'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The '"'"'gpt-5.5'"'"' model is not supported when using Codex with a ChatGPT account."}}\n' > "$TMP/gpt55"
+printf "There's an issue with the selected model (gpt-5.5). It may not exist or you may not have access to it. Run --model to pick a different model.\n[claude-code:unrecognized_model] {\"model\":\"gpt-5.5\"}\nClaude Code doesn't recognize the model gpt-5.5.\n" > "$TMP/selected_model"
+printf 'grep output:\nYou'"'"'re out of usage credits. Switch to another model to continue.\na\nb\nc\nd\ne\nERROR: stream disconnected\n' > "$TMP/quoted_credits"
+check "fable out of credits" '[ "$(classify_dispatch_failure "$TMP/fable_credits")" = model_unavailable ]'
+check "codex gpt-5.5 unsupported on ChatGPT account" '[ "$(classify_dispatch_failure "$TMP/gpt55")" = model_unavailable ]'
+check "selected-model issue followed by two warning lines" '[ "$(classify_dispatch_failure "$TMP/selected_model")" = model_unavailable ]'
+check "credits text quoted earlier in the transcript" '[ "$(classify_dispatch_failure "$TMP/quoted_credits")" = other ]'
+printf 'tool output quoted: {"message":"The '"'"'gpt-5.5'"'"' model is not supported when using Codex with a ChatGPT account."}\nERROR: stream disconnected\n' > "$TMP/quoted_codex"
+check "codex error quoted within the last five lines" '[ "$(classify_dispatch_failure "$TMP/quoted_codex")" = other ]'
+check "limit text before a model error still not a limit" '[ "$(classify_dispatch_failure "$TMP/fable_credits")" != limit ]'
+
+mark_model_unavailable fable model_unavailable 2>"$TMP/log"
+check "log names the model scope" 'grep -q "model claude-fable-5-1 unavailable (model not available)" "$TMP/log"'
+check "fable held" 'model_unavailable fable'
+check "alias and pinned name share one window" 'model_unavailable claude-fable-5-1 && [ "${#FAIL_MODEL_NAMES[@]}" = 1 ]'
+check "opus and sonnet on the same account stay dispatchable" '! model_unavailable opus && ! model_unavailable sonnet && ! model_unavailable claude-opus-5-5'
+check "window is the model_unavailable window" 'i=$(_fail_model_index model@claude-fable-5-1); [ $((FAIL_MODEL_UNTIL[i] - $(date +%s))) -ge $((MODEL_UNAVAILABLE_WINDOW - 5)) ]'
+clear_model_failures opus
+check "success on another model does not clear it" 'model_unavailable fable'
+i=$(_fail_model_index model@claude-fable-5-1); FAIL_MODEL_UNTIL[$i]=$(( $(date +%s) - 1 ))
+check "window end lets one probe through" '! model_unavailable fable'
+clear_model_failures claude-fable-5-1
+check "success clears the model's record" '[ "${#FAIL_MODEL_NAMES[@]}" = 0 ]'
+
+mark_model_unavailable gpt-5.5 model_unavailable 2>/dev/null
+check "gpt-5.5 held, gpt-5.6-sol not" 'model_unavailable gpt-5.5 && ! model_unavailable gpt-5.6-sol'
+clear_model_failures gpt-5.5
+
+mark_model_unavailable sonnet other 2>"$TMP/log"
+check "other failure holds only that model" 'model_unavailable sonnet && ! model_unavailable opus && ! model_unavailable fable'
+check "other failure log names the model" 'grep -q "model claude-sonnet-5-5 unavailable (dispatch failure" "$TMP/log"'
+mark_model_unavailable sonnet other 2>/dev/null
+i=$(_fail_model_index model@claude-sonnet-5-5)
+check "other escalates per model" '[ "${FAIL_MODEL_COUNTS[$i]}" = 2 ]'
+clear_model_failures sonnet
+
+mark_model_unavailable fable signin 2>/dev/null
+check "sign-in still holds every model of the account" 'model_unavailable opus && model_unavailable sonnet && model_unavailable haiku && ! model_unavailable gpt-5.5'
+clear_model_failures fable
+mark_model_unavailable fable limit "$((now + 3600))" 2>/dev/null
+check "limit still holds every model of the account" 'model_unavailable opus && model_unavailable sonnet && model_unavailable fable && ! model_unavailable gpt-5.5'
+clear_model_failures opus
 
 echo
 echo "$pass_count passed, $fail_count failed"
