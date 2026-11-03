@@ -371,7 +371,8 @@ func TestExecuteProjectMissingID(t *testing.T) {
 
 func TestExecuteShowTable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		switch r.URL.Path {
+		case "/tasks/task-1":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
 				ID:           "task-1",
@@ -385,6 +386,9 @@ func TestExecuteShowTable(t *testing.T) {
 					{Kind: "pr", Value: "https://github.com/boldfield/odonian/pull/102"},
 				},
 			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -424,7 +428,8 @@ func TestExecuteShowTable(t *testing.T) {
 
 func TestExecuteShowJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		switch r.URL.Path {
+		case "/tasks/task-1":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
 				ID:    "task-1",
@@ -434,6 +439,9 @@ func TestExecuteShowJSON(t *testing.T) {
 				Title: "Test Task",
 				Spec:  "Test spec",
 			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -463,7 +471,8 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 	// Real SHA-256 digest of the manifest bytes: printf '{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}' | sha256sum
 	realDigest := "461bf9e337f7d640ca135d4743755ab5538b777442eddafed2c5dfb38b1279be"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		switch r.URL.Path {
+		case "/tasks/task-1":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
 				ID:    "task-1",
@@ -482,6 +491,9 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 					},
 				},
 			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -530,16 +542,22 @@ func TestExecuteShowManifestWithHTMLCharsHashesToDigest(t *testing.T) {
 	sum := sha256.Sum256(manifestJSON)
 	digest := fmt.Sprintf("%x", sum)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		enc := json.NewEncoder(w)
-		enc.SetEscapeHTML(false)
-		enc.Encode(tuiclient.TaskDetail{
-			ID:    "task-1",
-			State: "in_progress",
-			SubmissionManifests: []tuiclient.SubmissionManifest{
-				{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: digest},
-			},
-		})
+		switch r.URL.Path {
+		case "/tasks/task-1":
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			enc.SetEscapeHTML(false)
+			enc.Encode(tuiclient.TaskDetail{
+				ID:    "task-1",
+				State: "in_progress",
+				SubmissionManifests: []tuiclient.SubmissionManifest{
+					{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: digest},
+				},
+			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		}
 	}))
 	defer server.Close()
 
@@ -570,14 +588,20 @@ func TestExecuteShowManifestWithHTMLCharsHashesToDigest(t *testing.T) {
 func TestExecuteShowJSONPreservesManifestKeyOrder(t *testing.T) {
 	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}`)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(tuiclient.TaskDetail{
-			ID:    "task-1",
-			State: "in_progress",
-			SubmissionManifests: []tuiclient.SubmissionManifest{
-				{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: "d"},
-			},
-		})
+		switch r.URL.Path {
+		case "/tasks/task-1":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:    "task-1",
+				State: "in_progress",
+				SubmissionManifests: []tuiclient.SubmissionManifest{
+					{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: "d"},
+				},
+			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		}
 	}))
 	defer server.Close()
 
@@ -956,6 +980,51 @@ func TestExecuteSubmitNoOp(t *testing.T) {
 	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
 		"--result", "already satisfied",
 		"--no-op",
+		"task123",
+	})
+	if err != nil {
+		t.Fatalf("executeSubmit failed: %v", err)
+	}
+}
+
+func TestExecuteSubmitNoOpWithValue(t *testing.T) {
+	expectedValue := "abc123def456"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/tasks/task123" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task123", "review_round": 0, "links": []map[string]string{}})
+			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/tasks/task123/submit" {
+			var req struct {
+				AgentID string
+				Result  string
+				Links   []struct {
+					Kind  string
+					Value string
+				}
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if len(req.Links) != 1 || req.Links[0].Kind != "no_op" || req.Links[0].Value != expectedValue {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	oldAgent := os.Getenv("AGENT_ID")
+	defer os.Setenv("AGENT_ID", oldAgent)
+	os.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+		"--result", "already satisfied",
+		"--no-op",
+		"--no-op-value", expectedValue,
 		"task123",
 	})
 	if err != nil {
@@ -4265,6 +4334,9 @@ func TestExecuteShowInitialTask(t *testing.T) {
 				Kind:        "implement",
 				Model:       "haiku",
 			})
+		case "/tasks/task-initial/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -4772,12 +4844,11 @@ func TestExecuteShowEventRetrievalFailure(t *testing.T) {
 
 	buf := &bytes.Buffer{}
 	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-fail"}, buf)
-	if err != nil {
-		t.Errorf("executeShow should succeed even when events fail to retrieve, got error: %v", err)
+	if err == nil {
+		t.Errorf("expected error when events cannot be retrieved, got nil")
 	}
-	output := buf.String()
-	if !strings.Contains(output, "Failing Task") {
-		t.Errorf("expected task output even when events fail, got: %s", output)
+	if !strings.Contains(err.Error(), "failed to get task events") {
+		t.Errorf("expected error message about event retrieval, got: %v", err)
 	}
 }
 

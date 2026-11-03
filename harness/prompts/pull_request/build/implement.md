@@ -58,11 +58,12 @@ submit, or block with a reason. Anything you start in the background is killed w
    - **REWORK — `origin/mr/<TASKID8>` already exists** (a prior attempt was pushed and the task was
      bounced back to ready): **Check the PR state first.** From the Links section of `odonian show`,
      find the PR URL. Run `gh pr view <url> --json state,mergeCommit` to check if the PR is MERGED,
-     OPEN, or CLOSED. **If MERGED:** Verify the merge commit is on origin/main with
-     `git merge-base --is-ancestor <mergeCommit> origin/main` after fetching. If ancestor check passes,
+     OPEN, or CLOSED. **If MERGED:** Fetch origin/main and verify the merge commit is on it with
+     `git merge-base --is-ancestor <mergeCommit> origin/main`. If ancestor check passes,
      do NOT rework, do NOT push, do NOT resubmit the PR link. Go straight to step 9 with
-     `odonian submit <id> --result "PR already merged; merge commit <mergeCommit> verified on origin/main"
-     --no-op <mergeCommit>`. **If CLOSED unmerged:** Block with `odonian transition <id> --to blocked
+     `odonian submit <id> --result "PR already merged; merge commit <mergeCommit> verified on origin/main; see <url>"
+     --no-op --no-op-value <mergeCommit>`. If ancestor check fails, block with `odonian transition <id> --to blocked
+     --note "merge commit <mergeCommit> not on origin/main; cannot verify merge"`. **If CLOSED unmerged:** Block with `odonian transition <id> --to blocked
      --note "PR is closed unmerged; cannot rework a closed PR"` — do NOT open a second PR for the same
      task. **If OPEN:** Continue it. `git checkout --detach origin/mr/<TASKID8>`; make your fixes;
      publish in step 8 with `git push origin HEAD:mr/<TASKID8>` — it stays the same branch and PR.
@@ -97,7 +98,7 @@ submit, or block with a reason. Anything you start in the background is killed w
 
    On a rework you MUST clear the reviewer's feedback before you may submit. Start by reading the full
    review context: run `odonian show <task-id>` to see the recorded review round, verdicts, findings
-   and operator notes from previous review rounds. These recorded findings explain the rework requirements
+   and operator notes (transition notes after the latest submit). These recorded findings explain the rework requirements
    alongside the current PR feedback. You MUST reconcile all sources:
    1. **Recorded PR state** — checked in step 4's REWORK path; if you reach step 7, the PR is OPEN.
    2. **Operator notes** — from `odonian show`; these are operator-provided context from task transitions that may override earlier review feedback.

@@ -60,11 +60,9 @@ submit, or block with a reason. Anything you start in the background is killed w
    verified against `main` and never reaches here. Before doing anything else, **VERIFY the `pr`
    link state**: `gh pr view <pr-url> --json number,state,mergeCommit` must succeed (and not 404).
    Check the state:
-   - **MERGED** — the PR was already merged. Verify the merge commit is on `origin/main`:
+   - **MERGED** — the PR was already merged. Fetch origin/main and verify the merge commit is on it:
      `git merge-base --is-ancestor <mergeCommit> origin/main`. If the merge commit is an ancestor of
-     main, review its diff (run `git show <mergeCommit>` to see the merge commit and its diff against
-     its first parent) against the parent task's acceptance criteria. Once Task A is deployed, a merged
-     PR will normally have been converged before review, so this branch is a backstop. If NOT on main,
+     main, review its diff against the parent task's acceptance criteria (run `git diff <mergeCommit>^1 <mergeCommit>` to see the merge commit's first-parent diff). Approve or reject on acceptance criteria only; skip the PR-head fetch, the merge-with-main step, and the CI gate below. Once docs/specs/2026-11-02-externally-merged-pr-convergence.md (PR-watch convergence) is deployed, a merged PR will normally have been converged before review, so this branch is a backstop. If NOT on main,
      reject with note "merge commit not found on origin/main — likely a different base branch or
      force-push".
    - **CLOSED** (unmerged) — the PR is closed without merging. Automatic reject: submit a `reject`

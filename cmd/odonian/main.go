@@ -766,8 +766,7 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 	var events []tuiclient.Event
 	events, err = client.ListEvents(ctx, taskID)
 	if err != nil {
-		// Continue without events if fetching fails
-		events = nil
+		return fmt.Errorf("failed to get task events: %w", err)
 	}
 
 	// Extract review findings and operator notes from events
@@ -1078,6 +1077,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	prFlag := fs.String("pr", "", "PR URL")
 	branchFlag := fs.String("branch", "", "branch name")
 	noOpFlag := fs.Bool("no-op", false, "mark as already-satisfied (no-op)")
+	noOpValueFlag := fs.String("no-op-value", "already-satisfied", "value for no-op submission (default: already-satisfied)")
 	messageFlag := fs.String("message", "", "commit message override (local_commit mode)")
 	agentFlag := fs.String("agent", "", "agent ID")
 	attemptFlag := fs.String("attempt", "", "research attempt ID (default: the one saved by claim)")
@@ -1109,6 +1109,10 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 
 	if *noOpFlag && (*prFlag != "" || *branchFlag != "") {
 		return fmt.Errorf("--no-op cannot be combined with --pr or --branch")
+	}
+
+	if *noOpValueFlag != "already-satisfied" && !*noOpFlag {
+		return fmt.Errorf("--no-op-value can only be used with --no-op")
 	}
 
 	// Validate findings file early, before any HTTP requests
@@ -1214,7 +1218,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 			// (implement prompt, step 6) has to bypass the commit entirely — same as pull_request
 			// mode. The reviewer verifies the claim against the base.
 			links = []tuiclient.LinkInput{
-				{Kind: "no_op", Value: "already-satisfied"},
+				{Kind: "no_op", Value: *noOpValueFlag},
 			}
 
 		default:
@@ -1253,7 +1257,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	} else {
 		if *noOpFlag {
 			links = []tuiclient.LinkInput{
-				{Kind: "no_op", Value: "already-satisfied"},
+				{Kind: "no_op", Value: *noOpValueFlag},
 			}
 		} else {
 			if *prFlag != "" && *branchFlag != "" {
