@@ -88,13 +88,14 @@ Submit with an empty findings array. Write your decision reasoning in a short pr
    link state**: `gh pr view <pr-url> --json number,state,mergeCommit` must succeed (and not 404).
    Check the state:
    - **MERGED** — the PR was already merged. Verify the merge commit is on `origin/main`:
-     `git fetch origin && git log origin/main | grep <mergeCommit>`. If the merge commit is on main,
-     proceed to review it (skip the "fetch the PR head" step below, instead `git checkout --detach
-     origin/main` and `git log -1` to inspect the merge and read the full diff). If NOT on main,
+     `git merge-base --is-ancestor <mergeCommit> origin/main`. If the merge commit is an ancestor of
+     main, review its diff (run `git show <mergeCommit>` to see the merge commit and its diff against
+     its first parent) against the parent task's acceptance criteria. Once Task A is deployed, a merged
+     PR will normally have been converged before review, so this branch is a backstop. If NOT on main,
      reject with note "merge commit not found on origin/main — likely a different base branch or
      force-push".
    - **CLOSED** (unmerged) — the PR is closed without merging. Automatic reject: submit a `reject`
-     verdict with note "PR is closed unmerged — submit a new PR for rework if needed" and STOP.
+     verdict with note "PR is closed unmerged; cannot reopen or rework it" and STOP.
    - **OPEN** or other — continue below.
    
    A `pr` link that does NOT resolve is fabricated or premature — a defect: submit

@@ -4740,7 +4740,7 @@ func TestExecuteShowMultipleRounds(t *testing.T) {
 	}
 }
 
-// TestExecuteShowEventRetrievalFailure tests handling of event retrieval failures
+// TestExecuteShowEventRetrievalFailure tests that show continues even when event retrieval fails
 func TestExecuteShowEventRetrievalFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -4772,11 +4772,12 @@ func TestExecuteShowEventRetrievalFailure(t *testing.T) {
 
 	buf := &bytes.Buffer{}
 	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-fail"}, buf)
-	if err == nil {
-		t.Errorf("expected error when events cannot be retrieved, got nil")
+	if err != nil {
+		t.Errorf("executeShow should succeed even when events fail to retrieve, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "failed to get task events") {
-		t.Errorf("expected error message about event retrieval, got: %v", err)
+	output := buf.String()
+	if !strings.Contains(output, "Failing Task") {
+		t.Errorf("expected task output even when events fail, got: %s", output)
 	}
 }
 
@@ -5835,9 +5836,12 @@ func TestExecuteSubmitManifestFileRejectedBeforeRequest(t *testing.T) {
 func showWithServer(t *testing.T, detail tuiclient.TaskDetail, jsonOutput bool) string {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		if strings.HasPrefix(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(detail)
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -5995,7 +5999,10 @@ func TestExecuteShowJSONKeepsContinuationAndFollowUpsSeparate(t *testing.T) {
 func TestExecuteShowPriority(t *testing.T) {
 	// Test that priority and topic anchor are displayed in show output
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		if r.URL.Path == "/tasks/task-1/events" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		} else if strings.HasPrefix(r.URL.Path, "/tasks/") {
 			w.Header().Set("Content-Type", "application/json")
 			priority600 := int64(600)
 			topicID := "topic-anchor-123"
@@ -6010,10 +6017,6 @@ func TestExecuteShowPriority(t *testing.T) {
 				Priority:      &priority600,
 				TopicAnchorID: &topicID,
 			})
-		}
-		if r.URL.Path == "/tasks/task-1/events" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -6038,7 +6041,10 @@ func TestExecuteShowPriority(t *testing.T) {
 func TestExecuteShowPriorityAbove1000(t *testing.T) {
 	// Test that priority values above 1000 (from Front action) are displayed
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		if r.URL.Path == "/tasks/task-1/events" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		} else if strings.HasPrefix(r.URL.Path, "/tasks/") {
 			w.Header().Set("Content-Type", "application/json")
 			priority := int64(1001) // From Front action
 
@@ -6051,10 +6057,6 @@ func TestExecuteShowPriorityAbove1000(t *testing.T) {
 				Spec:     "Test spec",
 				Priority: &priority,
 			})
-		}
-		if r.URL.Path == "/tasks/task-1/events" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -7160,14 +7162,14 @@ func TestExecuteShowOperatorNotesTextOutput(t *testing.T) {
 	}
 
 	output := buf.String()
-	if !strings.Contains(output, "Operator Notes:") {
-		t.Errorf("expected 'Operator Notes:' in output, got: %s", output)
+	if !strings.Contains(output, "Operator notes:") {
+		t.Errorf("expected 'Operator notes:' in output, got: %s", output)
 	}
-	if !strings.Contains(output, "[operator] unblocked by operator") {
-		t.Errorf("expected operator note 'unblocked by operator' in output, got: %s", output)
+	if !strings.Contains(output, "operator @ 2026-11-01T10:05:00Z: unblocked by operator") {
+		t.Errorf("expected operator note with timestamp 'operator @ 2026-11-01T10:05:00Z: unblocked by operator' in output, got: %s", output)
 	}
-	if !strings.Contains(output, "[operator] priority: high") {
-		t.Errorf("expected operator note 'priority: high' in output, got: %s", output)
+	if !strings.Contains(output, "operator @ 2026-11-01T10:10:00Z: priority: high") {
+		t.Errorf("expected operator note with timestamp 'operator @ 2026-11-01T10:10:00Z: priority: high' in output, got: %s", output)
 	}
 }
 
@@ -7224,9 +7226,20 @@ func TestExecuteShowOperatorNotesJSONOutput(t *testing.T) {
 	} else {
 		var notes []OperatorNote
 		notesJSON, _ := json.Marshal(result["operator_notes"])
-		if err := json.Unmarshal(notesJSON, &notes); err == nil {
-			if len(notes) == 0 {
-				t.Errorf("expected operator notes in JSON, but got empty array")
+		if err := json.Unmarshal(notesJSON, &notes); err != nil {
+			t.Errorf("failed to unmarshal operator notes: %v", err)
+		}
+		if len(notes) != 1 {
+			t.Errorf("expected 1 operator note in JSON, but got %d", len(notes))
+		} else {
+			if notes[0].Actor != "operator" {
+				t.Errorf("expected actor 'operator', got %q", notes[0].Actor)
+			}
+			if notes[0].Note != "unblocked" {
+				t.Errorf("expected note 'unblocked', got %q", notes[0].Note)
+			}
+			if notes[0].CreatedAt != "2026-11-01T10:05:00Z" {
+				t.Errorf("expected created_at '2026-11-01T10:05:00Z', got %q", notes[0].CreatedAt)
 			}
 		}
 	}
@@ -7283,14 +7296,14 @@ func TestExecuteShowOperatorNotesEmptyNotesOmitted(t *testing.T) {
 	}
 
 	output := buf.String()
-	if !strings.Contains(output, "Operator Notes:") {
-		t.Errorf("expected 'Operator Notes:' in output")
+	if !strings.Contains(output, "Operator notes:") {
+		t.Errorf("expected 'Operator notes:' in output")
 	}
-	if !strings.Contains(output, "[operator] important note") {
+	if !strings.Contains(output, "important note") {
 		t.Errorf("expected non-empty operator note in output")
 	}
 	// Make sure we only have one note (empty one is omitted)
-	count := strings.Count(output, "[operator]")
+	count := strings.Count(output, "operator @")
 	if count != 1 {
 		t.Errorf("expected 1 operator note, got %d", count)
 	}
@@ -7339,8 +7352,96 @@ func TestExecuteShowNoOperatorNotesBeforeSubmit(t *testing.T) {
 	}
 
 	output := buf.String()
-	// Should not have Operator Notes section if all notes are before submit
-	if strings.Contains(output, "Operator Notes:") {
-		t.Errorf("expected no 'Operator Notes:' section (transition was before submit), got: %s", output)
+	// Should not have Operator notes section if all notes are before submit
+	if strings.Contains(output, "Operator notes:") {
+		t.Errorf("expected no 'Operator notes:' section (transition was before submit), got: %s", output)
+	}
+}
+
+func TestExecuteShowOperatorNotesNoSubmitEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  0,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			transitionNote1 := "blocked: needs clarification"
+			transitionNote2 := "unblocked: spec clarified"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote1,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote2,
+					CreatedAt: "2026-11-01T10:30:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	// Test text output
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Operator notes:") {
+		t.Errorf("expected 'Operator notes:' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "operator @ 2026-11-01T10:00:00Z: blocked: needs clarification") {
+		t.Errorf("expected operator note with timestamp 'operator @ 2026-11-01T10:00:00Z: blocked: needs clarification' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "operator @ 2026-11-01T10:30:00Z: unblocked: spec clarified") {
+		t.Errorf("expected operator note with timestamp 'operator @ 2026-11-01T10:30:00Z: unblocked: spec clarified' in output, got: %s", output)
+	}
+
+	// Test JSON output
+	buf = &bytes.Buffer{}
+	err = executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow JSON failed: %v", err)
+	}
+
+	output = buf.String()
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+
+	if _, hasOperatorNotes := result["operator_notes"]; !hasOperatorNotes {
+		t.Errorf("expected 'operator_notes' in JSON output")
+	} else {
+		var notes []OperatorNote
+		notesJSON, _ := json.Marshal(result["operator_notes"])
+		if err := json.Unmarshal(notesJSON, &notes); err != nil {
+			t.Errorf("failed to unmarshal operator notes: %v", err)
+		}
+		if len(notes) != 2 {
+			t.Errorf("expected 2 operator notes in JSON, but got %d", len(notes))
+		} else {
+			if notes[0].Actor != "operator" || notes[0].Note != "blocked: needs clarification" || notes[0].CreatedAt != "2026-11-01T10:00:00Z" {
+				t.Errorf("first note mismatch: got %+v", notes[0])
+			}
+			if notes[1].Actor != "operator" || notes[1].Note != "unblocked: spec clarified" || notes[1].CreatedAt != "2026-11-01T10:30:00Z" {
+				t.Errorf("second note mismatch: got %+v", notes[1])
+			}
+		}
 	}
 }

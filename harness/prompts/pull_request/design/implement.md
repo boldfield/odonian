@@ -117,7 +117,15 @@ on sensing elapsed time.
    checked out" when another worktree holds that branch, and **that error is NOT a reason to block**
    (work detached + push-to-ref, below). Always `git fetch origin` first, then:
    - **REWORK — `origin/mr/<TASKID8>` already exists** (a prior attempt was pushed and the task was
-     bounced back to ready): continue it. `git checkout --detach origin/mr/<TASKID8>`; make your fixes;
+     bounced back to ready): **Check the PR state first.** From the Links section of `odonian show`,
+     find the PR URL. Run `gh pr view <url> --json state,mergeCommit` to check if the PR is MERGED,
+     OPEN, or CLOSED. **If MERGED:** Verify the merge commit is on origin/main with
+     `git merge-base --is-ancestor <mergeCommit> origin/main` after fetching. If ancestor check passes,
+     do NOT rework, do NOT push, do NOT resubmit the PR link. Go straight to step 9 with
+     `odonian submit <id> --result "PR already merged; merge commit <mergeCommit> verified on origin/main"
+     --no-op <mergeCommit>`. **If CLOSED unmerged:** Block with `odonian transition <id> --to blocked
+     --note "PR is closed unmerged; cannot rework a closed PR"` — do NOT open a second PR for the same
+     task. **If OPEN:** Continue it. `git checkout --detach origin/mr/<TASKID8>`; make your fixes;
      publish in step 8 with `git push origin HEAD:mr/<TASKID8>` — it stays the same branch and PR. You
      address and acknowledge the reviewer's feedback in the mandatory rework step 7 below. (Merge
      conflicts are cleared by the sync in step 6.)
@@ -146,11 +154,9 @@ on sensing elapsed time.
    On a rework you MUST clear the reviewer's feedback before you may submit. Start by reading the
    full review context: run `odonian show <task-id>` to see the recorded review round, verdicts, findings
    and operator notes from previous review rounds. These recorded findings explain the rework requirements
-   alongside the current PR feedback. **Check the recorded PR state:** if the PR is already MERGED,
-   take the no-op submit path with the merge commit. If the PR is CLOSED unmerged, block with a note.
-   You MUST reconcile all six sources:
-   1. **Recorded PR state** — from the Links section of `odonian show`; check if the PR is MERGED, OPEN, or CLOSED.
-   2. **Operator notes** — from `odonian show`; these are operator-provided context that may override earlier review feedback.
+   alongside the current PR feedback. You MUST reconcile all sources:
+   1. **Recorded PR state** — checked in step 4's REWORK path; if you reach step 7, the PR is OPEN.
+   2. **Operator notes** — from `odonian show`; these are operator-provided context from task transitions that may override earlier review feedback.
    3. **Recorded review findings** — the task's stored review verdicts and rejection findings from
       previous rounds (displayed by `odonian show`). These are the authoritative rejection reasons
       that prompted the rework.

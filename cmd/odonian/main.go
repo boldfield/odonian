@@ -762,13 +762,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		return fmt.Errorf("failed to get task: %w", err)
 	}
 
-	// Fetch events for rework tasks to display review findings and operator notes
+	// Fetch events to display review findings and operator notes
 	var events []tuiclient.Event
-	if task.ReviewRound > 0 {
-		events, err = client.ListEvents(ctx, taskID)
-		if err != nil {
-			return fmt.Errorf("failed to get task events: %w", err)
-		}
+	events, err = client.ListEvents(ctx, taskID)
+	if err != nil {
+		// Continue without events if fetching fails
+		events = nil
 	}
 
 	// Extract review findings and operator notes from events
@@ -850,9 +849,9 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		}
 		printContinuation(out, task)
 		if len(operatorNotes) > 0 {
-			fmt.Fprintf(out, "Operator Notes:\n")
+			fmt.Fprintf(out, "Operator notes:\n")
 			for _, note := range operatorNotes {
-				fmt.Fprintf(out, "  - [%s] %s\n", note.Actor, note.Note)
+				fmt.Fprintf(out, "  - %s @ %s: %s\n", note.Actor, note.CreatedAt, note.Note)
 			}
 		}
 		if len(reviewFindings) > 0 {
