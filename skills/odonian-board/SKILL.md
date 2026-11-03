@@ -33,7 +33,9 @@ safe; that's the whole point of keeping this skill clean.
 
 For "what's going on overall": `odonian projects --json` (add `--claimable` to see only boards with
 claimable work). Render a compact table — project name, id (first 8), repo, and a quick count of
-claimable work — so the human can pick where to look.
+claimable work — so the human can pick where to look. The projects response does not include
+counts; fetch `odonian tasks --project <id> --claimable --json` for each displayed count, or omit
+the count if you have not fetched it.
 
 ## The task board (one project) — render it like the TUI
 
@@ -48,7 +50,7 @@ Build it in two steps — the first is not optional:
 
 1. **FILTER FIRST — drop the bookkeeping before you render.** A `kind=review` or `kind=merge` task
    is server-spawned plumbing, not a deliverable. The **`done` column shows ONLY `implement` (and
-   design/track) deliverables** — **every `review`- and `merge`-kind task is excluded from `done`**,
+   design/research-track) deliverables** — **every `review`- and `merge`-kind task is excluded from `done`**,
    exactly as the TUI does. (Their `review` and `in_progress` lanes still show, because that's where
    live review/merge work is; it's specifically the **`done` lane** that must never list a
    `review`/`merge` task.) Apply this drop *before* counting or listing anything in `done` — do not
@@ -68,9 +70,12 @@ task, not a JSON dump. Summarize empty columns as "(none)".
 ## One task / document in detail
 
 - A specific task: `odonian show <id>` — render its state, kind, model, assignee, lease (flag if
-  expired), `review_round`/verdict, **links** (`pr` / `branch` / `commit` / `ci`), and dependencies.
+  expired), `review_round`/verdict, `track`, `held`, priority, **links** (`pr` / `branch` / `commit` / `ci` /
+  `no_op`), and dependencies.
   If a link is a PR, offer to surface its diff (`odonian diff <id>`).
-- A project's documents: `odonian project <id>` / the documents listing — show kind, title, ref.
+- A project: `odonian project <id>` shows project metadata. For its documents, read
+  `GET /projects/{id}/documents` and show kind, title, and ref; the project command does not list
+  documents.
 
 ## Watching work move
 

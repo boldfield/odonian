@@ -1,5 +1,8 @@
 # Cutover runbook: agentask → odonian
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Historical rename migration.**
+> This is the August agentask → odonian cutover checklist, not the current deployment procedure. Repository names have changed; unchecked boxes below do not establish outstanding production work. Do not rerun namespace/PVC migration steps as routine deployment. See [operations](../operations.md) and the [fleet guide](../../deploy/fleet/README.md).
+
 The repo-side rename (module path, binaries, env vars, manifests, skills, docs) lands in one
 PR; this runbook is the operational half. Everything here is human-run. Names on the left of
 each `→` are the pre-rename values still live in the clusters.

@@ -1,5 +1,8 @@
 # Sandbox and new-task model defaults
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Repository defaults updated; production rollout not verified.**
+> The Claude alias pins and gpt-6.1-sol routing/default examples are present in [sbx.sh](../../harness/sbx.sh) and the [task helper](../../skills/odonian-breakdown/scripts/odonian.sh). Historical production inventory and runtime observations below are not current provider-availability or deployment guarantees. See the [harness guide](../../harness/README.md) and [fleet guide](../../deploy/fleet/README.md).
+
 **Date:** 2026-09-30  
 **Status:** Approved  
 **Task:** Update sandbox and new-task model defaults

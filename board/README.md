@@ -1,5 +1,8 @@
 # Bootstrap board
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Historical bootstrap board.**
+> This file-backed board records the pre-service bootstrap process. Current tasks live in the Odonian service and are managed through its API; moving files here does not claim or transition a live task. See [AGENT-API.md](../AGENT-API.md) and [current documentation](../docs/README.md).
+
 A minimalist, text-file kanban used to build the Odonian MVP before Odonian exists.
 This mirrors the system's own model so we dogfood it.
 

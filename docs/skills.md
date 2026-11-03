@@ -19,7 +19,7 @@ and tasks through the API.
 It proposes and takes positions but stops for the human's decision at every design choice, task
 boundary, and spec. It never chooses what to build; the human brings the work. Its decomposition
 rules encode the system's conventions: no code in a spec, every coding task sized for the smallest
-model tier (decompose finer rather than escalate up front), and same-file tasks dependency-ordered
+model tier (Haiku initially, with `escalate=true` unless the human disables it), and same-file tasks dependency-ordered
 so parallel workers do not collide on merge. Helper scripts (`scripts/odonian.sh`,
 `scripts/create-repo.sh`) travel with the directory and must stay executable.
 
@@ -37,9 +37,10 @@ Triggers on "show me the board", "what's in flight?", "anything blocked?", "show
 ## `odonian-ops`: diagnose and operate
 
 [`skills/odonian-ops/`](../skills/odonian-ops/SKILL.md) works out why a task is wedged and, only
-on the human's explicit instruction, remediates it through the CLI: `transition`, `promote`,
-`archive`. It reads freely, mutates only when told, verifies the precondition before any
-irreversible action, and never touches tokens.
+on the human's explicit instruction, remediates it through CLI commands such as `transition` and
+`promote`, or the archive API/TUI actions (there is no `odonian archive` CLI verb). It reads freely,
+mutates only when told, verifies the precondition before any irreversible action, and never
+touches tokens.
 
 Triggers on "why is <task> stuck?", "unstick <task>", "sweep for zombie merge tasks", "promote
 <task>", "move <task> to <state>".
@@ -51,7 +52,9 @@ show the queue of tasks awaiting a decision (`odonian pending`), show one task's
 (`odonian diff`), and, only on the human's explicit instruction, record the verdict
 (`odonian approve` / `odonian reject --note …`). It never forms its own opinion. The human supplies
 the judgment; the CLI does the mechanics, which in `local_commit` mode includes the branch freeze
-and worktree cleanup.
+and worktree cleanup. Plain `reject` sends an `approved` task back to `ready`; although the CLI
+accepts `review` as input, the server refuses that direct rework transition. Automated review
+is completed through the spawned review tasks.
 
 Triggers on "what's waiting for review?", "show me the diff for <task>", "approve <task>",
 "reject <task> because …".

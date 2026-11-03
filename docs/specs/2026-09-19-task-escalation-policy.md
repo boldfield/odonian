@@ -1,5 +1,8 @@
 # Change an existing task's escalation policy
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented; historical limitation and plan.**
+> PATCH /tasks/{id}/escalation and UpdateTaskEscalate exist in the [API](../../internal/api/api.go) and [store](../../internal/store/store.go), with [API tests](../../internal/api/api_test.go). The “Current limitation” below describes the pre-change baseline. See the [API reference](../api.md); this status does not establish that the named production tasks were changed.
+
 Status: implementation plan for the user's 2026-09-19 policy correction.
 
 ## User requirement

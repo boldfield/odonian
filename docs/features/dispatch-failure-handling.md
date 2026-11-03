@@ -1,5 +1,8 @@
 # Dispatch failure handling: hand claims back, back off per account
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: D1–D5 implemented in source; historical incident and specification.**
+> Owner-fenced unclaim, account/model backoff and failed-dispatch handback are in the [store](../../internal/store/store.go) and [harness](../../harness/agent.sh); reviewer replacement is covered by [store tests](../../internal/store/review_models_test.go). See [backoff tests](../../harness/account_backoff_test.sh), [dispatch tests](../../harness/account_dispatch_test.sh), [AGENT-API.md](../../AGENT-API.md) and the [harness guide](../../harness/README.md). The defects and release instructions below describe the earlier baseline, not evidence of current deployment.
+
 Status: specification, 2026-10-21. D1–D3 implement the original design and merged as #502–#504. D4 and D5 were added on 2026-10-22, after the incident described in "What went wrong, again".
 
 ## What went wrong

@@ -1,5 +1,8 @@
 # Reliable Odonian reviewer feedback
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented; historical incident and specification.**
+> Actionable reviewer feedback and exact acknowledgment handling are in [feedback.go](../../internal/forge/feedback.go) with [regression tests](../../internal/forge/feedback_test.go); the normal CLI submission gate has [dedicated tests](../../cmd/odonian/submit_feedback_gate_test.go). Use [AGENT-API.md](../../AGENT-API.md) for current worker operation. Original task IDs and rollout steps below do not establish current board/deployment state.
+
 Status: approved by the user on 2026-09-19. This specification supersedes the detection and acknowledgment rules in `2026-08-18-pr-feedback-single-identity.md` and the conflicting best-effort submission-gate behavior documented with that feature.
 
 Target project: Odonian (`83c4152e-57dc-49b0-9244-d90ff1f9cf25`). Implementation stays in Odonian. Deployment changes belong to the manifests project.

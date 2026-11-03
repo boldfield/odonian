@@ -1,5 +1,8 @@
 # PR feedback under a single GitHub identity
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Superseded in part by the reviewer-feedback repair.**
+> The marker-only ignore/acknowledgment rules below are historical and must not be used as the current feedback contract. The [September repair](2026-09-19-reviewer-feedback-repair.md), implemented in [feedback.go](../../internal/forge/feedback.go) with [regression tests](../../internal/forge/feedback_test.go), preserves actionable reviewer comments and requires precise acknowledgments. See [AGENT-API.md](../../AGENT-API.md).
+
 **Status:** approved · **Date:** 2026-08-18 · **Supersedes behavior from:** `2026-06-26-pr-feedback-ack.md` (detection logic only; the CLI surface and prompt contract are unchanged)
 
 > The detection and acknowledgment rules below are superseded by the approved [reviewer feedback repair](2026-09-19-reviewer-feedback-repair.md). Agent authorship alone does not make feedback addressed. This document retains the historical problem statement and original design for context.

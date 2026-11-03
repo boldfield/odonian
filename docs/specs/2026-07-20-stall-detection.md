@@ -1,5 +1,8 @@
 # Feature spec — board stall detection (alert when claimable work stops moving)
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Not implemented in this baseline.**
+> The [notification reconciler](../../internal/notify/reconciler.go) still checks approved/blocked/failed tasks; it does not implement the project-level claimable-work stall alert proposed below. Do not rely on ODONIAN_STALL_THRESHOLD or an automatic board-stall page. See [operations](../operations.md) for current monitoring and recovery.
+
 **Status:** board milestone (Odonian project). **Date:** 2026-07-20.
 
 ## Problem

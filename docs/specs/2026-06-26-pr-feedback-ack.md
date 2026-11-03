@@ -1,5 +1,8 @@
 # Feature spec — workers address all unaddressed PR feedback + acknowledge it
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented, with later semantics superseded.**
+> The list/ack commands exist in [pr-feedback.go](../../cmd/odonian/pr-feedback.go). Use the [reviewer-feedback repair](2026-09-19-reviewer-feedback-repair.md) for the later actionable-feedback and exact-acknowledgment rules, and [AGENT-API.md](../../AGENT-API.md) for current usage. The original incident and proposal remain below.
+
 **Status:** board milestone (Odonian project). **Date:** 2026-06-26.
 
 ## Problem

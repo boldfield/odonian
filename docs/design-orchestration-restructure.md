@@ -1,5 +1,8 @@
 # Design: Foreman Design-Orchestration Restructure
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Historical cross-repository design; implementation only partly verified here.**
+> The Odonian [design prompt](../harness/prompts/pull_request/design/implement.md) contains the contract core described here, but this checkout does not establish the status of Foreman changes or the full cross-repository rollout. The original proposal and task plan remain below. Use [current documentation](README.md) for supported Odonian behavior.
+
 **Status:** design — 2026-06-10. Spans two repos: `boldfield/odonian` (substrate + harness) and
 `boldfield/foreman` (pipeline). All open calls **locked**: server-side merge primitive; scaffold
 pushes Makefile/CI in the initial commit (repo created pre-design); Option B (generic extensible
