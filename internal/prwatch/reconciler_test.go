@@ -19,17 +19,18 @@ import (
 )
 
 type fakeTaskSource struct {
-	projects                    []store.Project
-	projectsErr                 error
-	tasks                       map[string][]store.Task
-	tasksErr                    error
-	taskWithDepsAndLinks        map[string]store.TaskWithDepsAndLinks
-	getTaskErrs                 map[string]error
-	transitionCalls             []transitionCall
-	transitionErr               error
-	convergeExternallyMergedErr error
-	tombstoneLinkCalls          []tombstoneLinkCall
-	tombstoneLinkErr            error
+	projects                      []store.Project
+	projectsErr                   error
+	tasks                         map[string][]store.Task
+	tasksErr                      error
+	taskWithDepsAndLinks          map[string]store.TaskWithDepsAndLinks
+	getTaskErrs                   map[string]error
+	transitionCalls               []transitionCall
+	transitionErr                 error
+	convergeExternallyMergedCalls []convergeExternallyMergedCall
+	convergeExternallyMergedErr   error
+	tombstoneLinkCalls            []tombstoneLinkCall
+	tombstoneLinkErr              error
 }
 
 type tombstoneLinkCall struct {
@@ -41,6 +42,11 @@ type transitionCall struct {
 	taskID  string
 	toState string
 	note    *string
+}
+
+type convergeExternallyMergedCall struct {
+	taskID string
+	prURL  string
 }
 
 func (f *fakeTaskSource) ListProjects(ctx context.Context, filter store.ProjectListFilter) ([]store.Project, error) {
@@ -92,7 +98,11 @@ func (f *fakeTaskSource) TombstoneLink(ctx context.Context, taskID, linkID strin
 }
 
 func (f *fakeTaskSource) ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (store.Task, error) {
-	return store.Task{}, f.convergeExternallyMergedErr
+	f.convergeExternallyMergedCalls = append(f.convergeExternallyMergedCalls, convergeExternallyMergedCall{
+		taskID: taskID,
+		prURL:  prURL,
+	})
+	return store.Task{State: "done"}, f.convergeExternallyMergedErr
 }
 
 type fakeNotifierForReconciler struct {
@@ -2195,4 +2205,167 @@ func countRecordsByLevelAndMessage(records []*slog.Record, level slog.Level, msg
 		}
 	}
 	return count
+}
+
+// TestReconcileExternallyMergedBlockedAgentMerge verifies that blocked tasks with agent_merge=true
+// and a merged PR are converged to done regardless of agent_merge.
+func TestReconcileExternallyMergedBlockedAgentMerge(t *testing.T) {
+	ctx := context.Background()
+
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		return "merged", nil
+	}
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-1",
+					Title:      "Blocked Agent Merge Task",
+					State:      "blocked",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: true,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:    "task-1",
+				Title: "Blocked Agent Merge Task",
+				State: "blocked",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner/repo/pull/1"},
+				},
+			},
+		},
+	}
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
+	reconciler.getPRState = getPRState
+
+	err := reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(ts.convergeExternallyMergedCalls) != 1 {
+		t.Errorf("expected 1 ConvergeExternallyMergedTask call for blocked+agent_merge=true task, got %d", len(ts.convergeExternallyMergedCalls))
+	}
+
+	if len(notifier.publishCalls) != 1 {
+		t.Errorf("expected 1 notification, got %d", len(notifier.publishCalls))
+	}
+}
+
+// TestReconcileExternallyMergedInProgress verifies that in_progress tasks with a merged PR
+// are converged to done.
+func TestReconcileExternallyMergedInProgress(t *testing.T) {
+	ctx := context.Background()
+
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		return "merged", nil
+	}
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:        "task-1",
+					Title:     "In Progress Task",
+					State:     "in_progress",
+					UpdatedAt: "2024-01-01T00:00:00Z",
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:        "task-1",
+				Title:     "In Progress Task",
+				State:     "in_progress",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner/repo/pull/2"},
+				},
+			},
+		},
+	}
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
+	reconciler.getPRState = getPRState
+
+	err := reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(ts.convergeExternallyMergedCalls) != 1 {
+		t.Errorf("expected 1 ConvergeExternallyMergedTask call for in_progress task, got %d", len(ts.convergeExternallyMergedCalls))
+	}
+
+	if len(notifier.publishCalls) != 1 {
+		t.Errorf("expected 1 notification, got %d", len(notifier.publishCalls))
+	}
+}
+
+// TestReconcileExternallyMergedReady verifies that ready tasks with a merged PR are converged to done.
+func TestReconcileExternallyMergedReady(t *testing.T) {
+	ctx := context.Background()
+
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		return "merged", nil
+	}
+
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:        "task-1",
+					Title:     "Ready Task",
+					State:     "ready",
+					UpdatedAt: "2024-01-01T00:00:00Z",
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:    "task-1",
+				Title: "Ready Task",
+				State: "ready",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner/repo/pull/3"},
+				},
+			},
+		},
+	}
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
+	reconciler.getPRState = getPRState
+
+	err := reconciler.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(ts.convergeExternallyMergedCalls) != 1 {
+		t.Errorf("expected 1 ConvergeExternallyMergedTask call for ready task, got %d", len(ts.convergeExternallyMergedCalls))
+	}
+
+	if len(notifier.publishCalls) != 1 {
+		t.Errorf("expected 1 notification, got %d", len(notifier.publishCalls))
+	}
 }

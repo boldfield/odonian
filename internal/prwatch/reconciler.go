@@ -273,10 +273,6 @@ func (r *PRWatchReconciler) reconcileApprovedTask(ctx context.Context, task stor
 // left alone. This allows operators to merge PRs by hand and have them converge without
 // needing to manually transition the task.
 func (r *PRWatchReconciler) reconcileNonApprovedTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) error {
-	if task.AgentMerge {
-		return nil
-	}
-
 	fullTask, err := r.taskSource.GetTask(ctx, task.ID)
 	if err != nil {
 		return err
