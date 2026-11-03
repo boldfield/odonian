@@ -18806,6 +18806,334 @@ func TestConvergeExternallyMergedTaskFromReady(t *testing.T) {
 	}
 }
 
+func TestConvergeExternallyMergedTaskRefusesTerminalStates(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Create project and document
+	p, err := s.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	d, err := s.CreateDocument(ctx, p.ID, "design", "test doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Test each terminal state that should be refused
+	terminalStates := []string{"done", "failed", "superseded", "abandoned"}
+
+	for _, state := range terminalStates {
+		// Create a task
+		tasks, err := s.CreateTasks(ctx, p.ID, []TaskInput{
+			{
+				Title:      "Test Task",
+				Spec:       "Test spec",
+				DocumentID: d.ID,
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create task for state %s: %v", state, err)
+		}
+
+		task := tasks[0]
+
+		// Set task to terminal state directly
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := s.Conn().ExecContext(ctx, `
+			UPDATE task SET state = ?, updated_at = ? WHERE id = ?
+		`, state, now, task.ID); err != nil {
+			t.Fatalf("failed to set task to %s state: %v", state, err)
+		}
+
+		// Try to converge - should fail with ErrConflict
+		_, err = s.ConvergeExternallyMergedTask(ctx, task.ID, "https://github.com/owner/repo/pull/456")
+		if err != ErrConflict {
+			t.Errorf("expected ErrConflict for state %s, got %v", state, err)
+		}
+	}
+}
+
+func TestConvergeExternallyMergedTaskRetireAdjudicationChildren(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Create project and document
+	p, err := s.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	d, err := s.CreateDocument(ctx, p.ID, "design", "test doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a task
+	tasks, err := s.CreateTasks(ctx, p.ID, []TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: d.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	task := tasks[0]
+
+	// Promote to ready
+	promoted, err := s.PromoteTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	// Claim
+	claimed, err := s.ClaimTask(ctx, promoted.ID, "agent-1", "haiku", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit to transition to review
+	submitted, err := s.SubmitTask(ctx, claimed.ID, "agent-1", "Done", nil, []LinkInput{
+		{Kind: "pr", Value: "https://github.com/owner/repo/pull/456"},
+	}, 1, map[string]int{}, map[string]int{}, 0)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	if submitted.State != "review" {
+		t.Fatalf("expected review state, got %s", submitted.State)
+	}
+
+	// Create adjudication child (verdict-less) and regular review child manually
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	adjChildID := "adjudication-child-" + task.ID
+	regChildID := "regular-child-" + task.ID
+
+	if _, err := s.Conn().ExecContext(ctx, `
+		INSERT INTO task (id, project_id, document_id, title, spec, state, kind, target_task_id, review_round, adjudicate_finding_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, adjChildID, p.ID, d.ID, "Adjudication Child", "Test spec", "review", "review", task.ID, 1, "finding-123", now, now); err != nil {
+		t.Fatalf("failed to create adjudication child: %v", err)
+	}
+
+	if _, err := s.Conn().ExecContext(ctx, `
+		INSERT INTO task (id, project_id, document_id, title, spec, state, kind, target_task_id, review_round, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, regChildID, p.ID, d.ID, "Regular Review Child", "Test spec", "review", "review", task.ID, 1, now, now); err != nil {
+		t.Fatalf("failed to create regular child: %v", err)
+	}
+
+	children := []Task{
+		{ID: adjChildID},
+		{ID: regChildID},
+	}
+
+	// Converge the externally merged task
+	converged, err := s.ConvergeExternallyMergedTask(ctx, task.ID, "https://github.com/owner/repo/pull/456")
+	if err != nil {
+		t.Fatalf("failed to converge externally merged task: %v", err)
+	}
+
+	if converged.State != "done" {
+		t.Fatalf("expected done state, got %s", converged.State)
+	}
+
+	// Verify adjudication child was NOT retired (has adjudicate_finding_id)
+	adjChild, err := s.GetTask(ctx, children[0].ID)
+	if err != nil {
+		t.Fatalf("failed to get adjudication child: %v", err)
+	}
+	if adjChild.State != "review" {
+		t.Fatalf("expected adjudication child to remain in review, got %s", adjChild.State)
+	}
+
+	// Verify regular review child was retired
+	regChild, err := s.GetTask(ctx, children[1].ID)
+	if err != nil {
+		t.Fatalf("failed to get regular review child: %v", err)
+	}
+	if regChild.State != "abandoned" {
+		t.Fatalf("expected regular review child to be retired to abandoned, got %s", regChild.State)
+	}
+}
+
+func TestConvergeExternallyMergedTaskResearchContinuation(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Create project and document
+	p, err := s.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	d, err := s.CreateDocument(ctx, p.ID, "design", "test doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a research task that opts into continuations
+	researchSpec := `Some research spec
+
+## Continuation Manifest
+
+More details here` // Spec that opts into continuations
+	tasks, err := s.CreateTasks(ctx, p.ID, []TaskInput{
+		{
+			Title:      "Research Task",
+			Spec:       researchSpec,
+			DocumentID: d.ID,
+			Track:      "research",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create research task: %v", err)
+	}
+
+	task := tasks[0]
+
+	// Promote to ready
+	promoted, err := s.PromoteTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	// Claim
+	claimed, err := s.ClaimTask(ctx, promoted.ID, "agent-1", "haiku", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit to transition to review
+	_, err = s.SubmitTask(ctx, claimed.ID, "agent-1", "Done", nil, []LinkInput{
+		{Kind: "pr", Value: "https://github.com/owner/repo/pull/789"},
+	}, 1, map[string]int{}, map[string]int{}, 0)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Converge the externally merged task
+	converged, err := s.ConvergeExternallyMergedTask(ctx, task.ID, "https://github.com/owner/repo/pull/789")
+	if err != nil {
+		t.Fatalf("failed to converge externally merged task: %v", err)
+	}
+
+	if converged.State != "done" {
+		t.Fatalf("expected done state, got %s", converged.State)
+	}
+
+	// Verify transition event mentions no continuation materialized
+	events, err := s.ListEvents(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	var foundNoContEvent bool
+	for _, evt := range events {
+		if evt.Kind == "transition" && evt.Note != nil && strings.Contains(*evt.Note, "no continuation materialized for research task") {
+			foundNoContEvent = true
+			break
+		}
+	}
+	if !foundNoContEvent {
+		t.Error("expected note about no continuation materialized for research task")
+	}
+}
+
+func TestConvergeExternallyMergedTaskDependentClaimability(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Create project and document
+	p, err := s.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	d, err := s.CreateDocument(ctx, p.ID, "design", "test doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a parent task
+	tasks, err := s.CreateTasks(ctx, p.ID, []TaskInput{
+		{
+			Title:      "Parent Task",
+			Spec:       "Test spec",
+			DocumentID: d.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create parent task: %v", err)
+	}
+
+	parentTask := tasks[0]
+
+	// Promote to ready
+	promoted, err := s.PromoteTask(ctx, parentTask.ID)
+	if err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+
+	// Claim
+	claimed, err := s.ClaimTask(ctx, promoted.ID, "agent-1", "haiku", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Submit to transition to review
+	_, err = s.SubmitTask(ctx, claimed.ID, "agent-1", "Done", nil, []LinkInput{
+		{Kind: "pr", Value: "https://github.com/owner/repo/pull/100"},
+	}, 1, map[string]int{}, map[string]int{}, 0)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Create a dependent task
+	depTasks, err := s.CreateTasks(ctx, p.ID, []TaskInput{
+		{
+			Title:      "Dependent Task",
+			Spec:       "Test spec",
+			DocumentID: d.ID,
+			DependsOn:  []string{parentTask.ID},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create dependent task: %v", err)
+	}
+
+	depTask := depTasks[0]
+
+	// Verify dependent is in backlog initially
+	if depTask.State != "backlog" {
+		t.Fatalf("expected dependent task to be in backlog initially, got %s", depTask.State)
+	}
+
+	// Converge the parent
+	_, err = s.ConvergeExternallyMergedTask(ctx, parentTask.ID, "https://github.com/owner/repo/pull/100")
+	if err != nil {
+		t.Fatalf("failed to converge parent: %v", err)
+	}
+
+	// Reload dependent to check if it became ready
+	updatedDep, err := s.GetTask(ctx, depTask.ID)
+	if err != nil {
+		t.Fatalf("failed to get updated dependent: %v", err)
+	}
+
+	if updatedDep.State != "ready" {
+		t.Fatalf("expected dependent to become ready after parent convergence, got %s", updatedDep.State)
+	}
+}
+
 func TestConvergeExternallyMergedTaskFromInProgress(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
@@ -18852,6 +19180,14 @@ func TestConvergeExternallyMergedTaskFromInProgress(t *testing.T) {
 		t.Fatalf("expected in_progress state, got %s", claimed.State)
 	}
 
+	// Verify assignee and lease are set before convergence
+	if claimed.Assignee == nil || *claimed.Assignee != "agent-1" {
+		t.Fatalf("expected assignee to be 'agent-1', got %v", claimed.Assignee)
+	}
+	if claimed.LeaseExpiresAt == nil {
+		t.Fatalf("expected lease to be set for in_progress task")
+	}
+
 	// Converge the externally merged task
 	converged, err := s.ConvergeExternallyMergedTask(ctx, task.ID, "https://github.com/owner/repo/pull/456")
 	if err != nil {
@@ -18860,6 +19196,14 @@ func TestConvergeExternallyMergedTaskFromInProgress(t *testing.T) {
 
 	if converged.State != "done" {
 		t.Fatalf("expected done state, got %s", converged.State)
+	}
+
+	// Verify assignee and lease are cleared after convergence
+	if converged.Assignee != nil {
+		t.Fatalf("expected assignee to be nil after convergence, got %v", converged.Assignee)
+	}
+	if converged.LeaseExpiresAt != nil {
+		t.Fatalf("expected lease to be nil after convergence, got %v", converged.LeaseExpiresAt)
 	}
 }
 
@@ -18917,6 +19261,40 @@ func TestConvergeExternallyMergedTaskFromReview(t *testing.T) {
 		t.Fatalf("expected review state, got %s", submitted.State)
 	}
 
+	// Create review children manually with SQL
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	child1ID := "review-child-1-" + task.ID
+	child2ID := "review-child-2-" + task.ID
+
+	if _, err := s.Conn().ExecContext(ctx, `
+		INSERT INTO task (id, project_id, document_id, title, spec, state, kind, target_task_id, review_round, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, child1ID, p.ID, d.ID, "Review Child 1 (no verdict)", "Test spec", "review", "review", task.ID, 1, now, now); err != nil {
+		t.Fatalf("failed to create review child 1: %v", err)
+	}
+
+	if _, err := s.Conn().ExecContext(ctx, `
+		INSERT INTO task (id, project_id, document_id, title, spec, state, kind, target_task_id, review_round, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, child2ID, p.ID, d.ID, "Review Child 2 (with verdict)", "Test spec", "review", "review", task.ID, 1, now, now); err != nil {
+		t.Fatalf("failed to create review child 2: %v", err)
+	}
+
+	reviewChildren := []Task{
+		{ID: child1ID},
+		{ID: child2ID},
+	}
+
+	// Give the second child a verdict so it won't be retired
+	child2 := reviewChildren[1]
+	verdict := "approved"
+	nowUpdate := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.Conn().ExecContext(ctx, `
+		UPDATE task SET verdict = ?, updated_at = ? WHERE id = ?
+	`, verdict, nowUpdate, child2.ID); err != nil {
+		t.Fatalf("failed to set verdict on child: %v", err)
+	}
+
 	// Converge the externally merged task
 	converged, err := s.ConvergeExternallyMergedTask(ctx, task.ID, "https://github.com/owner/repo/pull/456")
 	if err != nil {
@@ -18925,6 +19303,40 @@ func TestConvergeExternallyMergedTaskFromReview(t *testing.T) {
 
 	if converged.State != "done" {
 		t.Fatalf("expected done state, got %s", converged.State)
+	}
+
+	// Verify first child was retired
+	child1Retired, err := s.GetTask(ctx, reviewChildren[0].ID)
+	if err != nil {
+		t.Fatalf("failed to get retired child: %v", err)
+	}
+	if child1Retired.State != "abandoned" {
+		t.Fatalf("expected abandoned state for child 1, got %s", child1Retired.State)
+	}
+
+	// Verify second child was not retired
+	child2Updated, err := s.GetTask(ctx, child2.ID)
+	if err != nil {
+		t.Fatalf("failed to get child 2: %v", err)
+	}
+	if child2Updated.State != "review" {
+		t.Fatalf("expected review state for child 2 with verdict, got %s", child2Updated.State)
+	}
+
+	// Verify retire event exists for first child
+	events, err := s.ListEvents(ctx, reviewChildren[0].ID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var foundRetireEvent bool
+	for _, evt := range events {
+		if evt.Kind == "transition" && evt.Note != nil && *evt.Note == "retired: parent PR merged outside the board" {
+			foundRetireEvent = true
+			break
+		}
+	}
+	if !foundRetireEvent {
+		t.Error("retire event not found for child 1")
 	}
 }
 

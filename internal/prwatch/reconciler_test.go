@@ -1068,8 +1068,94 @@ func TestNonApprovedTaskWithMergedPRConverges(t *testing.T) {
 		t.Fatal("getPRState was not called")
 	}
 
+	if len(ts.convergeExternallyMergedCalls) != 1 {
+		t.Errorf("expected exactly 1 convergeExternallyMergedTask call, got %d", len(ts.convergeExternallyMergedCalls))
+	}
+
 	if ts.convergeExternallyMergedErr == nil && len(ts.transitionCalls) != 0 {
 		t.Errorf("expected no transition calls for non-approved task, got %d", len(ts.transitionCalls))
+	}
+}
+
+func TestReviewTaskWithTwoInFlightChildrenConverges(t *testing.T) {
+	ctx := context.Background()
+	parentID := "parent-task"
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "parent-task",
+					Title:      "Parent Task in Review",
+					State:      "review",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+				{
+					ID:           "child-task-1",
+					Title:        "Review Child 1",
+					State:        "review",
+					UpdatedAt:    "2024-01-01T00:00:00Z",
+					TargetTaskID: &parentID,
+					Kind:         "review",
+					ReviewRound:  1,
+				},
+				{
+					ID:           "child-task-2",
+					Title:        "Review Child 2",
+					State:        "review",
+					UpdatedAt:    "2024-01-01T00:00:00Z",
+					TargetTaskID: &parentID,
+					Kind:         "review",
+					ReviewRound:  1,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"parent-task": {
+				ID:        "parent-task",
+				Title:     "Parent Task in Review",
+				State:     "review",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner/repo/pull/999"},
+				},
+			},
+		},
+	}
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	var getStateCalled bool
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		getStateCalled = true
+		return "merged", nil
+	}
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
+	reconciler.getPRState = getPRState
+
+	err := reconciler.Reconcile(ctx)
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if !getStateCalled {
+		t.Fatal("getPRState was not called")
+	}
+
+	if len(ts.convergeExternallyMergedCalls) != 1 {
+		t.Errorf("expected exactly 1 convergeExternallyMergedTask call, got %d", len(ts.convergeExternallyMergedCalls))
+	}
+
+	if len(ts.convergeExternallyMergedCalls) > 0 {
+		call := ts.convergeExternallyMergedCalls[0]
+		if call.taskID != "parent-task" {
+			t.Errorf("expected convergeExternallyMergedTask call for parent-task, got %s", call.taskID)
+		}
 	}
 }
 
@@ -1083,8 +1169,8 @@ func TestNonApprovedTaskWithOpenPRDoesNothing(t *testing.T) {
 			"proj-1": {
 				{
 					ID:         "task-1",
-					Title:      "Test Task in Review",
-					State:      "review",
+					Title:      "Test Task in Blocked",
+					State:      "blocked",
 					UpdatedAt:  "2024-01-01T00:00:00Z",
 					AgentMerge: false,
 				},
@@ -1093,8 +1179,8 @@ func TestNonApprovedTaskWithOpenPRDoesNothing(t *testing.T) {
 		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
 			"task-1": {
 				ID:        "task-1",
-				Title:     "Test Task in Review",
-				State:     "review",
+				Title:     "Test Task in Blocked",
+				State:     "blocked",
 				UpdatedAt: "2024-01-01T00:00:00Z",
 				Links: []store.TaskLink{
 					{Kind: "pr", Value: "https://github.com/owner/repo/pull/1"},
@@ -1120,6 +1206,10 @@ func TestNonApprovedTaskWithOpenPRDoesNothing(t *testing.T) {
 
 	if len(ts.transitionCalls) != 0 {
 		t.Errorf("expected no transition calls, got %d", len(ts.transitionCalls))
+	}
+
+	if len(ts.convergeExternallyMergedCalls) != 0 {
+		t.Errorf("expected no convergeExternallyMergedTask calls for open PR, got %d", len(ts.convergeExternallyMergedCalls))
 	}
 }
 
@@ -1170,6 +1260,10 @@ func TestNonApprovedTaskWithClosedPRDoesNothing(t *testing.T) {
 
 	if len(ts.transitionCalls) != 0 {
 		t.Errorf("expected no transition calls, got %d", len(ts.transitionCalls))
+	}
+
+	if len(ts.convergeExternallyMergedCalls) != 0 {
+		t.Errorf("expected no convergeExternallyMergedTask calls for closed PR, got %d", len(ts.convergeExternallyMergedCalls))
 	}
 }
 
