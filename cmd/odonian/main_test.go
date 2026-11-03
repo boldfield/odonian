@@ -7108,3 +7108,239 @@ func TestExecuteUpdateReviewModelsRoundTrip(t *testing.T) {
 		t.Error("expected error without --review-models")
 	}
 }
+
+func TestExecuteShowOperatorNotesTextOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  1,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			submitNote := "approved"
+			transitionNote1 := "unblocked by operator"
+			transitionNote2 := "priority: high"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "submit",
+					Actor:     "worker-1",
+					Note:      &submitNote,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote1,
+					CreatedAt: "2026-11-01T10:05:00Z",
+				},
+				{
+					ID:        "event-3",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote2,
+					CreatedAt: "2026-11-01T10:10:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Operator Notes:") {
+		t.Errorf("expected 'Operator Notes:' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "[operator] unblocked by operator") {
+		t.Errorf("expected operator note 'unblocked by operator' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "[operator] priority: high") {
+		t.Errorf("expected operator note 'priority: high' in output, got: %s", output)
+	}
+}
+
+func TestExecuteShowOperatorNotesJSONOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  1,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			submitNote := "approved"
+			transitionNote := "unblocked"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "submit",
+					Actor:     "worker-1",
+					Note:      &submitNote,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote,
+					CreatedAt: "2026-11-01T10:05:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+
+	if _, hasOperatorNotes := result["operator_notes"]; !hasOperatorNotes {
+		t.Errorf("expected 'operator_notes' in JSON output, got: %s", output)
+	} else {
+		var notes []OperatorNote
+		notesJSON, _ := json.Marshal(result["operator_notes"])
+		if err := json.Unmarshal(notesJSON, &notes); err == nil {
+			if len(notes) == 0 {
+				t.Errorf("expected operator notes in JSON, but got empty array")
+			}
+		}
+	}
+}
+
+func TestExecuteShowOperatorNotesEmptyNotesOmitted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  1,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			submitNote := "approved"
+			emptyNote := ""
+			transitionNote := "important note"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "submit",
+					Actor:     "worker-1",
+					Note:      &submitNote,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &emptyNote,
+					CreatedAt: "2026-11-01T10:05:00Z",
+				},
+				{
+					ID:        "event-3",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote,
+					CreatedAt: "2026-11-01T10:10:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Operator Notes:") {
+		t.Errorf("expected 'Operator Notes:' in output")
+	}
+	if !strings.Contains(output, "[operator] important note") {
+		t.Errorf("expected non-empty operator note in output")
+	}
+	// Make sure we only have one note (empty one is omitted)
+	count := strings.Count(output, "[operator]")
+	if count != 1 {
+		t.Errorf("expected 1 operator note, got %d", count)
+	}
+}
+
+func TestExecuteShowNoOperatorNotesBeforeSubmit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  1,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			transitionNote := "early transition"
+			submitNote := "approved"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "submit",
+					Actor:     "worker-1",
+					Note:      &submitNote,
+					CreatedAt: "2026-11-01T10:05:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	// Should not have Operator Notes section if all notes are before submit
+	if strings.Contains(output, "Operator Notes:") {
+		t.Errorf("expected no 'Operator Notes:' section (transition was before submit), got: %s", output)
+	}
+}

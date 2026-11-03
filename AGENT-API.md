@@ -125,12 +125,15 @@ Submit clears your lease, moves the task to `review`, and **auto-spawns one `rev
 entry in `review_models`** (default `["opus"]`), each `ready` and pinned to that reviewer's model.
 Only the assignee may submit, only from `in_progress`. Valid link kinds: `pr`, `branch`, `commit`,
 `ci`, `no_op`. On rework (a rejected task bounced back to `ready`), continue the **existing** PR — don't open
-a new one — and omit links you already attached.
+a new one — and omit links you already attached. **Exception: if the recorded PR is already MERGED,
+take the no-op path instead (see below).** If the PR is CLOSED unmerged, do not resubmit; the task
+must be blocked or transitioned by the operator.
 
-### No-op submissions (acceptance already satisfied)
+### No-op submissions (acceptance already satisfied or PR already merged)
 
 If the acceptance criteria are already satisfied (e.g., a fix merged to `main` before you claimed
-the task, making implementation unnecessary), submit with a `no_op` link and no `pr` link:
+the task, making implementation unnecessary), or the task's recorded PR has already been merged by
+a human, submit with a `no_op` link and no `pr` link:
 
 ```bash
 curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/submit" -d "$(jq -n \

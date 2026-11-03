@@ -88,15 +88,19 @@ submit, or block with a reason. Anything you start in the background is killed w
    skip straight to step 8.
 
    On a rework you MUST clear the reviewer's feedback before you may submit. Start by reading the full
-   review context: run `odonian show <task-id>` to see the recorded review round, verdicts, and findings
-   from previous review rounds. These recorded findings explain the rework requirements alongside the
-   current PR feedback. You MUST reconcile all three sources:
-   1. **Recorded review findings** — the task's stored review verdicts and rejection findings from
+   review context: run `odonian show <task-id>` to see the recorded review round, verdicts, findings
+   and operator notes from previous review rounds. These recorded findings explain the rework requirements
+   alongside the current PR feedback. **Check the recorded PR state:** if the PR is already MERGED,
+   take the no-op submit path with the merge commit. If the PR is CLOSED unmerged, block with a note.
+   You MUST reconcile all four sources:
+   1. **Recorded PR state** — from the Links section of `odonian show`; check if the PR is MERGED, OPEN, or CLOSED.
+   2. **Operator notes** — from `odonian show`; these are operator-provided context that may override earlier review feedback.
+   3. **Recorded review findings** — the task's stored review verdicts and rejection findings from
       previous rounds (displayed by `odonian show`). These are the authoritative rejection reasons
       that prompted the rework.
-   2. **Current PR feedback** — outstanding comments on the PR (listed by `odonian pr-feedback list`).
-   3. **Task specification and acceptance criteria** — what the task requires.
-   4. **Your current diff** — what you've changed in this rework.
+   4. **Current PR feedback** — outstanding comments on the PR (listed by `odonian pr-feedback list`).
+   5. **Task specification and acceptance criteria** — what the task requires.
+   6. **Your current diff** — what you've changed in this rework.
 
    An empty `odonian pr-feedback list` alone does NOT establish completion — you MUST ensure your
    diff addresses the recorded review findings. If a reviewer's earlier finding is not repeated in
