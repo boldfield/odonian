@@ -2463,3 +2463,40 @@ func TestReconcileExternallyMergedReady(t *testing.T) {
 		t.Errorf("expected 1 notification, got %d", len(notifier.publishCalls))
 	}
 }
+
+func TestNonApprovedTaskSkipsTombstonedPRLinkForActiveMergedOne(t *testing.T) {
+	ctx := context.Background()
+	tombstoned := "2024-01-01T00:00:00Z"
+	ts := &fakeTaskSource{
+		projects: []store.Project{{ID: "proj-1"}},
+		tasks: map[string][]store.Task{
+			"proj-1": {{ID: "task-1", Title: "Blocked", State: "blocked", UpdatedAt: "2024-01-01T00:00:00Z"}},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:    "task-1",
+				State: "blocked",
+				Links: []store.TaskLink{
+					{ID: "l1", Kind: "pr", Value: "https://github.com/owner/repo/pull/1", TombstonedAt: &tombstoned},
+					{ID: "l2", Kind: "pr", Value: "https://github.com/owner/repo/pull/2"},
+				},
+			},
+		},
+	}
+	var seen []int
+	reconciler := NewPRWatchReconciler(ts, &fakeNotifierForReconciler{}, func(string) (string, error) { return "token", nil }, time.Minute, 0, newTestLogger())
+	reconciler.getPRState = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		seen = append(seen, prNumber)
+		return "merged", nil
+	}
+
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(seen) != 1 || seen[0] != 2 {
+		t.Errorf("expected only PR 2 to be examined, got %v", seen)
+	}
+	if len(ts.convergeExternallyMergedCalls) != 1 {
+		t.Errorf("expected 1 convergence call, got %d", len(ts.convergeExternallyMergedCalls))
+	}
+}

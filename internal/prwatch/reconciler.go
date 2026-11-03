@@ -280,17 +280,13 @@ func (r *PRWatchReconciler) reconcileNonApprovedTask(ctx context.Context, task s
 
 	var prLink *store.TaskLink
 	for i := range fullTask.Links {
-		if fullTask.Links[i].Kind == "pr" {
+		if fullTask.Links[i].Kind == "pr" && fullTask.Links[i].TombstonedAt == nil {
 			prLink = &fullTask.Links[i]
 			break
 		}
 	}
 
 	if prLink == nil {
-		return nil
-	}
-
-	if prLink.TombstonedAt != nil {
 		return nil
 	}
 
