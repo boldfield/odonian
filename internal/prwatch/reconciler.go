@@ -18,6 +18,7 @@ type taskSource interface {
 	ListTasks(ctx context.Context, projectID string, filter store.TaskListFilter) ([]store.Task, error)
 	GetTask(ctx context.Context, id string) (store.TaskWithDepsAndLinks, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (store.Task, error)
+	ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (store.Task, error)
 	TombstoneLink(ctx context.Context, taskID, linkID string) error
 }
 
@@ -117,24 +118,41 @@ func (r *PRWatchReconciler) Reconcile(ctx context.Context) error {
 }
 
 func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID string, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) error {
+	// Check approved tasks for bounce/abandon actions
 	approvedState := "approved"
-	tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
+	approvedTasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
 		State: &approvedState,
 	})
 	if err != nil {
 		return err
 	}
 
-	for _, task := range tasks {
-		if err := r.reconcileTask(ctx, task, skippedPRsByOwner, quotaCheckedByOwner, now); err != nil {
-			r.logger.Error("reconcile task error", "task_id", task.ID, "error", err)
+	for _, task := range approvedTasks {
+		if err := r.reconcileApprovedTask(ctx, task, skippedPRsByOwner, quotaCheckedByOwner, now); err != nil {
+			r.logger.Error("reconcile approved task error", "task_id", task.ID, "error", err)
+		}
+	}
+
+	// Check non-approved tasks with PRs for merge convergence
+	for _, state := range []string{"ready", "in_progress", "review", "blocked"} {
+		tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
+			State: &state,
+		})
+		if err != nil {
+			return err
+		}
+
+		for _, task := range tasks {
+			if err := r.reconcileNonApprovedTask(ctx, task, skippedPRsByOwner, quotaCheckedByOwner, now); err != nil {
+				r.logger.Error("reconcile non-approved task error", "task_id", task.ID, "error", err)
+			}
 		}
 	}
 
 	return nil
 }
 
-func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) error {
+func (r *PRWatchReconciler) reconcileApprovedTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) error {
 	if task.AgentMerge {
 		return nil
 	}
@@ -245,6 +263,91 @@ func (r *PRWatchReconciler) reconcileTask(ctx context.Context, task store.Task, 
 			return nil
 		}
 	case Noop:
+	}
+
+	return nil
+}
+
+// reconcileNonApprovedTask checks if a task in a non-approved state has a merged PR and
+// converges it to done if so. Only the merged action is taken; open and closed PRs are
+// left alone. This allows operators to merge PRs by hand and have them converge without
+// needing to manually transition the task.
+func (r *PRWatchReconciler) reconcileNonApprovedTask(ctx context.Context, task store.Task, skippedPRsByOwner map[string]int, quotaCheckedByOwner map[string]bool, now time.Time) error {
+	if task.AgentMerge {
+		return nil
+	}
+
+	fullTask, err := r.taskSource.GetTask(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+
+	var prLink *store.TaskLink
+	for i := range fullTask.Links {
+		if fullTask.Links[i].Kind == "pr" {
+			prLink = &fullTask.Links[i]
+			break
+		}
+	}
+
+	if prLink == nil {
+		return nil
+	}
+
+	if prLink.TombstonedAt != nil {
+		return nil
+	}
+
+	owner, repo, prNumber, err := parsePRURL(prLink.Value)
+	if err != nil {
+		r.logger.Error("parse PR URL error", "task_id", task.ID, "pr_url", prLink.Value, "error", err)
+		return nil
+	}
+
+	if r.checkBackoff(owner, now) {
+		return nil
+	}
+
+	token, err := r.tokenLookup(owner)
+	if err != nil {
+		r.logger.Error("token lookup error", "task_id", task.ID, "owner", owner, "error", err)
+		return nil
+	}
+
+	if token == "" {
+		skippedPRsByOwner[owner]++
+		return nil
+	}
+
+	if r.checkQuotaFloor(ctx, owner, token, quotaCheckedByOwner, now) {
+		return nil
+	}
+
+	state, err := r.getPRState(ctx, owner, repo, prNumber, token)
+	if err != nil {
+		if is404Error(err) {
+			r.logger.Warn("PR owner/repo#N gone (404); will not retry", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber)
+			if err := r.taskSource.TombstoneLink(ctx, task.ID, prLink.ID); err != nil {
+				r.logger.Error("tombstone link error", "task_id", task.ID, "link_id", prLink.ID, "error", err)
+			}
+			return nil
+		}
+		if rle, ok := asRateLimitError(err); ok {
+			r.enterBackoff(owner, rle, now)
+			return nil
+		}
+		r.logger.Error("get PR state error", "task_id", task.ID, "owner", owner, "repo", repo, "pr_number", prNumber, "error", err)
+		return nil
+	}
+
+	// Only converge on merged; leave open/closed PRs alone
+	if state != "merged" {
+		return nil
+	}
+
+	if err := applyMergedExternally(ctx, r.taskSource, r.notifier, taskWithDepsLinksToTask(fullTask), prLink.Value); err != nil {
+		r.logger.Error("apply merged externally error", "task_id", task.ID, "error", err)
+		return nil
 	}
 
 	return nil

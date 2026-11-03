@@ -217,7 +217,7 @@ missed tick is caught by the next one.
 | Worker finds the work already on `main` | Submits a `no_op` link and no PR; the reviewer verifies the claim against `main`. |
 | Reviewer rejects repeatedly | Review round climbs; past the threshold the circuit breaker escalates the model tier, or blocks and pages. |
 | Human requests changes on GitHub after approval | PR-watch bounces the task to `ready` and posts a marker comment; the worker must ack every open item before resubmitting. |
-| PR merged or closed outside the board | PR-watch converges the task to `done` or `abandoned`. |
+| PR merged or closed outside the board | PR-watch converges: approved tasks to `done` (merged) or `abandoned` (closed); other states to `done` if PR merged, leaving open or closed PRs alone. |
 | Server restarts | Reconcilers re-derive from state. Writers wait on SQLite's 5s busy timeout instead of failing fast. |
 | Webhook endpoint down | Logged. Level-triggered, so the next tick resends. |
 | Forge token missing for an owner | PR-watch skips that owner's repositories, including public ones, and logs when the skipped count changes. Configure the server's per-owner token to resume convergence. |

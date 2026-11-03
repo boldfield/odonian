@@ -78,6 +78,7 @@ type Store interface {
 	SubmitTaskWithManifest(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
+	ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string, reviewModelsOverride []string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	SetTaskPriority(ctx context.Context, req SetPriorityRequest) (PriorityChange, error)
@@ -4860,6 +4861,123 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to fetch transitioned task: %w", err)
+	}
+
+	// Unmarshal review_models from JSON
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return t, nil
+}
+
+// ConvergeExternallyMergedTask moves a task from ready, in_progress, review, blocked or
+// approved to done when its PR has been merged outside the board. It retires review
+// children without verdicts, clears assignee and lease, and appends a transition event.
+// It does not materialize continuation children even for opted-in research tasks.
+func (s *sqliteStore) ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Load current state and kind
+	var taskState, taskTrack string
+	var taskReviewRound int
+	err = tx.QueryRowContext(ctx, "SELECT state, track, review_round FROM task WHERE id = ?", taskID).Scan(&taskState, &taskTrack, &taskReviewRound)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Task{}, ErrNotFound
+		}
+		return Task{}, fmt.Errorf("failed to load task state: %w", err)
+	}
+
+	// Only allowed from these states
+	allowedStates := map[string]bool{"ready": true, "in_progress": true, "review": true, "blocked": true, "approved": true}
+	if !allowedStates[taskState] {
+		return Task{}, ErrConflict
+	}
+
+	// Retire review children of the current round that have no verdict
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM task
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND state != 'done' AND adjudicate_finding_id IS NULL
+		ORDER BY rowid
+	`, taskID, taskReviewRound)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to list review children: %w", err)
+	}
+
+	now := nowTimestamp()
+	var childrenToRetire []string
+	for rows.Next() {
+		var childID string
+		if err := rows.Scan(&childID); err != nil {
+			rows.Close()
+			return Task{}, fmt.Errorf("failed to scan review child: %w", err)
+		}
+		childrenToRetire = append(childrenToRetire, childID)
+	}
+	rows.Close()
+
+	for _, childID := range childrenToRetire {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE task SET state = 'abandoned', assignee = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?
+		`, now, childID); err != nil {
+			return Task{}, fmt.Errorf("failed to retire review child: %w", err)
+		}
+		retireNote := "retired: parent PR merged outside the board"
+		if _, err := s.AppendEvent(ctx, tx, childID, "system", "transition", nil, &retireNote); err != nil {
+			return Task{}, fmt.Errorf("failed to append retire event: %w", err)
+		}
+	}
+
+	// Move task to done, clearing assignee and lease
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE task
+		SET state='done', updated_at=?, landing_round=NULL, landing_commit=NULL, landing_attempt=NULL,
+		    assignee=NULL, lease_expires_at=NULL
+		WHERE id=? AND state=?
+	`, now, taskID, taskState); err != nil {
+		return Task{}, fmt.Errorf("failed to transition task: %w", err)
+	}
+
+	// Append transition event noting the PR URL and that it was merged outside the board
+	note := fmt.Sprintf("PR %s merged outside the board", prURL)
+
+	// Check if this is a research task with continuation opt-in, and note if continuation skipped
+	if taskTrack == "research" {
+		var taskSpec string
+		err := tx.QueryRowContext(ctx, "SELECT spec FROM task WHERE id = ?", taskID).Scan(&taskSpec)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to load task spec: %w", err)
+		}
+		if specOptsIntoContinuations(taskSpec) {
+			note = fmt.Sprintf("%s; no continuation materialized for research task", note)
+		}
+	}
+
+	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, &note); err != nil {
+		return Task{}, err
+	}
+
+	// SELECT the updated task
+	var t Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch converged task: %w", err)
 	}
 
 	// Unmarshal review_models from JSON

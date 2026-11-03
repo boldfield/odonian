@@ -1368,6 +1368,7 @@ The state machine enforces these rules:
 - Any active state → `superseded` (retire without creating a replacement; use `/supersede` to create one)
 - `approved` → `abandoned` (retire without merging)
 - `in_progress` → `done` for `merge` tasks only
+- `ready` → `done`, `in_progress` → `done`, `review` → `done`, `blocked` → `done` (PR-watch only: when the PR is merged outside the board; clears assignee, retires in-flight review children, appends transition event)
 
 The operator `/transition` endpoint does not permit `review` → `done`. Review aggregation does
 perform that direct transition for the opted-in no-op case above, in a single update; the parent

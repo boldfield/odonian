@@ -19,16 +19,17 @@ import (
 )
 
 type fakeTaskSource struct {
-	projects             []store.Project
-	projectsErr          error
-	tasks                map[string][]store.Task
-	tasksErr             error
-	taskWithDepsAndLinks map[string]store.TaskWithDepsAndLinks
-	getTaskErrs          map[string]error
-	transitionCalls      []transitionCall
-	transitionErr        error
-	tombstoneLinkCalls   []tombstoneLinkCall
-	tombstoneLinkErr     error
+	projects                    []store.Project
+	projectsErr                 error
+	tasks                       map[string][]store.Task
+	tasksErr                    error
+	taskWithDepsAndLinks        map[string]store.TaskWithDepsAndLinks
+	getTaskErrs                 map[string]error
+	transitionCalls             []transitionCall
+	transitionErr               error
+	convergeExternallyMergedErr error
+	tombstoneLinkCalls          []tombstoneLinkCall
+	tombstoneLinkErr            error
 }
 
 type tombstoneLinkCall struct {
@@ -88,6 +89,10 @@ func (f *fakeTaskSource) TombstoneLink(ctx context.Context, taskID, linkID strin
 		linkID: linkID,
 	})
 	return f.tombstoneLinkErr
+}
+
+func (f *fakeTaskSource) ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (store.Task, error) {
+	return store.Task{}, f.convergeExternallyMergedErr
 }
 
 type fakeNotifierForReconciler struct {
@@ -999,6 +1004,162 @@ func TestRetrofitSkipsAlreadyClosedOrMergedSupersededPR(t *testing.T) {
 				t.Errorf("expected no GitHub calls on second pass after tombstoning, but got %d calls (was %d)", calls.getStateCount, callCountAfterFirstPass)
 			}
 		})
+	}
+}
+
+func TestNonApprovedTaskWithMergedPRConverges(t *testing.T) {
+	ctx := context.Background()
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-1",
+					Title:      "Test Task in Review",
+					State:      "review",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:        "task-1",
+				Title:     "Test Task in Review",
+				State:     "review",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner/repo/pull/1"},
+				},
+			},
+		},
+	}
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	var getStateCalled bool
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		getStateCalled = true
+		return "merged", nil
+	}
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
+	reconciler.getPRState = getPRState
+
+	err := reconciler.Reconcile(ctx)
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if !getStateCalled {
+		t.Fatal("getPRState was not called")
+	}
+
+	if ts.convergeExternallyMergedErr == nil && len(ts.transitionCalls) != 0 {
+		t.Errorf("expected no transition calls for non-approved task, got %d", len(ts.transitionCalls))
+	}
+}
+
+func TestNonApprovedTaskWithOpenPRDoesNothing(t *testing.T) {
+	ctx := context.Background()
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-1",
+					Title:      "Test Task in Review",
+					State:      "review",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:        "task-1",
+				Title:     "Test Task in Review",
+				State:     "review",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner/repo/pull/1"},
+				},
+			},
+		},
+	}
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		return "open", nil
+	}
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
+	reconciler.getPRState = getPRState
+
+	err := reconciler.Reconcile(ctx)
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(ts.transitionCalls) != 0 {
+		t.Errorf("expected no transition calls, got %d", len(ts.transitionCalls))
+	}
+}
+
+func TestNonApprovedTaskWithClosedPRDoesNothing(t *testing.T) {
+	ctx := context.Background()
+	ts := &fakeTaskSource{
+		projects: []store.Project{
+			{ID: "proj-1"},
+		},
+		tasks: map[string][]store.Task{
+			"proj-1": {
+				{
+					ID:         "task-1",
+					Title:      "Test Task Blocked",
+					State:      "blocked",
+					UpdatedAt:  "2024-01-01T00:00:00Z",
+					AgentMerge: false,
+				},
+			},
+		},
+		taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+			"task-1": {
+				ID:        "task-1",
+				Title:     "Test Task Blocked",
+				State:     "blocked",
+				UpdatedAt: "2024-01-01T00:00:00Z",
+				Links: []store.TaskLink{
+					{Kind: "pr", Value: "https://github.com/owner/repo/pull/1"},
+				},
+			},
+		},
+	}
+	notifier := &fakeNotifierForReconciler{}
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+
+	getPRState := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		return "closed", nil
+	}
+
+	reconciler := NewPRWatchReconciler(ts, notifier, tokenLookup, time.Minute, 0, newTestLogger())
+	reconciler.getPRState = getPRState
+
+	err := reconciler.Reconcile(ctx)
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(ts.transitionCalls) != 0 {
+		t.Errorf("expected no transition calls, got %d", len(ts.transitionCalls))
 	}
 }
 

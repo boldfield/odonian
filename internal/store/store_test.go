@@ -18663,3 +18663,160 @@ func TestResearchTrack_EndToEndVerification(t *testing.T) {
 		}
 	})
 }
+
+func TestConvergeExternallyMergedTaskFromBlocked(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Create project and document
+	p, err := s.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	d, err := s.CreateDocument(ctx, p.ID, "spec", "test doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create blocked task
+	tasks, err := s.CreateTasks(ctx, p.ID, []store.TaskInput{
+		{
+			Title:        "Test Task",
+			Spec:         "Test spec",
+			Kind:         "implement",
+			Track:        "build",
+			DocumentID:   d.ID,
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	task := tasks[0]
+
+	// Transition to blocked
+	blocked, err := s.TransitionTask(ctx, task.ID, "blocked", nil)
+	if err != nil {
+		t.Fatalf("failed to transition to blocked: %v", err)
+	}
+
+	if blocked.State != "blocked" {
+		t.Fatalf("expected blocked state, got %s", blocked.State)
+	}
+
+	// Converge the externally merged task
+	converged, err := s.ConvergeExternallyMergedTask(ctx, task.ID, "https://github.com/owner/repo/pull/123")
+	if err != nil {
+		t.Fatalf("failed to converge externally merged task: %v", err)
+	}
+
+	if converged.State != "done" {
+		t.Fatalf("expected done state, got %s", converged.State)
+	}
+
+	if converged.Assignee != nil {
+		t.Fatalf("expected assignee to be cleared, got %v", converged.Assignee)
+	}
+
+	if converged.LeaseExpiresAt != nil {
+		t.Fatalf("expected lease to be cleared, got %v", converged.LeaseExpiresAt)
+	}
+
+	// Verify the transition event was appended
+	events, err := s.ListEvents(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+
+	// Find transition event
+	var transitionEvent *store.Event
+	for i := range events {
+		if events[i].Kind == "transition" {
+			transitionEvent = &events[i]
+		}
+	}
+
+	if transitionEvent == nil {
+		t.Fatal("expected transition event not found")
+	}
+
+	if transitionEvent.Note == nil || !strings.Contains(*transitionEvent.Note, "https://github.com/owner/repo/pull/123") {
+		t.Fatalf("expected note to contain PR URL, got %v", transitionEvent.Note)
+	}
+}
+
+func TestConvergeExternallyMergedTaskFromApproved(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Create project and document
+	p, err := s.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	d, err := s.CreateDocument(ctx, p.ID, "spec", "test doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create and submit task to reach approved state
+	tasks, err := s.CreateTasks(ctx, p.ID, []store.TaskInput{
+		{
+			Title:        "Test Task",
+			Spec:         "Test spec",
+			Kind:         "implement",
+			Track:        "build",
+			DocumentID:   d.ID,
+			ReviewModels: []string{"opus"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	task := tasks[0]
+
+	// Claim and submit
+	claimed, err := s.ClaimTask(ctx, task.ID, "agent-1", "haiku", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	_, err = s.SubmitTask(ctx, claimed.ID, "agent-1", "Done", nil, []store.LinkInput{
+		{Kind: "pr", Value: "https://github.com/owner/repo/pull/456"},
+	}, 2, map[string]int{"opus": 0}, map[string]int{}, 0)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Add approval to reach approved state
+	_, err = s.AddReview(ctx, task.ID, "opus-1", "approve", nil)
+	if err != nil {
+		t.Fatalf("failed to add review: %v", err)
+	}
+
+	// Verify task is in approved state
+	approvedTask, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("failed to get task: %v", err)
+	}
+
+	if approvedTask.Task.State != "approved" {
+		t.Fatalf("expected approved state, got %s", approvedTask.Task.State)
+	}
+
+	// Converge the externally merged task
+	converged, err := s.ConvergeExternallyMergedTask(ctx, task.ID, "https://github.com/owner/repo/pull/456")
+	if err != nil {
+		t.Fatalf("failed to converge externally merged task: %v", err)
+	}
+
+	if converged.State != "done" {
+		t.Fatalf("expected done state, got %s", converged.State)
+	}
+}
