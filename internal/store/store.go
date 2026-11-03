@@ -4909,7 +4909,7 @@ func (s *sqliteStore) ConvergeExternallyMergedTask(ctx context.Context, taskID, 
 	// Retire review children of the current round that have no verdict
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id FROM task
-		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND state NOT IN ('done', 'abandoned') AND adjudicate_finding_id IS NULL AND verdict IS NULL
+		WHERE target_task_id = ? AND review_round = ? AND kind = 'review' AND state NOT IN ('done', 'abandoned') AND verdict IS NULL
 		ORDER BY rowid
 	`, taskID, taskReviewRound)
 	if err != nil {
@@ -4975,35 +4975,6 @@ func (s *sqliteStore) ConvergeExternallyMergedTask(ctx context.Context, taskID, 
 
 	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, &note); err != nil {
 		return Task{}, err
-	}
-
-	// Make dependents claimable by transitioning them from backlog to ready
-	depRows, err := tx.QueryContext(ctx, `
-		SELECT task_id FROM task_dep WHERE depends_on_id = ? ORDER BY task_id
-	`, taskID)
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to query dependents: %w", err)
-	}
-	defer depRows.Close()
-
-	var dependents []string
-	for depRows.Next() {
-		var depID string
-		if err := depRows.Scan(&depID); err != nil {
-			depRows.Close()
-			return Task{}, fmt.Errorf("failed to scan dependent: %w", err)
-		}
-		dependents = append(dependents, depID)
-	}
-	depRows.Close()
-
-	for _, depID := range dependents {
-		// Transition backlog dependents to ready
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE task SET state='ready', updated_at=? WHERE id=? AND state='backlog'
-		`, now, depID); err != nil {
-			return Task{}, fmt.Errorf("failed to transition dependent to ready: %w", err)
-		}
 	}
 
 	// SELECT the updated task

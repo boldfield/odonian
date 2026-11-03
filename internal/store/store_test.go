@@ -18944,16 +18944,16 @@ func TestConvergeExternallyMergedTaskRetireAdjudicationChildren(t *testing.T) {
 		t.Fatalf("expected done state, got %s", converged.State)
 	}
 
-	// Verify adjudication child was NOT retired (has adjudicate_finding_id)
+	// Verify adjudication child was retired (verdict-less review children should be abandoned)
 	adjChild, err := s.GetTask(ctx, children[0].ID)
 	if err != nil {
 		t.Fatalf("failed to get adjudication child: %v", err)
 	}
-	if adjChild.State != "review" {
-		t.Fatalf("expected adjudication child to remain in review, got %s", adjChild.State)
+	if adjChild.State != "abandoned" {
+		t.Fatalf("expected adjudication child to be retired to abandoned, got %s", adjChild.State)
 	}
 
-	// Verify regular review child was retired
+	// Verify regular review child was also retired
 	regChild, err := s.GetTask(ctx, children[1].ID)
 	if err != nil {
 		t.Fatalf("failed to get regular review child: %v", err)
@@ -19045,6 +19045,18 @@ More details here` // Spec that opts into continuations
 	if !foundNoContEvent {
 		t.Error("expected note about no continuation materialized for research task")
 	}
+
+	// Verify that no continuation children were created
+	var continuationCount int
+	err = s.Conn().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM task_link WHERE kind = 'continuation_parent' AND value = ?
+	`, task.ID).Scan(&continuationCount)
+	if err != nil {
+		t.Fatalf("failed to count continuation children: %v", err)
+	}
+	if continuationCount != 0 {
+		t.Fatalf("expected no continuation children, but found %d", continuationCount)
+	}
 }
 
 func TestConvergeExternallyMergedTaskDependentClaimability(t *testing.T) {
@@ -19117,20 +19129,68 @@ func TestConvergeExternallyMergedTaskDependentClaimability(t *testing.T) {
 		t.Fatalf("expected dependent task to be in backlog initially, got %s", depTask.State)
 	}
 
+	// Promote the dependent to ready (required for the claimability test)
+	promotedDep, err := s.PromoteTask(ctx, depTask.ID)
+	if err != nil {
+		t.Fatalf("failed to promote dependent task: %v", err)
+	}
+
+	if promotedDep.State != "ready" {
+		t.Fatalf("expected promoted dependent to be ready, got %s", promotedDep.State)
+	}
+
+	// Verify dependent is NOT claimable before parent convergence (parent is not done yet)
+	beforeList, err := s.ListTasks(ctx, p.ID, TaskListFilter{
+		Claimable: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to list claimable tasks: %v", err)
+	}
+
+	beforeClaimable := false
+	for _, task := range beforeList {
+		if task.ID == promotedDep.ID {
+			beforeClaimable = true
+			break
+		}
+	}
+	if beforeClaimable {
+		t.Fatalf("dependent should not be claimable while parent is not done")
+	}
+
 	// Converge the parent
 	_, err = s.ConvergeExternallyMergedTask(ctx, parentTask.ID, "https://github.com/owner/repo/pull/100")
 	if err != nil {
 		t.Fatalf("failed to converge parent: %v", err)
 	}
 
-	// Reload dependent to check if it became ready
+	// Reload dependent to verify state is still ready
 	updatedDep, err := s.GetTask(ctx, depTask.ID)
 	if err != nil {
 		t.Fatalf("failed to get updated dependent: %v", err)
 	}
 
 	if updatedDep.State != "ready" {
-		t.Fatalf("expected dependent to become ready after parent convergence, got %s", updatedDep.State)
+		t.Fatalf("expected dependent to remain ready after parent convergence, got %s", updatedDep.State)
+	}
+
+	// Verify dependent IS now claimable after parent is done
+	afterList, err := s.ListTasks(ctx, p.ID, TaskListFilter{
+		Claimable: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to list claimable tasks: %v", err)
+	}
+
+	afterClaimable := false
+	for _, task := range afterList {
+		if task.ID == promotedDep.ID {
+			afterClaimable = true
+			break
+		}
+	}
+	if !afterClaimable {
+		t.Fatalf("dependent should be claimable after parent is done")
 	}
 }
 
