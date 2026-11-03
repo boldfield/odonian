@@ -1,5 +1,8 @@
 # Work queue priority and move to front
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented in source; design reference.**
+> Numeric topic priority and move-to-front are implemented in the [store](../../internal/store/priority.go), [TUI](../../cmd/odonian-tui/), CLI and harness, with [API tests](../../internal/api/priority_test.go) and [scheduling smoke tests](../../harness/priority_scheduling_smoke_test.sh). “Proposed CLI” below records the design stage. See [AGENT-API.md](../../AGENT-API.md) and the [priority rollout guide](../runbooks/priority-rollout.md); implementation is not proof of deployment.
+
 ## Intent
 
 The owner needs to move time-sensitive research ahead of queued work without reducing research quality. Every topic has one positive integer priority P, default 500. Higher P runs first. Equal P uses task created_at ascending, then task ID ascending for deterministic ties. These are the only ordering keys. There is no urgent flag, special front token, front timestamp, extra priority tier or automatic aging.

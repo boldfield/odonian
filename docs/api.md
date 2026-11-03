@@ -11,6 +11,9 @@ JSON field names are lowercase (`id`, `project_id`, etc.).
 The shared token authorizes access across every project and task; agent IDs identify actors
 and lease owners, not separate authenticated principals.
 
+Optional authenticated `/debug/pprof/` routes are registered only when `ODONIAN_PPROF=true`;
+see [Runtime profiling with pprof](configuration.md#runtime-profiling-with-pprof).
+
 ## Authentication
 
 All endpoints except `GET /healthz` require the `Authorization: Bearer <token>` header.
@@ -354,7 +357,8 @@ curl -H "Authorization: Bearer token" \
 #### `GET /research/status`
 
 Read the current research pool status: configured limits, allowance tokens, active and deferred
-task counts. Safe to expose publicly (no credentials, no task details).
+task counts. The response contains no credentials or task details, but the endpoint still
+requires bearer-token authentication.
 
 **Request:**
 ```bash
@@ -577,7 +581,7 @@ Bulk-create tasks for a project.
 - `title` (required): Task title
 - `spec` (required): Task specification/description
 - `document_id` (required): ID of the design or feature document this task is decomposed from
-- `model` (optional): Assigned model (e.g., `haiku`, `sonnet`, `opus`); must be in the deployment allowlist if provided. If omitted or empty, defaults to the deployment default model.
+- `model` (optional): Assigned model (e.g., `haiku`, `sonnet`, `opus`); must be in the deployment allowlist if provided. If omitted or empty, uses `haiku` if allowlisted, otherwise the first allowlisted model; research uses `ODONIAN_RESEARCH_DEFAULT_MODEL` when configured.
 - `review_models` (optional): List of reviewer models for this task (e.g., `["opus", "sonnet"]`); each must be in the allowlist. Default is `["opus"]` if unset/empty. Ignored for review tasks (auto-spawned only).
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
 - `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
@@ -588,7 +592,7 @@ Bulk-create tasks for a project.
 
 | Delivery mode | Supported tracks |
 |---|---|
-| `pull_request` | `build`, `design` |
+| `pull_request` | `build`, `design`, `research` |
 | `local_commit` | `build` |
 
 These combinations have worker and reviewer prompts in the bundled harness. The API validates
@@ -921,29 +925,38 @@ Claim a task and move it to `in_progress` state with a lease.
 - `400 EMPTY_MODEL`: model cannot be empty
 - `400 JSON_DECODE_ERROR`: Invalid JSON in request body
 - `404 NOT_FOUND`: Task not found
-- `409 CONFLICT`: Task is not claimable (not in ready state, has an active lease, or has undone dependencies)
+- `409 CONFLICT`: Task is not claimable (ineligible state/lease, held, or unfinished dependencies)
 - `409 MODEL_MISMATCH`: The task's model does not match the declared model
 - `500 CLAIM_ERROR`: Server error claiming task
 
 **Claimability Rules:**
 A task is claimable only if:
-1. It is in the `ready` state
-2. No active lease exists (or the lease has expired)
+1. It is `ready`, or `in_progress` with a non-null expired lease
+2. It is not held (`held=false`)
 3. All tasks in its `depends_on` set are in the `done` state
 4. The task's `model` matches the agent's declared model (server enforced)
+
+Research admission and current-attempt checks can also refuse an otherwise eligible claim.
 
 The claim is atomic — implemented as a conditional UPDATE statement. If the claim succeeds, `rowsAffected == 1` and the task is guaranteed to be in `in_progress` with a fresh lease. If `rowsAffected == 0`, the client lost the race (another agent claimed it first) or the model didn't match, and should retry with a different task.
 
 **Research admission (research-track tasks only):**
-Research claims are admitted against the research pacing policy in the same transaction as the claim, so a start is debited only when the claim succeeds. Legacy clients that send only `agent_id` and `model` are paced identically. Non-research claims and `disabled` mode return the bare task above.
+In `enforce`, research admission, permit creation, start debit and claiming share one transaction.
+Mapped `observe` claims also create permits/attempts; they record hypothetical denials without
+refusing work and debit allowance only when the policy would admit. Non-research claims,
+`disabled` mode and unmapped `observe` claims have no permit or debit and return the bare task.
+Legacy clients sending only `agent_id` and `model` still undergo the applicable policy checks;
+without a stable `request_id`, each call receives a new generated request identity.
 
 Optional request fields: `request_id` (stable key; retrying the same request recovers the original admission, `replayed: true`), `account_id` and `work_class` (assertions only — the server derives both; a mismatch is `400 INVALID_RESEARCH_CLAIM`, an unknown class is `400 INVALID_WORK_CLASS`).
 
-An admitted claim adds `research_admission` to the task body: `permit_id`, `attempt_id`, `request_id`, `account_id`, `expires_at`, `replayed`, and in `observe` mode `observed_denial` (the hypothetical outcome; the work is still granted). Pass `attempt_id` on heartbeat and submit; a superseded attempt gets `409 ATTEMPT_FENCED` (or `409 ATTEMPT_EXPIRED`) and cannot change its replacement. Heartbeats never spend a start. The `odonian` CLI does this automatically: `claim` saves the attempt ID in a file keyed by task and worker session (`$ODONIAN_SESSION_ID`, else `$CLAUDE_CODE_SESSION_ID`, else `$CODEX_SESSION_ID`) under `$ODONIAN_STATE_DIR` (default the user cache dir), so a replacement session never overwrites the ID a stale session reads; with no session variable set the file is per-task and cannot distinguish sessions. `heartbeat`/`submit` send it back (override with `--attempt`). A heartbeat or submit with no `attempt_id` is a legacy call that cannot be told apart from a replacement of the same agent. Rework, adjudication, reclaim and retry each count as a start.
+A claim that creates a permit adds `research_admission` to the task body: `permit_id`, `attempt_id`, `request_id`, `account_id`, `expires_at`, `replayed`, and in `observe` mode `observed_denial` (the hypothetical outcome; the work is still granted). Pass `attempt_id` on heartbeat and submit; a superseded attempt gets `409 ATTEMPT_FENCED` (or `409 ATTEMPT_EXPIRED`) and cannot change its replacement. Heartbeats never spend a start. The `odonian` CLI does this automatically: `claim` saves the attempt ID in a file keyed by task and worker session (`$ODONIAN_SESSION_ID`, else `$CLAUDE_CODE_SESSION_ID`, else `$CODEX_SESSION_ID`) under `$ODONIAN_STATE_DIR` (default the user cache dir), so a replacement session never overwrites the ID a stale session reads; with no session variable set the file is per-task and cannot distinguish sessions. `heartbeat`/`submit` send it back (override with `--attempt`). A heartbeat or submit with no `attempt_id` is a legacy call that cannot be told apart from a replacement of the same agent. Rework, adjudication, reclaim and retry with a new request identity create new attempts and
+consume starts under the applicable policy. Retrying the same `request_id` while its original
+attempt still owns the task replays that claim without another debit.
 
 A denial is `429 ADMISSION_DENIED` with `error.outcome` (`defer` or `retry`), `error.reason` (`rate`, `concurrency` or `reserved_capacity`), `error.not_before` and/or `error.retry_after_seconds` (also sent as `Retry-After`). The task is left untouched — not blocked, failed or rejected — and may be claimed again later. Other research errors: `409 TASK_BUSY` (a live research attempt still holds the task), `409 REQUEST_ID_CONFLICT` (`request_id` reused for a different task, agent, model or pool).
 
-A submit ends task ownership but not the dispatch: the research attempt stays active, so it keeps holding its concurrency slot and a rework claim of that task is `409 TASK_BUSY` in `enforce` mode until the attempt lapses at its lease expiry. After submission, renewing and finalizing a research attempt is exposed via `POST /research/permits/{permit_id}/renew` and `POST /research/permits/{permit_id}/finalize` (see the dedicated sections below). In `observe` mode a live attempt on the task is recorded as a hypothetical busy refusal (`outcome: retry`, `reason: concurrency`) and superseded, and the claim is granted.
+A submit ends task ownership but not the dispatch: the research attempt stays active, so it keeps holding its concurrency slot and a rework claim of that task is `409 TASK_BUSY` in `enforce` mode until the attempt is finalized or its lease expires. After submission, renewing and finalizing a research attempt is exposed via `POST /research/permits/{permit_id}/renew` and `POST /research/permits/{permit_id}/finalize` (see the dedicated sections below). In `observe` mode a live attempt on the task is recorded as a hypothetical busy refusal (`outcome: retry`, `reason: concurrency`) and superseded, and the claim is granted.
 
 ---
 
@@ -960,7 +973,10 @@ Hand a claimed task back to `ready`, for example when a dispatch fails before an
 }
 ```
 
-`agent_id` must match the assignee, `reason` is required, and for a research task `attempt_id` is required and must be the live attempt (else `409 ATTEMPT_FENCED`, nothing changes). Implement, review and merge tasks can all be unclaimed; a task with an open PR link, or a non-review task with a submitted round, cannot (a review task's `review_round` labels the round it reviews and does not block it). The `odonian unclaim <id> [--attempt <id>] --reason <text>` CLI sends the attempt saved by `claim`.
+`agent_id` must match the assignee and `reason` is required. When a research permit exists for
+that agent, `attempt_id` is required and must identify the current attempt (else
+`409 ATTEMPT_FENCED`, nothing changes). A disabled or unmapped-observe claim without a permit
+has no attempt ID to send. Implement, review and merge tasks can all be unclaimed; a task with an open PR link, or a non-review task with a submitted round, cannot (a review task's `review_round` labels the round it reviews and does not block it). The `odonian unclaim <id> [--attempt <id>] --reason <text>` CLI sends the attempt saved by `claim`.
 
 **Effect (one transaction):** state becomes `ready`; assignee and lease are cleared; a `claim_released` event records agent, attempt and reason. Dependencies, review round, priority, `escalate` and `agent_merge` are unchanged, and no review, rework or escalation counter moves. A live research attempt is finalized as `cancelled` in the same transaction; the pool debit follows the existing rule that uncertain outcomes are never refunded.
 
@@ -1097,7 +1113,8 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
   findings.
 
 **Link Types:**
-- `pr`: Pull request reference (e.g., `#123` or `owner/repo#123`)
+- `pr`: Pull request reference. Workers should send the verified full PR URL (for example,
+  `https://github.com/owner/repo/pull/123`) so reviewers and merge tooling can resolve it.
 - `commit`: Commit hash (e.g., `abc123def456`)
 - `branch`: Branch name (e.g., `feature/auth`)
 - `ci`: CI status/build URL (e.g., `https://ci.example.com/builds/123`)
@@ -1208,9 +1225,12 @@ Submit a task for review (implement tasks) or submit a verdict (review tasks). B
 }
 ```
 
-The response includes the review task's own `id` and the parent implement task's `id` in `target_task_id`. If this verdict completes the current review round (all reviewers have verdicted), the parent task will also be automatically transitioned:
-- All approve → parent moves to `approved`
-- Any reject → parent moves to `ready` for rework
+The response includes the review task's own `id` and the parent implement task's `id` in
+`target_task_id`. Aggregation waits for all configured reviewers in the current round; a held
+parent waits for release. For build/design:
+
+- Unanimous approval → `approved`, or directly `done` for a current-round no-op with no active PR.
+- Any rejection → `ready` for rework, escalation, or `blocked` under the circuit breaker.
 
 Research-track parents aggregate on findings, not just verdicts: a `reject` verdict with `[]`
 findings can still pass the round, and an `approve` verdict carrying a blocking finding still fails
@@ -1260,7 +1280,8 @@ any findings, are recorded as events on the parent implement task for audit purp
 
 #### `POST /tasks/{id}/review`
 
-Post a review verdict on a task in the `review` state.
+Append a legacy review event on a task in the `review` state. This is not the spawned-review
+worker submission endpoint and does not contribute a vote to round aggregation.
 
 **Request:**
 ```json
@@ -1298,7 +1319,10 @@ Post a review verdict on a task in the `review` state.
 - `409 CONFLICT`: Task is not in review state
 - `500 REVIEW_ERROR`: Server error recording review
 
-**Note:** Review events are immutable and append-only. They do not directly transition the task state — that is done via a separate `POST /tasks/{id}/transition` call. If verdict is `reject`, the task typically transitions back to `ready` for rework.
+**Note:** These events are immutable and append-only. They neither finish a spawned review task
+nor drive the parent's state. Review workers must claim and submit their `review`-kind task via
+`POST /tasks/{review_task_id}/submit`; the server aggregates those submissions. A manual
+`review` → `ready` or `review` → `approved` transition is not supported.
 
 ---
 
@@ -1353,11 +1377,12 @@ to drain the `approved` lane by merging and marking done, or to override an appr
 `approved` → `done` is also the moment the server creates the children of a reviewed continuation manifest (see the `manifest` field of `POST /tasks/{id}/submit`); no other transition creates them. A repeated `done` is a `409 CONFLICT` and creates nothing.
 
 **Valid Transitions:**
-The state machine enforces these rules:
+The state machine enforces these rules. Review approval/rejection below describes build/design;
+research rounds instead use the structured blocking-findings rules documented under submit.
 - `ready` → `in_progress` (via claim)
 - `in_progress` → `review` (via submit for implement tasks)
 - `review` → `approved` (when all reviewers approve; via the final verdict, or release after a held round finishes)
-- `review` → `done` (automatic after unanimous approval when `agent_merge=true`, a `no_op` link exists, and no `pr` link exists)
+- `review` → `done` (automatic after unanimous approval when the current round has a `no_op` link and the task has no active `pr` link, regardless of `agent_merge`)
 - `review` → `ready` (once every review finishes and at least one rejects, unless the circuit breaker escalates or blocks the task)
 - `approved` → `done` (human merges PR; for a `local_commit` task, only via `POST /tasks/{id}/landing/complete` — see `LANDING_REQUIRED`)
 - `approved` → `ready` (human disagrees with reviewers, requests rework)
@@ -1365,19 +1390,19 @@ The state machine enforces these rules:
 - `blocked` → `failed` (retire a dead blocked task without re-entering the queue)
 - Any active state → `blocked` (off-ramp: external blocker)
 - Any active state → `failed` (off-ramp: task cannot be done as specified)
-- Any active state → `superseded` (retire without creating a replacement; use `/supersede` to create one)
+- Any active state → `superseded` (retire without creating a replacement; use `POST /tasks/{id}/supersede` to create one)
 - `approved` → `abandoned` (retire without merging)
 - `in_progress` → `done` for `merge` tasks only
 
 The operator `/transition` endpoint does not permit `review` → `done`. Review aggregation does
-perform that direct transition for the opted-in no-op case above, in a single update; the parent
-never enters `approved` and will not appear in a script that drains that lane. A no-op task with
-`agent_merge=false` still waits in `approved` for a human decision. Merge subtasks instead go
-from `in_progress` to `done` after merging.
+perform that direct transition for the verified current-round no-op case above, in a single
+update; the parent never enters `approved` and will not appear in a script that drains that lane.
+A no-op marker from an older rejected round is insufficient; an active PR link from any round
+prevents this path. Merge subtasks instead go from `in_progress` to `done` after merging.
 
 `blocked` is recoverable via `blocked` → `ready`; use `blocked` → `failed` to retire it.
 The `/transition` endpoint cannot move a task out of `done`, `failed`, `superseded`, or `abandoned`.
-The separate `/supersede` endpoint also rejects these terminal states with `409 CONFLICT`.
+The separate `POST /tasks/{id}/supersede` endpoint also rejects these terminal states with `409 CONFLICT`.
 
 ---
 
@@ -1569,8 +1594,8 @@ curl -X POST -H "Authorization: Bearer token" \
 
 If every review in the current round is done, release uses the same aggregation rules as
 review submission: unanimous approval moves the parent to `approved` (or directly to `done`
-for an opted-in no-op); rejection returns it to `ready`, escalates it, or blocks it according
-to the circuit breaker. Release itself does not increment `review_round`; the next implement
+for a verified current-round no-op with no active PR); rejection returns it to `ready`, escalates
+it, or blocks it according to the circuit breaker. Research applies its blocking-findings rules. Release itself does not increment `review_round`; the next implement
 submission starts a new round. A parent held through the final verdict needs only `/release`,
 not another implement pass, to apply that verdict.
 
@@ -1723,11 +1748,11 @@ curl -X POST -H "Authorization: Bearer token" \
 
 ## Evaluation Campaigns
 
-Evaluation campaigns compare candidate reviewer versions on frozen samples of past review work. They
-are a separate surface from tasks and reviews: every `/evaluation/...` route reads and writes only
-the evaluation tables. None of them reads or writes a task, review task, verdict, PR link or
-scorecard, so an experimental result **cannot vote on, reject, advance or otherwise change a
-research task**. Nothing is created automatically: a campaign, its candidate versions and its pools
+Evaluation campaigns compare candidate reviewer versions on frozen samples of past review work.
+Cohort tooling and report generation read production tasks, review events and links to freeze
+samples and identify baseline findings. Evaluation writes its own records; it does not mutate
+production tasks, review verdicts, PR links or scorecards. An experimental result **cannot vote on,
+reject, advance or otherwise change a research task**. Nothing is created automatically: a campaign, its candidate versions and its pools
 exist only because a caller created them, every cap is a finite integer the caller chose, and there
 is no "unlimited" value. Every route requires the bearer token. There are no provider-specific
 routes; a candidate is described by the generic candidate identity (adapter, model, runtime,
@@ -2209,15 +2234,15 @@ curl -fsS "$BASE/tasks/$TASK_ID" -H "$AUTH" | jq -e 'select(.state == "done")'
 **Key Points:**
 1. Tasks are created with a `model` field; workers claim by declaring their model (e.g., `haiku`, `opus`)
 2. Claiming is atomic and model-matched — if the model doesn't match, you get `409 MODEL_MISMATCH`
-3. In this human-gated example, implement tasks transition `in_progress` → `review` → `approved` → `done`. An `agent_merge=true` task whose current round has a `no_op` link and no `pr` link goes directly from `review` to `done` after unanimous approval.
+3. In this human-gated example, implement tasks transition `in_progress` → `review` → `approved` → `done`. A task whose current round has a `no_op` link and whose task-wide links have no active `pr` goes directly from `review` to `done` after unanimous approval.
 4. Submitting an implement task auto-spawns review tasks for each required reviewer (default: Opus)
 5. Review tasks are claimed and completed by reviewers submitting verdicts (approve or reject)
-6. When all reviewers of a round approve, the parent moves to `approved` (or directly to `done` for the opted-in no-op case); if any reject, it returns to `ready` unless the circuit breaker escalates or blocks it
+6. When all reviewers of a round approve, the parent moves to `approved` (or directly to `done` for the verified no-op case, regardless of `agent_merge`); if any reject, it returns to `ready` unless the circuit breaker escalates or blocks it
 7. The human gates the final merge: tasks in `approved` are merged and transitioned to `done` by humans
 8. Workers extend their lease via heartbeat to prevent task expiry
 9. Dependencies are enforced at claim time — tasks with undone deps cannot be claimed
 10. The second task `task2` cannot be claimed until `task1` is `done` (due to `depends_on`)
-11. `/transition` cannot reopen `done`, `failed`, `superseded`, or `abandoned` tasks, and `/supersede` also rejects them. Unblocking applies to `blocked` tasks.
+11. `/transition` cannot reopen `done`, `failed`, `superseded`, or `abandoned` tasks, and `POST /tasks/{id}/supersede` also rejects them. Unblocking applies to `blocked` tasks.
 
 ---
 
@@ -2263,7 +2288,7 @@ All error responses follow a consistent format:
 
 ## State Machine
 
-The default human-gated implement flow is:
+The default human-gated build/design flow is (held parents wait for release before aggregation):
 
 ```mermaid
 stateDiagram-v2
@@ -2280,9 +2305,11 @@ stateDiagram-v2
 `blocked`, `failed`, and `superseded` are off-ramps from active states.
 `approved` → `abandoned` retires work without merging.
 
-With `agent_merge=true`, unanimous review of a task carrying a `no_op` link and no `pr` link
-performs **`review` → `done` directly**, skipping `approved`. With a PR link, approval instead
-spawns a merge subtask. Lease expiry makes `in_progress` work reclaimable without first changing
+Unanimous build/design approval of a current-round `no_op` with no active task-wide `pr` link
+performs **`review` → `done` directly**, skipping `approved`, regardless of `agent_merge`.
+Research uses its blocking-findings rules to approve a round. With an active PR link and
+`agent_merge=true`, approval instead spawns a merge subtask. A held parent waits for release
+before aggregation. Lease expiry makes `in_progress` work reclaimable without first changing
 its state to `ready`.
 
 **For implement tasks:**
@@ -2290,8 +2317,8 @@ its state to `ready`.
 - `ready`: Promoted; claimability still depends on dependencies, hold, and model
 - `in_progress`: Claimed by an agent; work is in progress; lease-based crash recovery
 - `review`: Work submitted; reviewers are working; auto-spawned review tasks are claimable
-- `approved`: All reviewers approved; awaiting the human decision or an opted-in merger
-- `done`: Completed by a human or merger, or automatically finalized as an opted-in reviewed no-op
+- `approved`: The round passed review; awaiting the human decision or an opted-in merger
+- `done`: Completed by a human or merger, or automatically finalized as a reviewed no-op
 - `blocked`: Off-ramp; task cannot proceed (blocked on external dependency)
 - `failed`: Terminal; task attempt retired as failed
 - `superseded`: Terminal for `/transition`; the supersede endpoint creates a replacement and repoints dependencies
@@ -2316,7 +2343,7 @@ blocked / failed are off-ramps.
 The claim operation is a single conditional UPDATE that fails atomically if any precondition is violated (wrong state, lease active, unmet dependencies). This eliminates races and avoids need for distributed locks.
 
 **Lease-Based Crash Recovery:**
-When a task is claimed, a lease expiration time is set (`lease_expires_at`). If an agent crashes or hangs, the lease eventually expires and the task becomes claimable again (checked lazily in the next claim attempt). Agents must heartbeat regularly to extend the lease.
+When a task is claimed, a lease expiration time is set (`lease_expires_at`). If an agent crashes or hangs, the lease eventually expires and the task becomes claimable again (checked lazily in the next claim attempt). Custom workers must heartbeat regularly to extend the lease. The bundled harness runs background task-lease renewal while the worker owns the task; for admitted research it also renews the dispatch permit until the worker process exits and finalizes it on exit.
 
 **No Sweeper:**
-The MVP does not run a background sweeper. Lease expiry is checked lazily inside the atomic claim query. For target concurrency of 2–5 agents, this is sufficient and keeps the system simple.
+The server does not need a sweeper to move expired tasks back to `ready`. Discovery and atomic claim queries check lease expiry directly; an expired `in_progress` task remains in that state until a new agent reclaims it. Holds and unfinished dependencies still prevent claiming.

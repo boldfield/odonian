@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Odonian — let agents pull the work, keep control of what lands</title>
-<meta name="description" content="Odonian coordinates AI coding agents across your repositories: workers claim tasks from a board, reviewer agents check their changes, and human approval before merge is the default. Go + SQLite, one binary, REST API, self-hosted, AGPL-3.0.">
+<meta name="description" content="Odonian coordinates build, design and research work across repositories: agents claim tasks, configured reviewers check results, and human approval before merge is the default. Go + SQLite, one binary, REST API, self-hosted, AGPL-3.0.">
 <link rel="canonical" href="https://odonian.dev/">
 <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
 <meta name="color-scheme" content="light dark">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Odonian — let agents pull the work, keep control of what lands">
-<meta property="og:description" content="A self-hosted task board for AI coding agents. Workers claim tasks, reviewers check their changes, and human approval before merge is the default. Go + SQLite, AGPL-3.0.">
+<meta property="og:description" content="A self-hosted control plane for build, design and research agents. Claimed tasks, configured review, and human approval before merge by default. Go + SQLite, AGPL-3.0.">
 <meta property="og:url" content="https://odonian.dev/">
 <meta property="og:image" content="https://odonian.dev/assets/social-card.png">
 <meta property="og:image:width" content="1280">
@@ -18,7 +18,7 @@
 <meta property="og:image:alt" content="Odonian wordmark with the tagline: let agents pull the work, keep control of what lands.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Odonian — let agents pull the work, keep control of what lands">
-<meta name="twitter:description" content="A self-hosted task board for AI coding agents. Workers claim tasks, reviewers check their changes, and human approval before merge is the default.">
+<meta name="twitter:description" content="A self-hosted control plane for build, design and research agents. Claimed tasks, configured review, and human approval before merge by default.">
 <meta name="twitter:image" content="https://odonian.dev/assets/social-card.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -201,6 +201,7 @@
       <a href="#evidence">Evidence</a>
       <a href="#how">How it works</a>
       <a href="#quickstart">Quickstart</a>
+      <a href="https://github.com/boldfield/odonian/blob/main/docs/README.md">Docs</a>
       <a href="https://github.com/boldfield/odonian">GitHub</a>
     </nav>
   </header>
@@ -208,9 +209,9 @@
   <main id="main">
   <div class="hero">
     <h1>Let agents pull the work. <em>Keep control of what lands.</em></h1>
-    <p class="lede">Odonian coordinates AI coding agents across your repositories. Workers claim
-    tasks from a board, reviewer agents check their changes, and <strong>human approval before
-    merge is the default</strong>.</p>
+    <p class="lede">A self-hosted control plane for build, design and research work across your repositories.
+    Agents claim bounded tasks, configured reviewers check the results, and
+    <strong>human approval before merge is the default</strong>.</p>
     <ul class="specs" aria-label="Technical summary">
       <li>Go</li><li>SQLite</li><li>One binary: server + CLI</li><li>REST API</li><li>Self-hosted</li><li>Terminal UI</li><li>AGPL-3.0</li>
     </ul>
@@ -298,8 +299,8 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
 <span class="t-prompt">$ </span><span class="t-cmd">odonian approve &lt;task-id&gt;</span>  <span class="t-muted"># approved → done; or: odonian reject &lt;task-id&gt; --note "…"</span></pre>
       <figcaption>The human step, from the CLI. This local-delivery example uses full UUIDs for
       worktree operations; <code>show</code> and <code>diff</code> also accept unique task prefixes.
-      In local delivery, <code>approve</code> records completion and freezes a branch for you to merge;
-      it does not change <code>main</code>. In pull-request delivery, merge on the forge.</figcaption>
+      In current local delivery, <code>approve</code> lands reviewed work on a <code>wi/</code> integration
+      branch before recording completion; it does not change <code>main</code>. In pull-request delivery, merge on the forge.</figcaption>
     </figure>
     <p class="intro" style="margin:0">How these frames were made: they are text captured from the real <code>odonian-tui</code>
     and <code>odonian</code> binaries (v0.16.3) during a run of the guided demo on 2026-09-12, in a Docker
@@ -310,20 +311,20 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
 
   <section id="evidence">
     <h2>Evidence</h2>
-    <p class="intro">Odonian builds itself. Its own repository is a project on its author's board, and most of
-    what has merged there was opened by the fleet, reviewed by a second model, and merged by a person.</p>
+    <p class="intro">Odonian is used to develop its own repository. The public record shows how much merged
+    work carries the fleet's branch naming convention; the worked example below shows one review and rework cycle.</p>
     <div class="stats">
-      <div class="stat"><span class="n">309</span><span class="l">pull requests merged</span>
+      <div class="stat"><span class="n">423</span><span class="l">pull requests merged</span>
         <a href="https://github.com/boldfield/odonian/pulls?q=is%3Apr+is%3Amerged">Verify on GitHub</a></div>
-      <div class="stat"><span class="n">207</span><span class="l">of them fleet-authored</span>
+      <div class="stat"><span class="n">302</span><span class="l">with fleet branch names</span>
         <a href="https://github.com/boldfield/odonian/pulls?q=is%3Apr+is%3Amerged+head%3Amr%2F">Verify on GitHub</a></div>
-      <div class="stat"><span class="n">66%</span><span class="l">of merges came from the board</span>
+      <div class="stat"><span class="n">71%</span><span class="l">of merged PRs have mr/ branches</span>
         <a href="https://github.com/boldfield/odonian/blob/main/site/evidence.sh">How it is counted</a></div>
     </div>
-    <p class="asof">Counted 2026-09-11. A merged PR is fleet-authored when its head branch starts with
-    <code>mr/</code>, the name the harness derives from the task id. The project README also reports production
-    use since June 2026 across fifteen projects on the author's private board; that figure is the author's
-    report and is not independently verifiable from public data.</p>
+    <p class="asof">Counted 2026-11-03 with <a href="https://github.com/boldfield/odonian/blob/main/site/evidence.sh">evidence.sh</a>.
+    The fleet count uses the <code>mr/</code> head-branch prefix; the percentage is rounded down.
+    This proxy does not establish which model reviewed each PR or who merged it. The author's report of
+    operation since June 2026 is separate from these publicly reproducible counts.</p>
 
     <div class="case">
       <h3>Worked example: PR #326</h3>
@@ -361,19 +362,19 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
       <div class="step">
         <div class="num">02 · DRAIN</div>
         <h3>The fleet pulls work</h3>
-        <p>Workers claim tasks and open PRs (or commit locally). Reviewer agents claim the reviews and vote.
-        A rejection sends the task back to <code>ready</code> with the feedback; repeated rejection escalates the
-        model tier or blocks the task and notifies you.</p>
+        <p>Workers claim tasks and open PRs, or submit local build commits for review.
+        Build and design reviews require all configured reviewers to approve. Research reviews use structured
+        findings, with a separate rejection budget and finding-scoped adjudication.</p>
       </div>
       <div class="step">
         <div class="num">03 · DECIDE</div>
         <h3>A person approves</h3>
-        <p>Approved work waits. You read the diff and approve, reject with a note, or act on the PR itself;
-        a reconciler keeps the board in step with the forge. Configured notifications tell you when something needs a
-        decision.</p>
+        <p>Work that needs to land waits for your decision by default. You inspect it and approve or request
+        rework. PR-watch follows approved, human-gated PRs. Review-approved no-ops complete without a merge;
+        per-task automatic merging is an explicit opt-in.</p>
       </div>
     </div>
-    <div class="statemachine" role="img" aria-label="Task states: backlog, ready, in progress, review, approved, human decision, done. Off-ramps: blocked, failed, superseded, abandoned.">backlog → <b>ready</b> → in_progress → review → <b>approved</b> → <span class="gate">⟨ human ⟩</span> → <b>done</b> &nbsp;&nbsp;·&nbsp;&nbsp; off-ramps: blocked · failed · superseded · abandoned</div>
+    <div class="statemachine" role="img" aria-label="Default path for work requiring human approval: backlog, ready, in progress, review, approved, human decision, done. Reviewed no-ops and opted-in automatic merges have separate completion paths.">backlog → <b>ready</b> → in_progress → review → <b>approved</b> → <span class="gate">⟨ human ⟩</span> → <b>done</b> &nbsp;&nbsp;·&nbsp;&nbsp; off-ramps: blocked · failed · superseded · abandoned</div>
 
     <div class="cards">
       <div class="card">
@@ -382,8 +383,8 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
         predicate: ready (or a lapsed lease), not held, every dependency done. SQLite serializes writers, so
         exactly one of N concurrent claimers wins and the rest are told why they lost.</p>
         <p><strong>Why it matters:</strong> run as many workers as your rate limits allow against one board.
-        One successful claimant per live lease, with no scheduler to keep alive. Workers must renew
-        leases during long tasks to prevent another agent reclaiming their work.</p>
+        The board checks eligibility and model identity; optional research admission can defer a start.
+        The bundled harness renews owned leases in the background. Custom clients manage their own heartbeats.</p>
       </div>
       <div class="card">
         <h3>Leases instead of a reaper</h3>
@@ -395,21 +396,21 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
       </div>
       <div class="card">
         <h3>Review routing and a circuit breaker</h3>
-        <p>On submit, the board spawns one review task per reviewer model; approval must be unanimous.
-        Past a per-model rejection threshold the task is superseded by a copy pinned to the next tier of
-        the ladder (<code>haiku → sonnet → opus</code> by default, configurable), or blocked and you are
-        notified. Reviewers need not share a vendor with the worker.</p>
-        <p><strong>Why it matters:</strong> cheap models do the first pass, expensive ones only when needed,
-        and a task that cannot converge pages a human instead of looping.</p>
+        <p>The board creates a review task for each configured reviewer. Build and design work require
+        unanimous approval and can escalate after repeated rejection. Research passes only when no blocking
+        findings remain; its chain-wide rejection budget can require decomposition. Research escalation is off
+        unless separately configured.</p>
+        <p><strong>Why it matters:</strong> reviewers can use a different vendor from the author, and work
+        that cannot converge reaches an explicit recovery boundary instead of an unlimited retry loop.</p>
       </div>
       <div class="card">
         <h3>A mechanical rework gate</h3>
         <p>When a PR is bounced, the worker must list every unaddressed review item, fix it, and acknowledge
         it on the PR. <code>odonian submit</code> refuses while any item remains. A PR-watch reconciler applies
         what humans do on the forge (merge, close, request changes) back to the board.</p>
-        <p><strong>Why it matters:</strong> feedback cannot be skipped by a forgetful prompt, and the board
-        converges with GitHub on later checks. PR-watch needs a token for the repository owner;
-        missing credentials and rate limits delay those checks.</p>
+        <p><strong>Why it matters:</strong> the CLI checks outstanding PR feedback before resubmission.
+        PR-watch follows approved, human-gated tasks and requires a token for the repository owner;
+        missing credentials and rate limits delay checks. It does not reconcile every task state.</p>
       </div>
     </div>
 
@@ -418,7 +419,9 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
       <p>Tasks default to <code>agent_merge=false</code>. After the reviewers approve, the work sits in
       <strong>approved</strong> until a person records a verdict or merges the PR. Setting
       <code>agent_merge=true</code> on a task opts that task into a non-LLM merger that squash-merges once
-      reviewers approve. Review and merge subtasks have their own completion paths.</p>
+      reviewers approve. A current-round, review-approved <code>no_op</code> with no active PR link goes
+      straight to <strong>done</strong> regardless of <code>agent_merge</code>: there is no change to merge.
+      Review and merge subtasks also have their own completion paths.</p>
       <p>The board is a workflow, not a permission system. What actually stops an agent from reaching
       <code>main</code> is branch protection on your forge and the scopes on the tokens you hand the fleet.
       The shared board token gives access to every project and task, and worktrees do not restrict
@@ -427,12 +430,36 @@ bc02c73f  <span class="t-state">approved</span>  implement  Append greeting line
     </div>
   </section>
 
+  <section id="tracks">
+    <h2>One board, three work tracks</h2>
+    <p class="intro">The track selects what a worker produces and how the result is reviewed.
+    It is separate from the implement, review and merge task kinds.</p>
+    <div class="steps">
+      <div class="step"><div class="num">BUILD</div><h3>Repository changes</h3>
+        <p>Code, tests and documentation move through configured review and a landing decision.
+        Use pull requests or the local-commit workflow.</p></div>
+      <div class="step"><div class="num">DESIGN</div><h3>A reviewable specification</h3>
+        <p>The design prompt produces a document with the required contract, command surface and
+        acceptance criteria. It uses pull-request delivery and the build/design review rules.</p></div>
+      <div class="step"><div class="num">RESEARCH</div><h3>Claims with evidence</h3>
+        <p>Workers verify claims against primary sources. Reviewers report structured findings;
+        disputes can be adjudicated per finding. Reviewed continuations can create follow-up work.</p></div>
+    </div>
+    <p>Topic priority orders future dispatch without interrupting running work. Optional research pacing
+    limits starts by account pool and reserves completion capacity; it is disabled by default.
+    Isolated reviewer evaluation compares candidate results without voting on production tasks or changing
+    reviewer assignments. Read the <a href="https://github.com/boldfield/odonian/blob/main/docs/research.md">research guide</a>
+    and <a href="https://github.com/boldfield/odonian/blob/main/docs/operations.md">operations guide</a>.</p>
+  </section>
+
   <section id="quickstart">
     <h2>Run the demo</h2>
     <p class="intro">One example task, implemented by a real <code>haiku</code> worker and reviewed by a real
     <code>opus</code> reviewer, ending in <strong>approved</strong> for you to decide. Everything runs in a throwaway
     sandbox with a throwaway repository under <code>/tmp/odonian</code>; the fleet does not push to GitHub.
     The Odonian source checkout is mounted from your host and remains writable from the sandbox.
+    The fixed <code>sbx-local-token</code> below is only for this disposable demo; do not reuse it for
+    a deployed board or expose the demo server to an untrusted network.
     The full walkthrough, with expected output at each step, is
     <a href="https://github.com/boldfield/odonian/blob/main/docs/demo.md">docs/demo.md</a>.</p>
 
@@ -485,15 +512,15 @@ tail -f /tmp/odonian/logs/workers.log /tmp/odonian/logs/reviewers.log
 <span class="c"># copy these commands with their full IDs from the boot banner</span>
 odonian pending --project &lt;project-id&gt;   <span class="c"># empty until review or approved</span>
 odonian diff &lt;task-id&gt;
-odonian approve &lt;task-id&gt;   <span class="c"># freezes a branch; or reject --note "…"</span></pre>
+odonian approve &lt;task-id&gt;   <span class="c"># lands on wi/&lt;slug&gt;; or reject --note "…"</span></pre>
       </div>
     </div>
     <div class="qs">
       <p>The boot builds the binary, checks that <code>claude</code> is authenticated with a live probe, starts the
       server on <code>:8080</code> (reusing its SQLite file on later runs), creates the repo and the project, posts the task, and
       starts two workers and two reviewers. It ends with <code>[sbx] Odonian fleet is UP.</code> and the exact
-      commands for your board. Approval records <code>done</code> and preserves a branch for you to merge;
-      it does not merge into <code>main</code>. Clean up with <code>bash harness/sbx.sh stop</code>, then
+      commands for your board. Approval lands the reviewed commit on a <code>wi/</code> integration branch, then records
+      <code>done</code>; it does not merge into <code>main</code>. Clean up with <code>bash harness/sbx.sh stop</code>, then
       <code>rm -rf /tmp/odonian</code> after saving any work you want to keep.</p>
       <h3>Run it on your own repository</h3>
       <p>Run the fleet in a disposable sandbox or container with authenticated Claude and GitHub CLIs.
@@ -514,7 +541,7 @@ cd harness &amp;&amp; ./worker.sh worker-1     <span class="c"># ./reviewer.sh r
       laptop, in a sandbox, and on Kubernetes; the
       <a href="https://github.com/boldfield/odonian/blob/main/harness/README.md">harness README</a> covers slots, worktrees,
       per-owner forge tokens, and multi-project mode;
-      <a href="https://github.com/boldfield/odonian/blob/main/docs/configuration.md">configuration</a> lists every variable.</p>
+      <a href="https://github.com/boldfield/odonian/blob/main/docs/configuration.md">configuration</a> explains settings and defaults.</p>
     </div>
   </section>
 
@@ -531,10 +558,10 @@ cd harness &amp;&amp; ./worker.sh worker-1     <span class="c"># ./reviewer.sh r
         <p>From Ursula K. Le Guin's <em>The Dispossessed</em>: the Odonians of Anarres organize work through
         voluntary association. Postings are claimed by the people who will do them because the work is worth
         doing; no boss dispatches anyone. Two convictions from that book shape how this system behaves.</p>
-        <p><strong>Work is claimed, not assigned.</strong> There is no assignment API and no scheduler. An agent asks
-        for the next task it can do and takes it, or is told why it cannot. Capacity is whatever you point at
-        the board, a stuck agent affects only its own lease, and the substrate's only promises are that
-        claiming is atomic and dependencies are honored.</p>
+        <p><strong>Work is claimed, not assigned.</strong> There is no assignment API. The harness selects eligible
+        work by priority, age and task ID; an agent claims it or is told why it cannot. Account limits,
+        dependencies and review capacity still affect throughput. Atomic claims prevent two live owners
+        of the same task.</p>
         <p><strong>Machines labor; a person makes the living judgment.</strong> Agents write and review every
         line, but the merge decision is a state in the machine that defaults to a human, reviewers can be a
         different vendor from the author, and the board keeps an audit trail of who did what. The

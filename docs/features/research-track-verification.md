@@ -1,6 +1,8 @@
 # Research Track Verification
 
-This document describes the end-to-end verification scenario for the research track feature, covering all acceptance criteria in `docs/features/research-track.md`.
+> Source-checked 2026-11-03 against `b3da896` (v0.24.0). This is an automated coverage map, not a live-fleet acceptance report. Store fixtures supply findings programmatically; they do not prove that a real model retrieves sources or follows its prompt. See the [research guide](../research.md) and [live smoke plan](../runbooks/research-track-smoke-test.md).
+
+This document maps the original research-track acceptance criteria to automated store, API and TUI coverage. Prompt behavior and real source retrieval require the separate live smoke test; these fixtures do not verify them.
 
 ## Overview
 
@@ -12,24 +14,26 @@ The research track is a third task track alongside `build` and `design` for veri
 
 ## Deployment Configuration
 
-Before running the verification scenario, ensure these environment variables are configured in your Odonian deployment:
+The automated tests below construct their own stores and configuration; they do not require a running deployment or these environment exports. For an isolated live smoke deployment, the following is an example configuration, not a production recommendation. Both reviewer models and the adjudicator must be available and correctly routed, and the adjudicator must differ from the reviewers:
 
 ```bash
 # Allowed models must include the research default and adjudicator before
 # they are referenced below — ODONIAN_MODELS is the allowlist (NOT
 # ODONIAN_ALLOWED_MODELS, which the server does not read).
 export ODONIAN_MODELS="haiku,sonnet,opus,claude-opus-5-5,claude-fable-5-1"
+# Keep reviewer/adjudicator-only names out of build/design escalation.
+export ODONIAN_ESCALATION_LADDER="haiku,sonnet,opus"
 
-# Required settings for research track
+# Example settings for an isolated research smoke deployment
 export ODONIAN_RESEARCH_DEFAULT_MODEL=claude-opus-5-5
 export ODONIAN_RESEARCH_ADJUDICATOR=claude-fable-5-1  # For adjudication disputes
-export ODONIAN_RESEARCH_ROUND_BUDGET=6  # Recommended: 6 rounds before decompose block
+export ODONIAN_RESEARCH_ROUND_BUDGET=6  # Code default: 6 rejected rounds before decompose block
 export ODONIAN_RESEARCH_ESCALATION_LADDER=""  # Empty by default: no escalation
 export ODONIAN_RESEARCH_ESCALATION_THRESHOLDS=""  # Empty when ladder is empty
 
 # Optional: test with research escalation enabled. ODONIAN_RESEARCH_ESCALATION_THRESHOLDS
 # only applies when ODONIAN_RESEARCH_ESCALATION_LADDER is non-empty, and each entry must be
-# a "model=count" pair (parseResearchEscalationThresholds, cmd/odonian/main.go:1183) —
+# a "model=count" pair (parseResearchEscalationThresholds in cmd/odonian/main.go) —
 # a bare "3,2" list fails to parse and the server refuses to start (log.Fatalf).
 # export ODONIAN_RESEARCH_ESCALATION_LADDER=claude-opus-5-5,claude-fable-5-1
 # export ODONIAN_RESEARCH_ESCALATION_THRESHOLDS=claude-opus-5-5=3,claude-fable-5-1=2
@@ -38,9 +42,9 @@ export ODONIAN_RESEARCH_ESCALATION_THRESHOLDS=""  # Empty when ladder is empty
 ## Verification Approach
 
 The research track verification uses automated test coverage in `internal/store/store_test.go:TestResearchTrack_EndToEndVerification`.
-This test suite covers all acceptance criteria through programmatic scenario execution.
+The fixture exercises state-machine outcomes for those criteria using synthetic findings. It does not execute a model or check the contents of a real source.
 
-Run the complete end-to-end verification with:
+Run the store scenario with:
 
 ```bash
 go test -count=1 ./internal/store -run TestResearchTrack_EndToEndVerification -v
@@ -52,7 +56,7 @@ go test -count=1 ./internal/store -run TestResearchTrack_EndToEndVerification -v
 
 **Test:** `acceptance_1_research_track_no_makefile`
 
-Verified by: Creating a research task and confirming its track is "research", without requiring a Makefile.
+Covered by: Creating a research task and confirming its track is "research", without requiring a Makefile. This subtest only checks track storage; it does not launch a reviewer or establish that a real review passes without a Makefile.
 
 Expected outcome: Task.Track == "research"
 
@@ -89,15 +93,15 @@ Expected outcomes:
 - One follow-up task created per P3 finding
 - Follow-up tasks have track="research" and state="backlog"
 
-### AC4: After round 1, P2 in unchanged text doesn't fail the round but creates follow-up
+### AC4: After round 1, a new P2 in unchanged text creates a follow-up without failing the round
 
 **Test:** `acceptance_4_p2_unchanged_creates_followup`
 
-Verified by: Round 1 rejects (P2 in changed text), round 2 approves (P2 in unchanged text), follow-up is created.
+Covered by: Round 1 rejects for a P2 in changed text. In round 2 that original finding is reported `resolved` with its `prior_id`, and a different, newly discovered P2 is reported in unchanged text. The new finding becomes a follow-up without blocking the round. An unresolved prior P2 reported `still_open` remains blocking even if its text is now unchanged.
 
 Expected outcomes:
 - Round 1: Blocks (P2 in changed text)
-- Round 2: Passes (P2 in unchanged text doesn't block)
+- Round 2: Passes because the old blocker is resolved and the new P2 is outside changed text
 - Follow-up task created for the P2 in unchanged text
 
 ### AC5: P2 in changed text fails the round from either reviewer
@@ -123,7 +127,7 @@ Verified by:
 
 Expected outcomes:
 - Adjudication task created with correct model
-- When adjudicator upholds: parent blocked (finding still blocking)
+- When adjudicator upholds: the finding still blocks the round and this fixture returns the parent to `ready` for rework. Reaching the circuit-breaker or chain budget can instead produce state `blocked`; a blocking finding does not by itself mean state `blocked`.
 - When adjudicator overturns: parent approved (finding no longer blocks)
 
 ### AC7: Round budget blocks task with "decompose" reason; model tier and budget handling
@@ -231,13 +235,13 @@ go test -count=1 ./cmd/odonian-tui -run Scorecard -v
 
 Verified by:
 1. Create research task and get it to "approved" state
-2. Verify no merge-kind task is spawned (agent_merge=false for research)
+2. Verify no merge-kind task is spawned for this fixture with `agent_merge=false`
 3. Confirm approved task stays in "approved" state pending human decision
 
 Expected outcome:
 - Approved research task does not trigger automatic merge-kind task creation
 - Task remains in "approved" state awaiting human review and merge decision
-- This enforces the human merge gate: only humans can merge research findings
+- This covers the human gate for a non-no-op task with `agent_merge=false`. The API can create research tasks with `agent_merge=true`, and an approved current-round no-op with no active PR finalizes directly regardless of that flag; this fixture is not evidence of a universal research merge restriction.
 
 ## Regression Testing
 
@@ -276,14 +280,16 @@ go test -count=1 ./internal/store -run TestResearchAggregation -v
 go test -count=1 ./internal/store -run TestResearchAdjudication -v
 ```
 
-## Completion Checklist
+## Automated Coverage Checklist
+
+Checked boxes identify the scenarios represented in test source, not a test run or live acceptance result from this documentation refresh.
 
 - [x] AC1: Research track created without Makefile requirement
 - [x] AC2a: Confirmed claim with inaccessible source fails round
 - [x] AC2b: Pending with access record doesn't fail (round 2 resolves the round-1
       finding and raises no new one; round passes with no follow-up)
 - [x] AC3: P3 findings pass and create follow-ups
-- [x] AC4: P2 in unchanged text creates follow-up (not blocking after round 1)
+- [x] AC4: New P2 in unchanged text creates a follow-up after round 1; prior blocker is resolved
 - [x] AC5: P2 in changed text blocks from either reviewer
 - [x] AC6: Disputed findings trigger adjudication; ruling decides finding
 - [x] AC7a: Round budget blocks with "decompose" (empty-ladder case)

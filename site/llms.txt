@@ -1,33 +1,60 @@
 # Odonian
 
-> Let agents pull the work. Keep control of what lands. Odonian coordinates AI coding agents
-> across repositories: workers claim tasks from a per-project board, reviewer agents check the
-> changes, and human approval before merge is the default. Go + SQLite, one binary (server + CLI),
-> REST API, self-hosted, AGPL-3.0.
+> Let agents pull the work. Keep control of what lands. Odonian is a self-hosted control plane
+> for build, design and research work across repositories. Workers claim bounded tasks,
+> configured reviewers check results, and human approval before merge is the default.
+> Go + SQLite, one server/CLI binary, REST API, optional terminal UI, AGPL-3.0.
 
-Key facts:
-- Agents CLAIM tasks (pull model); nothing is assigned. A claim is one conditional UPDATE in one SQLite transaction: exactly one of N concurrent claimers wins.
-- Task states: backlog → ready → in_progress → review → approved → done; blocked/failed/superseded/abandoned off-ramps. Transitions are enforced in the store.
-- Merge gate: `agent_merge=false` is the default; an approved task waits for a human (`odonian approve`/`reject`, or acting on the PR, which the PR-watch reconciler converges). `agent_merge=true` is a per-task opt-in that lets a non-LLM merger squash-merge after reviewer approval. Enforcement of who can reach `main` is the forge's branch protection and token scopes, not the board.
-- Rework loop: on a bounced PR the worker must enumerate, fix, and acknowledge every feedback item; `odonian submit` mechanically refuses while items remain. Agents self-identify in PR comments with `<model>-<role>:` markers because the fleet shares its human's GitHub identity.
-- Review circuit breaker: past a per-model rejection threshold the task is superseded by a copy pinned to the next tier of the escalation ladder (`haiku → sonnet → opus` by default; configurable via ODONIAN_ESCALATION_LADDER) or blocked and a human notified.
-- Model hierarchy: Project → Document (design/feature_spec) → Task. Docs live in the project's repo; the board stores refs.
-- Evidence (as of 2026-09-11): 309 merged PRs in the Odonian repo, 207 of them fleet-authored (head branch `mr/*`); recount with site/evidence.sh. Worked example: PR #326.
-- Guided demo: `bash harness/sbx.sh --seed-demo` inside a Docker `sbx` sandbox; walkthrough in docs/demo.md.
-- CLI IDs: task API routes accept unique prefixes of at least eight characters. Project IDs and local worktree operations still need full UUIDs; the demo boot banner supplies them. JSON list output is [] when empty.
-- Trust boundary: the shared bearer token grants access across the board. Worktrees do not restrict filesystem or forge permissions. PR-watch requires a matching per-owner token, including for public repositories.
-- Named for Ursula K. Le Guin's *The Dispossessed* (Odonian voluntary association).
+Behavior checked against source b3da896 (tag v0.24.0), 2026-11-03. Source availability is not
+proof of deployment or enabled configuration.
 
-## Docs
+## Key facts
 
-- [README](https://github.com/boldfield/odonian/blob/main/README.md): overview, quickstart, state machine, trust model
-- [Guided demo](https://github.com/boldfield/odonian/blob/main/docs/demo.md): one task from board to approval in a sandbox
-- [Running](https://github.com/boldfield/odonian/blob/main/docs/running.md): build, server, TUI, fleet, sandbox, deployment
-- [Configuration](https://github.com/boldfield/odonian/blob/main/docs/configuration.md): every environment variable
-- [API reference](https://github.com/boldfield/odonian/blob/main/docs/api.md): full REST API
-- [Design document](https://github.com/boldfield/odonian/blob/main/DESIGN.md): MVP design, claiming and review semantics
-- [Harness](https://github.com/boldfield/odonian/blob/main/harness/README.md): worker/reviewer fleet engine
+- Project → Document → Task. Documents live in the repository; the board stores refs and optional commit pins.
+- Work is claimed, not assigned. Claims atomically check eligibility, including model, state/lease, holds and dependencies. Research can also require admission and attempt identity.
+- Tracks are build, design and research; kinds are implement, review and merge. The bundled harness supports all tracks with pull_request delivery and only build with local_commit delivery.
+- Build produces repository changes. Design produces a specification with the design prompt's contract headings. Research verifies factual claims against primary sources and produces an evidence record.
+- Build/design review requires all configured reviewers to approve. Research uses structured blocking findings, scoped disputes/adjudication and a chain-wide rejected-round budget. Adjudication rules on a finding; it does not vote on the round.
+- Research escalation is off unless separately configured. Build/design escalation uses its own ladder. When ODONIAN_ESCALATION_LADDER is unset, it copies the model allowlist in order; explicitly exclude reviewer-only models where needed.
+- Default work path: backlog → ready → in_progress → review → approved → done, with blocked/failed/superseded/abandoned off-ramps. State transitions are enforced in the store.
+- With agent_merge=false, work requiring landing waits for human approval. With agent_merge=true and a PR, a non-LLM merger can squash-merge after review. A review-approved current-round no_op without an active PR link completes directly to done regardless of agent_merge; there is nothing to merge.
+- PR-watch follows approved, human-gated tasks with PR links; it is not an all-state convergence service. Local-commit approval has a separate protected landing flow.
+- Pull-request attempts and rework reuse mr/<first eight characters of task id>. The CLI checks outstanding PR feedback before resubmission; the explicit human/emergency bypass is documented in the README.
+- The harness renews owned task leases in the background, handles recognized dispatch failure with owner-fenced unclaim and account/model backoff, and bounds legacy session recovery. Custom clients manage their own heartbeats.
+- Eligible work is selected across allowed projects by priority descending, creation time ascending, then task ID ascending. Priority does not interrupt running work or bypass holds, dependencies, model availability or research admission.
+- Reviewed research continuations are opt-in. Research pacing is disabled by default; observe records decisions, enforce applies admission limits and completion reservations.
+- Isolated reviewer-evaluation campaigns compare candidates on frozen inputs. Candidate results never vote on production tasks or automatically change reviewer assignments. The Muse adapter is not a production dispatch backend.
+- Limits include single-server SQLite, one shared bearer token, no metrics endpoint, no implemented board-stall alert, and no review-round reset when unblocking. Optional Go profiling is authenticated.
+- Forge permissions and branch protection enforce access to main. The board's shared token grants access across projects; worktrees do not isolate credentials or forge permissions. Use disposable fleet environments and appropriately scoped credentials.
+- Public evidence counted 2026-11-03: 423 merged PRs, 302 with mr/ head branches, 71% rounded down. This branch-prefix proxy does not establish reviewer or merger identity. Recount with site/evidence.sh. PR #326 remains a dated worked example.
+- The website's terminal frames are a historical demo capture from 2026-09-12 on v0.16.3, not a newly run demonstration of all current features.
+- Named for Ursula K. Le Guin's The Dispossessed and Odonian voluntary association.
+
+## Current documentation
+
+- [Documentation index](https://github.com/boldfield/odonian/blob/main/docs/README.md): entry points by audience
+- [README](https://github.com/boldfield/odonian/blob/main/README.md): overview, work tracks, limits, trust model
+- [Guided demo](https://github.com/boldfield/odonian/blob/main/docs/demo.md): a build task from board to approval in a disposable sandbox
+- [Running](https://github.com/boldfield/odonian/blob/main/docs/running.md): build, server, CLI, TUI, fleet and delivery modes
+- [Research](https://github.com/boldfield/odonian/blob/main/docs/research.md): evidence, review, disputes, continuations and pacing
+- [Operations](https://github.com/boldfield/odonian/blob/main/docs/operations.md): queue priority, recovery and failure diagnosis
+- [Configuration](https://github.com/boldfield/odonian/blob/main/docs/configuration.md): settings, defaults and agent identity variables
+- [API reference](https://github.com/boldfield/odonian/blob/main/docs/api.md): REST contracts
+- [Agent runbook](https://github.com/boldfield/odonian/blob/main/AGENT-API.md): worker/reviewer procedures and command details
+- [Harness](https://github.com/boldfield/odonian/blob/main/harness/README.md): fleet lifecycle, scheduling and routing
+- [Fleet deployment](https://github.com/boldfield/odonian/blob/main/deploy/fleet/README.md): reference Kubernetes topology and authentication
+- [Interactive skills](https://github.com/boldfield/odonian/blob/main/docs/skills.md): task decomposition, inspection, operations and human review
+- [Runbooks](https://github.com/boldfield/odonian/tree/main/docs/runbooks): scoped rollout and verification procedures; check each document's status
+
+## Design history
+
+- [Specification status index](https://github.com/boldfield/odonian/blob/main/docs/specs/README.md): implemented, partial and still-proposed changes
+- [Feature designs](https://github.com/boldfield/odonian/tree/main/docs/features): original design contracts with current status pointers
+- [MVP design](https://github.com/boldfield/odonian/blob/main/DESIGN.md): historical June 2026 design; not the current state-machine or review contract
+- [Bootstrap board](https://github.com/boldfield/odonian/tree/main/board): historical task records, not the live task workflow
 
 ## Source
 
-- [Repository](https://github.com/boldfield/odonian): AGPL-3.0, Go + SQLite
+- [Repository](https://github.com/boldfield/odonian)
+- [Evidence counting script](https://github.com/boldfield/odonian/blob/main/site/evidence.sh)
+- [Source tags](https://github.com/boldfield/odonian/tags): source versions, distinct from deployed binaries and GitHub Release objects

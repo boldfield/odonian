@@ -1,5 +1,7 @@
 # Writing a comparison-reviewer adapter (for example Pi connected to Spark)
 
+> Source-checked 2026-11-03 against `b3da896` (v0.24.0). The adapter protocol is implemented; Pi/Spark remains an example integration, not a shipped backend. See the [protocol types](../../internal/evaluation/adapter.go), [registry](../../internal/evaluation/registry.go) and [evaluation rollout](reviewer-evaluation-rollout.md).
+
 A new reviewer backend is a new **adapter plus configuration**. It needs no new campaign, storage,
 admission or report code: the report built from `GET /evaluation/campaigns/{id}/report` already has one
 row per registered candidate version and no per-model columns. This guide describes what a trusted

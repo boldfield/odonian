@@ -12,16 +12,17 @@
 
 **Let agents pull the work. Keep control of what lands.**
 
-Odonian coordinates AI coding agents across your repositories. A human decomposes a design into
-bite-size tasks on a per-project board. Worker agents claim tasks **pull-model** (nothing is ever
-assigned), do the work, and submit. Reviewer agents vote. Human approval before merge is the
-default; automatic merging is a per-task opt-in (`agent_merge=true`), and what actually keeps an
-agent off `main` is your forge's branch protection and token scopes, not the board.
+Odonian is a self-hosted control plane for agent work across your repositories: software builds,
+design documents, and source-backed research. A human decomposes the work into bounded tasks on a
+per-project board. Workers claim tasks, produce the result, and submit it to configured reviewers.
+Human approval before merge is the default; automatic merging is a per-task opt-in
+(`agent_merge=true`). Forge branch protection and token scopes enforce who can reach `main`.
+A review-approved no-op with no PR completes without a merge or a separate human approval.
 
 It is the control plane only: a work queue with a precise state machine, atomic claiming,
 lease-based crash recovery, review routing with a circuit breaker, and a set of level-triggered
-reconcilers, behind a small REST API and one CLI binary. It is **not a kanban UI**. The board is a
-queue with claiming primitives.
+reconcilers, behind a REST API and one server/CLI binary. An optional terminal UI lets people
+inspect and operate the board; the fleet works through the API.
 
 Two convictions shape the design:
 
@@ -54,18 +55,17 @@ flowchart LR
 
 ## Status
 
-Odonian has run in production since June 2026. A Kubernetes fleet of workers, reviewers, and a
-non-LLM merger drains boards for fifteen projects on the author's board. One of those projects is
-this repository: as of 2026-09-11, 207 of the 309 pull requests merged here were opened by the
-fleet from its own board (head branch `mr/*`), reviewed by a second model, and merged by a human.
-Recount with [`site/evidence.sh`](./site/evidence.sh).
+The author has operated Odonian since June 2026, including using it to develop this repository.
+The public evidence is narrower than that operational report: as of **2026-11-03**, **423** PRs
+had merged here; **302** had a head branch beginning with `mr/`, the fleet's deterministic naming
+convention. That is **71%**, rounded down as in [`site/evidence.sh`](./site/evidence.sh). Branch
+names alone do not prove which model reviewed a change or who merged it.
 
-| | |
-|---|---|
-| Go source | 11.8k lines, 11 packages |
-| Tests | 31.5k lines, 531 test functions; every push runs them plus a Docker smoke test |
-| Merged pull requests | 309, of which 207 fleet-authored (as of 2026-09-11) |
-| Latest release | v0.16.3 |
+This overview was checked against source commit `b3da896`, tagged
+[`v0.24.0`](https://github.com/boldfield/odonian/tree/v0.24.0). Tags identify source snapshots,
+not the version running in any deployment. See [release and deployment](./docs/running.md#release-and-deployment)
+for how images are built and rolled out. CI runs on pull requests and pushes to `main`; its checks
+include Go tests and container smoke checks.
 
 It is a personal-scale substrate and wears that honestly. Known limits, in the order they would
 hurt at larger scale:
@@ -73,9 +73,11 @@ hurt at larger scale:
 - **Single replica; SQLite in WAL mode on one persistent volume.** No HA, no replication. Backup
   is whatever the volume layer provides.
 - **One bearer token; no multi-tenancy.** Everyone with the token is the same principal.
-- **No metrics endpoint.** Observability is structured logs plus the notifier.
-- **Lease renewal is agent-driven.** The harness has no background heartbeat, so the lease TTL is
-  kept generous and crash recovery is correspondingly slow.
+- **No metrics endpoint.** Observability is structured logs, the notifier, and optional authenticated
+  [Go profiling](./docs/configuration.md#runtime-profiling-with-pprof).
+- **Recovery still depends on leases.** The harness renews owned task leases in the background and
+  can hand back claims after recognized backend failures. A hard crash can still leave work waiting
+  for expiry; custom clients must manage their own heartbeats.
 - **Board-stall detection is specced from an incident and not yet built.** See
   [What broke](#what-broke).
 
@@ -89,15 +91,35 @@ hurt at larger scale:
 - A **document** is a `design` (one per project) or a `feature_spec`. It lives in the repo;
   Odonian stores the ref and an optional commit pin, never the content.
 - A **task** is a unit of work decomposed from a document: a spec, a pinned model, the models that
-  must review it, its dependencies, and a `kind`.
+  must review it, its dependencies, a `kind`, and a work `track`.
 
-Tasks carry typed **links** back to the forge: `pr`, `branch`, `commit`, `ci`, and `no_op`. Links
-are indexed both ways, so a PR URL resolves to its task. The branch name is a pure function of the
-task id, so every attempt and every rework of one task lands on the same branch and the same PR.
+Submission links include `pr`, `branch`, `commit`, `ci`, and `no_op`; research and continuation
+lineage also use server-generated link types. Links support reverse lookup. In pull-request delivery,
+`mr/<first eight characters of task id>` identifies the branch, so attempts and rework reuse the
+same branch and PR. Local delivery has its own [worktree and landing workflow](./docs/running.md#delivery-modes).
+
+### Work tracks
+
+| Track | Worker output | Review and recovery |
+|---|---|---|
+| `build` | Code, tests and other repository changes | Configured reviewers must approve; repeated rejection can escalate along the build ladder. |
+| `design` | A design document with the required contract headings | Uses its design prompt and the build/design review and escalation rules. |
+| `research` | Claims checked against primary sources and an evidence record | Structured findings decide acceptance; finding-scoped disputes, follow-ups and a chain-wide rejection budget govern recovery. |
+
+Tracks select the prompt and review rules; they are separate from task kinds. The bundled harness
+supports all three tracks with `pull_request` delivery and only `build` with `local_commit`.
+Research escalation is off unless a research ladder is configured. Its rejection budget can require
+decomposition even when escalation is enabled. See the [research guide](./docs/research.md).
+
+Reviewed research tasks can opt in to continuation manifests that create bounded follow-up work
+when the parent moves from `approved` to `done`. Research admission pacing is optional and **disabled by default**;
+in `enforce` mode it reserves capacity and limits starts by account pool. `observe` records policy decisions without denying starts. Isolated reviewer-evaluation
+campaigns compare candidate results against frozen inputs; they do not vote on production tasks or
+automatically change reviewer assignments. Details are in the [documentation index](./docs/README.md).
 
 ### Claiming
 
-A claim is one conditional `UPDATE` whose `WHERE` clause is the claimability predicate:
+At its core, a claim is one conditional `UPDATE`. A simplified eligibility predicate is:
 
 ```sql
 (state = 'ready' OR (state = 'in_progress' AND lease_expires_at < now))  -- ready, or a dead lease
@@ -109,7 +131,14 @@ SQLite serializes writers, so exactly one of N concurrent claimers sees `rows af
 rest see `0` and are told why: not found, model mismatch, or plain conflict. The claim, its lease,
 and its audit event commit in the same transaction. Leases are checked lazily inside the predicate:
 a crashed agent's task becomes claimable the moment its lease lapses, with no sweeper and no reaper
-race. None has been needed under a production fleet of roughly ten concurrent agents.
+race. Model matching and additional research admission/attempt rules also apply; the SQL above is
+not the full contract. See [claiming and leases](./docs/api.md#concurrency--leases).
+
+The harness chooses eligible work across allowed projects by priority descending, creation time
+ascending, then task ID ascending. Topic priority is inherited by the tasks the server spawns from it, including reviews,
+merges, adjudications and continuations.
+Moving a topic to the front affects future dispatch; it neither interrupts running work nor bypasses
+holds, dependencies, model availability or admission limits. See [operations](./docs/operations.md).
 
 ### States
 
@@ -119,26 +148,28 @@ race. None has been needed under a production fleet of roughly ten concurrent ag
 | `ready` | Claimable, subject to dependencies, hold, and model. |
 | `in_progress` | Claimed and leased. |
 | `review` | Submitted. One review task per required reviewer model is in flight. |
-| `approved` | Every reviewer approved. Awaits the merge gate. |
+| `approved` | Passed the track's review rules. Awaits landing or the merge gate. |
 | `blocked` | Circuit breaker or operator. Unblocking returns it to `ready` with a cleared lease. The review round is not reset yet, so a re-rejection re-trips the breaker; a fix is specced in `docs/specs/`. |
-| `done` | Merged. Terminal. |
+| `done` | Completed: merged, landed locally, or review-verified as a no-op. Terminal. |
 | `failed`, `abandoned` | Terminal off-ramps: retired by an operator, or PR closed unmerged. `failed` is absorbing; there is no revive. |
-| `superseded` | Terminal. The recovery path for a wrong spec or approach: a replacement task is created with the same spec, dependents are re-pointed at it, and the stale attempt's PR is closed. |
+| `superseded` | Terminal. A replacement carries the original assignment plus prior rejection feedback (build/design) or unresolved findings (research). Dependents are re-pointed at it; stale-PR cleanup is best effort. |
 
-Transitions are enforced in the store, not the API layer. Each automated transition (claim,
-submit, review aggregation, PR-watch) has exactly one entry point; operator transitions are a
-whitelist in `TransitionTask` ([`internal/store/store.go`](./internal/store/store.go)).
+Transitions are enforced in the store. Claims, submissions, review aggregation and PR-watch use
+store transition logic; operator transitions follow the whitelist in `TransitionTask` ([`internal/store/store.go`](./internal/store/store.go)).
 
 ### Kinds, review, and the circuit breaker
 
 - **`implement`**: the work. Pinned to a model, carries a spec, names its reviewer models. On
   submit, one `review` task is spawned per reviewer model.
 - **`review`**: auto-created, points at its parent, carries a verdict when submitted.
-- **`merge`**: auto-created when an `implement` task with `agent_merge=true` is approved. A
+- **`merge`**: auto-created when an `implement` task with `agent_merge=true` and an active PR is approved. A
   non-LLM merger squash-merges through the forge API. Its lifecycle is
   `ready → in_progress → done` with no review step.
 
-Review is unanimous: one reject returns the parent to `ready` with its review round incremented.
+Build/design review requires all configured reviewers to approve. Once the review round finishes,
+a rejection returns the parent for rework unless escalation or the circuit breaker intervenes.
+Research instead aggregates structured blocking findings; adjudication rules on a disputed finding
+and never adds a vote to the round.
 On rework, the worker must address every unaddressed review item on the PR, inline threads and
 top-level comments alike: enumerate them with `odonian pr-feedback list`, acknowledge each with
 `odonian pr-feedback ack` (a marker-stamped reply naming the exact comment/thread and a fixing
@@ -149,20 +180,29 @@ zero outstanding items — that failure is retryable, so retry the submit once t
 or pass `--skip-feedback-gate` for an explicit human/emergency bypass. That gate is mechanical,
 in the CLI, not an instruction in a prompt. Past a per-model round threshold the **circuit breaker** fires: if
 escalation is enabled for the task and a higher tier exists, the task is superseded by a copy pinned
-to the next model up (`haiku → sonnet → opus` by default) and promoted straight to `ready`;
-otherwise it goes to `blocked` and a human is notified.
+to the next model on the configured build/design ladder and promoted straight to `ready`;
+otherwise it goes to `blocked` and a human is notified. With the default allowlist the ladder is
+`haiku → sonnet → opus`. If the ladder is unset, it copies the **entire model allowlist in order**;
+configure it explicitly when reviewer-only models should not become implementation targets.
 
-Reviewer and worker need not share a vendor. Reviews pinned to `gpt-5.5` are dispatched through
-the Codex CLI while workers run Claude via `claude -p`. Independence of reviewer from author is one
-line of fleet configuration.
+Reviewer and worker need not share a vendor. Models listed in `AGENT_CODEX_MODELS` run through
+Codex; other model names route through Claude. Reviewer identity, the model allowlist and the
+escalation ladder are separate configuration choices. Model names in examples are not a promise
+that a provider account has access to them.
 
 ### The merge gate
 
-With `agent_merge=false` (the default) an approved task waits. The human either records a verdict
+For work that needs to land, `agent_merge=false` (the default) leaves an approved task waiting. The human either records a verdict
 with `odonian approve` / `odonian reject`, or acts on GitHub and lets the **PR-watch reconciler**
 converge the board: merged → `done`; closed unmerged → `abandoned`; "changes requested" newer than
 the approval → back to `ready`, with a marker comment on the PR. With `agent_merge=true` the merger
 does the squash-merge after reviewer approval, with no human step.
+
+A current-round `no_op` submission with no active PR link goes directly from review to `done`
+after passing review, regardless of `agent_merge`: there is no new change to merge. In
+`local_commit` delivery, `odonian approve` performs the protected local landing flow instead of
+a forge merge. PR-watch currently follows **approved, human-gated** tasks; it is not a general
+reconciler for every task state.
 
 ## Operating it
 
@@ -182,22 +222,17 @@ does the squash-merge after reviewer approval, with no human step.
 
 ### One binary
 
-`odonian` is both the server and the client:
+`odonian` is both server and CLI. Run `odonian --help` for the current command list; the
+[agent runbook](./AGENT-API.md) explains claiming, submission, priority, research permits and
+isolated evaluation, and the [API reference](./docs/api.md) covers operations without a CLI wrapper.
 
-| Who | Commands |
-|---|---|
-| Server | `server` |
-| Fleet | `next`, `claim`, `heartbeat`, `submit`, `pr-feedback`, `merge`, `wt-ensure` |
-| Human | `pending`, `diff`, `approve`, `reject`, `promote`, `transition`, `projects`, `tasks`, `show` |
-
-An optional terminal UI (`odonian-tui`) shows the board by state with search, filtering, and
-confirm-gated archive actions. Four Claude Code skills wrap the human-facing ends of the workflow:
-decompose a design onto the board, view it, operate it, and drive the merge gate. See
-[`docs/skills.md`](./docs/skills.md).
+The optional `odonian-tui` shows the board by state with search, filtering, topic priority,
+reviewer scorecards and confirm-gated archive actions. Four [interactive skills](./docs/skills.md)
+cover task decomposition, board inspection, operations and the human merge gate.
 
 ### Reconcilers
 
-All background behavior is a set of **level-triggered reconcilers** on one runner. Each tick reads
+Server reconciliation uses **level-triggered reconcilers** on one runner. Each tick reads
 current state and acts on it. Nothing keeps a cursor, so a restart mid-tick loses nothing and a
 missed tick is caught by the next one.
 
@@ -205,23 +240,25 @@ missed tick is caught by the next one.
   recently `failed`). A no-op when no URL is configured.
 - **PR-watch**: for approved, human-gated tasks with a PR link, fetches PR state and review
   decisions from GitHub and applies the transitions under [The merge gate](#the-merge-gate).
-  Comments it posts carry a marker so they are never mistaken for review feedback.
+  It also retries stale-PR cleanup for superseded/abandoned tasks and respects per-owner GitHub
+  quota backoff. Comments carry a marker so they are not mistaken for review feedback.
 - **Event pruning** at startup: audit events for terminal tasks are trimmed by a retention window.
-  Events for live tasks are never pruned.
+  Events for live tasks and research-track tasks are retained.
 
 ### Failure modes
 
 | Failure | What happens |
 |---|---|
 | Worker crashes mid-task | Lease lapses; any worker of that model can claim it. The rework lands on the same deterministic branch. |
-| Worker finds the work already on `main` | Submits a `no_op` link and no PR; the reviewer verifies the claim against `main`. |
-| Reviewer rejects repeatedly | Review round climbs; past the threshold the circuit breaker escalates the model tier, or blocks and pages. |
+| Worker finds the work already on `main` | Submits a `no_op` link and no PR; passing review completes the task without a merge. |
+| Reviewer rejects repeatedly | Build/design can escalate or block. Research has separate rules and a chain-wide budget that blocks for decomposition. |
 | Human requests changes on GitHub after approval | PR-watch bounces the task to `ready` and posts a marker comment; the worker must ack every open item before resubmitting. |
-| PR merged or closed outside the board | PR-watch converges the task to `done` or `abandoned`. |
+| PR merged or closed outside the board | PR-watch converges approved human-gated tasks to `done` or `abandoned`; other states need operator attention. |
 | Server restarts | Reconcilers re-derive from state. Writers wait on SQLite's 5s busy timeout instead of failing fast. |
 | Webhook endpoint down | Logged. Level-triggered, so the next tick resends. |
 | Forge token missing for an owner | PR-watch skips that owner's repositories, including public ones, and logs when the skipped count changes. Configure the server's per-owner token to resume convergence. |
-| A task is wedged | `hold` pins it out of automated flow; `supersede` replaces it and closes its stale PR; `transition` to `blocked` or `failed` retires it. |
+| A backend fails during dispatch | Known failures trigger account/model backoff and owner-fenced claim handback; other eligible work can proceed. |
+| A task is wedged | Hold it via the API/TUI; supersede an abandoned approach and revise the replacement spec if needed, or use an allowed operator transition. See the operations guide. |
 
 ### What broke
 
@@ -239,9 +276,18 @@ What changed: Codex auth got `make` targets and documentation of its refresh-tok
 the detection gap got a written spec with the correct signal. The obvious signal, age of the oldest
 claimable task, false-positives: a task whose dependencies cleared this morning looks ten days
 stale. The correct signal is board-level: claimable work exists **and** no non-terminal task has
-changed within the threshold window. What is still open: building that reconciler, and removing
-the peek-without-claim amplifier. Postmortem and spec:
+changed within the threshold window. The board-stall reconciler is still unbuilt. The harness now
+skips known failing models/accounts and deferred candidates, mitigating the old head-of-line failure;
+research work is preclaimed before dispatch, while legacy work still claims inside the model session.
+Postmortem and spec:
 [`docs/specs/2026-07-20-stall-detection.md`](./docs/specs/2026-07-20-stall-detection.md).
+
+An October 2026 incident exposed a different gap: backend limits left claimed research work
+orphaned until lease expiry, while model-local backoff missed aliases sharing an account. The
+harness now hands back owned claims on recognized dispatch failure and distinguishes account-wide
+rate/sign-in failures from model-specific failures. These mitigations do not replace board-level
+stall detection. See [dispatch failure handling](./docs/features/dispatch-failure-handling.md)
+and the [operations guide](./docs/operations.md).
 
 ### Trust model
 
@@ -302,17 +348,13 @@ reference is in [`docs/running.md`](./docs/running.md).
 
 ## Documentation
 
-- [`docs/demo.md`](./docs/demo.md): the guided first run: one task from board to approval in a sandbox.
-- [`docs/running.md`](./docs/running.md): build, run, test, deploy, and run the fleet locally or in a sandbox.
-- [`docs/configuration.md`](./docs/configuration.md): every environment variable for the server, notifier, PR-watch, CLI, and harness.
-- [`docs/api.md`](./docs/api.md): REST API reference.
-- [`DESIGN.md`](./DESIGN.md): the original MVP design: state machine, atomic claiming, review semantics.
-- [`harness/README.md`](./harness/README.md): the fleet engine, prompts, per-owner auth, multi-project mode.
-- [`deploy/fleet/README.md`](./deploy/fleet/README.md): running the fleet on Kubernetes.
-- [`docs/skills.md`](./docs/skills.md): the four Claude Code skills and how to install them.
-- [`docs/specs/`](./docs/specs/): dated feature specs, including the stall postmortem.
-- [`docs/features/`](./docs/features/): feature designs for the model ladder, TUI, and sandbox bootstrap.
-- [`board/`](./board/README.md) and [`AGENT.md`](./AGENT.md): the text-file board and runbook used to bootstrap the first release before the API existed.
+Start with the [documentation index](./docs/README.md). The main entry points are:
+
+- [First-run demo](./docs/demo.md) and [running guide](./docs/running.md).
+- [Research workflows](./docs/research.md) and [queue/recovery operations](./docs/operations.md).
+- [Configuration](./docs/configuration.md), [API reference](./docs/api.md), and [agent runbook](./AGENT-API.md).
+- [Fleet harness](./harness/README.md), [reference Kubernetes deployment](./deploy/fleet/README.md), and [interactive skills](./docs/skills.md).
+- [Dated-spec status index](./docs/specs/README.md), [feature designs](./docs/features/), and the historical [MVP design](./DESIGN.md).
 
 ## License
 

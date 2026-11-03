@@ -5,8 +5,8 @@ description: Use to drive the human review gate from inside an interactive `clau
 
 # Odonian review (human gate)
 
-A conversational wrapper for the **human review gate**. The sandbox's only interface is an
-interactive `claude` session, so this skill is how a human inspects what is waiting, reads a diff,
+A conversational wrapper for the **human review gate** inside an interactive `claude` session.
+This skill is how a human inspects what is waiting, reads a diff,
 and then — once they have made the call — records that verdict on the board. It surfaces the queue
 and the diff so the human can decide, then executes the decision they hand back.
 
@@ -135,16 +135,20 @@ odonian approve <task-id>
 
 ### Reject
 
-When the human says to reject a task (one in **`review`** or **`approved`**), you must have a
-reason from them — `--note` is required:
+When the human says to send an **`approved`** task back for rework, you must have a reason
+from them — `--note` is required:
 
 ```
 odonian reject <task-id> --note "<the human's reason>"
 ```
 
-- Without `--abandon`, this transitions the task to **`ready`** for rework (the implementer
+- Without `--abandon`, an `approved` task transitions to **`ready`** for rework (the implementer
   re-claims it; a fresh review round spawns on resubmit).
-- With `--abandon`, it transitions the task to **`failed`** instead, and in `local_commit` mode
+- **Current limitation:** the CLI also accepts a `review` task as input, but the server rejects its
+  attempted `review` → `ready` transition. During automated review, verdicts must come from the
+  spawned reviewers' submissions. Report the refusal; do not work around it by recording a legacy
+  review event or cycling the task through `blocked`.
+- With `--abandon`, either a `review` or `approved` task transitions to **`failed`** instead, and in `local_commit` mode
   also cleans up the item's worktree and `wip/<id>` branch (the `wi/<slug>` MR branch is left
   intact). Use this only when the human wants to drop the work entirely, not send it back:
 

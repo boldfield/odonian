@@ -1,5 +1,8 @@
 # Feature spec — supersession closes the superseded attempt's pull request
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented; historical incident and specification.**
+> The [store](../../internal/store/store.go) contains best-effort superseded-PR cleanup, covered by [store tests](../../internal/store/store_test.go); the [PR watcher](../../internal/prwatch/reconciler.go) provides terminal-task cleanup. See the [later quota repair](2026-09-10-prwatch-quota-burn.md) and [operations](../operations.md). Source presence does not guarantee a live forge call succeeds.
+
 **Status:** board milestone (Odonian project). **Date:** 2026-08-06.
 
 ## Problem
