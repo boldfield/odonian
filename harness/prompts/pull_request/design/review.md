@@ -116,7 +116,7 @@ not an acceptable reject. Approve only when all four hold for the design as writ
    - **CLOSED** (unmerged) — the PR is closed without merging. Automatic reject: submit a `reject`
      verdict with note "PR is closed unmerged; cannot reopen or rework it" and STOP.
    - **OPEN** or other — continue below.
-   
+
    A `pr` link that does NOT resolve is fabricated or premature — a defect: submit a `reject` verdict
    (step 5) with note "pr link does not resolve to a real PR" and STOP. **Do NOT fall back to reviewing
    the raw branch.** Likewise, if the PR-head fetch below fails (`git fetch origin "pull/<n>/head"`

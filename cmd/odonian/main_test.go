@@ -7360,6 +7360,7 @@ func TestExecuteShowOperatorNotesEmptyNotesOmitted(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// Test text output
 	buf := &bytes.Buffer{}
 	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
 	if err != nil {
@@ -7377,6 +7378,44 @@ func TestExecuteShowOperatorNotesEmptyNotesOmitted(t *testing.T) {
 	count := strings.Count(output, "operator @")
 	if count != 1 {
 		t.Errorf("expected 1 operator note, got %d", count)
+	}
+
+	// Test JSON output
+	jsonBuf := &bytes.Buffer{}
+	err = executeShow(context.Background(), server.URL, "test-token", true, []string{"task-1"}, jsonBuf)
+	if err != nil {
+		t.Fatalf("executeShow JSON failed: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(jsonBuf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	notes, ok := result["operator_notes"].([]interface{})
+	if !ok {
+		t.Fatalf("operator_notes not found or not an array in JSON output")
+	}
+
+	// Should have exactly 1 note (empty note is omitted)
+	if len(notes) != 1 {
+		t.Errorf("expected 1 operator note in JSON, got %d", len(notes))
+	}
+
+	if len(notes) > 0 {
+		noteObj, ok := notes[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("operator note is not an object")
+		}
+
+		noteText, ok := noteObj["note"].(string)
+		if !ok || noteText != "important note" {
+			t.Errorf("expected note text 'important note', got %v", noteObj["note"])
+		}
+
+		if _, ok := noteObj["created_at"]; !ok {
+			t.Errorf("expected created_at in operator note")
+		}
 	}
 }
 
@@ -7416,6 +7455,7 @@ func TestExecuteShowNoOperatorNotesBeforeSubmit(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// Test text output
 	buf := &bytes.Buffer{}
 	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
 	if err != nil {
@@ -7426,6 +7466,25 @@ func TestExecuteShowNoOperatorNotesBeforeSubmit(t *testing.T) {
 	// Should not have Operator notes section if all notes are before submit
 	if strings.Contains(output, "Operator notes:") {
 		t.Errorf("expected no 'Operator notes:' section (transition was before submit), got: %s", output)
+	}
+
+	// Test JSON output
+	jsonBuf := &bytes.Buffer{}
+	err = executeShow(context.Background(), server.URL, "test-token", true, []string{"task-1"}, jsonBuf)
+	if err != nil {
+		t.Fatalf("executeShow JSON failed: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(jsonBuf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	// operator_notes should not be present or should be empty/nil
+	if notes, ok := result["operator_notes"]; ok {
+		if notesArr, isArr := notes.([]interface{}); isArr && len(notesArr) > 0 {
+			t.Errorf("expected operator_notes to be absent or empty in JSON (transition was before submit), got %v", notesArr)
+		}
 	}
 }
 
