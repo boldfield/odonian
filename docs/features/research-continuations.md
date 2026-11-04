@@ -1,5 +1,8 @@
 # Feature: research continuations
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented in source; design reference.**
+> Manifest validation, per-round persistence and child creation are covered by the [validator](../../internal/manifest/manifest.go), [submission tests](../../internal/store/manifest_submission_test.go) and [child-creation tests](../../internal/store/continuation_children_test.go). See the [research guide](../research.md) and [API reference](../api.md) for current operation. This status does not establish that any live parent is opted in or that a rollout has occurred.
+
 ## Overview
 
 Research continuation manifests enable controlled creation of child tasks from a parent research task. A parent task's worker proposes a set of child tasks in a versioned manifest carried in the parent's PR. Both reviewers examine the exact proposal, and only the parent's verified human merge can create the children. This prevents child tasks from being created without explicit human approval of the specific work breakdown.

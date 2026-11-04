@@ -1,5 +1,7 @@
 # Muse Code adapter runbook
 
+> Source-checked 2026-11-03 against `b3da896` (v0.24.0). The bundled adapter still pins `muse-spark-1.3` in [muse.go](../../internal/evaluation/muse.go); it does not select `muse-wonder-full-1.0`. Provider documentation notes below are the dated October 3 snapshot, not a current CLI/model-availability guarantee. Recheck the installed CLI through the documented preflight; this refresh did not run an evaluation or verify billing.
+
 Audience: the operator who installs and registers the Muse Code comparison-reviewer adapter. Design background is in
 [`docs/features/research-pacing-and-reviewer-evaluation.md`](../features/research-pacing-and-reviewer-evaluation.md);
 the host-side contract it implements is `internal/evaluation/adapter.go`.
@@ -171,9 +173,12 @@ when omitted), `--max-model-steps` (default 100), `--timeout` (default 30m).
    `failed` / `output_malformed`.
 6. Exit codes: `1` and unknown codes `failed` / `runtime_error`; `2` `failed` / `runtime_error` naming a likely
    incompatible flag; `130`, `143` or death by signal `interrupted` / `interrupted`.
-7. Interruption: SIGINT or SIGTERM to the adapter, or the host cancelling it, kills muse's whole process group and
-   writes `interrupted` / `interrupted`; the adapter's `--timeout` writes `interrupted` / `timeout`. Timing is measured
-   either way.
+7. Interruption: when the adapter receives SIGINT or SIGTERM, it kills Muse's process group and
+   writes `interrupted` / `interrupted`; its own `--timeout` also cleans up the group and writes
+   `interrupted` / `timeout`. These handled paths record timing. Arbitrary host cancellation is different:
+   the host pipeline uses `exec.CommandContext`, whose cancellation kills the adapter process directly.
+   That SIGKILL bypasses the adapter's cleanup and can leave Muse descendants running without a result.
+   Keep the host timeout longer than the adapter timeout; a direct host kill provides no group-cleanup guarantee.
 
 The adapter exits `0` whenever it wrote a contract-valid response (the response carries the outcome) and `2` when it
 could not operate (unreadable request, unwritable result path).

@@ -1,5 +1,7 @@
 # Research pacing rollout runbook (milestone 1)
 
+> Source-checked 2026-11-03 against `b3da896` (v0.24.0). This is a rollout procedure, not evidence pacing is enabled in any deployment. See the [research guide](../research.md), [claim implementation](../../internal/store/research_claim.go) and [pacing smoke test](../../harness/research_pacing_smoke_test.sh).
+
 Audience: the operator turning on automatic research pacing for a deployment. Design background is in
 [`docs/features/research-pacing-and-reviewer-evaluation.md`](../features/research-pacing-and-reviewer-evaluation.md);
 variable reference is [`docs/configuration.md`](../configuration.md#research-pacing-pools); the CLI verbs are in
@@ -12,13 +14,12 @@ yours to perform there.
 
 ## What pacing does, in one paragraph
 
-Research LLM work (first-pass writing, review, rework, adjudication) must be *admitted* before a model
+With policy mode `enforce`, research LLM work (first-pass writing, review, rework, adjudication) must be *admitted* before a model
 process is launched. Admission is one atomic server operation (`odonian claim <task>` on a research task):
 it checks the task is claimable, checks the account pool, spends one start, records a durable permit and
-attempt, and claims the task. A denial leaves the task `ready` and untouched (no lease, round, failure or
-blocked state) and no model starts; the launcher skips it until the retry time and works on other eligible
+attempt, and claims the task. A denial preserves the task's prior state, assignment, lease and review round: a `ready` task stays `ready`, while an expired-lease `in_progress` task stays `in_progress`. It creates no new claim or failure, and no model starts; the launcher skips it until the retry time and works on other eligible
 tasks, so a deferred task resumes by itself. Build, design and merge work is never paced. Active research is
-never interrupted by rate exhaustion.
+never interrupted by rate exhaustion. The harness still preclaims research tasks when policy is disabled, but those claims create no permits or pool debits. In `observe`, mapped models create attempts and record hypothetical denials without rejecting work; unmapped models can be claimed without a permit.
 
 ## Configuration examples (illustrative only)
 
@@ -253,11 +254,10 @@ Each step is reversible by the rollback section. Do not start step 5 until steps
 
 4. **Drain every legacy research launcher.** A launcher built before admission starts the model first and lets
    the model claim a task. Under `enforce` that is the wasteful path: the model process is already running (and
-   spending usage) when the claim is denied with exit 10. Under `observe` such launchers are merely invisible
-   to the permit tables, so their attempts may be missing from or expire in your calibration data. Scale legacy
-   research workers and reviewers to zero and confirm none remain (the pod image tag on every research
-   worker/reviewer). Then let their in-flight sessions finish. List research tasks still in progress in each
-   project and wait for them to leave `in_progress`:
+   spending usage) when the claim is denied with exit 10. Under `observe`, mapped claims can still create permits, but old launchers do not reliably renew/finalize the dispatch lifecycle, so their calibration data can expire or be incomplete.
+
+   Before stopping legacy pods, prevent new selection using a deployment-supported drain procedure and let active sessions finish. The bundled harness has no drain command: TERM/scale-to-zero interrupts active sessions. If the deployment cannot stop selection independently, either wait for idle slots and stop them while preventing new work, or explicitly plan an interruption and lease-based recovery. Only after sessions have finished (or interruption recovery has been checked), scale the legacy workers/reviewers to zero and confirm none remain by pod image tag. List research tasks still in progress in each
+   project and reconcile them against the slot logs; task submission alone does not prove the model process has exited:
 
    ```bash
    odonian tasks --project <project-id> --state in_progress --json | jq -r '.[] | select(.track == "research") | "\(.id) \(.assignee)"'
@@ -278,7 +278,7 @@ Each step is reversible by the rollback section. Do not start step 5 until steps
           d.not_before, d.retry_after_ms
    FROM research_admission_diagnostic d
    JOIN task t ON t.id = d.task_id
-   WHERE t.state = 'ready' AND d.hypothetical = 0 AND d.outcome IN ('defer', 'retry')
+   WHERE t.state IN ('ready', 'in_progress') AND d.hypothetical = 0 AND d.outcome IN ('defer', 'retry')
    ORDER BY d.decided_at;
    ```
 
@@ -288,7 +288,7 @@ Each step is reversible by the rollback section. Do not start step 5 until steps
 
    No manual action is needed. The launcher skips a deferred task until its retry time and then asks again, so
    the task starts by itself once capacity exists (single-project launchers also shorten their idle sleep to the
-   next retry time). Never `promote`, edit or re-queue a deferred task to push it along; it is already `ready`.
+   next retry time). Never `promote`, edit or re-queue a deferred task to push it along; denial preserved its prior claimable state (`ready` or expired-lease `in_progress`).
    A task that stays deferred for a long time with `active = 0` is a pool-configuration or launcher problem, not
    something to fix on the task.
 
@@ -304,8 +304,7 @@ Rolling back is a policy change, not a data repair:
 2. Active sessions keep running: restarting the server interrupts nothing and the launchers keep renewing.
    Their permits are simply no longer enforced; the attempts finish and finalize normally or lapse at lease
    expiry.
-3. Waiting tasks are ordinary `ready` tasks and are claimed on the next poll. No task, round, lease or review
-   state needs repair, and no task content changed.
+3. Deferred tasks keep their existing state and become eligible for a new claim on a subsequent poll if the ordinary claim conditions still hold. They may be `ready` or expired-lease `in_progress`; disabling pacing does not rewrite their task, round, lease or review state.
 4. Pool rows and attempt history are kept for the next attempt. Keep `ODONIAN_DB`; discarding it resets
    allowance.
 
@@ -317,12 +316,11 @@ You do not need to roll back the launchers: with the policy disabled the upgrade
   (`ODONIAN_LEASE_TTL`, five minutes unless changed) that the harness renews while the process lives. If the
   harness loses the server, the server cannot signal it. After the lease lapses the attempt is marked `expired`
   and its slot is freed, even if the remote model process is still running and consuming usage. During that
-  window the pool can be over-committed by the partitioned dispatches, for at most about one lease per such
-  dispatch.
+  window the pool can be over-committed by the partitioned dispatches. That physical overlap is not bounded by one lease: transient network failures are retried while the old process remains alive. It ends only when the process exits, the harness receives positive fencing evidence and stops it, or an operator stops it.
 - **Fencing is by identity.** The stale process cannot affect the replacement: the server rejects its
   heartbeat, permit renewal and submit by attempt id (`ATTEMPT_FENCED`, `ATTEMPT_EXPIRED`,
   `ATTEMPT_FINALIZED`; exit code 11), and the harness stops its own process group on such positive evidence. A
-  partitioned harness that cannot reach the server cannot do either, which is the limit described above.
+  partitioned harness cannot receive that positive evidence, so it can continue running beyond lease expiry even though the server will reject its later stale writes.
 - **Transient errors never kill work.** A failed renewal or heartbeat that is not an ownership conflict is
   logged and retried; rate exhaustion never stops an active session.
 - **A submit does not end the dispatch.** Submission ends task ownership, but the permit stays active until the

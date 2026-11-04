@@ -10,11 +10,11 @@ Requires Go 1.25.6 or newer, `git`, and `make`. From the repository root:
 ```bash
 make build      # ./bin/odonian        (server + CLI, one binary)
 make tui        # ./bin/odonian-tui    (optional terminal UI)
-make test       # go test ./...
+make test       # Go tests + fleet-auth Python tests
 make check      # gofmt, go vet, go mod tidy drift
 ```
 
-CI runs `make check`, `make build`, and the tests on every push and pull request, then builds the
+CI runs `make check`, `make build`, and Go tests on pushes to `main` and pull requests, then builds the
 Docker image and smoke-tests `/healthz`.
 
 ## Server
@@ -88,7 +88,9 @@ The wrappers are one-liners:
 | `fleet.sh --kind <k> --count <n>` | spawns and manages several slots at once |
 
 Each slot has a persistent agent id and its own detached git worktree, so parallel agents never
-collide. One `claude -p` (or `codex exec`) dispatch per task; the prompt under
+collide. Each task dispatch runs `claude -p` or `codex exec`, with bounded session recovery for eligible
+legacy dispatches. The harness renews owned leases in the background; custom agents must handle
+their own renewals. See the [harness lifecycle](../harness/README.md). The prompt under
 `harness/prompts/<delivery_mode>/<track>/<kind>.md` is read fresh each dispatch, so editing it
 applies to the next task without a restart. For workers and reviewers, Ctrl-C sends `SIGTERM`
 to the active agent session and exits; it does not wait for the task to finish. Cleanup removes
@@ -207,18 +209,27 @@ A nested `claude -p` inside a sandbox needs `--allow-dangerously-skip-permission
 ## Delivery modes
 
 - **`pull_request`** (default): the worker pushes a branch named from the task id and opens a PR.
-  Review happens on the PR; the merge gate is the human on GitHub, PR-watch, or the merger for
-  `agent_merge=true` tasks.
+  Reviewer tasks record their verdicts on the board. For an approved task with a PR, a human
+  merges by default and PR-watch observes completion; `agent_merge=true` opts in to the merger.
+  Review-verified no-op work completes directly when there is no active PR.
 - **`local_commit`**: no forge. The CLI creates a per-task worktree (`odonian wt-ensure`), the
-  worker commits into it, and `odonian approve` freezes the branch and cleans the worktree for a
-  human to assemble. Serial by design; used for sandboxed and offline work.
+  worker submits its commit for review, and human `odonian approve` performs the landing. Workers
+  can run in parallel; landing is serialized per integration branch. Approval prepares the merge,
+  fast-forwards when possible, or runs `make check` and `make test` when concurrent work requires
+  a merge. It publishes the exact reviewed round to `wi/<branch-or-title-slug>`, marks the task
+  done, and cleans up. It does not merge that integration branch into `main`.
+  The bundled prompts support only `build` in this mode. See [the agent contract](../AGENT-API.md)
+  for worktree, submission and approval commands.
 
 ## Release and deployment
 
 The server ships as a single container image, and this repository's responsibility is building
 and pushing it (`make release`). Deploying it is owned by your own infrastructure repo: a
 kustomization with a namespace, PVC, deployment, and service is all it takes. The deployment needs
-`replicas: 1` and `strategy: Recreate`, because SQLite is single-writer. Relevant targets here:
+`replicas: 1` and `strategy: Recreate`, because SQLite is single-writer. The targets below encode the author's reference infrastructure and registry; inspect them before
+using them for another installation. In particular, `make deploy` mutates the **current kubectl
+context**, namespace `odonian`, deployment `odonian`; it does not use `SERVER_CONTEXT`.
+Relevant targets here:
 
 | Target | Purpose |
 |---|---|
@@ -227,9 +238,13 @@ kustomization with a namespace, PVC, deployment, and service is all it takes. Th
 | `make versions` | Show what is built, tagged, and deployed |
 | `make fleet-image`, `make merger-image` | Build and push the worker/reviewer and merger images |
 | `make fleet-deploy`, `make merger-deploy`, `make diff-fleet` | Retired; fleet rollouts go through `boldfield/manifests` and ArgoCD |
-| `make codex-auth`, `make codex-auth-check` | Seed and verify the Codex credential secret |
+| `make claude-auth`, `make claude-auth-check` | Synchronize Claude credentials; update restarts workers and reviewers |
+| `make codex-auth`, `make codex-auth-check` | Seed/check Codex credentials; update restarts reviewers |
 
 `deploy/fleet/` stays in this repository because it holds build inputs (`Dockerfile.fleet`,
 `Dockerfile.merger`, the fleet entrypoint) that are coupled to the harness. Cluster topology,
 image registry, secrets, and the Codex credential rotation hazard are documented in
 [`deploy/fleet/README.md`](../deploy/fleet/README.md).
+
+Source versions are Git tags (this refresh uses `v0.24.0` / `b3da896`). GitHub Releases, image tags,
+and deployed versions are separate records; a source tag does not establish what is running.

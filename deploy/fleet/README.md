@@ -2,12 +2,16 @@
 
 Run the worker/reviewer/merger fleet in-cluster instead of on a laptop. **Merger-first**: the merger
 is non-LLM and repo-less (`odonian merge` is pure REST), so it proves the in-cluster plumbing with
-zero subscription-auth risk. Workers and reviewers (which need `claude` + a build toolchain) come
-next, on a separate, heavier image.
+no model-provider authentication. Workers and reviewers use a separate, heavier image containing
+the model CLIs and build toolchains; both image definitions are present in this repository.
 
-## Topology
+## Reference topology
 
-- Two **separate** clusters: `summercamp-cp` (3× amd64) and `summercamp-lab` (8× arm64 Pis). They
+This describes the author's infrastructure conventions, checked against repository build inputs
+on 2026-11-03 (`b3da896`), not a fresh cluster inventory. Replace the contexts, registries,
+namespaces and secret references for your installation.
+
+- Two **separate** clusters: `summercamp-cp` (amd64) and `summercamp-lab` (arm64 Pis). They
   are not one mixed cluster, so fleet pods reach the server via its **public ingress**
   (`https://odonian.summercamp.eastharbor.casa`), not a cluster-DNS service name.
 - **Placement:** mergers are cheap → run them on the **Pi (lab)** cluster. Workers/reviewers are
@@ -116,7 +120,7 @@ reused — create them in this namespace on the cp cluster too if they aren't th
 
 Reviewers that run `gpt-6.1-sol` or `gpt-5.5` (via `AGENT_CODEX_MODELS`) authenticate codex with the `codex-auth`
 secret, seeded from `~/.codex/auth.json` (see `secret.example.yaml`). Unlike the claude
-`setup-token`, **this one decays and will take your review queue down.**
+`setup-token`, **shared refresh-token snapshots can invalidate one another.**
 
 Under `auth_mode: chatgpt`, codex uses **refresh-token rotation**: every refresh mints a new refresh
 token and *revokes the previous one*. The secret is therefore a **snapshot**. The
@@ -127,9 +131,11 @@ revoking each other. Expect it to break periodically — a 4-replica fleet survi
 
 Symptom: reviewers log `Your access token could not be refreshed because your refresh token was
 revoked` plus `401 Unauthorized`, and every Codex reviewer (`gpt-6.1-sol` / `gpt-5.5`) dispatch
-exits `rc=1`. Because the
-harness peeks the queue head without claiming it, the failing task stays at the head and stalls the
-whole review queue rather than just its own task.
+exits `rc=1`. Earlier harnesses repeatedly selected failing queue-head work. The current harness
+recognizes sign-in failures, backs off the affected account and hands back owned claims where
+possible; model-unavailable responses have separate model backoff. This reduces repeated failed
+dispatches but does not repair credentials or guarantee progress when every eligible backend is
+unavailable. See [operations](../../docs/operations.md) and [configuration](../../docs/configuration.md).
 
 Check and repair:
 
@@ -140,7 +146,7 @@ make codex-auth          # re-seeds the secret AND rolls the reviewers
 ```
 
 The rollout restart is **mandatory** — updating the secret alone does nothing, because the
-initContainer only reads it at pod start.
+initContainer only reads it at pod start. Restarting reviewers can interrupt in-flight work.
 
 Running exactly one codex-capable reviewer reduces the churn (one rotation lineage instead of N) at
 the cost of Codex reviewer (`gpt-6.1-sol` / `gpt-5.5`) throughput. `auth_mode: apikey` avoids
@@ -171,15 +177,14 @@ in-flight task needs) until usage is back at or under a low-water mark. Two env 
 - `ODONIAN_REPOS_HIGH_GIB` (default `14`) — usage above this triggers a prune pass.
 - `ODONIAN_REPOS_LOW_GIB` (default `8`) — prune deletes clones until usage is at or below this.
 
-Defaults are sized for the current 20Gi emptyDir (being raised to 30Gi separately as breathing
-room, not as a substitute for this bound), leaving headroom for worktrees and tool caches, which
+Defaults were sized for the reference 20Gi emptyDir, leaving headroom for worktrees and tool caches, which
 also live under `$ODONIAN_HOME` but are not touched by this prune — only `$ODONIAN_HOME/repos`
 is in scope.
 
 ### Research pacing and launcher rollout
 
 Research workers and reviewers request admission before launching a model: `harness/agent.sh` runs
-`odonian claim` for the chosen research task, starts `claude` only if the server admits it (passing
+`odonian claim` for the chosen research task, starts the configured model CLI only if the server admits it (passing
 `ODONIAN_PRECLAIMED_TASK_ID` and `ODONIAN_PRECLAIMED_ATTEMPT_ID`), renews the permit while the process
 lives, and finalizes it on exit. A denied task stays `ready` and the launcher moves on and retries on its
 own. Build, design and merge slots are unaffected.
@@ -208,14 +213,13 @@ and text extraction, used by research workflows that inspect source PDFs.
 To render or inspect a PDF file within a worker/reviewer pod:
 
 1. **Get PDF metadata:** `pdfinfo /path/to/file.pdf` — lists page count, dimensions, encryption
-   status, and other document properties. Redacted PDFs report `text "cannot" be extracted`.
+   status, and other document properties. Metadata alone does not establish redaction.
 2. **Render a page to image:** `pdftoppm -png -singlefile -f 2 -l 2 /path/to/file.pdf /tmp/page` —
    renders page 2 of the PDF to a PNG image at `/tmp/page.png`. Use `-f` and `-l` to specify the
    page range; `-png` sets the output format.
 3. **Extract text from a page:** `pdftotext -f 2 -l 2 /path/to/file.pdf -` — extracts text from
-   pages 2 through 2, writing to stdout. If the PDF is redacted or malformed, extraction may fail
-   silently (producing empty output), which is NOT treated as proof of redaction without visual
-   verification.
+   page 2, writing to stdout. Scanned pages, extraction restrictions or malformed content can
+   produce empty output. Inspect the rendered page; empty text is not proof of redaction.
 
 **Performance note:** Large PDFs or full-document operations (extracting all pages) can be
 memory-intensive. Extract specific page ranges when possible. Rendering outputs (images and
@@ -236,7 +240,7 @@ rsvg-convert /path/to/file.svg -o /tmp/output.png
 ```
 
 Optional flags:
-- `-w <width>` and `-h <height>` — specify output dimensions in pixels; aspect ratio is preserved
+- `-w <width>` and `-h <height>` — specify output dimensions in pixels; consult `rsvg-convert --help` for aspect-ratio controls
 - `-f png` (default) or `-f pdf` — output format
 - `--background-color rgb(255,255,255)` — set background color (default: transparent)
 

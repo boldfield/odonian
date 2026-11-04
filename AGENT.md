@@ -1,5 +1,8 @@
 # Execution agent runbook
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Historical bootstrap runbook.**
+> The file-backed board loop below predates the running Odonian service; do not use it to operate the current queue. Use [AGENT-API.md](AGENT-API.md) for agent workflow and [the documentation index](docs/README.md) for current guides.
+
 You are an execution agent draining the bootstrap board in `board/`. Work **one task at a
 time**, end to end, following this loop exactly. Do not skip steps.
 

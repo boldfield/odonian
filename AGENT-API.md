@@ -40,9 +40,10 @@ Work **one task at a time**, end to end. Don't start a second task until the cur
 curl -s "${A[@]}" "$ODONIAN_URL/projects/$PROJECT_ID/tasks?model=$AGENT_MODEL&claimable=true" | jq -r '.[].id'
 ```
 
-`claimable=true` returns only tasks that are `ready`, have all dependencies `done`, and carry no
-live lease; `model=$AGENT_MODEL` further restricts to your tier. Implementers can add `&kind=implement`
-to filter for implement-only tasks; reviewers can add `&kind=review` for review-only tasks. Pick one id.
+`claimable=true` returns unarchived tasks that are `ready` or `in_progress` with an expired
+lease, are not held, and have all dependencies `done`; `model=$AGENT_MODEL` further restricts to
+your tier. Implementers can add `&kind=implement` to filter for implement-only tasks; reviewers
+can add `&kind=review` for review-only tasks. Pick one id.
 Empty list → nothing to do; stop.
 
 ### 2. Claim it (atomic, model-matched — you must win)
@@ -71,9 +72,13 @@ it derives from for context (`GET /projects/$PROJECT_ID/documents`).
 
 ### 4. Branch and implement
 
-Branch from the remote (`git fetch origin && git checkout -b <slug> origin/main`); never commit to
-`main`. Implement on the branch, scoped to this task, with the tests the acceptance criteria call
-for.
+Work in an isolated worktree with a **detached HEAD**. The remote branch is deterministic:
+`mr/<TASKID8>`, using the first eight characters of the task ID. Fetch first; if
+`origin/mr/<TASKID8>` exists, continue it with `git checkout --detach origin/mr/<TASKID8>`.
+Otherwise start with `git checkout --detach origin/main`. Never check out `main` or a named
+worker branch shared with another worktree. Implement only this task's scope and its required tests.
+The bundled [build prompt](harness/prompts/pull_request/build/implement.md) is the complete
+pull-request execution contract; local-commit delivery uses a different worktree/landing flow.
 
 ### 5. Heartbeat on long work
 
@@ -84,13 +89,18 @@ task:
 curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/heartbeat" -d "{\"agent_id\":\"$AGENT_ID\"}" | jq -r .lease_expires_at
 ```
 
-Only the current assignee may heartbeat, only while `in_progress`.
+Only the current assignee may heartbeat, only while `in_progress`. The bundled harness renews
+build/design/review task leases in a background monitor while the worker owns them. For admitted
+research dispatches it also renews the attempt permit until the worker exits, including after
+submission. Custom API workers must implement their own renewal and research finalization.
 
 If you claimed but cannot do the work (for example the model account hit a limit), hand the claim back
 instead of letting the lease run out: `odonian unclaim "$TASK_ID" --reason "<why>"`
-(`POST /tasks/$TASK_ID/unclaim` with `agent_id`, `attempt_id` for research, and `reason`). Only the owner
+(`POST /tasks/$TASK_ID/unclaim` with `agent_id`, `attempt_id` when a research permit exists, and `reason`). Only the owner
 may; the task returns to `ready` with nothing counted against it. A task with a submitted round or open PR
-answers 409. Review and merge tasks can be handed back too; a research task requires its live `attempt_id`.
+answers 409. Review and merge tasks can be handed back too. Research requires the current
+`attempt_id` when a permit exists for the agent; disabled or unmapped-observe claims without a
+permit have no attempt ID to send.
 
 ### 6. Sync with main, then verify
 
@@ -101,33 +111,41 @@ git fetch origin && git merge origin/main --no-edit   # resolve any conflicts, k
 make check && make test                               # on the merged result; don't submit with failures
 ```
 
-### 7. Open a PR
+### 7. Find or create the task's PR
+
+Push the detached HEAD to the deterministic branch:
 
 ```bash
-git push -u origin <slug>
-gh pr create --fill --base main
+git push origin HEAD:mr/<TASKID8>
+gh pr list --head mr/<TASKID8> --state open --json url
 ```
 
+Reuse the existing open PR URL. Only if none exists, run
+`gh pr create --head mr/<TASKID8> --base main --fill` and use the URL it prints.
+Verify it with `gh pr view "$PR_URL" --json number,state`; it must resolve and be `OPEN`.
 The PR body should list which acceptance criteria are met and how you verified them.
+On rework, address the recorded review findings and outstanding PR feedback before submitting.
 
 ### 8. Submit (moves the task to `review` and spawns review tasks)
 
 For an **implement** task, submit with the PR/commit links and **no verdict**:
 
 ```bash
-PR_URL=$(gh pr view --json url -q .url); SHA=$(git rev-parse HEAD)
+# PR_URL is the verified open URL from step 7.
+SHA=$(git rev-parse HEAD)
 curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/submit" -d "$(jq -n \
-  --arg a "$AGENT_ID" --arg pr "$PR_URL" --arg sha "$SHA" \
-  '{agent_id:$a, result:"see PR", links:[{kind:"pr",value:$pr},{kind:"commit",value:$sha}]}')"
+  --arg a "$AGENT_ID" --arg pr "$PR_URL" --arg sha "$SHA" --arg branch "mr/${TASK_ID:0:8}" \
+  '{agent_id:$a, result:"see PR", links:[{kind:"pr",value:$pr},{kind:"branch",value:$branch},{kind:"commit",value:$sha}]}')"
 ```
 
 Submit clears your lease, moves the task to `review`, and **auto-spawns one `review`-kind task per
 entry in `review_models`** (default `["opus"]`), each `ready` and pinned to that reviewer's model.
 Only the assignee may submit, only from `in_progress`. Valid link kinds: `pr`, `branch`, `commit`,
 `ci`, `no_op`. On rework (a rejected task bounced back to `ready`), continue the **existing** PR — don't open
-a new one — and omit links you already attached. **Exception: if the recorded PR is already MERGED,
-take the no-op path instead (see below).** If the PR is CLOSED unmerged, do not resubmit; the task
-must be blocked or transitioned by the operator.
+a new one. Resend its verified PR and branch links on every non-no-op submission; the server
+deduplicates them. **Exception: if the recorded PR is already MERGED, take the no-op path instead
+(see below).** If the PR is CLOSED unmerged, do not resubmit; the task must be blocked or
+transitioned by the operator.
 
 ### No-op submissions (acceptance already satisfied or PR already merged)
 
@@ -141,10 +159,11 @@ curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/submit" -d "$(jq -n \
   '{agent_id:$a, result:"acceptance already satisfied on main at <commit>", links:[{kind:"no_op",value:"<commit>"}]}')"
 ```
 
-A `no_op` link with no `pr` link signals that the task requires no merge and reviewers should verify
-the no-op claim. Once **all** reviewers approve, the task goes straight to `done` (regardless of
-`agent_merge`), with no merge task spawned. `agent_merge` remains immutable; it's the absence of a
-`pr` link that triggers the no-op path.
+A `no_op` link in the current submitted round with no active `pr` link anywhere on the task
+signals that the task requires no merge and reviewers should verify the no-op claim. Once the
+round passes review, the task goes straight to `done` (regardless of `agent_merge`), with no
+merge task spawned. A held parent waits for release before applying that result. An old no-op marker
+from a rejected round does not qualify a later round, and omitting a new PR link does not remove a previously attached active PR.
 
 ### 9. Stop
 
@@ -184,9 +203,11 @@ curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$REVIEW_TASK_ID/submit" -d "$(jq -
   --arg a "$AGENT_ID" '{agent_id:$a, result:"<findings>", verdict:"approve"}')"   # or "reject"
 ```
 
-The server records the verdict on the parent and drives it: **reject → parent back to `ready`**
-(rework); **approve →** once *all* of this round's reviewers approve (wait-for-all), the parent
-moves to `approved`. A fresh review round spawns each time the parent re-enters `review`.
+The server waits for all reviewers in the current round. For build/design, any rejection returns
+the parent to `ready`, escalates it, or blocks it under the circuit breaker; unanimous approval
+moves it to `approved` (or directly to `done` for a verified current-round no-op). A held parent
+waits for release before aggregation. Research uses structured blocking findings instead of the
+verdict string alone. A fresh review round spawns each time the parent re-enters `review`.
 
 ## The `approved` state and the merge gate
 
@@ -213,14 +234,16 @@ transitions. `approved → done` / `approved → ready` are the merge gate.
 - **Parent is a verified no-op (a `no_op` link, no `pr` link):** the server drives the parent
   straight to `done` in the aggregation — no merge task, nothing to merge.
 
-When `agent_merge` is `false`, the parent waits in `approved` for the **human** merge gate. In no
-case does a reviewer run `gh pr merge` or transition the parent.
+When `agent_merge` is `false`, work requiring a merge waits in `approved` for the **human** merge
+gate. Verified current-round no-ops with no active PR finalize directly regardless of this flag.
+In no case does a reviewer run `gh pr merge` or transition the parent.
 
 ## Research continuation manifests (opt-in)
 
 A research-track parent can propose follow-on work as a **continuation manifest**. Reviewers
-examine the exact proposal together with the parent's PR, and the children exist only after the
-parent's verified human merge — nobody transcribes or promotes tickets by hand.
+examine the exact proposal together with the parent's PR. In this human-gated workflow, merge
+the PR before recording `approved → done`, which creates the children. The board transition
+does not itself verify the forge merge; direct no-op completion does not create children.
 
 ### Opt-in contract
 
@@ -239,18 +262,22 @@ parent's verified human merge — nobody transcribes or promotes tickets by hand
    it with its SHA-256 digest for the review round the submission starts. A refused manifest
    (`400`) changes nothing: the task stays `in_progress`, no review round starts, and no manifest
    is stored. The worker fixes the manifest and submits again.
-2. **Review.** Two independent reviewers (opus and sonnet by default) examine the manifest in
+2. **Review.** The parent's configured `review_models` (default `["opus"]`) examine the manifest in
    `GET /tasks/{id}` → `submission_manifests` / `continuation.proposed_children` (each child
    `pending`). Each reviewer must judge the proposed split — claims covered, source-only scope,
-   non-overlapping file scopes, dependencies — and **reject with a finding** if it is wrong.
+   non-overlapping file scopes, dependencies — and raise a **blocking finding** if the proposal
+   must not pass. A `reject` verdict alone does not fail a research round.
    Nothing is created while the parent is `review` or `approved`.
-3. **Approve.** When both approve, the parent moves to `approved`. Still nothing exists.
+3. **Approve.** Once all configured reviews finish and no blocking findings or pending
+   adjudication remain, the PR-backed parent moves to `approved` (a held parent waits for
+   release). Still no continuation children exist.
 4. **Merge.** When the human merges and transitions the parent `approved → done`, the server, in
    the same transaction, loads the manifest of the approved round, re-validates it, checks its
-   digest, and creates one task per child. The merge fails as a whole if any step fails.
+   digest, and creates one task per child. If any step fails, the board completion and child
+   creation transaction rolls back; this does not undo a forge merge already performed.
 5. **Work.** Research children start `ready`; generated build and design children start
-   `backlog` and must be promoted explicitly. A child is claimable only when it is `ready`, not
-   held, and every dependency (including a `parent` or sibling `child` dependency) is `done`; the
+   `backlog` and must be promoted explicitly. A child is claimable when it is `ready` or
+   `in_progress` with an expired lease, is not held, and every dependency (including a `parent` or sibling `child` dependency) is `done`; the
    `claimable`, `dependency_status` and `blocked_by` fields of `continuation.created_children`
    report this. The `GET /projects/{id}/tasks?claimable=true&model=<model>` list shows eligible
    research children with no manual promotion.
@@ -282,12 +309,14 @@ distinct `review_models`; the full rules and error codes are in `docs/features/r
 
 ### Review duties
 
-Both reviewers verify the **exact** manifest in the parent's current round, not a summary of it:
+All configured parent reviewers verify the **exact** manifest in the parent's current round, not a summary of it:
 that every claim is assigned, carried forward or excluded; that children are source-only and
 independent; that no two children write the same file; that dependencies are right; and that the
-digest shown for the round is the one they reviewed. A reviewer who finds a problem rejects the
-parent with a finding. The parent goes back to `ready`, and the next submission starts a new
-round with its own manifest.
+digest shown for the round is the one they reviewed. A problem that must prevent acceptance
+requires a blocking finding. After the round completes, blocking findings cause rework,
+escalation or a budget/circuit-breaker block; held parents wait for release. A rework submission
+starts a new round with its own manifest. Exactly two distinct reviewers are required on each
+manifest child; that envelope does not set the parent's reviewer count.
 
 ### Rejected and invalid manifests: how to recover
 
@@ -333,7 +362,10 @@ digest and therefore creates a separate set.
 
 ## Research admission CLI commands
 
-Research tasks are admitted against a research pacing policy that manages consumption automatically.
+Research pacing is disabled by default. In `enforce`, admission gates research starts against
+account pools. Mapped `observe` claims create attempts and record hypothetical denials without
+refusing work; they debit allowance when the policy would admit the start. Disabled and
+unmapped-observe claims create no permit or debit.
 Operators: the rollout runbook, calibration queries and smoke test are in
 [`docs/runbooks/research-pacing-rollout.md`](docs/runbooks/research-pacing-rollout.md).
 The following CLI commands expose research admission operations and status.
@@ -427,8 +459,9 @@ Research prompts (`harness/prompts/pull_request/research/implement.md` and
   without proceeding. Only `ODONIAN_PRECLAIMED_TASK_ID` may be worked; the prompts never select
   another task. This applies to regular research reviews and to adjudication tasks alike.
 - `ODONIAN_PRECLAIMED_ATTEMPT_ID` carries the admitted permit attempt identity (the `attempt_id`
-  from the claim's `research_admission` output). The harness must export it alongside the task ID;
-  the prompts pass it as `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on every `odonian heartbeat`
+  from the claim's `research_admission` output), when one exists. The harness exports it only
+  when non-empty; disabled and unmapped-observe claims have no attempt ID. When set, the prompts
+  pass it as `--attempt "$ODONIAN_PRECLAIMED_ATTEMPT_ID"` on every `odonian heartbeat`
   and `odonian submit` so the work is fenced to that attempt (no claim ran in the worker process,
   so no attempt file was saved for it).
 - When `ODONIAN_PRECLAIMED_TASK_ID` is not set, the prompts run the ordinary `odonian next` +
@@ -438,15 +471,17 @@ Research prompts (`harness/prompts/pull_request/research/implement.md` and
 - Preserve all source checks, findings, adjudication, manifestation and submission requirements
   from the regular prompt flow.
 
-This support allows the harness to pre-admit research tasks against the pacing policy (atomically
-claiming and debiting a start in one call), then supply the admitted task ID to the worker/reviewer
-process so no additional claims or discovery calls are needed.
+The harness claims research tasks before dispatch and supplies the task ID so the worker needs
+no additional claim or discovery call. Enforced admission creates a permit and debits a start in
+the claim transaction. Mapped observe creates an attempt and debits only when the policy would
+admit; disabled and unmapped-observe claims are ordinary claims without a permit or debit.
 
 ## Evaluation campaign CLI commands
 
-Evaluation campaigns compare candidate reviewer versions on frozen samples. They are isolated from
-the board: these commands never read or write a task, review, verdict or PR link, and a finalized
-evaluation attempt **cannot vote on a research task**. Nothing is created automatically, every cap is
+Evaluation campaigns compare candidate reviewer versions on frozen samples. Cohort tooling and
+reports read production tasks, review events and links for samples and baseline findings. Evaluation
+writes only its own records: it never changes production tasks, review verdicts or PR links, and a
+finalized evaluation attempt **cannot vote on a research task**. Nothing is created automatically, every cap is
 a finite integer you pass, and there is no unlimited default. See `docs/api.md` ("Evaluation
 Campaigns") for the HTTP interface each command wraps.
 
@@ -576,8 +611,10 @@ transient admission deferral (which may succeed on retry) from fatal conflicts:
   "model": "haiku", "review_models": ["opus"], "agent_merge": false }
 ```
 
-- `model` (required) and each `review_models` entry must be in the deployment allowlist
-  (`ODONIAN_MODELS`) — else `400 UNKNOWN_MODEL`. `review_models` defaults to `["opus"]`.
+- `model` is optional at creation: omitted/empty uses `haiku` if allowlisted, otherwise the first
+  allowlisted model; research uses `ODONIAN_RESEARCH_DEFAULT_MODEL` when configured. Explicit
+  models and each `review_models` entry must be in `ODONIAN_MODELS`, else `400 UNKNOWN_MODEL`.
+  `review_models` defaults to `["opus"]`. A claim still requires an explicit matching `model`.
 - `agent_merge` defaults to `false` and is immutable.
 - Review tasks are auto-spawned only — never create them directly.
 
@@ -736,15 +773,14 @@ Both priority endpoints:
 
 ## State machine
 
+```text
+backlog ─promote→ ready ─claim→ in_progress ─submit→ review ─passes review→ approved ─merge gate→ done
 ```
-backlog ─promote→ ready ─claim→ in_progress ─submit→ review ─(all reviewers approve)→ approved ─merge→ done
-                  ▲ ▲                              │                                       │
-                  │ └────── lease expiry ──────────┘            reject ─→ ready    human/agent_merge gate
-                  │
-                  └─ blocked ─→ ready (unblock / retry; clears stale assignee/lease)
-                        │
-                        └─→ failed (retire without retry; dead-end blocker)
-                  
-blocked / failed are off-ramps from any active state. blocked is recoverable via → ready; done/failed are terminal.
-blocked → failed retires a dead-end blocked task cleanly without re-entering the queue.
-```
+
+Lease expiry makes `in_progress` work reclaimable without changing its state to `ready`.
+Review aggregation waits for all reviewers, then approves or sends the parent to rework,
+escalation, or `blocked`; held parents wait for release. A verified current-round no-op with
+no active PR goes directly from `review` to `done`, regardless of `agent_merge`.
+`blocked` → `ready` clears stale ownership but preserves round history. `blocked` → `failed`
+retires a task without retry. Terminal states cannot be reopened through `/transition`.
+See the [API state machine](docs/api.md#state-machine) for the full contract.

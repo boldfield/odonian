@@ -1,5 +1,8 @@
 # Feature: research track
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented in source; historical design.**
+> Research findings, adjudication, follow-ups, round budgets and scorecards are present in the [store](../../internal/store/store.go), [scorecards](../../internal/store/scorecard.go) and [research prompts](../../harness/prompts/pull_request/research/). Original owner-review questions and incident measurements remain below as design history. Use the [research guide](../research.md) for current behavior; source presence does not establish deployment configuration.
+
 Status: ready for owner review · September 25, 2026. Open questions have recommended defaults, marked below; the owner can override any of them before the milestone they affect.
 
 ## What this is

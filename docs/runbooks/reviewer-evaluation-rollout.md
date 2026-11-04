@@ -1,5 +1,7 @@
 # Reviewer evaluation: rollout, operation and reading the report
 
+> Source-checked 2026-11-03 against `b3da896` (v0.24.0). Evaluation libraries and the Muse adapter exist; no live campaign or deployment launcher was verified for this refresh. See the [research guide](../research.md) and [runner](../../internal/evalrun/runner.go).
+
 This is the operator procedure for a comparison campaign: checking the subscription route, choosing
 finite caps, running **one** evaluation process at a time, stopping cleanly, and turning the results
 into a report with evidence-backed labels. It sets no production values: every number below is a
@@ -11,8 +13,7 @@ The campaign interface is `odonian evaluation-*` (see `AGENT-API.md`, "Evaluatio
 commands", and `docs/api.md`, "Evaluation Campaigns"). The part that actually runs candidates is a
 host program built on `internal/evalrun` (`evalrun.New(cfg).RunCampaign(ctx, campaignID)`) with a
 registry of trusted runtimes. This repository ships the library, the Muse Code adapter
-(`cmd/muse-adapter`) and no separate launcher for it: the deployment's own process (kept in the
-separate manifests project) is the "evaluation process" below.
+(`cmd/muse-adapter`) and no separate launcher for it. Supply a deployment-specific host process; its existence and configuration in the separate manifests project are not established by this checkout. That host is the "evaluation process" below.
 
 ## 1. Check the billing route first (no model call)
 
@@ -64,8 +65,7 @@ again, so do not loop it: the caps are the only thing that bounds a second pass,
 already completed would be run a second time. Run one pass, read the report, and decide.
 
 - Do not start a second process against the same campaign (or the same pool) until the first has
-  exited. The store's fencing keeps results correct if you do, but two processes defeat the pacing you
-  chose.
+  exited. Shared pool admission and campaign/candidate caps remain atomically enforced if two processes run, but their independent passes can repeat or interleave sample/candidate work and consume the finite caps faster than the intended single pass. One process keeps the operational sequence and comparison coverage predictable.
 - Start it with the process's logs visible, and check progress with
   `odonian evaluation-get-campaign-status --id <campaign>`: `state`, `attempts_remaining` and each
   candidate's `attempts_remaining`, `active_attempts` and `pool`.

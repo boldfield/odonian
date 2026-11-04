@@ -11,21 +11,27 @@ the process that reads them. Defaults are what the code does when the variable i
 | `ODONIAN_DB` | `odonian.db` | SQLite database path, created on first run. Opened with `journal_mode=WAL`, `foreign_keys=ON`, and `busy_timeout=5000`. |
 | `ODONIAN_ADDR` | `:8080` | Listen address. |
 | `ODONIAN_MODELS` | `haiku,sonnet,opus` | Allowlist of model names that may be pinned to a task or named as a reviewer. |
-| `ODONIAN_RESEARCH_DEFAULT_MODEL` | unset | Default model for research tasks created without an explicit model. Must be in `ODONIAN_MODELS` if set. Recommended: `claude-opus-5-5`. When unset, research tasks without an explicit model use the default fallback (prefers `haiku`). |
-| `ODONIAN_ESCALATION_LADDER` | same as `ODONIAN_MODELS` | Ordered tiers for the review circuit breaker's escalation path. Every entry must be in `ODONIAN_MODELS`. A model can be a valid reviewer without being on the ladder; `gpt-6.1-sol` via Codex is the current active example, with `gpt-5.5` retained for backwards compatibility. |
+| `ODONIAN_RESEARCH_DEFAULT_MODEL` | unset | Default model for research tasks created without an explicit model. Must be in `ODONIAN_MODELS` if set, or the server refuses to start. When unset, research tasks without an explicit model use the default fallback (prefers `haiku`). Example only: a deployment whose allowlist contains `claude-opus-5-5` could set `ODONIAN_RESEARCH_DEFAULT_MODEL=claude-opus-5-5`; that is a scoped example, not a statement about any active deployment. |
+| `ODONIAN_ESCALATION_LADDER` | unset → copy of `ODONIAN_MODELS` | Ordered tiers for the review circuit breaker's escalation path. **When unset, the ladder is a copy of the whole `ODONIAN_MODELS` allowlist, in allowlist order** — every allowed model becomes an escalation tier. So a reviewer-only model that must never receive escalated work is *not* excluded by leaving this unset: set an explicit ladder that omits it. Every entry must be in `ODONIAN_MODELS`, or the server refuses to start. A model can be a valid reviewer without being on the ladder. Scoped example: with `ODONIAN_MODELS=haiku,sonnet,opus,gpt-6.1-sol`, set `ODONIAN_ESCALATION_LADDER=haiku,sonnet,opus` to keep the Codex-routed model review-only. |
 | `ODONIAN_ESCALATION_THRESHOLDS` | `haiku=8,sonnet=6,opus=4` | Per-model review-round threshold for build and design tasks. A rejection that pushes a task past its threshold trips the circuit breaker. A malformed value logs a warning and falls back to the defaults. |
 | `ODONIAN_RESEARCH_ESCALATION_LADDER` | unset | Ordered tiers for the review circuit breaker's escalation path for research tasks. Empty or unset means research tasks never change tier on rejection. Every entry must be in `ODONIAN_MODELS`. A configured research ladder operates independently of the build/design ladder. |
 | `ODONIAN_RESEARCH_ESCALATION_THRESHOLDS` | unset (treated as empty map) | Per-model review-round threshold for research tasks. Only applies if `ODONIAN_RESEARCH_ESCALATION_LADDER` is configured. When a research task's model is not on the research ladder, falls back to `ODONIAN_MAX_REVIEW_ROUNDS`. Build and design tasks use `ODONIAN_ESCALATION_THRESHOLDS` exclusively. |
 | `ODONIAN_RESEARCH_ROUND_BUDGET` | `6` | Chain-wide rejected-review-round budget for research tasks (docs/features/research-track.md section 6). Counts rejected rounds across a research task's entire supersede chain — automatic escalation and manual `SupersedeTask` both count, and neither resets it. When the chain-wide count reaches the budget, the task is blocked with reason `decompose` instead of continuing or escalating, whatever its tier. The budget always takes precedence over research escalation: a rejection that would otherwise trip the per-tier circuit breaker blocks instead of escalating if it also reaches the budget. Must be a positive integer; the server refuses to start otherwise. Never applies to build or design tasks. |
 | `ODONIAN_RESEARCH_ADJUDICATOR` | unset | Model assigned to finding-scoped adjudication review tasks when a reviewer maintains a worker-disputed research finding (docs/features/research-track.md section 5). Must be in `ODONIAN_MODELS`, or the server refuses to start. Must differ from both of the research task's review_models, checked per task at aggregation time by exact model-name string comparison (e.g., `opus` and `claude-opus-5-5` are not detected as the same). When unset or equal to one of the task's reviewers, a maintained dispute stays blocking with a `research_adjudication_unavailable` event explaining why. The ruling binds only the disputed finding and never votes on the round. |
 | `ODONIAN_MAX_REVIEW_ROUNDS` | `5` | Threshold fallback for models with no entry in their respective escalation thresholds. |
-| `ODONIAN_LEASE_TTL` | `5m` | Lease granted on claim and extended by each heartbeat. A task whose lease has lapsed is claimable again, so a session that outlives its lease loses the task to another worker. Kept generous in production because renewal is agent-driven. |
+| `ODONIAN_LEASE_TTL` | `5m` | Lease granted on claim and extended by each heartbeat. A task whose lease has lapsed is claimable again, so a session that outlives its lease loses the task to another worker. The fleet harness renews leases automatically for its own dispatches (see `ODONIAN_RENEW_INTERVAL_SECS`); agents claiming outside the harness must heartbeat themselves. This page records the code default only; it is not a recommendation to change any production TTL. |
 | `ODONIAN_EVENT_TERMINAL_RETENTION_DAYS` | `1` | At startup, audit events for tasks in terminal states older than this are pruned. Events for live tasks are never pruned. Research-track task events are kept indefinitely because the reviewer scorecard is computed from them. |
 | `ODONIAN_PPROF` | unset | Enable Go runtime profiling on `/debug/pprof/` when set to exactly `true`. All pprof endpoints require the same bearer-token auth as every other protected route. When unset or any other value, `/debug/pprof/` returns 404. See [Runtime profiling with pprof](#runtime-profiling-with-pprof). |
 | `ODONIAN_SLOW_REQUEST_MS` | `500` | Per-request latency logging threshold in milliseconds. Requests at or above this threshold log at INFO level; below it log at DEBUG. `/healthz` is never logged. A non-integer or negative value logs one warning at startup and falls back to the default. |
 | `FORGE_TOKENS` | `~/.odonian/forge-tokens` | Path to the per-owner GitHub token file used by PR-watch, supersession PR cleanup, and `odonian merge`. See [Forge tokens](#forge-tokens). |
 | `ODONIAN_RESEARCH_POLICY_MODE` | `disabled` | Research admission policy mode: `disabled`, `observe` or `enforce`. Validated at startup; an invalid value or pool configuration stops the server. Read once at start, so changing it means a server restart (pool allowance and active attempts persist across it). Under `enforce`, research claims (`odonian claim`, `next --claim`) are gated by the pool and a denied task stays `ready`; `observe` admits everything and records what `enforce` would have decided; `disabled` writes nothing. Roll out with [the rollout runbook](runbooks/research-pacing-rollout.md). See [Research pacing pools](#research-pacing-pools). |
 | `ODONIAN_RESEARCH_POOLS` | unset | JSON object mapping pool names to account pools for research LLM work; ignored when the mode is `disabled`. See [Research pacing pools](#research-pacing-pools). |
+
+One server default is not an environment variable: a task created with an empty `review_models`
+is reviewed by the literal default `["opus"]` (`defaultReviewModels` in `internal/store`). The
+stored list stays empty; the default is applied when review tasks are spawned and when later
+decisions (such as the research adjudicator-conflict check) ask who reviewed a round. There is
+no variable to change it — set `review_models` explicitly on the task to use other reviewers.
 
 ### Research tasks and escalation
 
@@ -71,7 +77,10 @@ rollback, is in [`docs/runbooks/research-pacing-rollout.md`](runbooks/research-p
 
 - `disabled` (default): everything is admitted and nothing is tracked. `ODONIAN_RESEARCH_POOLS` is ignored.
 - `observe`: everything is admitted; each decision also reports what `enforce` would have decided, so
-  hypothetical denials can be counted. Observe does not limit spending.
+  hypothetical denials can be counted. Observe does not limit spending — but for a model mapped to a
+  pool it still creates the durable permit/attempt (debiting a start when the hypothetical decision is
+  admit), so attempt fencing and permit finalization behave as under `enforce`. Only an unmapped model
+  under `observe` claims with no permit/attempt.
 - `enforce`: decisions are applied to every research claim. Every model in `ODONIAN_MODELS` must be mapped
   to a pool, otherwise startup fails. Launchers older than research admission start the model before it
   claims, so drain them before enforcing; see the runbook.
@@ -261,7 +270,7 @@ PR-watch skips an owner when its token is missing, even for public repositories.
 `no forge token for owner` when the skipped count first appears or changes, and logs when the
 owner is no longer skipped. Add the matching token to the server's file to enable checks;
 the file is read again on later passes. An empty file disables PR-watch's checks, including its
-stale-PR cleanup. Cleanup triggered by `/supersede` also skips GitHub requests when the matching
+stale-PR cleanup. Cleanup triggered by `POST /tasks/{id}/supersede` also skips GitHub requests when the matching
 token is missing or empty, logging the owner and PR once for that cleanup attempt. The board
 supersession still commits successfully.
 
@@ -283,6 +292,27 @@ missing owner entry results in an unauthenticated merge request, which cannot me
 | `ODONIAN_DELIVERY_MODE` | `pull_request` | `pull_request` (branch + PR on a forge) or `local_commit` (the CLI commits into a local repo; no forge). |
 | `ODONIAN_HOME` | `~/.odonian` | Root for harness state: agent ids, worktrees, repo clones, `env`, `forge-tokens`. |
 | `ODONIAN_WORKTREE_HOME` | `$ODONIAN_HOME` in the CLI | Per-task worktree root in `local_commit` mode. The CLI requires one of these variables; the worker harness requires `ODONIAN_WORKTREE_HOME` explicitly. Use persistent storage for work that must survive a reboot. The sandbox demo deliberately uses `/tmp/odonian/worktrees`. |
+| `ODONIAN_STATE_DIR` | user cache dir / temp dir | Root for the CLI's per-session attempt files (`<dir>/attempts/`): a research `claim` saves the attempt id there so the separate `heartbeat`/`submit`/`unclaim` processes can fence themselves to it. Unset, the CLI uses `<user-cache>/odonian/attempts`, falling back to `<temp>/odonian-attempts`. Mostly a test/isolation knob; fleet pods share nothing through it. |
+| `ODONIAN_GATE_ENV` | unset | `local_commit` merge gate only: comma-separated names of *additional* environment variables to pass through to the gate's `make check`/`make test`. The gate otherwise runs with a scrubbed allowlist (basics plus Go/Rust/Python/Node/Java toolchain variables; no tokens or credentials). Name only what the repository's `make` needs — anything named here is visible to agent-written code. |
+| `SANDBOX_NAME` | unset | Set by the sandbox runtime (`sbx`), not by the operator. Its presence is how `odonian approve` knows the local-commit gate may run agent-written code here; outside a sandbox the gate refuses unless `--allow-host-gate` is passed. |
+
+The CLI also reads session/attempt identifiers that other processes inject — `ODONIAN_SESSION_ID`,
+`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, and the harness pin/preclaim variables. Those are
+not operator tunables; see [Internal injected variables](#internal-injected-variables-not-operator-tunables).
+
+## TUI (`odonian-tui`)
+
+The TUI resolves configuration with precedence **flags > environment > config file > defaults**.
+The file is TOML at `$XDG_CONFIG_HOME/odonian/config.toml` (default `~/.config/odonian/config.toml`);
+a missing file is fine.
+
+| Setting | Env | File key | Flag | Default | Meaning |
+|---|---|---|---|---|---|
+| Server URL | `ODONIAN_URL` | `url` | `--url` | required | Base URL of the server. |
+| Token | `ODONIAN_TOKEN` | `token` | `--token` | required | Bearer token. A token read from a group/world-readable file draws a warning. |
+| Actor | `ODONIAN_ACTOR` | `actor` | `--actor` | OS username | Identity recorded for operator actions taken from the TUI. |
+| Default project | — | `default_project` | — | unset | File-only; no env or flag equivalent. |
+| Poll interval | — | `poll_interval` | — | `2s` | File-only Go duration string; an unparseable value warns and keeps `2s`. |
 
 ## Harness (`harness/agent.sh` and its wrappers)
 
@@ -299,8 +329,21 @@ overridden per invocation.
 | `ODONIAN_REPOS_HIGH_GIB`, `ODONIAN_REPOS_LOW_GIB` | `14`, `8` | Disk watermarks for the on-demand clone cache in `all` mode: when usage crosses the high mark, clones are evicted until it is under the low mark. |
 | `AGENT_SLOT` | wrapper default | Slot name (`worker-1`, `reviewer-2`, …). Each slot gets a persistent agent id and its own worktree. |
 | `AGENT_CLAUDE_FLAGS` | empty | Extra flags appended to every `claude -p` dispatch. `sbx.sh` uses it to pass the flag a nested `claude` needs inside a sandbox. |
-| `AGENT_CODEX_MODELS` | unset | Comma-separated models to dispatch through `codex exec` instead of `claude -p`, e.g. `gpt-6.1-sol` or `gpt-5.5` (for backwards compatibility). Review-only in practice. |
+| `AGENT_CODEX_MODELS` | unset | Comma-separated models to dispatch through `codex exec` instead of `claude -p`. Routing only: removing a model reroutes its tasks to `claude -p`, it does not make them unclaimable. Scoped example: `AGENT_CODEX_MODELS=gpt-6.1-sol` in a deployment whose allowlist contains that model. |
 | `AGENT_CODEX_FLAGS` | unset | Extra flags for `codex exec`, on top of the hardcoded `-c model_reasoning_effort=high`. |
+| `ODONIAN_ACCOUNT_MAX_WINDOW` | `604800` (7 days) | Cap, in seconds, on any single account/model backoff window. |
+| `ODONIAN_ACCOUNT_RESET_MARGIN` | `60` | Seconds added after a reset time stated by the provider CLI before the account is probed again. |
+| `ODONIAN_ACCOUNT_SIGNIN_WINDOW` | `600` (10 minutes) | How long a sign-in failure holds the whole provider account before one probe dispatch. |
+| `ODONIAN_MODEL_UNAVAILABLE_WINDOW` | `1800` (30 minutes) | How long a `model_unavailable` failure holds that one model before one probe dispatch. Unclassified failures instead keep escalating 30s-step backoff capped at 300s, per model (not tunable). |
+| `ODONIAN_ADMISSION_TRIES` | `3` | Research preclaim: attempts of an admission claim that ends without a definite answer before it is recorded as ambiguous. |
+| `ODONIAN_ADMISSION_RETRY_NAP` | `2` | Seconds slept between those admission retries. |
+| `ODONIAN_AMBIGUOUS_RETRY_SECS` | `30` | Seconds an ambiguous admission is locally deferred before its remembered request id is replayed. Server deferral hints (`retry-after`/`not-before`) are clamped to 1–900s in code (not tunable). |
+| `ODONIAN_RENEW_POLL_SECS` | `1` | Lease/permit monitors' wake interval while watching the model process. Fractional values are accepted as given to `sleep`. |
+| `ODONIAN_RENEW_INTERVAL_SECS` | `20` | Lease (and research permit) renewal period for both harness monitors. Must stay well under `ODONIAN_LEASE_TTL`; nothing validates that for you. |
+| `ODONIAN_FENCE_GRACE_SECS` | `5` | Research monitor only: seconds between TERM and KILL when stopping a process whose ownership was positively lost. |
+| `ODONIAN_SESSION_RECOVERY` | `on` (anything but `off`) | Legacy dispatches only: `off` disables headless session recovery (resume-then-block) entirely. |
+| `ODONIAN_MAX_RESUMES` | `3` | Resumes of a legacy session that ended with its task still owned, before the task is blocked. `0` means zero resumes. A non-numeric value falls back to `3` in code. |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_FABLE_MODEL` | unset in the harness | Model pins. Primarily consumed by the `claude` CLI to resolve the `haiku`/`sonnet`/`opus`/`fable` aliases to specific model ids. `agent.sh` also reads them so an alias and its pinned id share one backoff key and map to the Anthropic account. With no pin, the alias is its own backoff key. `harness/env.example` and `harness/sbx.sh` show scoped example pins; they are examples, not a record of what any deployment runs. `harness/verify-model-config.sh` checks the first three agree between environment and env file. |
 
 Project selection is evaluated after sourcing `$ODONIAN_HOME/env`. The example file supplies
 the placeholder `<project-uuid-or-all>` when the variable was unset or empty; replace it before
@@ -316,3 +359,20 @@ Codex-routed reviewers authenticate with a `codex-auth` secret seeded from `~/.c
 That credential rotates on every refresh and revokes its predecessor, so a snapshot copied into
 several pods decays. [`deploy/fleet/README.md`](../deploy/fleet/README.md) covers the operational
 consequences and the `make codex-auth` targets.
+
+### Internal injected variables (not operator tunables)
+
+These are set by one Odonian process for another, per dispatch or per session. They are listed so
+an operator reading logs, prompts, or a process environment can recognise them. Do not set them
+in `~/.odonian/env`: the harness unsets and re-exports its own per dispatch and clears them
+afterwards, and a stale value in an interactive shell can pin or fence the wrong task.
+
+| Variable | Set by | Read by | Meaning |
+|---|---|---|---|
+| `ODONIAN_SELECTED_TASK_ID` | harness (legacy + merge) | `odonian next` | Pins `next` to the one task the harness selected under the global comparator. If it was raced away, `next` reports nothing claimable; it never falls back to another task. |
+| `ODONIAN_PRECLAIMED_TASK_ID` | harness (research) | dispatched model session (prompt) | The task the harness already claimed/admitted before launch. The session works exactly this task and never claims again. |
+| `ODONIAN_PRECLAIMED_ATTEMPT_ID` | harness (research) | dispatched model session | The admitted attempt; passed as `--attempt` on every heartbeat/submit to fence the session to it. Empty only when the claim carried no permit: policy `disabled`, or an unmapped model under `observe`. A *mapped* model under `observe` does get a permit and attempt — the claim is granted regardless of the pool decision, but the attempt is created (and a start debited when the hypothetical decision is admit), so fencing, renewal, and finalization all apply exactly as under `enforce`. |
+| `ODONIAN_DISPATCH_ID` | harness | harness reaper | Unique marker stamped on the model process's environment (inherited by descendants) so leftovers can be reaped exactly after the dispatch. Never reaches the harness or its monitors. |
+| `ODONIAN_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`, then `CODEX_SESSION_ID` | operator wrapper or the Claude/Codex harness running the worker | `odonian` CLI | First set value names the worker session that keys the CLI's saved attempt file, so a replacement session reclaiming a task never overwrites the file a stale session reads. With none set, the attempt file is per-task only and cannot tell two sessions apart. An explicit `--attempt` always overrides the file. |
+| `AGENT_ID` | harness (per slot, from `agents/<slot>.id`) | CLI, model session | Agent identity on claim/heartbeat/submit/unclaim. Standalone CLI users set this themselves; inside the fleet it is harness-owned. |
+| `AGENT_MODEL` | harness (task's model, per dispatch) | CLI, model session | Model of the current dispatch; also the fallback for `claim` without `--model`. The harness also exports it as `ODONIAN_MODEL` for the pr-feedback marker, overriding any env-file value for that dispatch. |

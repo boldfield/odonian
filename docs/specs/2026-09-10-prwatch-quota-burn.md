@@ -1,5 +1,8 @@
 # Feature spec — PR-watch must stop re-polling settled pull requests and must leave the fleet GitHub headroom
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented; historical incident and specification.**
+> The [PR watcher](../../internal/prwatch/reconciler.go) now tombstones settled terminal-task PR links and checks a quota floor, with [regression tests](../../internal/prwatch/reconciler_test.go). The measurements below describe the September incident, not current load or remaining quota. See [operations](../operations.md) for current configuration and diagnostics.
+
 **Status:** board milestone (Odonian project). **Date:** 2026-09-10.
 
 ## Problem
