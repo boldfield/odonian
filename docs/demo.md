@@ -11,6 +11,9 @@ This is a real agent run, not a simulation: the worker is `claude -p` with the `
 reviewer is `claude -p` with `opus`. The only thing that is fake is the repository, which the
 script creates for the purpose.
 
+This procedure was checked against source `b3da896` on 2026-11-03; the timings below are historical
+measurements, not a fresh live-model smoke test.
+
 ## What you need
 
 | Requirement | Why |
@@ -82,7 +85,8 @@ What the script does, in order, and what you should see:
    with an actionable message.
 3. Starts `odonian server` on `:8080` with SQLite at `/tmp/odonian/odonian.db` and
    the fixed token `sbx-local-token`, then waits for `/healthz`.
-   The database is created on the first run and reused on later runs.
+   The database is created on the first run and reused on later runs. This fixed credential is
+   for a disposable local sandbox; do not expose the listener to an untrusted network.
 4. Creates a throwaway git repository at `/tmp/odonian/repo` (a `README.md`, a `GREETINGS.md`,
    and a `Makefile` whose `check` and `test` targets pass) with a bare `origin`.
 5. Creates the project `sbx-local`, a `feature_spec` document, and **one task**:
@@ -92,7 +96,8 @@ What the script does, in order, and what you should see:
 6. Configures `claude` for the board by running `harness/sbx-agent-setup.sh`: the repo's skills,
    the board instructions in `~/.claude/CLAUDE.md`, and the `ODONIAN_*` variables in
    `~/.claude/settings.json`, so a `claude` you start in the sandbox can use `odonian` directly.
-   A failure here warns and does not stop the boot.
+   Setup failures warn, but the subsequent board-environment validation is mandatory: a stale
+   or missing required `settings.json` board environment stops the fleet from starting.
 7. Starts 2 workers and 2 reviewers in `local_commit` delivery mode (the CLI makes the commits;
    there is no push and no pull request).
 
@@ -209,18 +214,23 @@ odonian diff <task-id>          # the diff of the worker's commit (add --full fo
 Then the human step. This is the merge gate: nothing the fleet did so far has changed `main`.
 
 ```bash
-odonian approve <task-id>       # approved -> done; freezes the branch and cleans up the worktree
+odonian approve <task-id>       # lands reviewed work on wi/<slug>, marks done, and cleans up
 odonian reject  <task-id> --note "..."   # back to ready with your note; a worker reworks it
 ```
 
-`approve` records `done` on the board, then freezes the work as a `wi/<title-slug>` branch in
-`/tmp/odonian/repo` and removes the worktree, for you to merge however you like. The two halves are
-separate: if the freeze fails (for example because `ODONIAN_WORKTREE_HOME` was not exported, which
-is the error `neither ODONIAN_WORKTREE_HOME nor ODONIAN_HOME is set`), the board is already `done`;
-export the variable and retry only the freeze with `odonian approve --freeze-only <full-task-id>`.
-If a prefix caused the freeze to fail, use the full UUID for that retry. In
-pull-request mode the equivalent step is merging the PR on GitHub, which the PR-watch reconciler
-notices and records as `done`.
+`approve` lands the reviewed commit on `wi/<title-slug>` in `/tmp/odonian/repo`, then records
+`done` and removes the task's worktree and `wip/<task-id>` branch. It does not merge into `main`.
+Tasks with an explicit `branch` share `wi/<branch>`; otherwise the title supplies the slug.
+Landing is locked per integration branch: it fast-forwards when possible, or merges concurrent
+changes and runs `make check` plus `make test` before publishing. The board reservation prevents
+landing an obsolete review round.
+
+If approval is interrupted, inspect the reported state and rerun `odonian approve <full-task-id>`;
+it resumes a landing reservation or finishes cleanup idempotently. `--freeze-only` is only for a
+task already `done`. `--cancel-landing` drops an interrupted reservation only when the work has
+not reached the integration branch. Keep the banner's environment exported and use the full UUID.
+See [the agent contract](../AGENT-API.md) for the full recovery procedure. In pull-request mode,
+merge the PR on GitHub; PR-watch observes the approved human-gated task and records completion.
 
 To run it again:
 
@@ -229,7 +239,7 @@ bash harness/seed-demo.sh --project <project-id> --again    # posts "Append gree
 ```
 
 Each `--again` task has a distinct title and a distinct line. That matters: the CLI branches a
-task's worktree from the frozen `wi/<slug>` branch of the same title if one exists, so a same-titled
+task's worktree from the existing `wi/<slug>` integration branch of the same title if one exists, so a same-titled
 repeat would find the line already present. The worker then submits a `no_op` link instead of a
 commit and the reviewer verifies the claim against the repository before approving. That path is
 real product behaviour (it is how a task whose work already landed on `main` gets closed) and you

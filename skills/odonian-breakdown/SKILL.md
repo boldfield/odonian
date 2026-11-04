@@ -123,7 +123,7 @@ Non-negotiable decomposition rules:
 
 ### Sizing research tasks
 
-Research tasks verify factual claims against primary sources and are tracked separately from build tasks. Unlike build tasks (which are Haiku-sized and start on Haiku with optional escalation), research tasks **start on their configured default model** (recommended: `claude-opus-5-5`), do not use the build escalation ladder, and are not Haiku-sized — their sizing is by claim count and source diversity, not by code volume. Sizing rules ensure each research task is reviewable within the research round budget. The sizing split and post-budget-block decomposition are proposed here and then STOP for the human to decide task boundaries and confirm the breakdown. Once created, research tasks go through the same independent reviews and human merge gate as build tasks. Apply these rules when decomposing a research design into tasks:
+Research tasks verify factual claims against primary sources. Set `track=research`; their kind is still `implement` (the server spawns `review` and, where applicable, `merge` tasks). Unlike build tasks (which are Haiku-sized and start on Haiku with optional escalation), research tasks **start on their configured default model** (recommended: `claude-opus-5-5`), do not use the build escalation ladder, and are not Haiku-sized — their sizing is by claim count and source diversity, not by code volume. Sizing rules ensure each research task is reviewable within the research round budget. The sizing split and post-budget-block decomposition are proposed here and then STOP for the human to decide task boundaries and confirm the breakdown. Once created, research tasks go through the same independent reviews and human merge gate as build tasks. Apply these rules when decomposing a research design into tasks:
 
 - **Claim row limit: six independently checkable rows maximum.** Each row is one verifiable claim
   (e.g., "function X was added in version Y", "vendor Z's CVE-2024-1234 affects this library").
@@ -166,7 +166,9 @@ Using `scripts/odonian.sh`:
 1. Create the project (greenfield) or confirm the existing one.
 2. Register the document (`kind` = `design` | `feature_spec`, pointing at its repo ref) — or, if the
    human's document is already registered on the board, just locate and reuse it. Don't duplicate.
-3. Bulk-create the tasks — dependencies by intra-batch `key`, plus `model` and `agent_merge`.
+3. Bulk-create the tasks in batches of 2–3 — dependencies by intra-batch `key` (or full IDs from
+   earlier batches), plus `model`, `agent_merge`, and `escalate=true` unless explicitly disabled.
+   Small batches avoid oversized API responses that can stall interactive clients.
 4. **Promote milestone-by-milestone — NOT the whole backlog at once.** There is no `ready→backlog`
    demote; to halt a promoted task, transition it to `blocked` (reversible — `blocked→ready`
    re-readies it and clears its stale lease) or `failed` (terminal). Promote the first milestone,

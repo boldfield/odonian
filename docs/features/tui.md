@@ -1,5 +1,8 @@
 # Feature: Odonian TUI
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented and expanded; historical v1 scope.**
+> The [TUI implementation](../../cmd/odonian-tui/) now includes capabilities beyond this proposal, including priority controls and research scorecards. The original non-goals below are historical, not a current capability list. See the [main guide](../../README.md) and [documentation index](../README.md).
+
 Status: feature spec, 2026-06-05
 Kind: feature_spec (for project Odonian)
 

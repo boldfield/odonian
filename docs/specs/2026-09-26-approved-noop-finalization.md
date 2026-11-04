@@ -1,5 +1,8 @@
 # Auto-finalize review-approved no-op tasks
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented; historical incident and specification.**
+> The [approved-round handler](../../internal/store/store.go) finalizes a unanimously approved current-round no-op with no active PR directly to done, regardless of agent_merge. [Store regressions](../../internal/store/store_test.go), [round-link tests](../../internal/store/link_round_test.go) and [API coverage](../../internal/api/api_test.go) cover this path. The bug described below is historical; see [AGENT-API.md](../../AGENT-API.md) for the current contract.
+
 A worker submitted foia.info task `84af4e1c-3d48-4390-b066-0ac1f18aa77a` with a `no_op` link and no PR link because its acceptance criteria were already on `main`. Both independent reviewers approved it on September 26, 2026. The task stayed `approved`, so its dependent work could not be claimed. An operator verified the result on `main` and manually transitioned it to `done`.
 
 `AGENT-API.md` says an approved no-op goes straight to `done` because there is no PR to merge. The store's review aggregation at `internal/store/store.go` currently checks the `no_op` link only inside `if parentAgentMerge`, so tasks created with the normal human-merge setting (`agent_merge=false`) remain stuck at a merge gate with nothing to merge. This is a control-flow bug, not a reason to set `agent_merge=true` for work that may later produce a PR.

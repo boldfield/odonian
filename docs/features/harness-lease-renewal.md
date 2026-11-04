@@ -1,5 +1,8 @@
 # Harness lease renewal for every dispatch
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented; historical incident and specification.**
+> The harness now runs monitor_legacy_lease for selected legacy tasks as well as monitor_dispatch for research attempts; see [agent.sh](../../harness/agent.sh) and [lease-renewal tests](../../harness/lease_renewal_test.sh). The “today” behavior in the problem statement describes the incident baseline. See the [harness guide](../../harness/README.md) for current operation.
+
 ## Problem
 
 A claimed task holds a lease. If the lease lapses, `claimableSQL` (`internal/store/store.go`) makes an `in_progress` task claimable again, so another agent can take over work that is still running.

@@ -1,5 +1,8 @@
 # Research pacing and model-agnostic reviewer evaluation
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Both milestones implemented in source; rollout is separate.**
+> Research admission/permits and evaluation storage, adapters and reporting exist in the [research claim code](../../internal/store/research_claim.go), [evaluation package](../../internal/evaluation/) and [evaluation API](../../internal/api/evaluation.go). This does not establish enforcement, a running Muse campaign or production reviewer replacement. The original implementation authorization below is historical, not a new rollout authorization. Use the [research guide](../research.md), [pacing rollout](../runbooks/research-pacing-rollout.md) and [evaluation rollout](../runbooks/reviewer-evaluation-rollout.md).
+
 ## Agreement and constraints
 
 Approved direction, 2026-10-02: preserve the existing research quality process while automatically pacing research consumption; build a model-agnostic reviewer comparison system, with Meta Muse as its first candidate using the owner's existing Power subscription. A later adapter, such as Pi connected to the owner's Spark deployment, must fit the same process without changing evaluation storage, sampling or reporting. Opus remains the research writer and Astra/Fable remain the production reviewers. Do not change claim limits, source-verification requirements, acceptance rules, escalation, continuation creation, or the human merge gate. Do not route work to cheaper models based on assumed difficulty. Any future replacement requires a separately reviewed decision supported by matched evaluations.

@@ -1,5 +1,8 @@
 # Odonian — MVP Design
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Historical MVP design.**
+> The approved June design is preserved below, including its original non-goals. It is not the current feature inventory: the repository now includes a [TUI](cmd/odonian-tui/), [research support](docs/research.md), automated review and configurable merge handling. Start with [current documentation](docs/README.md) and the [API reference](docs/api.md).
+
 Status: MVP design, approved 2026-06-04
 Owner: brian@oldfield.io
 

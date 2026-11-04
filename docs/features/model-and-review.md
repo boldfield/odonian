@@ -1,5 +1,8 @@
 # Feature: Model assignment & review tasks
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented; historical design.**
+> Model-aware claims and generated review tasks are present in the [store](../../internal/store/store.go) and its [tests](../../internal/store/store_test.go). The defaults and state-machine description below record the original proposal and have evolved. Use [AGENT-API.md](../../AGENT-API.md) and the [API reference](../api.md) for the current contract.
+
 Status: feature spec, 2026-06-06
 Kind: feature_spec (for project Odonian)
 

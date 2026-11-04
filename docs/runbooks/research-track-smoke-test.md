@@ -1,6 +1,8 @@
 # Research track live smoke test
 
-Status: draft, September 27, 2026. Not yet run. Board: project `4ff592d7-da96-40b0-8753-db42be264a68`, document `a2001386-bf46-4b5d-8024-bb90c0e16da9`.
+> Reviewed 2026-11-03 against `b3da896` (v0.24.0). The September plan and fixture identifiers below are historical; no live execution result or current deployment configuration was verified. Use an isolated test project and confirm model routing/availability before running. Current workflow: [research guide](../research.md); automated coverage: [verification guide](../features/research-track-verification.md).
+
+Original status (September 27, 2026): draft, not yet run at that date. Historical board: project `4ff592d7-da96-40b0-8753-db42be264a68`, document `a2001386-bf46-4b5d-8024-bb90c0e16da9`.
 
 R16 verified the research track with store and API tests only. This runbook exercises the paths
 unit tests can't: the real fleet worker and reviewer prompts, `odonian submit --findings-file` and
@@ -22,7 +24,7 @@ research-track server code or research prompts.
 | Fleet worker addresses the upheld finding; round passes | Fixture A round 3 |
 | Scorecard reflects raised, upheld and fixed findings | End |
 | Chain-wide round budget, `decompose` block | Unit tests only: 6 rejected rounds of paid reviews is not worth it |
-| Research escalation ladder | Not deployed (ladder is empty) |
+| Research escalation ladder | Not exercised by this plan; keep the test deployment ladder empty |
 
 The operator plays the worker in fixture A's first two rounds because the dispute path can't be
 forced otherwise: an honest fleet worker fixes a false claim instead of disputing it, which is
@@ -30,16 +32,16 @@ correct behavior but leaves adjudication unexercised.
 
 ## Setup
 
-1. The private sandbox repo `boldfield/odonian-research-smoke` holds a neutral README and the two
+1. The original fixture repo was `boldfield/odonian-research-smoke`. Verify that it is still a disposable test repo, or create a new isolated fixture repo, with a neutral README and the two
    fixture files below on `main`. Keep this runbook out of that repo: reviewers read the whole
    repo, and knowing the round-2 dispute is deliberately weak would bias them.
-2. Its Odonian project, `odonian-research-smoke`, uses `delivery_mode` `pull_request`. One
+2. Use an isolated Odonian project and run its harness with `ODONIAN_DELIVERY_MODE=pull_request` (delivery mode is harness configuration, not a project field). One
    `feature_spec` document references the sandbox README, not this runbook (same reason), and the
    fixture tasks hang off it.
 3. Reset the fixtures before a re-run: close the previous run's PRs unmerged, so `main` still
    carries the original rows.
-4. Set `review_models` to `["gpt-6-astra","claude-fable-5-1"]` on both tasks, the production
-   research pair. It must not include `ODONIAN_RESEARCH_ADJUDICATOR` (see "Reviewer pair" below).
+4. The original reviewer pair was `["gpt-6-astra","claude-fable-5-1"]`; confirm available models and routing for the test deployment, then set an explicit pair on both tasks. It must not include `ODONIAN_RESEARCH_ADJUDICATOR` (see "Reviewer pair" below).
+5. For operator-driven rounds, exclude this project from every automated implementer while leaving reviewers/adjudicators available. Sequential promote/claim or release/claim calls are not atomic and cannot reserve the task against another worker. Do not interrupt unrelated production workers to run this fixture. Set the operator's `AGENT_ID` and matching `AGENT_MODEL`, renew the task lease while working, and, if pacing creates a permit, retain its attempt ID and finalize the dispatch after submission as described in the [pacing runbook](research-pacing-rollout.md).
 
 All sources are the National Archives page on Amendments XI–XXVII,
 `https://www.archives.gov/founding-docs/amendments-11-27`, which is stable, public and
@@ -90,18 +92,16 @@ Task: `track=research`, `agent_merge=false`, created in `backlog`. Spec:
 > date you retrieved the source for each row. Correct any claim the source does not support, and
 > keep status `confirmed` only for claims you verified.
 
-**Round 1 (operator).** Promote and claim in one step so no fleet worker wins the race:
-`odonian promote <id> && odonian claim <id>`. Confirm the assignee is the operator. Open a PR that
+**Round 1 (operator).** With automated implementers excluded from this project, promote and claim:
+`odonian promote <id> && odonian claim <id>`. These are two separate requests; check both succeeded and confirm the assignee is the operator. Open a PR that
 adds only the `Accessed` column and leaves row 2 false. Submit.
 
 Expected: at least one reviewer raises a P1 on row 2 (confirmed claim the source contradicts).
 The round rejects and the task returns to `ready`.
 
-**Between rounds.** Watch for the task to reach `ready` (poll every 5 s) and hold it immediately
-(`POST /tasks/{id}/hold`), so a fleet worker doesn't take round 2 and fix row 2. Don't hold it while
-it's in review: a hold in review strands the task.
+**Between rounds.** Keep automated implementers excluded so they cannot take round 2 and fix row 2. A parent may be held during review (`POST /tasks/{id}/hold`): its reviewer tasks can finish, and parent aggregation waits until `POST /tasks/{id}/release`. Release then applies the completed round without requiring another submission. A hold is not a replacement for excluding competing implementers during the operator claim window.
 
-**Round 2 (operator).** Unhold and claim in one step. Leave row 2 unchanged. Submit with
+**Round 2 (operator).** Release any hold, confirm state `ready`, then claim and verify ownership. Leave row 2 unchanged. Submit with
 `--disputes-file` disputing the row 2 finding, quoting the page's own line for Amendment XXVII:
 "Originally proposed Sept. 25, 1789." The quote is real but supports only the proposal date, not
 "ratified in 1791," and the same line goes on to say "Ratified May 7, 1992." A correct reviewer
@@ -119,7 +119,7 @@ Expected:
 **Compaction.** Hold the task again when it reaches `ready`, then supersede it
 (`POST /tasks/{id}/supersede`). The replacement's spec must contain the original assignment and the
 row 2 finding only, not round 1's full review prose. It keeps the track, review models and
-`agent_merge=false`. Release the replacement to the fleet (unhold; don't claim it).
+`agent_merge=false`. Inspect the replacement's actual state and hold flag. Release any hold and promote it if it is in `backlog`; then restore this test project to the implementer scope so the fleet can claim it.
 
 **Round 3 (fleet).** A fleet worker corrects row 2 to the 1992 ratification date. Both reviewers
 report the row 2 finding `resolved` and approve. The task reaches `approved`, and no merge task is
@@ -134,13 +134,12 @@ numbers.
 
 ## Cleanup
 
-Close the fixture PRs without merging, archive or cancel the follow-up task, and keep the repo and
-project for the next run.
+Close the fixture PRs without merging, retire unwanted nonterminal follow-ups with a supported transition such as `failed`, then archive the fixture tasks/project if appropriate. Archiving only changes visibility and does not revoke a live lease or prevent an explicit claim by ID. Keep the fixture repo if another run is planned.
 
 ## Reviewer pair
 
 `ODONIAN_RESEARCH_ADJUDICATOR` must differ from both of a task's reviewers. The server compares
 model strings only, so it can't detect aliases: `opus` and `claude-opus-5-5` are the same model on
 this fleet but pass the check as different models. Pick the adjudicator as a genuinely third model.
-The research pair is `gpt-6-astra` + `claude-fable-5-1` and the adjudicator is `claude-opus-5-5`
-(manifests #161). Never give a research task an `opus` reviewer while that holds.
+The historical pair was `gpt-6-astra` + `claude-fable-5-1`, with adjudicator `claude-opus-5-5`
+(manifests #161). This is not a current deployment inventory. Check the effective alias pins as well as the strings; do not assign an `opus` reviewer if it resolves to the configured adjudicator.

@@ -1,5 +1,8 @@
 # Feature: sbx agent bootstrap (provision the sandbox: toolchain, agents, auth, board config)
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented components with a boot-order limitation; historical specification.**
+> Container-local builds, toolchain checks, model routing, authentication helpers and board setup exist in [sbx.sh](../../harness/sbx.sh), [sbx-agent-setup.sh](../../harness/sbx-agent-setup.sh) and the [Makefile](../../Makefile). The standalone setup script can install both CLIs, but sbx.sh still requires Claude on PATH before it invokes that setup; the original blanket fresh-container promise is not fully met. Model defaults below have [subsequently changed](../specs/2026-09-30-sandbox-and-task-model-defaults.md). See the [harness guide](../../harness/README.md) for current operation.
+
 Status: feature spec, 2026-08-10
 Kind: feature_spec (for project Odonian)
 

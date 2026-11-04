@@ -1,5 +1,7 @@
 # Priority and Move-to-front rollout runbook
 
+> Source-checked 2026-11-03 against `b3da896` (v0.24.0). Priority is implemented; this checklist does not establish a completed production rollout. See the [priority implementation](../../internal/store/priority.go), [smoke test](../../harness/priority_scheduling_smoke_test.sh) and [operations guide](../operations.md).
+
 Design: [`docs/features/urgent-work-queue.md`](../features/urgent-work-queue.md). This runbook covers what the verification smoke proves, what it does not, and what an operator must do before and after deploying numeric priority. It sets no production values and performs no live action.
 
 ## Two kinds of number
@@ -7,7 +9,7 @@ Design: [`docs/features/urgent-work-queue.md`](../features/urgent-work-queue.md)
 | | Where it comes from | Allowed values |
 | --- | --- | --- |
 | **External input** | A person or client: task creation, `odonian priority --set N`, the TUI "Set priority" action, `--reset` (assigns 500) | integers 1..1000 only. Anything else (0, negatives, fractions, 1001 and above, non-numbers) is rejected with an error and **never clamped**. Omitted means 500. |
-| **Generated / inherited value** | The server: `odonian priority --front` assigns `max(1000, max(P_queued)) + 1`; reviews, rework, adjudications, replacements, merges and continuations inherit the topic's value | any integer; always above 1000 for Front. These values are valid, are stored and displayed exactly, and are never passed through the manual-entry validator. |
+| **Generated / inherited value** | The server: `odonian priority --front` assigns `max(1000, max(P_queued)) + 1`; reviews, rework, adjudications, replacements, merges and continuations inherit the topic's value | positive integers representable by the server; always above 1000 for Front, with overflow rejected atomically. These values are valid, are stored and displayed exactly, and are never passed through the manual-entry validator. |
 
 Consequences an operator should expect:
 
@@ -48,7 +50,7 @@ Starvation is deliberate and unmitigated (no aging): a steady supply of higher-p
 ## Rollout requirements
 
 1. Deploy server, CLI, TUI and fleet launcher image together; an old launcher still shuffles projects. Check `odonian version` on every runner and confirm no worker is on a pre-priority `agent.sh`.
-2. Confirm the new server started cleanly on the production database and that `odonian tasks --json` now reports `priority` before announcing the feature.
+2. Confirm the new server started cleanly on the production database and that `odonian tasks --project <project-id> --json` now reports `priority` before announcing the feature.
 3. Announce the equal-priority change: at default priority, dispatch becomes oldest-first across projects.
 4. Do not reprioritize live work or release research holds as part of rollout; priority never releases a hold or promotes backlog work.
 5. After deploy, with the operator's own judgment and on non-urgent work: Front one topic, confirm `odonian next` and a launcher pick it up at the next refresh (no in-flight task is interrupted), then Reset it. Confirm one approved continuation inherits the topic priority.

@@ -1,3 +1,9 @@
+> **Historical implementation breakdown.** Retained as the original planning record. The current
+> source supports parallel local workers and serialized integration-branch landing; use
+> [Running Odonian](./running.md#delivery-modes) and the [agent contract](../AGENT-API.md) for
+> operating instructions. Status checked against `b3da896` on 2026-11-03; old board/model choices
+> below are not a current task queue or deployment recommendation.
+
 # local_commit delivery mode — task breakdown (FOR REVIEW, not yet on the board)
 
 **Target board:** project `83c4152e`, new document **"local_commit delivery mode"**.

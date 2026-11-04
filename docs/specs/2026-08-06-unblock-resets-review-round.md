@@ -1,5 +1,8 @@
 # Feature spec — unblocking a task resets its review round counter
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Not implemented in this baseline.**
+> TransitionTask in the [store](../../internal/store/store.go) clears assignment and lease on unblock but does not reset review_round. The reset below remains a proposal: blocked → ready does not grant a fresh round budget. Use [AGENT-API.md](../../AGENT-API.md) for supported recovery operations.
+
 **Status:** board milestone (Odonian project). **Date:** 2026-08-06.
 
 ## Problem

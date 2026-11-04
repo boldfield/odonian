@@ -1,5 +1,8 @@
 # Claude fleet authentication Make targets
 
+> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented; historical specification.**
+> The [Make targets](../../Makefile), [authentication helper](../../deploy/fleet/claude_auth.py) and [fixture tests](../../deploy/fleet/claude_auth_test.py) are present. Statements below that the Makefile has only Codex targets describe the pre-change baseline. Current usage is in the [fleet guide](../../deploy/fleet/README.md); source inspection does not verify live credential validity.
+
 ## Requested behavior
 
 Add make claude-auth and make claude-auth-check, matching the convenience of existing codex-auth and codex-auth-check. Reuse CP_CONTEXT and FLEET_NAMESPACE, currently admin@summercamp-cp and odonian-fleet. The live worker and reviewer deployments both inject CLAUDE_CODE_OAUTH_TOKEN from secret claude-oauth, key token. Keep Claude subscription authentication through claude setup-token. Do not change billing/auth mode, deployments, replica counts, model routing or existing Codex targets.
