@@ -674,6 +674,11 @@ curl -s "${A[@]}" -X POST "$ODONIAN_URL/tasks/$TASK_ID/transition" -d '{"to":"fa
 
 This retires the blocked task to terminal state without re-entering the ready queue.
 
+If a blocked task's PR has been merged outside the board (e.g., by a human using repo admin
+bypass), PR-watch will converge the task to `done` on the next reconciliation tick, without
+requiring an explicit unblock transition. The task's assignee and lease will be cleared, and
+any in-flight review children from the current round without verdicts will be retired.
+
 ## Task priority management
 
 Tasks are ordered in the execution queue by priority (higher first), then creation order, then ID.

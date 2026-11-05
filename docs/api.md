@@ -1393,6 +1393,7 @@ research rounds instead use the structured blocking-findings rules documented un
 - Any active state → `superseded` (retire without creating a replacement; use `POST /tasks/{id}/supersede` to create one)
 - `approved` → `abandoned` (retire without merging)
 - `in_progress` → `done` for `merge` tasks only
+- `ready` → `done`, `in_progress` → `done`, `review` → `done`, `blocked` → `done` (PR-watch only: when the PR is merged outside the board; clears assignee, retires in-flight review children, appends transition event)
 
 The operator `/transition` endpoint does not permit `review` → `done`. Review aggregation does
 perform that direct transition for the verified current-round no-op case above, in a single
