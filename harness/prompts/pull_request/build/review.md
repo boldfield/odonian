@@ -58,8 +58,18 @@ submit, or block with a reason. Anything you start in the background is killed w
 3. **Validate the PR link, THEN reproduce AS MERGED WITH MAIN.** This step is for PR cases
    (recorded link from step 2 or branch-resolved from step 2) — the no-op path from step 2 is
    verified against `main` and never reaches here. Before doing anything else, **VERIFY the `pr`
-   link resolves to a real OPEN PR**: `gh pr view <pr-url> --json number,state` must succeed
-   (and not 404). A `pr` link that does NOT resolve is fabricated or premature — a defect: submit
+   link state**: `gh pr view <pr-url> --json number,state,mergeCommit` must succeed (and not 404).
+   Check the state:
+   - **MERGED** — the PR was already merged. Fetch origin/main and verify the merge commit is on it:
+     `git merge-base --is-ancestor <mergeCommit> origin/main`. If the merge commit is an ancestor of
+     main, review its diff against the parent task's acceptance criteria (run `git diff <mergeCommit>^1 <mergeCommit>` to see the merge commit's first-parent diff). Approve or reject on acceptance criteria only; skip the PR-head fetch, the merge-with-main step, and the CI gate below. Once docs/specs/2026-11-02-externally-merged-pr-convergence.md (PR-watch convergence) is deployed, a merged PR will normally have been converged before review, so this branch is a backstop. If NOT on main,
+     reject with note "merge commit not found on origin/main — likely a different base branch or
+     force-push".
+   - **CLOSED** (unmerged) — the PR is closed without merging. Automatic reject: submit a `reject`
+     verdict with note "PR is closed unmerged; cannot reopen or rework it" and STOP.
+   - **OPEN** or other — continue below.
+
+   A `pr` link that does NOT resolve is fabricated or premature — a defect: submit
    a `reject` verdict (step 5) with note "pr link does not resolve to a real PR" and STOP. **Do
    NOT fall back to reviewing the raw branch.** Likewise, if the PR-head fetch below fails
    (`git fetch origin "pull/<n>/head"` reports no such ref → the PR doesn't exist), that is a
@@ -67,7 +77,7 @@ submit, or block with a reason. Anything you start in the background is killed w
    link IS present but unresolvable; a legitimate `no_op` submission carries no `pr` link and is
    handled entirely by step 2 — never reject it here.)
 
-   Once the link is verified, in your worktree, do NOT check out `main` or a named branch.
+   For OPEN PRs, in your worktree, do NOT check out `main` or a named branch.
    Fetch the PR head and merge current main into it:
    `git fetch origin && git fetch origin "pull/<n>/head" && git checkout --detach FETCH_HEAD`, then
    `git merge origin/main --no-edit`.

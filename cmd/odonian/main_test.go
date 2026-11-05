@@ -371,7 +371,8 @@ func TestExecuteProjectMissingID(t *testing.T) {
 
 func TestExecuteShowTable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		switch r.URL.Path {
+		case "/tasks/task-1":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
 				ID:           "task-1",
@@ -385,6 +386,9 @@ func TestExecuteShowTable(t *testing.T) {
 					{Kind: "pr", Value: "https://github.com/boldfield/odonian/pull/102"},
 				},
 			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -424,7 +428,8 @@ func TestExecuteShowTable(t *testing.T) {
 
 func TestExecuteShowJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		switch r.URL.Path {
+		case "/tasks/task-1":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
 				ID:    "task-1",
@@ -434,6 +439,9 @@ func TestExecuteShowJSON(t *testing.T) {
 				Title: "Test Task",
 				Spec:  "Test spec",
 			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -463,7 +471,8 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 	// Real SHA-256 digest of the manifest bytes: printf '{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}' | sha256sum
 	realDigest := "461bf9e337f7d640ca135d4743755ab5538b777442eddafed2c5dfb38b1279be"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		switch r.URL.Path {
+		case "/tasks/task-1":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
 				ID:    "task-1",
@@ -482,6 +491,9 @@ func TestExecuteShowWithSubmissionManifests(t *testing.T) {
 					},
 				},
 			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -530,16 +542,22 @@ func TestExecuteShowManifestWithHTMLCharsHashesToDigest(t *testing.T) {
 	sum := sha256.Sum256(manifestJSON)
 	digest := fmt.Sprintf("%x", sum)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		enc := json.NewEncoder(w)
-		enc.SetEscapeHTML(false)
-		enc.Encode(tuiclient.TaskDetail{
-			ID:    "task-1",
-			State: "in_progress",
-			SubmissionManifests: []tuiclient.SubmissionManifest{
-				{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: digest},
-			},
-		})
+		switch r.URL.Path {
+		case "/tasks/task-1":
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			enc.SetEscapeHTML(false)
+			enc.Encode(tuiclient.TaskDetail{
+				ID:    "task-1",
+				State: "in_progress",
+				SubmissionManifests: []tuiclient.SubmissionManifest{
+					{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: digest},
+				},
+			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		}
 	}))
 	defer server.Close()
 
@@ -570,14 +588,20 @@ func TestExecuteShowManifestWithHTMLCharsHashesToDigest(t *testing.T) {
 func TestExecuteShowJSONPreservesManifestKeyOrder(t *testing.T) {
 	manifestJSON := json.RawMessage(`{"version":1,"parent_task_id":"task-1","children":[],"pending_candidates":[]}`)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(tuiclient.TaskDetail{
-			ID:    "task-1",
-			State: "in_progress",
-			SubmissionManifests: []tuiclient.SubmissionManifest{
-				{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: "d"},
-			},
-		})
+		switch r.URL.Path {
+		case "/tasks/task-1":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:    "task-1",
+				State: "in_progress",
+				SubmissionManifests: []tuiclient.SubmissionManifest{
+					{ReviewRound: 1, ParentTaskID: "task-1", ManifestJSON: manifestJSON, ManifestDigest: "d"},
+				},
+			})
+		case "/tasks/task-1/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		}
 	}))
 	defer server.Close()
 
@@ -956,6 +980,51 @@ func TestExecuteSubmitNoOp(t *testing.T) {
 	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
 		"--result", "already satisfied",
 		"--no-op",
+		"task123",
+	})
+	if err != nil {
+		t.Fatalf("executeSubmit failed: %v", err)
+	}
+}
+
+func TestExecuteSubmitNoOpWithValue(t *testing.T) {
+	expectedValue := "abc123def456"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/tasks/task123" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task123", "review_round": 0, "links": []map[string]string{}})
+			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/tasks/task123/submit" {
+			var req struct {
+				AgentID string
+				Result  string
+				Links   []struct {
+					Kind  string
+					Value string
+				}
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if len(req.Links) != 1 || req.Links[0].Kind != "no_op" || req.Links[0].Value != expectedValue {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	oldAgent := os.Getenv("AGENT_ID")
+	defer os.Setenv("AGENT_ID", oldAgent)
+	os.Setenv("AGENT_ID", "test-agent")
+
+	err := executeSubmit(context.Background(), server.URL, "test-token", []string{
+		"--result", "already satisfied",
+		"--no-op",
+		"--no-op-value", expectedValue,
 		"task123",
 	})
 	if err != nil {
@@ -4265,6 +4334,9 @@ func TestExecuteShowInitialTask(t *testing.T) {
 				Kind:        "implement",
 				Model:       "haiku",
 			})
+		case "/tasks/task-initial/events":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -4740,7 +4812,7 @@ func TestExecuteShowMultipleRounds(t *testing.T) {
 	}
 }
 
-// TestExecuteShowEventRetrievalFailure tests handling of event retrieval failures
+// TestExecuteShowEventRetrievalFailure tests that show continues even when event retrieval fails
 func TestExecuteShowEventRetrievalFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -5835,9 +5907,12 @@ func TestExecuteSubmitManifestFileRejectedBeforeRequest(t *testing.T) {
 func showWithServer(t *testing.T, detail tuiclient.TaskDetail, jsonOutput bool) string {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		if strings.HasPrefix(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(detail)
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -5995,7 +6070,10 @@ func TestExecuteShowJSONKeepsContinuationAndFollowUpsSeparate(t *testing.T) {
 func TestExecuteShowPriority(t *testing.T) {
 	// Test that priority and topic anchor are displayed in show output
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		if r.URL.Path == "/tasks/task-1/events" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		} else if strings.HasPrefix(r.URL.Path, "/tasks/") {
 			w.Header().Set("Content-Type", "application/json")
 			priority600 := int64(600)
 			topicID := "topic-anchor-123"
@@ -6010,10 +6088,6 @@ func TestExecuteShowPriority(t *testing.T) {
 				Priority:      &priority600,
 				TopicAnchorID: &topicID,
 			})
-		}
-		if r.URL.Path == "/tasks/task-1/events" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -6038,7 +6112,10 @@ func TestExecuteShowPriority(t *testing.T) {
 func TestExecuteShowPriorityAbove1000(t *testing.T) {
 	// Test that priority values above 1000 (from Front action) are displayed
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/tasks/") {
+		if r.URL.Path == "/tasks/task-1/events" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode([]tuiclient.Event{})
+		} else if strings.HasPrefix(r.URL.Path, "/tasks/") {
 			w.Header().Set("Content-Type", "application/json")
 			priority := int64(1001) // From Front action
 
@@ -6051,10 +6128,6 @@ func TestExecuteShowPriorityAbove1000(t *testing.T) {
 				Spec:     "Test spec",
 				Priority: &priority,
 			})
-		}
-		if r.URL.Path == "/tasks/task-1/events" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]tuiclient.Event{})
 		}
 	}))
 	defer server.Close()
@@ -7106,5 +7179,399 @@ func TestExecuteUpdateReviewModelsRoundTrip(t *testing.T) {
 
 	if err := executeUpdate(context.Background(), server.URL, "test-token", []string{"task-123"}); err == nil {
 		t.Error("expected error without --review-models")
+	}
+}
+
+func TestExecuteShowOperatorNotesTextOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  1,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			submitNote := "approved"
+			transitionNote1 := "unblocked by operator"
+			transitionNote2 := "priority: high"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "submit",
+					Actor:     "worker-1",
+					Note:      &submitNote,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote1,
+					CreatedAt: "2026-11-01T10:05:00Z",
+				},
+				{
+					ID:        "event-3",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote2,
+					CreatedAt: "2026-11-01T10:10:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Operator notes:") {
+		t.Errorf("expected 'Operator notes:' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "operator @ 2026-11-01T10:05:00Z: unblocked by operator") {
+		t.Errorf("expected operator note with timestamp 'operator @ 2026-11-01T10:05:00Z: unblocked by operator' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "operator @ 2026-11-01T10:10:00Z: priority: high") {
+		t.Errorf("expected operator note with timestamp 'operator @ 2026-11-01T10:10:00Z: priority: high' in output, got: %s", output)
+	}
+}
+
+func TestExecuteShowOperatorNotesJSONOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  1,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			submitNote := "approved"
+			transitionNote := "unblocked"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "submit",
+					Actor:     "worker-1",
+					Note:      &submitNote,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote,
+					CreatedAt: "2026-11-01T10:05:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+
+	if _, hasOperatorNotes := result["operator_notes"]; !hasOperatorNotes {
+		t.Errorf("expected 'operator_notes' in JSON output, got: %s", output)
+	} else {
+		var notes []OperatorNote
+		notesJSON, _ := json.Marshal(result["operator_notes"])
+		if err := json.Unmarshal(notesJSON, &notes); err != nil {
+			t.Errorf("failed to unmarshal operator notes: %v", err)
+		}
+		if len(notes) != 1 {
+			t.Errorf("expected 1 operator note in JSON, but got %d", len(notes))
+		} else {
+			if notes[0].Actor != "operator" {
+				t.Errorf("expected actor 'operator', got %q", notes[0].Actor)
+			}
+			if notes[0].Note != "unblocked" {
+				t.Errorf("expected note 'unblocked', got %q", notes[0].Note)
+			}
+			if notes[0].CreatedAt != "2026-11-01T10:05:00Z" {
+				t.Errorf("expected created_at '2026-11-01T10:05:00Z', got %q", notes[0].CreatedAt)
+			}
+		}
+	}
+}
+
+func TestExecuteShowOperatorNotesEmptyNotesOmitted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  1,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			submitNote := "approved"
+			emptyNote := ""
+			transitionNote := "important note"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "submit",
+					Actor:     "worker-1",
+					Note:      &submitNote,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &emptyNote,
+					CreatedAt: "2026-11-01T10:05:00Z",
+				},
+				{
+					ID:        "event-3",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote,
+					CreatedAt: "2026-11-01T10:10:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	// Test text output
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Operator notes:") {
+		t.Errorf("expected 'Operator notes:' in output")
+	}
+	if !strings.Contains(output, "important note") {
+		t.Errorf("expected non-empty operator note in output")
+	}
+	// Make sure we only have one note (empty one is omitted)
+	count := strings.Count(output, "operator @")
+	if count != 1 {
+		t.Errorf("expected 1 operator note, got %d", count)
+	}
+
+	// Test JSON output
+	jsonBuf := &bytes.Buffer{}
+	err = executeShow(context.Background(), server.URL, "test-token", true, []string{"task-1"}, jsonBuf)
+	if err != nil {
+		t.Fatalf("executeShow JSON failed: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(jsonBuf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	notes, ok := result["operator_notes"].([]interface{})
+	if !ok {
+		t.Fatalf("operator_notes not found or not an array in JSON output")
+	}
+
+	// Should have exactly 1 note (empty note is omitted)
+	if len(notes) != 1 {
+		t.Errorf("expected 1 operator note in JSON, got %d", len(notes))
+	}
+
+	if len(notes) > 0 {
+		noteObj, ok := notes[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("operator note is not an object")
+		}
+
+		noteText, ok := noteObj["note"].(string)
+		if !ok || noteText != "important note" {
+			t.Errorf("expected note text 'important note', got %v", noteObj["note"])
+		}
+
+		if _, ok := noteObj["created_at"]; !ok {
+			t.Errorf("expected created_at in operator note")
+		}
+	}
+}
+
+func TestExecuteShowNoOperatorNotesBeforeSubmit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  1,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			transitionNote := "early transition"
+			submitNote := "approved"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "submit",
+					Actor:     "worker-1",
+					Note:      &submitNote,
+					CreatedAt: "2026-11-01T10:05:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	// Test text output
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	// Should not have Operator notes section if all notes are before submit
+	if strings.Contains(output, "Operator notes:") {
+		t.Errorf("expected no 'Operator notes:' section (transition was before submit), got: %s", output)
+	}
+
+	// Test JSON output
+	jsonBuf := &bytes.Buffer{}
+	err = executeShow(context.Background(), server.URL, "test-token", true, []string{"task-1"}, jsonBuf)
+	if err != nil {
+		t.Fatalf("executeShow JSON failed: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(jsonBuf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	// operator_notes should not be present or should be empty/nil
+	if notes, ok := result["operator_notes"]; ok {
+		if notesArr, isArr := notes.([]interface{}); isArr && len(notesArr) > 0 {
+			t.Errorf("expected operator_notes to be absent or empty in JSON (transition was before submit), got %v", notesArr)
+		}
+	}
+}
+
+func TestExecuteShowOperatorNotesNoSubmitEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tasks/") && !strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(tuiclient.TaskDetail{
+				ID:           "task-1",
+				State:        "in_progress",
+				ReviewRound:  0,
+				Title:        "Test Task",
+				Spec:         "Test spec",
+				TargetTaskID: nil,
+			})
+		} else if strings.Contains(r.URL.Path, "/events") {
+			w.Header().Set("Content-Type", "application/json")
+			transitionNote1 := "blocked: needs clarification"
+			transitionNote2 := "unblocked: spec clarified"
+			json.NewEncoder(w).Encode([]tuiclient.Event{
+				{
+					ID:        "event-1",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote1,
+					CreatedAt: "2026-11-01T10:00:00Z",
+				},
+				{
+					ID:        "event-2",
+					Kind:      "transition",
+					Actor:     "operator",
+					Note:      &transitionNote2,
+					CreatedAt: "2026-11-01T10:30:00Z",
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	// Test text output
+	buf := &bytes.Buffer{}
+	err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Operator notes:") {
+		t.Errorf("expected 'Operator notes:' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "operator @ 2026-11-01T10:00:00Z: blocked: needs clarification") {
+		t.Errorf("expected operator note with timestamp 'operator @ 2026-11-01T10:00:00Z: blocked: needs clarification' in output, got: %s", output)
+	}
+	if !strings.Contains(output, "operator @ 2026-11-01T10:30:00Z: unblocked: spec clarified") {
+		t.Errorf("expected operator note with timestamp 'operator @ 2026-11-01T10:30:00Z: unblocked: spec clarified' in output, got: %s", output)
+	}
+
+	// Test JSON output
+	buf = &bytes.Buffer{}
+	err = executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "task-1"}, buf)
+	if err != nil {
+		t.Fatalf("executeShow JSON failed: %v", err)
+	}
+
+	output = buf.String()
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v", err)
+	}
+
+	if _, hasOperatorNotes := result["operator_notes"]; !hasOperatorNotes {
+		t.Errorf("expected 'operator_notes' in JSON output")
+	} else {
+		var notes []OperatorNote
+		notesJSON, _ := json.Marshal(result["operator_notes"])
+		if err := json.Unmarshal(notesJSON, &notes); err != nil {
+			t.Errorf("failed to unmarshal operator notes: %v", err)
+		}
+		if len(notes) != 2 {
+			t.Errorf("expected 2 operator notes in JSON, but got %d", len(notes))
+		} else {
+			if notes[0].Actor != "operator" || notes[0].Note != "blocked: needs clarification" || notes[0].CreatedAt != "2026-11-01T10:00:00Z" {
+				t.Errorf("first note mismatch: got %+v", notes[0])
+			}
+			if notes[1].Actor != "operator" || notes[1].Note != "unblocked: spec clarified" || notes[1].CreatedAt != "2026-11-01T10:30:00Z" {
+				t.Errorf("second note mismatch: got %+v", notes[1])
+			}
+		}
 	}
 }

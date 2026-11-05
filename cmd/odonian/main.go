@@ -762,20 +762,19 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		return fmt.Errorf("failed to get task: %w", err)
 	}
 
-	// Fetch events for rework tasks to display review findings
+	// Fetch events to display review findings and operator notes
 	var events []tuiclient.Event
-	if task.ReviewRound > 0 {
-		events, err = client.ListEvents(ctx, taskID)
-		if err != nil {
-			return fmt.Errorf("failed to get task events: %w", err)
-		}
+	events, err = client.ListEvents(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("failed to get task events: %w", err)
 	}
 
-	// Extract review findings from events
+	// Extract review findings and operator notes from events
 	reviewFindings := extractReviewFindings(events, task.ReviewRound)
+	operatorNotes := extractOperatorNotes(events)
 
 	if jsonOutput {
-		// Build output with review findings added to the task
+		// Build output with review findings and operator notes added to the task
 		output := map[string]json.RawMessage{}
 		taskJSON, err := marshalNoHTMLEscape(task, "")
 		if err != nil {
@@ -790,6 +789,13 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 				return fmt.Errorf("failed to marshal review findings: %w", err)
 			}
 			output["review_findings"] = findingsJSON
+		}
+		if len(operatorNotes) > 0 {
+			notesJSON, err := marshalNoHTMLEscape(operatorNotes, "")
+			if err != nil {
+				return fmt.Errorf("failed to marshal operator notes: %w", err)
+			}
+			output["operator_notes"] = notesJSON
 		}
 		finalOutput, err := marshalNoHTMLEscape(output, "  ")
 		if err != nil {
@@ -841,6 +847,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 			}
 		}
 		printContinuation(out, task)
+		if len(operatorNotes) > 0 {
+			fmt.Fprintf(out, "Operator notes:\n")
+			for _, note := range operatorNotes {
+				fmt.Fprintf(out, "  - %s @ %s: %s\n", note.Actor, note.CreatedAt, note.Note)
+			}
+		}
 		if len(reviewFindings) > 0 {
 			fmt.Fprintf(out, "Review Findings:\n")
 			for _, finding := range reviewFindings {
@@ -1065,6 +1077,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	prFlag := fs.String("pr", "", "PR URL")
 	branchFlag := fs.String("branch", "", "branch name")
 	noOpFlag := fs.Bool("no-op", false, "mark as already-satisfied (no-op)")
+	noOpValueFlag := fs.String("no-op-value", "already-satisfied", "value for no-op submission (default: already-satisfied)")
 	messageFlag := fs.String("message", "", "commit message override (local_commit mode)")
 	agentFlag := fs.String("agent", "", "agent ID")
 	attemptFlag := fs.String("attempt", "", "research attempt ID (default: the one saved by claim)")
@@ -1096,6 +1109,10 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 
 	if *noOpFlag && (*prFlag != "" || *branchFlag != "") {
 		return fmt.Errorf("--no-op cannot be combined with --pr or --branch")
+	}
+
+	if *noOpValueFlag != "already-satisfied" && !*noOpFlag {
+		return fmt.Errorf("--no-op-value can only be used with --no-op")
 	}
 
 	// Validate findings file early, before any HTTP requests
@@ -1201,7 +1218,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 			// (implement prompt, step 6) has to bypass the commit entirely — same as pull_request
 			// mode. The reviewer verifies the claim against the base.
 			links = []tuiclient.LinkInput{
-				{Kind: "no_op", Value: "already-satisfied"},
+				{Kind: "no_op", Value: *noOpValueFlag},
 			}
 
 		default:
@@ -1240,7 +1257,7 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	} else {
 		if *noOpFlag {
 			links = []tuiclient.LinkInput{
-				{Kind: "no_op", Value: "already-satisfied"},
+				{Kind: "no_op", Value: *noOpValueFlag},
 			}
 		} else {
 			if *prFlag != "" && *branchFlag != "" {
@@ -2203,6 +2220,43 @@ type ReviewRoundFindings struct {
 	Round    int                 `json:"round"`
 	Verdicts []ReviewVerdictInfo `json:"verdicts,omitempty"`
 	Findings []ReviewFindingInfo `json:"findings,omitempty"`
+}
+
+// OperatorNote holds a single note from a transition event
+type OperatorNote struct {
+	Actor     string `json:"actor"`
+	Note      string `json:"note"`
+	CreatedAt string `json:"created_at"`
+}
+
+// extractOperatorNotes extracts notes from transition events after the latest submit event.
+// Returns notes in chronological order (oldest first), omitting empty notes.
+func extractOperatorNotes(events []tuiclient.Event) []OperatorNote {
+	// Find the index of the latest submit event
+	latestSubmitIdx := -1
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Kind == "submit" {
+			latestSubmitIdx = i
+			break
+		}
+	}
+
+	var notes []OperatorNote
+
+	// Extract transition events after the latest submit event
+	startIdx := latestSubmitIdx + 1
+	for i := startIdx; i < len(events); i++ {
+		event := events[i]
+		if event.Kind == "transition" && event.Note != nil && *event.Note != "" {
+			notes = append(notes, OperatorNote{
+				Actor:     event.Actor,
+				Note:      *event.Note,
+				CreatedAt: event.CreatedAt,
+			})
+		}
+	}
+
+	return notes
 }
 
 // extractReviewFindings extracts review context from task events, grouped by review round.

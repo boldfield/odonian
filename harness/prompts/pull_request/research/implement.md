@@ -80,10 +80,19 @@ sensing elapsed time.
    with "already checked out" when another worktree holds that branch, and **that error is NOT a
    reason to block** (work detached + push-to-ref, below). Always `git fetch origin` first, then:
    - **REWORK — `origin/mr/<TASKID8>` already exists** (a prior attempt was pushed and the task was
-     bounced back to ready): continue it. `git checkout --detach origin/mr/<TASKID8>`; make your
-     fixes; publish in step 8 with `git push origin HEAD:mr/<TASKID8>` — it stays the same branch and
-     PR. You address and acknowledge the reviewer's feedback in the mandatory rework step 7 below.
-     (Merge conflicts are cleared by the sync in step 6.)
+     bounced back to ready): **Check the PR state first.** From the Links section of `odonian show`,
+     find the PR URL. Run `gh pr view <url> --json state,mergeCommit` to check if the PR is MERGED,
+     OPEN, or CLOSED. **If MERGED:** Fetch origin/main and verify the merge commit is on it with
+     `git merge-base --is-ancestor <mergeCommit> origin/main`. If ancestor check passes,
+     do NOT rework, do NOT push, do NOT resubmit the PR link. Go straight to step 9 with
+     `odonian submit <id> --result "PR already merged; merge commit <mergeCommit> verified on origin/main; see <url>"
+     --no-op --no-op-value <mergeCommit>`. If ancestor check fails, block with `odonian transition <id> --to blocked
+     --note "merge commit <mergeCommit> not on origin/main; cannot verify merge"`. **If CLOSED unmerged:** Block with `odonian transition <id> --to blocked
+     --note "PR is closed unmerged; cannot rework a closed PR"` — do NOT open a second PR for the same
+     task. **If OPEN:** Continue it. `git checkout --detach origin/mr/<TASKID8>`; make your fixes;
+     publish in step 8 with `git push origin HEAD:mr/<TASKID8>` — it stays the same branch and PR. You
+     address and acknowledge the reviewer's feedback in the mandatory rework step 7 below. (Merge
+     conflicts are cleared by the sync in step 6.)
    - **FRESH — `origin/mr/<TASKID8>` does not exist** (first attempt): `git checkout --detach
      origin/main`; you'll create the branch and PR by pushing in step 8.
 5. Do the research work exactly as the spec and the project's task contract require — nothing more,
@@ -133,16 +142,18 @@ sensing elapsed time.
    skip straight to step 8.
 
    On a rework you MUST clear the reviewer's feedback before you may submit. Start by reading the full
-   review context: run `odonian show <task-id>` to see the recorded review round, verdicts, and
-   findings from previous review rounds — including any structured "Findings" block a reviewer left.
-   These recorded findings explain the rework requirements alongside the current PR feedback. You MUST
-   reconcile all four sources:
-   1. **Recorded review findings** — the task's stored review verdicts and rejection findings from
+   review context: run `odonian show <task-id>` to see the recorded review round, verdicts, findings
+   and operator notes (transition notes after the latest submit) — including any structured "Findings" block a reviewer
+   left. These recorded findings explain the rework requirements alongside the current PR feedback.
+   You MUST reconcile all sources:
+   1. **Recorded PR state** — checked in step 4's REWORK path; if you reach step 7, the PR is OPEN.
+   2. **Operator notes** — from `odonian show`; these are operator-provided context from task transitions that may override earlier review feedback.
+   3. **Recorded review findings** — the task's stored review verdicts and rejection findings from
       previous rounds (displayed by `odonian show`), including any P1/P2 findings that blocked the
       round. These are the authoritative rejection reasons that prompted the rework.
-   2. **Current PR feedback** — outstanding comments on the PR (listed by `odonian pr-feedback list`).
-   3. **Task specification, acceptance criteria and the project's task contract.**
-   4. **Your current diff** — what you've changed in this rework.
+   4. **Current PR feedback** — outstanding comments on the PR (listed by `odonian pr-feedback list`).
+   5. **Task specification, acceptance criteria and the project's task contract.**
+   6. **Your current diff** — what you've changed in this rework.
 
    An empty `odonian pr-feedback list` alone does NOT establish completion — you MUST ensure your
    diff addresses the recorded review findings. If a reviewer's earlier finding is not repeated in
