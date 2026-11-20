@@ -61,7 +61,6 @@ type Store interface {
 	ResolveTaskID(ctx context.Context, id string) (string, error)
 	GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error)
 	ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error)
-	ListDependencies(ctx context.Context, taskID string) ([]string, error)
 	ListDependents(ctx context.Context, taskID string) ([]string, error)
 	UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string, awaitChecks *bool) (Task, error)
 	UpdateTaskReviewModels(ctx context.Context, taskID string, models []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error)
@@ -1898,32 +1897,6 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 	}
 
 	return tasks, nil
-}
-
-// ListDependencies returns all task IDs that the given taskID depends on.
-// Returns an empty slice if the task has no dependencies.
-func (s *sqliteStore) ListDependencies(ctx context.Context, taskID string) ([]string, error) {
-	rows, err := s.readConn.QueryContext(ctx, `
-		SELECT depends_on_id FROM task_dep WHERE task_id = ? ORDER BY depends_on_id
-	`, taskID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query dependencies: %w", err)
-	}
-	defer rows.Close()
-
-	dependencies := make([]string, 0)
-	for rows.Next() {
-		var depID string
-		if err := rows.Scan(&depID); err != nil {
-			return nil, fmt.Errorf("failed to scan dependency: %w", err)
-		}
-		dependencies = append(dependencies, depID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating dependencies: %w", err)
-	}
-
-	return dependencies, nil
 }
 
 // ListDependents returns all task IDs that depend on the given taskID (reverse dependencies).

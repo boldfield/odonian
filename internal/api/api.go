@@ -691,18 +691,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	if fieldsSummary {
 		summaries := make([]map[string]interface{}, len(tasks))
 		for i, task := range tasks {
-			summary := taskToSummary(task)
-			// Load depends_on for each task
-			deps, err := s.store.ListDependencies(r.Context(), task.ID)
-			if err != nil {
-				s.errorResponse(w, http.StatusInternalServerError, "LIST_ERROR", "Failed to load task dependencies")
-				return
-			}
-			if deps == nil {
-				deps = make([]string, 0)
-			}
-			summary["depends_on"] = deps
-			summaries[i] = summary
+			summaries[i] = taskToSummary(task)
 		}
 		s.encodeJSON(w, http.StatusOK, summaries)
 		return
