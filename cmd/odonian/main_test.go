@@ -7575,3 +7575,56 @@ func TestExecuteShowOperatorNotesNoSubmitEvents(t *testing.T) {
 		}
 	}
 }
+
+func TestExecuteShowAwaitChecks(t *testing.T) {
+	started := "2026-01-02T03:04:05Z"
+	cases := []struct {
+		name    string
+		await   bool
+		started *string
+	}{
+		{"await true, started set", true, &started},
+		{"await false, started null", false, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/tasks/task-1":
+					json.NewEncoder(w).Encode(tuiclient.TaskDetail{ID: "task-1", State: "ready", Model: "haiku", Kind: "implement", Title: "T", Spec: "S", AwaitChecks: tc.await, ChecksStartedAt: tc.started})
+				case "/tasks/task-1/events":
+					json.NewEncoder(w).Encode([]tuiclient.Event{})
+				}
+			}))
+			defer server.Close()
+
+			buf := &bytes.Buffer{}
+			if err := executeShow(context.Background(), server.URL, "test-token", false, []string{"task-1"}, buf); err != nil {
+				t.Fatal(err)
+			}
+			if want := fmt.Sprintf("Await Checks: %t", tc.await); !strings.Contains(buf.String(), want) {
+				t.Errorf("expected %q in output, got: %s", want, buf.String())
+			}
+			if got := strings.Contains(buf.String(), "Checks Started At: "+started); got != (tc.started != nil) {
+				t.Errorf("Checks Started At presence = %v, output: %s", got, buf.String())
+			}
+
+			buf.Reset()
+			if err := executeShow(context.Background(), server.URL, "test-token", true, []string{"--json", "task-1"}, buf); err != nil {
+				t.Fatal(err)
+			}
+			var raw map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &raw); err != nil {
+				t.Fatal(err)
+			}
+			if raw["await_checks"] != tc.await {
+				t.Errorf("await_checks = %v, want %v", raw["await_checks"], tc.await)
+			}
+			v, ok := raw["checks_started_at"]
+			if !ok || (v == nil) != (tc.started == nil) {
+				t.Errorf("checks_started_at = %v (present=%v)", v, ok)
+			}
+		})
+	}
+}

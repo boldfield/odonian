@@ -127,6 +127,8 @@ type TaskDetail struct {
 	ReviewRound         int                  `json:"review_round"`
 	TargetTaskID        *string              `json:"target_task_id"`
 	AgentMerge          bool                 `json:"agent_merge"`
+	AwaitChecks         bool                 `json:"await_checks"`
+	ChecksStartedAt     *string              `json:"checks_started_at"`
 	CreatedAt           string               `json:"created_at"`
 	UpdatedAt           string               `json:"updated_at"`
 	DependsOn           []string             `json:"depends_on"`
