@@ -64,7 +64,7 @@ Never work a task you did not win.
 ### 3. Read the full spec
 
 ```bash
-curl -s "${A[@]}" "$ODONIAN_URL/tasks/$TASK_ID" | jq '{title, spec, model, review_models, agent_merge, depends_on, links}'
+curl -s "${A[@]}" "$ODONIAN_URL/tasks/$TASK_ID" | jq '{title, spec, model, review_models, agent_merge, await_checks, depends_on, links}'
 ```
 
 The `spec` is your contract — build exactly what it says, no more. Read the design/feature document
@@ -237,6 +237,14 @@ transitions. `approved → done` / `approved → ready` are the merge gate.
 When `agent_merge` is `false`, work requiring a merge waits in `approved` for the **human** merge
 gate. Verified current-round no-ops with no active PR finalize directly regardless of this flag.
 In no case does a reviewer run `gh pr merge` or transition the parent.
+
+## Checks gate: `await_checks` field (C2)
+
+`await_checks` is an **optional per-task boolean** (default `false`, settable at creation and
+mutable via `PATCH`). The field is part of C2 deliverables and is intended to work with a checks
+state and reconciler (C3/C4, not yet implemented). **C2 scope:** the field is set/read/returned; the
+gate lifecycle and task routing are deferred. The field is returned by `GET /tasks/{id}`, list
+responses, and `odonian show`.
 
 ## Agent comment markers
 
@@ -637,6 +645,9 @@ transient admission deferral (which may succeed on retry) from fatal conflicts:
   models and each `review_models` entry must be in `ODONIAN_MODELS`, else `400 UNKNOWN_MODEL`.
   `review_models` defaults to `["opus"]`. A claim still requires an explicit matching `model`.
 - `agent_merge` defaults to `false` and is immutable.
+- `await_checks` defaults to `false` and is mutable (see `PATCH` below). When `true` on a
+  `research`-track task, creation returns `400 AWAIT_CHECKS_RESEARCH` (the checks gate applies only
+  to `build` and `design` tracks).
 - Review tasks are auto-spawned only — never create them directly.
 
 ## Updating a task: `PATCH /tasks/{id}`
@@ -660,6 +671,10 @@ curl -X PATCH -H "Authorization: Bearer $ODONIAN_TOKEN" -H 'Content-Type: applic
   slot; a reviewer of a model new to the list starts with no dispute lineage.
   CLI: `odonian update <id> --review-models a,b`. `POST /tasks/{id}/supersede` takes the same optional
   `review_models` for the replacement.
+- `await_checks` a boolean: sets whether the task waits for CI checks before entering review. When
+  sent alone, accepted in any state. When true on a `research`-track task, `PATCH` returns
+  `400 AWAIT_CHECKS_RESEARCH`. When sent alongside `review_models` or `depends_on`, the state
+  restrictions for those fields apply.
 - Any other field (`spec`, `title`, `state`, unknown names): `400 FIELD_NOT_UPDATABLE` naming the
   field; nothing is changed, even if `depends_on` was sent alongside. Specs are immutable after
   creation; state changes go through `/transition`.
