@@ -609,3 +609,37 @@ func TestFailChecksOutsideChecksConflicts(t *testing.T) {
 		}
 	}
 }
+
+func TestFailChecksEscalationIncludesHeadCommitInSpec(t *testing.T) {
+	ctx := context.Background()
+	h := failChecksHarness(t, true)
+	got, err := h.store.FailChecks(ctx, h.taskID, "deadbeef1234", "lint failed (https://ci/1)", 5, map[string]int{"haiku": 0}, nil)
+	if err != nil {
+		t.Fatalf("FailChecks: %v", err)
+	}
+	if got.State != "superseded" || got.SupersededBy == nil {
+		t.Fatalf("state = %q superseded_by = %v, want superseded with replacement", got.State, got.SupersededBy)
+	}
+	
+	repl, err := h.store.GetTask(ctx, *got.SupersededBy)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	
+	// Debug output
+	t.Logf("Replacement spec:\n%s\n", repl.Spec)
+	
+	// Verify the replacement spec contains both the head commit and the summary
+	if !strings.Contains(repl.Spec, "Prior attempt feedback") {
+		t.Errorf("replacement spec lacks 'Prior attempt feedback' block")
+	}
+	if !strings.Contains(repl.Spec, "deadbeef1234") {
+		t.Errorf("replacement spec lacks head commit 'deadbeef1234'")
+	}
+	if !strings.Contains(repl.Spec, "lint failed (https://ci/1)") {
+		t.Errorf("replacement spec lacks failure summary 'lint failed (https://ci/1)'")
+	}
+	if !strings.Contains(repl.Spec, "checks failed") {
+		t.Errorf("replacement spec lacks 'checks failed' marker")
+	}
+}
