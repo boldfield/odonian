@@ -19672,3 +19672,99 @@ func TestEscalatedTaskInheritsAwaitChecks(t *testing.T) {
 		t.Errorf("expected escalated task AwaitChecks to be true (inherited), got false")
 	}
 }
+
+// TestSubmitReviewTaskContents pins the exact review tasks and spawn_review event a
+// submit creates: models, round, priority, title, spec text and event note.
+func TestSubmitReviewTaskContents(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "DESIGN.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{{
+		Title: "Implementation task", Spec: "Implement feature X", DocumentID: doc.ID,
+		Model: "haiku", ReviewModels: []string{"opus", "sonnet"},
+	}})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	if _, err := store.Conn().ExecContext(ctx, "UPDATE task SET state = 'ready' WHERE id = ?", taskID); err != nil {
+		t.Fatalf("failed to promote task: %v", err)
+	}
+	if _, err := store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+	_, err = store.SubmitTask(ctx, taskID, "agent-1", "done", nil, []LinkInput{{Kind: "pr", Value: "https://github.com/example/repo/pull/7"}}, 5, nil, nil, testUnlimitedResearchBudget)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	all, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+	want := map[string]string{
+		"opus":   "Review: Implementation task [opus]",
+		"sonnet": "Review: Implementation task [sonnet]",
+	}
+	wantSpec := "Review the implementation:\n\n" +
+		"Implementation PR: https://github.com/example/repo/pull/7\n\n" +
+		"Parent task: " + taskID + "\n\n" +
+		"## Instructions\n\n" +
+		"Examine the submitted implementation and provide approval or rejection with written feedback.\n\n" +
+		"Approve if:\n" +
+		"- The implementation matches the specification\n" +
+		"- The code is correct and follows the project conventions\n" +
+		"- Tests pass and coverage is adequate\n\n" +
+		"Reject if:\n" +
+		"- The implementation has issues or does not match the specification\n" +
+		"- Further work is needed before merging\n\n" +
+		"Provide your verdict: approve or reject"
+	n := 0
+	for _, rt := range all {
+		if rt.Kind != "review" || rt.TargetTaskID == nil || *rt.TargetTaskID != taskID {
+			continue
+		}
+		n++
+		if title, ok := want[rt.Model]; !ok || rt.Title != title {
+			t.Errorf("unexpected review task model/title: %q / %q", rt.Model, rt.Title)
+		}
+		if rt.ReviewRound != 1 || rt.State != "ready" || rt.Priority != tasks[0].Priority {
+			t.Errorf("review task round/state/priority = %d/%s/%d, want 1/ready/%d", rt.ReviewRound, rt.State, rt.Priority, tasks[0].Priority)
+		}
+		if rt.Spec != wantSpec {
+			t.Errorf("review spec mismatch:\n%q\nwant:\n%q", rt.Spec, wantSpec)
+		}
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 review tasks, got %d", n)
+	}
+
+	events, err := store.ListEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	found := false
+	for _, e := range events {
+		if e.Kind == "spawn_review" {
+			found = true
+			if e.Actor != "system" || e.Note == nil || *e.Note != `Round 1 with models: ["opus","sonnet"]` {
+				t.Errorf("unexpected spawn_review event: actor=%q note=%v", e.Actor, e.Note)
+			}
+		}
+	}
+	if !found {
+		t.Error("spawn_review event not found")
+	}
+}
