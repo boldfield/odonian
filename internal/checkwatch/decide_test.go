@@ -27,6 +27,7 @@ func TestDecide(t *testing.T) {
 		checksStartedAt  time.Time
 		expectedDecision Decision
 		descContains     string
+		descNotContains  string
 	}{
 		// Rule 1: Merged PR
 		{
@@ -152,7 +153,8 @@ func TestDecide(t *testing.T) {
 			},
 			checksStartedAt:  unsettled,
 			expectedDecision: Fail,
-			descContains:     "build",
+			descContains:     "build (http://x/1), lint (http://x/2)",
+			descNotContains:  "test",
 		},
 		// Rule 3: Green and settled passes
 		{
@@ -323,6 +325,9 @@ func TestDecide(t *testing.T) {
 			}
 			if !contains(result.Summary, tt.descContains) {
 				t.Errorf("got summary %q, want to contain %q", result.Summary, tt.descContains)
+			}
+			if tt.descNotContains != "" && contains(result.Summary, tt.descNotContains) {
+				t.Errorf("got summary %q, should not contain %q", result.Summary, tt.descNotContains)
 			}
 		})
 	}
