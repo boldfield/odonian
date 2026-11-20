@@ -1133,7 +1133,7 @@ func buildReviewModel(t *testing.T, reviewClient *tuiclient.MockClient) *BoardMo
 	m, _ = model.Update(tasksFetchedMsg{tasks: reviewTestBucketed("review-task-1")})
 	model = m.(*BoardModel)
 
-	// Navigate to the review column (index 3). Starting from in_progress (index 2), press right once.
+	// Navigate to the review column (index 4). Starting from in_progress (index 2), press right twice (past checks).
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
@@ -1654,7 +1654,7 @@ func TestBoardModel_ApproveTransition409(t *testing.T) {
 }
 
 // TestBoardModel_ReviewActionsNoopOutsideReviewColumn tests that pressing 'a' or 'x'
-// when the active column is NOT review (index 3) does nothing — no API calls, no mode change.
+// when the active column is NOT review (index 4) does nothing — no API calls, no mode change.
 func TestBoardModel_ReviewActionsNoopOutsideReviewColumn(t *testing.T) {
 	reviewCalled := false
 	transitionCalled := false
@@ -2351,7 +2351,7 @@ func TestDetail_ReviewApproveFromDetail(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: boardTasks})
 	model = m.(*BoardModel)
 
-	// Navigate to review column (index 3): one right from in_progress (index 2).
+	// Navigate to review column (index 4): two rights from in_progress (index 2), passing checks (index 3).
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
@@ -2658,14 +2658,14 @@ func TestBoardModel_ReviewHelpBar(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to review column (index 3): one right from in_progress (index 2).
+	// Navigate to review column (index 4): two rights from in_progress (index 2), passing checks (index 3).
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 
 	if model.selectedColumn != columnIndex(stateReview) {
-		t.Fatalf("Expected review column (3), got %d", model.selectedColumn)
+		t.Fatalf("Expected review column (%d), got %d", columnIndex(stateReview), model.selectedColumn)
 	}
 
 	reviewOutput := model.View()
@@ -3174,8 +3174,8 @@ func buildBlockedModel(t *testing.T, blockedClient *tuiclient.MockClient) *Board
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to the blocked column (index 6).
-	// Starting from in_progress (index 2), press right 4 times.
+	// Navigate to the blocked column (index 7).
+	// Starting from in_progress (index 2), press right 5 times.
 	for i := 0; i < 5; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
@@ -3415,8 +3415,8 @@ func TestBoardModel_AbandonedTaskVisible(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to the abandoned column (index 8).
-	// Starting from in_progress (index 2), press right 6 times.
+	// Navigate to the abandoned column (index 9).
+	// Starting from in_progress (index 2), press right 7 times.
 	for i := 0; i < 7; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
@@ -3596,7 +3596,7 @@ func TestBoardModel_ColumnScrolling(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to done column (5 rights from in_progress at index 2)
+	// Navigate to done column (4 rights from in_progress at index 2)
 	for i := 0; i < 4; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
@@ -3679,7 +3679,7 @@ func TestBoardModel_DoneTabScrollingRendering(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to done column (3 rights from in_progress at index 2)
+	// Navigate to done column (4 rights from in_progress at index 2)
 	for i := 0; i < 4; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
@@ -4662,7 +4662,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to done column (5 right presses from in_progress at index 2)
+	// Navigate to done column (4 right presses from in_progress at index 2)
 	for i := 0; i < 4; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
