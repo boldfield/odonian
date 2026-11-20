@@ -574,7 +574,7 @@ func TestFailChecksPastThresholdBlocksWithoutEscalation(t *testing.T) {
 func TestFailChecksPastThresholdEscalates(t *testing.T) {
 	ctx := context.Background()
 	h := failChecksHarness(t, true)
-	got, err := h.store.FailChecks(ctx, h.taskID, "abc123", "lint (https://ci/1)", 5, map[string]int{"haiku": 0}, nil)
+	got, err := h.store.FailChecks(ctx, h.taskID, "deadbeef1234", "lint (https://ci/1)", 5, map[string]int{"haiku": 0}, nil)
 	if err != nil {
 		t.Fatalf("FailChecks: %v", err)
 	}
@@ -588,8 +588,23 @@ func TestFailChecksPastThresholdEscalates(t *testing.T) {
 	if repl.State != "ready" || repl.Model != "sonnet" {
 		t.Errorf("replacement state = %q model = %q, want ready sonnet", repl.State, repl.Model)
 	}
-	if !strings.Contains(repl.Spec, "Prior attempt feedback") || !strings.Contains(repl.Spec, "lint (https://ci/1)") {
-		t.Errorf("replacement spec lacks failure summary: %q", repl.Spec)
+
+	// Extract the Prior attempt feedback block
+	feedbackStart := strings.Index(repl.Spec, "## Prior attempt feedback")
+	if feedbackStart == -1 {
+		t.Fatalf("replacement spec lacks 'Prior attempt feedback' block")
+	}
+	feedbackBlock := repl.Spec[feedbackStart:]
+
+	// Verify head commit and failure summary are in the feedback block
+	if !strings.Contains(feedbackBlock, "deadbeef1234") {
+		t.Errorf("feedback block lacks head commit 'deadbeef1234'")
+	}
+	if !strings.Contains(feedbackBlock, "lint (https://ci/1)") {
+		t.Errorf("feedback block lacks failure summary 'lint (https://ci/1)'")
+	}
+	if !strings.Contains(feedbackBlock, "checks failed") {
+		t.Errorf("feedback block lacks 'checks failed' marker")
 	}
 }
 
@@ -610,10 +625,30 @@ func TestFailChecksOutsideChecksConflicts(t *testing.T) {
 	}
 }
 
-func TestFailChecksEscalationIncludesHeadCommitInSpec(t *testing.T) {
+func TestFailChecksEscalationWithRejectionAndChecksFailure(t *testing.T) {
 	ctx := context.Background()
 	h := failChecksHarness(t, true)
-	got, err := h.store.FailChecks(ctx, h.taskID, "deadbeef1234", "lint failed (https://ci/1)", 5, map[string]int{"haiku": 0}, nil)
+
+	// Record a reviewer rejection first
+	tx, err := h.store.Conn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin tx: %v", err)
+	}
+	defer tx.Rollback()
+
+	verdict := "reject"
+	note := "Found critical bug in line 42"
+	_, err = h.store.AppendEvent(ctx, tx, h.taskID, "reviewer", "review", &verdict, &note)
+	if err != nil {
+		t.Fatalf("failed to append review event: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit tx: %v", err)
+	}
+
+	// Now fail checks, which should escalate
+	got, err := h.store.FailChecks(ctx, h.taskID, "deadbeef5678", "lint failed (https://ci/1)", 5, map[string]int{"haiku": 0}, nil)
 	if err != nil {
 		t.Fatalf("FailChecks: %v", err)
 	}
@@ -626,20 +661,34 @@ func TestFailChecksEscalationIncludesHeadCommitInSpec(t *testing.T) {
 		t.Fatalf("GetTask: %v", err)
 	}
 
-	// Debug output
-	t.Logf("Replacement spec:\n%s\n", repl.Spec)
+	// Extract the Prior attempt feedback block
+	feedbackStart := strings.Index(repl.Spec, "## Prior attempt feedback")
+	if feedbackStart == -1 {
+		t.Fatalf("replacement spec lacks 'Prior attempt feedback' block")
+	}
+	feedbackBlock := repl.Spec[feedbackStart:]
 
-	// Verify the replacement spec contains both the head commit and the summary
-	if !strings.Contains(repl.Spec, "Prior attempt feedback") {
-		t.Errorf("replacement spec lacks 'Prior attempt feedback' block")
+	// Verify both rejection and checks failure are in the feedback block
+	if !strings.Contains(feedbackBlock, "reviewer") {
+		t.Errorf("feedback block lacks 'reviewer'")
 	}
-	if !strings.Contains(repl.Spec, "deadbeef1234") {
-		t.Errorf("replacement spec lacks head commit 'deadbeef1234'")
+	if !strings.Contains(feedbackBlock, "reject") {
+		t.Errorf("feedback block lacks rejection verdict")
 	}
-	if !strings.Contains(repl.Spec, "lint failed (https://ci/1)") {
-		t.Errorf("replacement spec lacks failure summary 'lint failed (https://ci/1)'")
+	if !strings.Contains(feedbackBlock, "Found critical bug") {
+		t.Errorf("feedback block lacks rejection note")
 	}
-	if !strings.Contains(repl.Spec, "checks failed") {
-		t.Errorf("replacement spec lacks 'checks failed' marker")
+	if !strings.Contains(feedbackBlock, "checks failed") {
+		t.Errorf("feedback block lacks 'checks failed' marker")
+	}
+	if !strings.Contains(feedbackBlock, "deadbeef5678") {
+		t.Errorf("feedback block lacks head commit 'deadbeef5678'")
+	}
+
+	// Verify order: rejection should appear before checks failure
+	rejectionPos := strings.Index(feedbackBlock, "verdict: reject")
+	checksFailedPos := strings.Index(feedbackBlock, "checks failed")
+	if rejectionPos >= checksFailedPos {
+		t.Errorf("rejection at %d should appear before checks failure at %d", rejectionPos, checksFailedPos)
 	}
 }
