@@ -7606,8 +7606,12 @@ func TestExecuteShowAwaitChecks(t *testing.T) {
 			if want := fmt.Sprintf("Await Checks: %t", tc.await); !strings.Contains(buf.String(), want) {
 				t.Errorf("expected %q in output, got: %s", want, buf.String())
 			}
-			if got := strings.Contains(buf.String(), "Checks Started At: "+started); got != (tc.started != nil) {
-				t.Errorf("Checks Started At presence = %v, output: %s", got, buf.String())
+			wantStarted := "Checks Started At: null"
+			if tc.started != nil {
+				wantStarted = "Checks Started At: " + *tc.started
+			}
+			if !strings.Contains(buf.String(), wantStarted) {
+				t.Errorf("expected %q in output, got: %s", wantStarted, buf.String())
 			}
 
 			buf.Reset()

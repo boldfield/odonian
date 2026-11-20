@@ -822,6 +822,8 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		fmt.Fprintf(out, "Await Checks: %t\n", task.AwaitChecks)
 		if task.ChecksStartedAt != nil {
 			fmt.Fprintf(out, "Checks Started At: %s\n", *task.ChecksStartedAt)
+		} else {
+			fmt.Fprintf(out, "Checks Started At: null\n")
 		}
 		fmt.Fprintf(out, "Title: %s\n", task.Title)
 		fmt.Fprintf(out, "Spec: %s\n", task.Spec)
