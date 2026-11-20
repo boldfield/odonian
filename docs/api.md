@@ -1395,7 +1395,7 @@ research rounds instead use the structured blocking-findings rules documented un
 - Any active state → `superseded` (retire without creating a replacement; use `POST /tasks/{id}/supersede` to create one)
 - `approved` → `abandoned` (retire without merging)
 - `in_progress` → `done` for `merge` tasks only
-- `ready` → `done`, `in_progress` → `done`, `review` → `done`, `blocked` → `done` (PR-watch only: when the PR is merged outside the board; clears assignee, retires in-flight review children, appends transition event)
+- `ready` → `done`, `in_progress` → `done`, `checks` → `done`, `review` → `done`, `blocked` → `done` (PR-watch only: when the PR is merged outside the board; clears assignee, retires in-flight review children, appends transition event; `checks` → `done` also clears `checks_started_at`)
 - `checks` → `blocked` (operator-initiated abort or manual override; clears `checks_started_at`)
 - `checks` → `failed` (operator-initiated task failure; clears `checks_started_at`)
 - `checks` → `superseded` (operator-initiated task supersession; clears `checks_started_at`)
