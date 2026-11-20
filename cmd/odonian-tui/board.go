@@ -2474,6 +2474,9 @@ func (m *BoardModel) renderColumnTasks() string {
 		// Show assignee for in_progress, review, approved, and done states
 		shouldShowAssignee := task.State == stateInProgress || task.State == stateChecks || task.State == stateReview ||
 			task.State == stateApproved || task.State == stateDone
+		if task.State == stateChecks && task.Assignee == nil {
+			b.WriteString(fmt.Sprintf("    in checks %s · updated %s ago\n", formatChecksDuration(task.ChecksStartedAt, time.Now()), m.formatTime(task.UpdatedAt)))
+		}
 		if shouldShowAssignee && task.Assignee != nil {
 			assignee := *task.Assignee
 			// Truncate long agent IDs to keep layout compact

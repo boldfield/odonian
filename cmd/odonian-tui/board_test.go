@@ -1140,7 +1140,7 @@ func buildReviewModel(t *testing.T, reviewClient *tuiclient.MockClient) *BoardMo
 	model = m.(*BoardModel)
 
 	if model.selectedColumn != columnIndex(stateReview) {
-		t.Fatalf("buildReviewModel: expected selectedColumn 3 (review), got %d", model.selectedColumn)
+		t.Fatalf("buildReviewModel: expected selectedColumn %d (review), got %d", columnIndex(stateReview), model.selectedColumn)
 	}
 	if model.selectedTaskID != "review-task-1" {
 		t.Fatalf("buildReviewModel: expected selectedTaskID review-task-1, got %q", model.selectedTaskID)
@@ -1695,7 +1695,7 @@ func TestBoardModel_ReviewActionsNoopOutsideReviewColumn(t *testing.T) {
 
 	// Sanity check: model starts in in_progress (index 2).
 	if model.selectedColumn != columnIndex(stateInProgress) {
-		t.Fatalf("Expected selectedColumn 2 (in_progress), got %d", model.selectedColumn)
+		t.Fatalf("Expected selectedColumn %d (in_progress), got %d", columnIndex(stateInProgress), model.selectedColumn)
 	}
 
 	// Press 'a' in in_progress — must be a no-op.
@@ -3182,7 +3182,7 @@ func buildBlockedModel(t *testing.T, blockedClient *tuiclient.MockClient) *Board
 	}
 
 	if model.selectedColumn != columnIndex(stateBlocked) {
-		t.Fatalf("buildBlockedModel: expected selectedColumn 6 (blocked), got %d", model.selectedColumn)
+		t.Fatalf("buildBlockedModel: expected selectedColumn %d (blocked), got %d", columnIndex(stateBlocked), model.selectedColumn)
 	}
 	if model.selectedTaskID != "blocked-task-1" {
 		t.Fatalf("buildBlockedModel: expected selectedTaskID blocked-task-1, got %q", model.selectedTaskID)
@@ -3603,7 +3603,7 @@ func TestBoardModel_ColumnScrolling(t *testing.T) {
 	}
 
 	if model.selectedColumn != columnIndex(stateDone) {
-		t.Fatalf("Expected selectedColumn 5 (done), got %d", model.selectedColumn)
+		t.Fatalf("Expected selectedColumn %d (done), got %d", columnIndex(stateDone), model.selectedColumn)
 	}
 
 	// Check initial state: should be at first task with scrollOffset 0
@@ -4670,7 +4670,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 
 	// Verify we're in the done column
 	if model.selectedColumn != columnIndex(stateDone) {
-		t.Fatalf("Expected selectedColumn 5 (done), got %d", model.selectedColumn)
+		t.Fatalf("Expected selectedColumn %d (done), got %d", columnIndex(stateDone), model.selectedColumn)
 	}
 
 	// Verify getVisibleTaskHeight returns 4 (not 9).
@@ -6176,5 +6176,42 @@ func TestFormatChecksDuration(t *testing.T) {
 		if got := formatChecksDuration(c.in, now); got != c.want {
 			t.Errorf("got %q want %q", got, c.want)
 		}
+	}
+}
+
+func TestChecksTask_RenderedOutput(t *testing.T) {
+	config := &tuiconfig.Config{URL: "http://test", Token: "test", Actor: "testuser", PollInterval: 100 * time.Millisecond}
+	model := NewBoardModel(&tuiclient.MockClient{}, config, tuiclient.Project{ID: "project-1", Name: "Test Project"})
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = m.(*BoardModel)
+
+	started := time.Now().Add(-7 * time.Minute).UTC().Format(time.RFC3339Nano)
+	agent := "w1"
+	bucketed := map[string][]tuiclient.Task{
+		"in_progress": {},
+		"checks": {
+			{ID: "task-c1", Title: "With assignee", State: "checks", Assignee: &agent, ChecksStartedAt: &started},
+			{ID: "task-c2", Title: "No assignee", State: "checks", ChecksStartedAt: &started},
+		},
+		"review": {},
+	}
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+	for model.selectedColumn < columnIndex(stateChecks) {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		model = m.(*BoardModel)
+	}
+	out := model.View()
+	ip, ch, rv := strings.Index(out, "in_progress("), strings.Index(out, "checks(2)"), strings.Index(out, "review(")
+	if ip < 0 || ch < ip || rv < ch {
+		t.Fatalf("expected tabs in_progress < checks(2) < review, got:\n%s", out)
+	}
+	if got := strings.Count(out, "in checks 7m"); got != 2 {
+		t.Fatalf("expected 2 rows with 'in checks 7m', got %d:\n%s", got, out)
+	}
+
+	detail := model.buildDetailContent(tuiclient.TaskDetail{ID: "task-c1", State: "checks", ChecksStartedAt: &started})
+	if !strings.Contains(detail, "In checks: 7m") {
+		t.Fatalf("expected 'In checks: 7m' in detail, got:\n%s", detail)
 	}
 }

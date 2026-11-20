@@ -60,7 +60,7 @@ func buildApprovedModel(t *testing.T, approvedClient *tuiclient.MockClient) *Boa
 	model = m.(*BoardModel)
 
 	if model.selectedColumn != columnIndex(stateApproved) {
-		t.Fatalf("buildApprovedModel: expected selectedColumn 4 (approved), got %d", model.selectedColumn)
+		t.Fatalf("buildApprovedModel: expected selectedColumn %d (approved), got %d", columnIndex(stateApproved), model.selectedColumn)
 	}
 	if model.selectedTaskID != "approved-task-1" {
 		t.Fatalf("buildApprovedModel: expected selectedTaskID approved-task-1, got %q", model.selectedTaskID)

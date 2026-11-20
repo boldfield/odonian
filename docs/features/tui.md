@@ -21,7 +21,7 @@ the API-only design: humans and agents drive the same single source of truth.
 ## Goals (v1)
 
 - **Pick a project** (`GET /projects`); auto-select if there's one or a configured default.
-- **See the board** as five states — `backlog`, `ready`, `in_progress`, `review`, `done` —
+- **See the board** as states — `backlog`, `ready`, `in_progress`, `checks`, `review`, `done` —
   from a single `GET /projects/{id}/tasks` call, bucketed by state client-side.
 - **Watch agents work**: `in_progress` cards show `assignee` and a live lease countdown.
 - **Watch the checks gate**: a `checks` column sits between `in_progress` and `review`; its cards
