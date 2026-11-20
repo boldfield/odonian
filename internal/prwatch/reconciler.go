@@ -138,7 +138,7 @@ func (r *PRWatchReconciler) reconcileProject(ctx context.Context, projectID stri
 	}
 
 	// Check non-approved tasks with PRs for merge convergence
-	for _, state := range []string{"ready", "in_progress", "review", "blocked"} {
+	for _, state := range []string{"ready", "in_progress", "checks", "review", "blocked"} {
 		tasks, err := r.taskSource.ListTasks(ctx, projectID, store.TaskListFilter{
 			State: &state,
 		})

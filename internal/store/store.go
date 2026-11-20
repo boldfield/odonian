@@ -4876,10 +4876,11 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 	return t, nil
 }
 
-// ConvergeExternallyMergedTask moves a task from ready, in_progress, review, blocked or
-// approved to done when its PR has been merged outside the board. It retires review
-// children without verdicts, clears assignee and lease, and appends a transition event.
-// It does not materialize continuation children even for opted-in research tasks.
+// ConvergeExternallyMergedTask moves a task from ready, in_progress, review, blocked,
+// approved, or checks to done when its PR has been merged outside the board. It retires
+// review children without verdicts, clears assignee, lease, and checks_started_at, and
+// appends a transition event. It does not materialize continuation children even for
+// opted-in research tasks.
 func (s *sqliteStore) ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -4899,7 +4900,7 @@ func (s *sqliteStore) ConvergeExternallyMergedTask(ctx context.Context, taskID, 
 	}
 
 	// Only allowed from these states
-	allowedStates := map[string]bool{"ready": true, "in_progress": true, "review": true, "blocked": true, "approved": true}
+	allowedStates := map[string]bool{"ready": true, "in_progress": true, "checks": true, "review": true, "blocked": true, "approved": true}
 	if !allowedStates[taskState] {
 		return Task{}, ErrConflict
 	}
@@ -4942,7 +4943,7 @@ func (s *sqliteStore) ConvergeExternallyMergedTask(ctx context.Context, taskID, 
 	result, err := tx.ExecContext(ctx, `
 		UPDATE task
 		SET state='done', updated_at=?, landing_round=NULL, landing_commit=NULL, landing_attempt=NULL,
-		    assignee=NULL, lease_expires_at=NULL
+		    assignee=NULL, lease_expires_at=NULL, checks_started_at=NULL
 		WHERE id=? AND state=?
 	`, now, taskID, taskState)
 	if err != nil {
