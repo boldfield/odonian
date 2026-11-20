@@ -2293,9 +2293,10 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 	var targetTaskID *string
 	var taskTrack string
 	var currentReviewRound int
+	var awaitChecks bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT kind, target_task_id, track, review_round FROM task WHERE id = ? AND state='in_progress' AND assignee=?
-	`, taskID, agentID).Scan(&taskKind, &targetTaskID, &taskTrack, &currentReviewRound)
+		SELECT kind, target_task_id, track, review_round, await_checks FROM task WHERE id = ? AND state='in_progress' AND assignee=?
+	`, taskID, agentID).Scan(&taskKind, &targetTaskID, &taskTrack, &currentReviewRound, &awaitChecks)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Task not found or not submittable
@@ -2477,15 +2478,35 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 		nextState = "done"
 	} else {
 		nextState = "review"
+		// An opted-in submission carrying a pr link (and not a no_op resolution) waits for the
+		// PR's checks before review (docs/features/checks-gate.md, C3).
+		if awaitChecks {
+			hasPR, hasNoOp := false, false
+			for _, link := range links {
+				switch link.Kind {
+				case "pr":
+					hasPR = true
+				case "no_op":
+					hasNoOp = true
+				}
+			}
+			if hasPR && !hasNoOp {
+				nextState = "checks"
+			}
+		}
 	}
 
 	// Single conditional UPDATE: transition from in_progress to the next state
 	result_ptr := &result
+	var checksStartedAt *string
+	if nextState == "checks" {
+		checksStartedAt = &now
+	}
 	update_result, err := tx.ExecContext(ctx, `
 		UPDATE task
-		SET state=?, result=?, verdict=?, lease_expires_at=NULL, updated_at=?
+		SET state=?, result=?, verdict=?, lease_expires_at=NULL, checks_started_at=COALESCE(?, checks_started_at), updated_at=?
 		WHERE id=? AND state='in_progress' AND assignee=?
-	`, nextState, result_ptr, verdict, now, taskID, agentID)
+	`, nextState, result_ptr, verdict, checksStartedAt, now, taskID, agentID)
 	if err != nil {
 		return TaskWithDepsAndLinks{}, fmt.Errorf("failed to submit task: %w", err)
 	}
@@ -2592,8 +2613,10 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 				}
 			}
 
-			if err := s.createReviewTasks(ctx, tx, t, newReviewRound, currentReviewRound, links, disputesByLineage, now); err != nil {
-				return TaskWithDepsAndLinks{}, err
+			if t.State != "checks" {
+				if err := s.createReviewTasks(ctx, tx, t, newReviewRound, currentReviewRound, links, disputesByLineage, now); err != nil {
+					return TaskWithDepsAndLinks{}, err
+				}
 			}
 
 			// Update t.ReviewRound for the response
@@ -2666,32 +2689,34 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 		}
 
 		return TaskWithDepsAndLinks{
-			ID:             t.ID,
-			ProjectID:      t.ProjectID,
-			DocumentID:     t.DocumentID,
-			Title:          t.Title,
-			Spec:           t.Spec,
-			State:          t.State,
-			Assignee:       t.Assignee,
-			LeaseExpiresAt: t.LeaseExpiresAt,
-			Result:         t.Result,
-			Model:          t.Model,
-			Kind:           t.Kind,
-			ReviewModels:   t.ReviewModels,
-			ReviewRound:    t.ReviewRound,
-			TargetTaskID:   t.TargetTaskID,
-			Verdict:        t.Verdict,
-			AgentMerge:     t.AgentMerge,
-			Held:           t.Held,
-			Escalate:       t.Escalate,
-			Track:          t.Track,
-			Branch:         t.Branch,
-			CreatedAt:      t.CreatedAt,
-			UpdatedAt:      t.UpdatedAt,
-			ArchivedAt:     t.ArchivedAt,
-			SupersededBy:   t.SupersededBy,
-			DependsOn:      dependsOn,
-			Links:          fetchedLinks,
+			ID:              t.ID,
+			ProjectID:       t.ProjectID,
+			DocumentID:      t.DocumentID,
+			Title:           t.Title,
+			Spec:            t.Spec,
+			State:           t.State,
+			Assignee:        t.Assignee,
+			LeaseExpiresAt:  t.LeaseExpiresAt,
+			Result:          t.Result,
+			Model:           t.Model,
+			Kind:            t.Kind,
+			ReviewModels:    t.ReviewModels,
+			ReviewRound:     t.ReviewRound,
+			TargetTaskID:    t.TargetTaskID,
+			Verdict:         t.Verdict,
+			AgentMerge:      t.AgentMerge,
+			Held:            t.Held,
+			Escalate:        t.Escalate,
+			Track:           t.Track,
+			Branch:          t.Branch,
+			AwaitChecks:     t.AwaitChecks,
+			ChecksStartedAt: t.ChecksStartedAt,
+			CreatedAt:       t.CreatedAt,
+			UpdatedAt:       t.UpdatedAt,
+			ArchivedAt:      t.ArchivedAt,
+			SupersededBy:    t.SupersededBy,
+			DependsOn:       dependsOn,
+			Links:           fetchedLinks,
 
 			SubmissionManifests: manifests,
 		}, nil
