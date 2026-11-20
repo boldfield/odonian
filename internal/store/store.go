@@ -2592,85 +2592,8 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 				}
 			}
 
-			// Extract PR link and any no_op marker from the submitted links.
-			// A no_op submission carries the marker and NO pr link: the implementer
-			// claims the acceptance is already satisfied on main with no diff.
-			var prLink string
-			var noOpMarker string
-			for _, link := range links {
-				switch link.Kind {
-				case "pr":
-					prLink = link.Value
-				case "no_op":
-					noOpMarker = link.Value
-				}
-			}
-			isNoOp := noOpMarker != "" && prLink == ""
-
-			// Determine reviewers (default to ["opus"] if empty)
-			reviewers := defaultReviewModels(t.ReviewModels)
-
-			// Create a review task for each reviewer
-			reviewerSlotsTaken := make(map[string]int)
-			for _, reviewerModel := range reviewers {
-				reviewTaskID := GenerateID()
-				reviewTitle := "Review: " + t.Title + " [" + reviewerModel + "]"
-
-				// This reviewer's lineage among this round's review tasks (see
-				// researchReviewerLineage): the same lineage computation
-				// collectResearchReviewReports uses when it later reads this round's
-				// review tasks back, so a dispute resolved against a lineage above is
-				// routed to the matching reviewer's spec below.
-				slot := reviewerSlotsTaken[reviewerModel]
-				reviewerSlotsTaken[reviewerModel] = slot + 1
-				lineage := researchReviewerLineage(reviewerModel, slot)
-
-				// Build the spec for the review task: a strict-review brief pointing at the parent's PR link
-				reviewSpec := "Review the implementation:\n\n"
-				if prLink != "" {
-					reviewSpec += "Implementation PR: " + prLink + "\n\n"
-				}
-				reviewSpec += "Parent task: " + t.ID + "\n\n"
-				if isNoOp {
-					reviewSpec += "## NO-OP submission (verify, do not auto-reject)\n\n"
-					reviewSpec += "The implementer reports the parent's acceptance criteria are ALREADY satisfied on `main` with no code changes, so there is NO PR. Do NOT reject merely because a PR is missing. VERIFY the claim against current `main`: if the parent's acceptance criteria genuinely hold in the repo, approve; if work is actually needed, reject with the specific gap.\n\n"
-				}
-				if disputed := disputesByLineage[lineage]; len(disputed) > 0 {
-					reviewSpec += "## Prior Review Round: Disputed Finding(s)\n\n"
-					reviewSpec += fmt.Sprintf("The worker disputes the following finding(s) you raised in round %d, citing source evidence. Re-evaluate each against the evidence: withdraw it (report it resolved) if the evidence resolves it, or maintain it (report it still_open) if not. This does not change the finding on record; your re-evaluation is what decides it.\n\n", currentReviewRound)
-					for _, entry := range disputed {
-						reviewSpec += fmt.Sprintf("- Finding %s [%s] at %s:%d: %s\n", entry.Finding.ID, entry.Finding.Severity, entry.Finding.File, entry.Finding.Line, entry.Finding.Summary)
-						reviewSpec += fmt.Sprintf("  Worker's evidence: %s\n", entry.Evidence)
-					}
-					reviewSpec += "\n"
-				}
-				reviewSpec += "## Instructions\n\n"
-				reviewSpec += "Examine the submitted implementation and provide approval or rejection with written feedback.\n\n"
-				reviewSpec += "Approve if:\n"
-				reviewSpec += "- The implementation matches the specification\n"
-				reviewSpec += "- The code is correct and follows the project conventions\n"
-				reviewSpec += "- Tests pass and coverage is adequate\n\n"
-				reviewSpec += "Reject if:\n"
-				reviewSpec += "- The implementation has issues or does not match the specification\n"
-				reviewSpec += "- Further work is needed before merging\n\n"
-				reviewSpec += "Provide your verdict: approve or reject"
-
-				reviewModelsJSON := (*string)(nil) // review tasks don't have review_models
-				_, err := tx.ExecContext(ctx, `
-					INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, track, priority, created_at, updated_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				`, reviewTaskID, t.ProjectID, t.DocumentID, reviewTitle, reviewSpec, "ready", reviewerModel, "review", reviewModelsJSON, newReviewRound, &t.ID, false, t.Track, t.Priority, now, now)
-				if err != nil {
-					return TaskWithDepsAndLinks{}, fmt.Errorf("failed to create review task: %w", err)
-				}
-			}
-
-			// Append spawn_review event on the parent task
-			reviewersList, _ := json.Marshal(reviewers)
-			eventNote := "Round " + fmt.Sprintf("%d", newReviewRound) + " with models: " + string(reviewersList)
-			_, err = s.AppendEvent(ctx, tx, taskID, "system", "spawn_review", nil, &eventNote)
-			if err != nil {
-				return TaskWithDepsAndLinks{}, fmt.Errorf("failed to append spawn_review event: %w", err)
+			if err := s.createReviewTasks(ctx, tx, t, newReviewRound, currentReviewRound, links, disputesByLineage, now); err != nil {
+				return TaskWithDepsAndLinks{}, err
 			}
 
 			// Update t.ReviewRound for the response
@@ -6767,4 +6690,92 @@ func (s *sqliteStore) canonicalizeManifest(raw json.RawMessage, taskID string) (
 	canonical := strings.TrimSuffix(buf.String(), "\n")
 	sum := sha256.Sum256([]byte(canonical))
 	return &canonicalManifest{parentTaskID: m.ParentTaskID, json: canonical, digest: hex.EncodeToString(sum[:])}, nil
+}
+
+// createReviewTasks opens review round newReviewRound for the implement task t: one
+// review task per reviewer model, then the spawn_review event on t. It is the only
+// place review tasks are created for a submitted round. links supplies the PR link and
+// no-op marker; disputesByLineage routes disputed findings to the matching reviewer.
+func (s *sqliteStore) createReviewTasks(ctx context.Context, tx *sql.Tx, t Task, newReviewRound, currentReviewRound int, links []LinkInput, disputesByLineage map[string][]disputeContextEntry, now string) error {
+	// Extract PR link and any no_op marker from the submitted links.
+	// A no_op submission carries the marker and NO pr link: the implementer
+	// claims the acceptance is already satisfied on main with no diff.
+	var prLink string
+	var noOpMarker string
+	for _, link := range links {
+		switch link.Kind {
+		case "pr":
+			prLink = link.Value
+		case "no_op":
+			noOpMarker = link.Value
+		}
+	}
+	isNoOp := noOpMarker != "" && prLink == ""
+
+	// Determine reviewers (default to ["opus"] if empty)
+	reviewers := defaultReviewModels(t.ReviewModels)
+
+	// Create a review task for each reviewer
+	reviewerSlotsTaken := make(map[string]int)
+	for _, reviewerModel := range reviewers {
+		reviewTaskID := GenerateID()
+		reviewTitle := "Review: " + t.Title + " [" + reviewerModel + "]"
+
+		// This reviewer's lineage among this round's review tasks (see
+		// researchReviewerLineage): the same lineage computation
+		// collectResearchReviewReports uses when it later reads this round's
+		// review tasks back, so a dispute resolved against a lineage above is
+		// routed to the matching reviewer's spec below.
+		slot := reviewerSlotsTaken[reviewerModel]
+		reviewerSlotsTaken[reviewerModel] = slot + 1
+		lineage := researchReviewerLineage(reviewerModel, slot)
+
+		// Build the spec for the review task: a strict-review brief pointing at the parent's PR link
+		reviewSpec := "Review the implementation:\n\n"
+		if prLink != "" {
+			reviewSpec += "Implementation PR: " + prLink + "\n\n"
+		}
+		reviewSpec += "Parent task: " + t.ID + "\n\n"
+		if isNoOp {
+			reviewSpec += "## NO-OP submission (verify, do not auto-reject)\n\n"
+			reviewSpec += "The implementer reports the parent's acceptance criteria are ALREADY satisfied on `main` with no code changes, so there is NO PR. Do NOT reject merely because a PR is missing. VERIFY the claim against current `main`: if the parent's acceptance criteria genuinely hold in the repo, approve; if work is actually needed, reject with the specific gap.\n\n"
+		}
+		if disputed := disputesByLineage[lineage]; len(disputed) > 0 {
+			reviewSpec += "## Prior Review Round: Disputed Finding(s)\n\n"
+			reviewSpec += fmt.Sprintf("The worker disputes the following finding(s) you raised in round %d, citing source evidence. Re-evaluate each against the evidence: withdraw it (report it resolved) if the evidence resolves it, or maintain it (report it still_open) if not. This does not change the finding on record; your re-evaluation is what decides it.\n\n", currentReviewRound)
+			for _, entry := range disputed {
+				reviewSpec += fmt.Sprintf("- Finding %s [%s] at %s:%d: %s\n", entry.Finding.ID, entry.Finding.Severity, entry.Finding.File, entry.Finding.Line, entry.Finding.Summary)
+				reviewSpec += fmt.Sprintf("  Worker's evidence: %s\n", entry.Evidence)
+			}
+			reviewSpec += "\n"
+		}
+		reviewSpec += "## Instructions\n\n"
+		reviewSpec += "Examine the submitted implementation and provide approval or rejection with written feedback.\n\n"
+		reviewSpec += "Approve if:\n"
+		reviewSpec += "- The implementation matches the specification\n"
+		reviewSpec += "- The code is correct and follows the project conventions\n"
+		reviewSpec += "- Tests pass and coverage is adequate\n\n"
+		reviewSpec += "Reject if:\n"
+		reviewSpec += "- The implementation has issues or does not match the specification\n"
+		reviewSpec += "- Further work is needed before merging\n\n"
+		reviewSpec += "Provide your verdict: approve or reject"
+
+		reviewModelsJSON := (*string)(nil) // review tasks don't have review_models
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO task (id, project_id, document_id, title, spec, state, model, kind, review_models, review_round, target_task_id, agent_merge, track, priority, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, reviewTaskID, t.ProjectID, t.DocumentID, reviewTitle, reviewSpec, "ready", reviewerModel, "review", reviewModelsJSON, newReviewRound, &t.ID, false, t.Track, t.Priority, now, now)
+		if err != nil {
+			return fmt.Errorf("failed to create review task: %w", err)
+		}
+	}
+
+	// Append spawn_review event on the parent task
+	reviewersList, _ := json.Marshal(reviewers)
+	eventNote := "Round " + fmt.Sprintf("%d", newReviewRound) + " with models: " + string(reviewersList)
+	_, err := s.AppendEvent(ctx, tx, t.ID, "system", "spawn_review", nil, &eventNote)
+	if err != nil {
+		return fmt.Errorf("failed to append spawn_review event: %w", err)
+	}
+	return nil
 }
