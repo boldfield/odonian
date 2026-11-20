@@ -5501,7 +5501,7 @@ func (s *sqliteStore) UpdateTaskAwaitChecks(ctx context.Context, taskID string, 
 }
 
 // PassChecks transitions a task from 'checks' to 'review' and creates review tasks.
-// It is a no-op if called a second time (returns ErrConflict). It returns ErrConflict
+// A second call returns ErrConflict and changes nothing. It returns ErrConflict
 // if the task is not in 'checks' state.
 func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary string) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
@@ -5556,19 +5556,15 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		return Task{}, ErrConflict
 	}
 
-	// Increment review_round
-	newReviewRound := t.ReviewRound + 1
-	_, err = tx.ExecContext(ctx, `
-		UPDATE task SET review_round = ? WHERE id = ?
-	`, newReviewRound, taskID)
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to increment review_round: %w", err)
-	}
+	// review_round was already incremented by submitTask when entering checks;
+	// use t.ReviewRound as-is for the review tasks, and t.ReviewRound-1 as currentReviewRound
+	newReviewRound := t.ReviewRound
+	currentReviewRound := t.ReviewRound - 1
 
-	// Fetch the links for createReviewTasks
+	// Fetch the links for createReviewTasks, restricted to the current round
 	linkRows, err := tx.QueryContext(ctx, `
-		SELECT kind, value FROM task_link WHERE task_id = ? AND tombstoned_at IS NULL
-	`, taskID)
+		SELECT kind, value FROM task_link WHERE task_id = ? AND review_round = ? AND tombstoned_at IS NULL
+	`, taskID, newReviewRound)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to query links: %w", err)
 	}
@@ -5586,8 +5582,51 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		return Task{}, fmt.Errorf("error iterating links: %w", err)
 	}
 
+	// Fetch disputes from the submit event if this is an await_checks rework
+	disputesByLineage := make(map[string][]disputeContextEntry)
+	if t.AwaitChecks && t.Track == "research" {
+		// Fetch the most recent submit event's disputes
+		var disputesText string
+		err := tx.QueryRowContext(ctx, `
+			SELECT disputes FROM event WHERE task_id = ? AND kind = 'submit' ORDER BY created_at DESC LIMIT 1
+		`, taskID).Scan(&disputesText)
+		if err != nil && err != sql.ErrNoRows {
+			return Task{}, fmt.Errorf("failed to fetch submit event disputes: %w", err)
+		}
+
+		if err == nil {
+			var parsedDisputes []Dispute
+			if err := json.Unmarshal([]byte(disputesText), &parsedDisputes); err == nil {
+				// Get all findings to map dispute targets to full findings
+				allFindings, _, cerr := s.collectResearchReviewReports(ctx, tx, taskID, currentReviewRound)
+				if cerr != nil {
+					return Task{}, fmt.Errorf("failed to collect review findings for disputes: %w", cerr)
+				}
+
+				// Map findings by their ID and lineage
+				findingsByID := make(map[string][]researchCollectedFinding)
+				for _, cf := range allFindings {
+					if cf.round == currentReviewRound {
+						findingsByID[cf.ID] = append(findingsByID[cf.ID], cf)
+					}
+				}
+
+				// Build disputesByLineage by matching disputes to findings
+				for _, d := range parsedDisputes {
+					if targets, ok := findingsByID[d.FindingID]; ok && len(targets) > 0 {
+						target := targets[0]
+						disputesByLineage[target.lineage] = append(disputesByLineage[target.lineage], disputeContextEntry{
+							Finding:  target.Finding,
+							Evidence: d.Evidence,
+						})
+					}
+				}
+			}
+		}
+	}
+
 	// Create review tasks
-	if err := s.createReviewTasks(ctx, tx, t, newReviewRound, t.ReviewRound, links, nil, now); err != nil {
+	if err := s.createReviewTasks(ctx, tx, t, newReviewRound, currentReviewRound, links, disputesByLineage, now); err != nil {
 		return Task{}, err
 	}
 
