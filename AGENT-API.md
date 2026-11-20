@@ -238,6 +238,28 @@ When `agent_merge` is `false`, work requiring a merge waits in `approved` for th
 gate. Verified current-round no-ops with no active PR finalize directly regardless of this flag.
 In no case does a reviewer run `gh pr merge` or transition the parent.
 
+## Checks gate (`await_checks`)
+
+`await_checks` is an **optional per-task boolean** (default `false`, settable at creation and
+mutable via `PATCH`). When `true`, a task submission with a pull request enters a `checks` state
+instead of `review`, and the server watches the PR's CI status before opening the review round:
+
+- **Submission enters `checks`:** When an implement task with `await_checks: true` is submitted
+  with a `pr` link, the task moves to `checks` instead of `review`. Review tasks are not created
+  yet; `checks_started_at` is set. `review_round` increments as usual so links and rounds align.
+- **Green passes to review:** Once CI on the PR's head commit shows a successful rollup and the
+  task has settled in `checks` for a configured minimum time (default 2 minutes), the server
+  transitions to `review`, creates review tasks, and clears `checks_started_at`.
+- **Red returns to `ready`:** If CI fails, the task returns to `ready` with the failure recorded
+  as feedback. Workers see it via `odonian pr-feedback list`, acknowledge it with the fixing
+  commit, and resubmit—no manual rework claim required.
+- **Timeout blocks:** If the task stays in `checks` longer than the configured timeout (default 3
+  hours), it moves to `blocked`.
+
+The gate is opt-in per task. Tasks without `await_checks` or with `await_checks: false` behave as
+today: submission moves directly to `review` with no CI wait. The field is returned by
+`GET /tasks/{id}`, list responses, and `odonian show`.
+
 ## Agent comment markers
 
 PR comments from agents are marked with a prefix to identify their role:
@@ -637,6 +659,9 @@ transient admission deferral (which may succeed on retry) from fatal conflicts:
   models and each `review_models` entry must be in `ODONIAN_MODELS`, else `400 UNKNOWN_MODEL`.
   `review_models` defaults to `["opus"]`. A claim still requires an explicit matching `model`.
 - `agent_merge` defaults to `false` and is immutable.
+- `await_checks` defaults to `false` and is mutable (see `PATCH` below). When `true` on a
+  `research`-track task, creation returns `400 INVALID_AWAIT_CHECKS` (the checks gate applies only
+  to `build` and `design` tracks).
 - Review tasks are auto-spawned only — never create them directly.
 
 ## Updating a task: `PATCH /tasks/{id}`
@@ -660,6 +685,9 @@ curl -X PATCH -H "Authorization: Bearer $ODONIAN_TOKEN" -H 'Content-Type: applic
   slot; a reviewer of a model new to the list starts with no dispute lineage.
   CLI: `odonian update <id> --review-models a,b`. `POST /tasks/{id}/supersede` takes the same optional
   `review_models` for the replacement.
+- `await_checks` a boolean: sets whether the task waits for CI checks before entering review. Mutable
+  in all states. A change while the task is in `checks` does not move the task; it stays in `checks`
+  and the reconciler uses the updated value on the next poll.
 - Any other field (`spec`, `title`, `state`, unknown names): `400 FIELD_NOT_UPDATABLE` naming the
   field; nothing is changed, even if `depends_on` was sent alongside. Specs are immutable after
   creation; state changes go through `/transition`.
