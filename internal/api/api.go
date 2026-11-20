@@ -1275,12 +1275,33 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var awaitChecks *bool
 	if rawAwaitChecks, ok := fields["await_checks"]; ok {
+		if bytes.Equal(bytes.TrimSpace(rawAwaitChecks), []byte("null")) {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_AWAIT_CHECKS", "await_checks must be a boolean; null is not allowed")
+			return
+		}
 		var val bool
 		if err := json.Unmarshal(rawAwaitChecks, &val); err != nil {
 			s.errorResponse(w, http.StatusBadRequest, "INVALID_AWAIT_CHECKS", "await_checks must be a boolean")
 			return
 		}
 		awaitChecks = &val
+	}
+
+	// Validate all fields before writing anything, so a refusal of any field leaves the task unchanged.
+	if awaitChecks != nil && *awaitChecks {
+		task, err := s.store.GetTask(r.Context(), taskID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+				return
+			}
+			s.errorResponse(w, http.StatusInternalServerError, "GET_ERROR", "Failed to load task")
+			return
+		}
+		if task.Track == "research" {
+			s.errorResponse(w, http.StatusBadRequest, "AWAIT_CHECKS_RESEARCH", "await_checks is not allowed on a research-track task")
+			return
+		}
 	}
 
 	if hasModels || hasDeps || awaitChecks != nil {
