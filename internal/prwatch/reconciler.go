@@ -10,6 +10,7 @@ import (
 
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/notify"
+	"github.com/boldfield/odonian/internal/ratelimit"
 	"github.com/boldfield/odonian/internal/store"
 )
 
@@ -31,10 +32,8 @@ type PRWatchReconciler struct {
 	getReviewDecision       func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error)
 	postPRComment           func(ctx context.Context, owner, repo string, prNumber int, token, comment string) error
 	remainingQuotaLookup    func(ctx context.Context, token string) (*forge.QuotaInfo, error)
-	backoffInterval         time.Duration
-	rateLimitFloor          int
 	now                     func() time.Time
-	backoff                 *rateLimitBackoff
+	limiter                 *ratelimit.Limiter
 	lastLoggedSkippedCounts map[string]int
 }
 
@@ -55,12 +54,17 @@ func NewPRWatchReconciler(
 		getReviewDecision:       forge.GetReviewDecision,
 		postPRComment:           forge.PostPRComment,
 		remainingQuotaLookup:    forge.GetRemainingQuota,
-		backoffInterval:         backoffInterval,
-		rateLimitFloor:          rateLimitFloor,
 		now:                     time.Now,
-		backoff:                 newRateLimitBackoff(),
+		limiter:                 ratelimit.New(backoffInterval, rateLimitFloor),
 		lastLoggedSkippedCounts: make(map[string]int),
 	}
+}
+
+// WithLimiter replaces the reconciler's private rate limiter with one shared
+// with other reconcilers, so a rate limit seen by any of them stops them all.
+func (r *PRWatchReconciler) WithLimiter(l *ratelimit.Limiter) *PRWatchReconciler {
+	r.limiter = l
+	return r
 }
 
 func (r *PRWatchReconciler) Name() string {
@@ -551,7 +555,7 @@ func asRateLimitError(err error) (*forge.RateLimitError, bool) {
 // transition (the backoff entry is cleared on that first check); later tasks for
 // the same owner this pass just see "no entry" and stay silent.
 func (r *PRWatchReconciler) checkBackoff(owner string, now time.Time) bool {
-	backedOff, resumed := r.backoff.check(owner, now)
+	backedOff, resumed := r.limiter.Check(owner, now)
 	if resumed {
 		r.logger.Info("rate limit backoff resumed", "owner", owner)
 	}
@@ -567,11 +571,7 @@ func (r *PRWatchReconciler) checkBackoff(owner string, now time.Time) bool {
 // time (clock skew, or GitHub reporting a reset that's already elapsed) must not
 // let a later task for the same owner slip through and call GitHub again this pass.
 func (r *PRWatchReconciler) enterBackoff(owner string, rle *forge.RateLimitError, now time.Time) {
-	notBefore := now.Add(r.backoffInterval)
-	if !rle.Reset.IsZero() && rle.Reset.After(now) {
-		notBefore = rle.Reset
-	}
-	r.backoff.enter(owner, notBefore)
+	notBefore := r.limiter.Enter(owner, rle.Reset, now)
 	r.logger.Warn("entering rate limit backoff", "owner", owner, "not_before", notBefore, "status", rle.StatusCode)
 }
 
@@ -589,7 +589,7 @@ func (r *PRWatchReconciler) enterBackoff(owner string, rle *forge.RateLimitError
 // lookup error is logged once for the owner this pass and treated as "proceed":
 // a broken lookup must not stall reconciliation.
 func (r *PRWatchReconciler) checkQuotaFloor(ctx context.Context, owner, token string, quotaCheckedByOwner map[string]bool, now time.Time) bool {
-	if r.rateLimitFloor <= 0 || quotaCheckedByOwner[owner] {
+	if r.limiter.Floor() <= 0 || quotaCheckedByOwner[owner] {
 		return false
 	}
 	quotaCheckedByOwner[owner] = true
@@ -604,48 +604,11 @@ func (r *PRWatchReconciler) checkQuotaFloor(ctx context.Context, owner, token st
 		return false
 	}
 
-	if quota.Remaining > r.rateLimitFloor {
+	if !r.limiter.BelowFloor(quota.Remaining) {
 		return false
 	}
 
-	notBefore := now.Add(r.backoffInterval)
-	if !quota.Reset.IsZero() && quota.Reset.After(now) {
-		notBefore = quota.Reset
-	}
-	r.backoff.enter(owner, notBefore)
-	r.logger.Warn("remaining quota below floor; entering backoff", "owner", owner, "remaining", quota.Remaining, "floor", r.rateLimitFloor, "not_before", notBefore)
+	notBefore := r.limiter.Enter(owner, quota.Reset, now)
+	r.logger.Warn("remaining quota below floor; entering backoff", "owner", owner, "remaining", quota.Remaining, "floor", r.limiter.Floor(), "not_before", notBefore)
 	return true
-}
-
-// rateLimitBackoff tracks, per owner, the time before which no further GitHub calls
-// should be made — the "abort the remainder of the current reconcile pass" state.
-// It lives on PRWatchReconciler (not local to a single Reconcile call) so the
-// not-before time also skips the owner's checks on subsequent passes, up until it
-// passes.
-type rateLimitBackoff struct {
-	notBefore map[string]time.Time
-}
-
-func newRateLimitBackoff() *rateLimitBackoff {
-	return &rateLimitBackoff{notBefore: make(map[string]time.Time)}
-}
-
-// check reports whether owner is currently backed off as of now. If a previously
-// set backoff has just expired (now is at or after the recorded not-before time),
-// the entry is cleared and resumed is true — a one-shot signal for the caller to
-// log the resume transition exactly once.
-func (b *rateLimitBackoff) check(owner string, now time.Time) (backedOff, resumed bool) {
-	nb, ok := b.notBefore[owner]
-	if !ok {
-		return false, false
-	}
-	if now.Before(nb) {
-		return true, false
-	}
-	delete(b.notBefore, owner)
-	return false, true
-}
-
-func (b *rateLimitBackoff) enter(owner string, notBefore time.Time) {
-	b.notBefore[owner] = notBefore
 }
