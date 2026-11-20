@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -338,7 +339,7 @@ func TestOperatorBypassReviewTasksMatchPassChecks(t *testing.T) {
 	// Test PassChecks path
 	store1, projectID1, docID1 := newBranchTestStore(t)
 	tasks1, err := store1.CreateTasks(ctx, projectID1, []TaskInput{
-		{Title: "Task", Spec: "Spec", DocumentID: docID1, Model: "haiku", ReviewModels: []string{"opus"}, AwaitChecks: true},
+		{Title: "Task", Spec: "Spec", DocumentID: docID1, Model: "haiku", ReviewModels: []string{"opus", "sonnet"}, AwaitChecks: true},
 	})
 	if err != nil {
 		t.Fatalf("CreateTasks (PassChecks path): %v", err)
@@ -369,7 +370,7 @@ func TestOperatorBypassReviewTasksMatchPassChecks(t *testing.T) {
 	// Test operator bypass path
 	store2, projectID2, docID2 := newBranchTestStore(t)
 	tasks2, err := store2.CreateTasks(ctx, projectID2, []TaskInput{
-		{Title: "Task", Spec: "Spec", DocumentID: docID2, Model: "haiku", ReviewModels: []string{"opus"}, AwaitChecks: true},
+		{Title: "Task", Spec: "Spec", DocumentID: docID2, Model: "haiku", ReviewModels: []string{"opus", "sonnet"}, AwaitChecks: true},
 	})
 	if err != nil {
 		t.Fatalf("CreateTasks (bypass path): %v", err)
@@ -387,9 +388,9 @@ func TestOperatorBypassReviewTasksMatchPassChecks(t *testing.T) {
 	}, 5, nil, nil, testUnlimitedResearchBudget); err != nil {
 		t.Fatalf("SubmitTask (bypass path): %v", err)
 	}
-	parentAfterBypass, err := store2.TransitionTask(ctx, taskID2, "review", nil)
+	parentAfterBypass, err := store2.TransitionTaskWithActor(ctx, taskID2, "review", "my-custom-actor", nil)
 	if err != nil {
-		t.Fatalf("TransitionTask: %v", err)
+		t.Fatalf("TransitionTaskWithActor: %v", err)
 	}
 
 	reviewTasks2, err := store2.ListTasks(ctx, projectID2, TaskListFilter{Kind: ptrStr("review")})
@@ -399,33 +400,62 @@ func TestOperatorBypassReviewTasksMatchPassChecks(t *testing.T) {
 
 	// Both should create the same number of review tasks
 	if len(reviewTasks1) != len(reviewTasks2) {
-		t.Errorf("PassChecks created %d review tasks, operator bypass created %d", len(reviewTasks1), len(reviewTasks2))
+		t.Fatalf("PassChecks created %d review tasks, operator bypass created %d", len(reviewTasks1), len(reviewTasks2))
 	}
 
-	// Compare all review task fields (except target_task_id which points to different parents)
-	if len(reviewTasks1) > 0 && len(reviewTasks2) > 0 {
-		for i := range reviewTasks1 {
-			rt1 := reviewTasks1[i]
-			rt2 := reviewTasks2[i]
+	// Compare all review task fields
+	if len(reviewTasks1) == 0 {
+		t.Fatalf("Expected at least one review task, got 0")
+	}
 
-			if rt1.Model != rt2.Model {
-				t.Errorf("Review task %d model: PassChecks=%s, bypass=%s", i, rt1.Model, rt2.Model)
-			}
-			// target_task_id differs because they point to different parents (taskID1 vs taskID2)
-			if rt1.TargetTaskID == nil || rt2.TargetTaskID == nil {
-				t.Errorf("Review task %d target_task_id is nil", i)
-			}
-			if rt1.ReviewRound != rt2.ReviewRound {
-				t.Errorf("Review task %d review_round: PassChecks=%d, bypass=%d", i, rt1.ReviewRound, rt2.ReviewRound)
-			}
-			if rt1.Priority != rt2.Priority {
-				t.Errorf("Review task %d priority: PassChecks=%d, bypass=%d", i, rt1.Priority, rt2.Priority)
-			}
-			// Spec includes parent task PR links, which differ across the two paths. Both should
-			// contain the base spec and their respective parent's PR links.
-			if rt1.Spec == "" || rt2.Spec == "" {
-				t.Errorf("Review task %d spec is empty", i)
-			}
+	// Build maps by model for comparison (models may be in different order)
+	rt1ByModel := make(map[string]*Task)
+	rt2ByModel := make(map[string]*Task)
+	for i := range reviewTasks1 {
+		rt1ByModel[reviewTasks1[i].Model] = &reviewTasks1[i]
+		rt2ByModel[reviewTasks2[i].Model] = &reviewTasks2[i]
+	}
+
+	// Verify all models match
+	for model := range rt1ByModel {
+		if _, ok := rt2ByModel[model]; !ok {
+			t.Errorf("Model %s present in PassChecks but not in bypass", model)
+		}
+	}
+	for model := range rt2ByModel {
+		if _, ok := rt1ByModel[model]; !ok {
+			t.Errorf("Model %s present in bypass but not in PassChecks", model)
+		}
+	}
+
+	// Compare review tasks for each model
+	for model, rt1 := range rt1ByModel {
+		rt2 := rt2ByModel[model]
+
+		// Verify target_task_id equals expected parent
+		if rt1.TargetTaskID == nil || *rt1.TargetTaskID != taskID1 {
+			t.Errorf("Review task (model %s) target_task_id: expected %s, got %v", model, taskID1, rt1.TargetTaskID)
+		}
+		if rt2.TargetTaskID == nil || *rt2.TargetTaskID != taskID2 {
+			t.Errorf("Review task (model %s) target_task_id: expected %s, got %v", model, taskID2, rt2.TargetTaskID)
+		}
+
+		if rt1.ReviewRound != rt2.ReviewRound {
+			t.Errorf("Review task (model %s) review_round: PassChecks=%d, bypass=%d", model, rt1.ReviewRound, rt2.ReviewRound)
+		}
+		if rt1.Priority != rt2.Priority {
+			t.Errorf("Review task (model %s) priority: PassChecks=%d, bypass=%d", model, rt1.Priority, rt2.Priority)
+		}
+
+		// Both specs should contain PR context
+		if rt1.Spec == "" || rt2.Spec == "" {
+			t.Errorf("Review task (model %s) spec is empty", model)
+		}
+		if !strings.Contains(rt1.Spec, "https://github.com/o/r/pull/1") {
+			t.Errorf("Review task (model %s) spec missing PR link (PassChecks)", model)
+		}
+		if !strings.Contains(rt2.Spec, "https://github.com/o/r/pull/1") {
+			t.Errorf("Review task (model %s) spec missing PR link (bypass)", model)
 		}
 	}
 
@@ -435,5 +465,24 @@ func TestOperatorBypassReviewTasksMatchPassChecks(t *testing.T) {
 	}
 	if parentAfterBypass.State != "review" {
 		t.Errorf("Parent after bypass state: got %q, want 'review'", parentAfterBypass.State)
+	}
+
+	// Verify operator_bypass event has custom actor recorded
+	task2Events, err := store2.ListEvents(ctx, taskID2)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var foundBypassEvent bool
+	for _, event := range task2Events {
+		if event.Kind == "operator_bypass" {
+			foundBypassEvent = true
+			if event.Actor != "my-custom-actor" {
+				t.Errorf("operator_bypass event actor: expected 'my-custom-actor', got %q", event.Actor)
+			}
+			break
+		}
+	}
+	if !foundBypassEvent {
+		t.Errorf("operator_bypass event not found in task events")
 	}
 }

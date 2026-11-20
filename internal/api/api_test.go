@@ -3816,6 +3816,103 @@ func TestTransitionChecksToReviewCreatesReviewTasks(t *testing.T) {
 	}
 }
 
+func TestTransitionChecksToReviewRecordsCustomActor(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Test checks task",
+			Spec:         "Test spec",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			AwaitChecks:  true,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Promote and claim
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "test-agent", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	// Submit to enter checks state
+	submitPayload := map[string]interface{}{
+		"agent_id": "test-agent",
+		"result":   "done",
+		"links": []map[string]string{
+			{"kind": "pr", "value": "https://github.com/o/r/pull/1"},
+		},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	// Transition to review with custom actor
+	transitionPayload := map[string]interface{}{
+		"to":    "review",
+		"note":  "Operator bypass",
+		"actor": "my-custom-operator",
+	}
+	transitionBody, _ := json.Marshal(transitionPayload)
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader(transitionBody))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", transitionW.Code)
+	}
+
+	// Get task events and verify operator_bypass event has correct actor
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+taskID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+
+	var events []store.Event
+	json.NewDecoder(eventsW.Body).Decode(&events)
+
+	var foundBypassEvent bool
+	for _, event := range events {
+		if event.Kind == "operator_bypass" {
+			foundBypassEvent = true
+			if event.Actor != "my-custom-operator" {
+				t.Errorf("operator_bypass event actor: expected 'my-custom-operator', got %q", event.Actor)
+			}
+			break
+		}
+	}
+
+	if !foundBypassEvent {
+		t.Errorf("operator_bypass event not found in task events")
+	}
+}
+
 func TestTransitionToReviewFromNonChecksStateReturns409(t *testing.T) {
 	server := setupTestServer(t, "test-token")
 	authHeader := "Bearer test-token"

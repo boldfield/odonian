@@ -1395,10 +1395,10 @@ research rounds instead use the structured blocking-findings rules documented un
 - `approved` → `abandoned` (retire without merging)
 - `in_progress` → `done` for `merge` tasks only
 - `ready` → `done`, `in_progress` → `done`, `review` → `done`, `blocked` → `done` (PR-watch only: when the PR is merged outside the board; clears assignee, retires in-flight review children, appends transition event)
-- `checks` → `blocked` (operator abort, timeouts, or manual override; clears `checks_started_at` and assignee)
+- `checks` → `blocked` (operator-initiated abort or manual override; clears `checks_started_at`)
 - `checks` → `failed` (operator-initiated task failure; clears `checks_started_at`)
 - `checks` → `superseded` (operator-initiated task supersession; clears `checks_started_at`)
-- `checks` → `review` (operator bypass: creates review tasks exactly as `PassChecks` does; records `operator_bypass` event with actor `operator`)
+- `checks` → `review` (operator bypass: creates review tasks exactly as `PassChecks` does; records `operator_bypass` event with the calling actor, or `operator` if no actor is provided)
 
 The operator `/transition` endpoint does not permit `review` → `done`. Review aggregation does
 perform that direct transition for the verified current-round no-op case above, in a single

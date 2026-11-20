@@ -78,6 +78,7 @@ type Store interface {
 	SubmitTaskWithManifest(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
+	TransitionTaskWithActor(ctx context.Context, taskID, to, actor string, note *string) (Task, error)
 	ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string, reviewModelsOverride []string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
@@ -4616,7 +4617,13 @@ func (s *sqliteStore) AddReview(ctx context.Context, taskID, actor, verdict stri
 // Returns ErrConflict if the transition is not allowed.
 // Returns ValidationError if 'to' state is invalid.
 func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error) {
-	return s.transitionTask(ctx, taskID, to, note, nil)
+	return s.TransitionTaskWithActor(ctx, taskID, to, "", note)
+}
+
+// TransitionTaskWithActor is like TransitionTask but allows specifying the actor for the bypass event.
+// If actor is empty, defaults to "operator" for the checks→review bypass.
+func (s *sqliteStore) TransitionTaskWithActor(ctx context.Context, taskID, to, actor string, note *string) (Task, error) {
+	return s.transitionTask(ctx, taskID, to, note, nil, actor)
 }
 
 // CompleteLanding marks an approved task done for the approve attempt that holds its landing
@@ -4625,11 +4632,11 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 // done: TransitionTask refuses that, so dependents can never unblock before the work has landed.
 // Returns NOT_RESERVED or LANDING_ATTEMPT_MISMATCH conflicts unless attempt owns the reservation.
 func (s *sqliteStore) CompleteLanding(ctx context.Context, taskID, attempt string, note *string) (Task, error) {
-	return s.transitionTask(ctx, taskID, "done", note, &attempt)
+	return s.transitionTask(ctx, taskID, "done", note, &attempt, "")
 }
 
-// transitionTask is TransitionTask, or with landingAttempt set, CompleteLanding.
-func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, note *string, landingAttempt *string) (Task, error) {
+// transitionTask is TransitionTask (or TransitionTaskWithActor), or with landingAttempt set, CompleteLanding.
+func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, note *string, landingAttempt *string, actor string) (Task, error) {
 	// Validate 'to' state
 	validTargets := map[string]bool{"done": true, "ready": true, "blocked": true, "failed": true, "superseded": true, "abandoned": true, "review": true}
 	if !validTargets[to] {
@@ -4737,8 +4744,12 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 
 	// Special handling for checks → review operator bypass
 	if to == "review" && taskState == "checks" {
-		// Use helper to do the transition, with "operator" as the actor to distinguish from PassChecks
-		updatedTask, err := s.transitionChecksToReviewHelper(ctx, tx, taskID, "operator", "operator_bypass", note)
+		// Use helper to do the transition, with the provided actor (or "operator" as default)
+		bypassActor := actor
+		if bypassActor == "" {
+			bypassActor = "operator"
+		}
+		updatedTask, err := s.transitionChecksToReviewHelper(ctx, tx, taskID, bypassActor, "operator_bypass", note)
 		if err != nil {
 			return Task{}, err
 		}

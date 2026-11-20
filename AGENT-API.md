@@ -264,18 +264,16 @@ A task in `checks` is not claimable by any agent and is not returned by `GET /pr
 
 An operator can transition a task in `checks` to `blocked`, `failed`, `superseded`, or `review`:
 
-- **`checks → blocked`** (operator abort or manual override): clears `checks_started_at` and assignee; records `transition` event.
+- **`checks → blocked`** (operator abort or manual override): clears `checks_started_at`; records `transition` event.
 - **`checks → failed`** (operator-initiated task failure): clears `checks_started_at`; records `transition` event.
 - **`checks → superseded`** (operator-initiated task supersession): clears `checks_started_at`; records `transition` event.
-- **`checks → review`** (operator bypass): creates review tasks exactly as if checks passed; records `operator_bypass` event with actor `operator` and note (optional).
-
-**Limitation:** The transition endpoint has no caller identity parameter. The actor on the `operator_bypass` event is always the fixed string `operator`, regardless of who initiated the transition. The endpoint identifies the operator through authentication and authorization only, not through the event log.
+- **`checks → review`** (operator bypass): creates review tasks exactly as if checks passed; records `operator_bypass` event with the calling actor (or `operator` if not provided) and note (optional).
 
 #### Events
 
 - **`checks_passed`** (from reconciler, actor: `system`): The PR's head commit CI checks passed. Contains head commit SHA and a summary. Signals the transition from `checks` to `review` and review task creation.
 - **`checks_failed`** (from reconciler, actor: `system`): The PR's head commit CI checks failed. Contains head commit SHA and failed check names and URLs. Triggers the circuit breaker as if a review round failed; the task may go to `ready`, `blocked`, or be superseded.
-- **`operator_bypass`** (from operator transition, actor: `operator`): An operator bypassed the checks gate, moving the task directly from `checks` to `review`. Review tasks are created. The event's `note` field holds the operator's reason (if provided). The actor is always `operator`, not the actual caller.
+- **`operator_bypass`** (from operator transition, actor: supplied caller, default `operator`): An operator bypassed the checks gate, moving the task directly from `checks` to `review`. Review tasks are created. The event's `note` field holds the operator's reason (if provided). The actor field identifies the caller who initiated the bypass.
 
 ## Agent comment markers
 
@@ -846,13 +844,15 @@ Both priority endpoints:
 ## State machine
 
 ```text
-backlog ─promote→ ready ─claim→ in_progress ─submit→ review ─passes review→ approved ─merge gate→ done
-                                                        ↓
-                                                      checks (when await_checks=true and PR present)
-                                                        ├─green (reconciler)→ review
-                                                        ├─red (reconciler)──→ ready
+backlog ─promote→ ready ─claim→ in_progress ─submit→ checks (when await_checks=true and PR present)
+                                                        ├─green (reconciler)──→ review
+                                                        ├─red (reconciler)────→ ready
                                                         ├─timeout (reconciler)→ blocked
-                                                        └─operator bypass──→ review
+                                                        └─operator bypass────→ review
+                                                     
+                                             ─submit→ review (when not await_checks or no PR)
+                                                        ↓
+                                           passes review→ approved ─merge gate→ done
 ```
 
 For tasks with `await_checks: true` and a PR link, submit moves them to `checks` instead of `review`.
