@@ -144,6 +144,14 @@ the session cannot be resumed — the task is moved to `blocked` with a note quo
 final message (secrets redacted). `ODONIAN_SESSION_RECOVERY=off` disables the mechanism.
 Research dispatches are not resumed this way.
 
+**Tasks that wait for CI on the board (`await_checks`).** For a task with `await_checks: true`,
+the build and design pull-request prompts tell the worker to push, open or reuse the pull request
+and submit without waiting for CI; the board waits and returns the task if a check fails, and on
+rework the failure is a `pr-feedback` item the worker fixes (or re-runs) and acknowledges. The
+reviewer still reads `gh pr checks` and rejects if the head commit's checks are no longer green,
+but never waits. Other tasks keep the wait-in-the-foreground instructions. Design:
+[`docs/features/checks-gate.md`](../docs/features/checks-gate.md).
+
 **Process cleanup.** Each dispatch stamps the model's environment with a unique
 `ODONIAN_DISPATCH_ID`; descendants inherit it whatever their process group. After the model
 (and any resumes) exit — success, failure, or stop — the harness reaps exactly the processes
