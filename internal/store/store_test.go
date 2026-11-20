@@ -19449,6 +19449,75 @@ func TestConvergeExternallyMergedTaskFromApproved(t *testing.T) {
 	}
 }
 
+func TestConvergeExternallyMergedTaskFromChecks(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Create project and document
+	p, err := s.CreateProject(ctx, "test-proj", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	d, err := s.CreateDocument(ctx, p.ID, "design", "test doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a task
+	tasks, err := s.CreateTasks(ctx, p.ID, []TaskInput{
+		{
+			Title:      "Test Task",
+			Spec:       "Test spec",
+			DocumentID: d.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	task := tasks[0]
+
+	// Set task to checks state with checks_started_at set
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.Conn().ExecContext(ctx, `
+		UPDATE task SET state = 'checks', checks_started_at = ?, updated_at = ? WHERE id = ?
+	`, now, now, task.ID); err != nil {
+		t.Fatalf("failed to set task to checks: %v", err)
+	}
+
+	// Converge the externally merged task
+	converged, err := s.ConvergeExternallyMergedTask(ctx, task.ID, "https://github.com/owner/repo/pull/456")
+	if err != nil {
+		t.Fatalf("failed to converge externally merged task: %v", err)
+	}
+
+	if converged.State != "done" {
+		t.Fatalf("expected done state, got %s", converged.State)
+	}
+
+	if converged.ChecksStartedAt != nil {
+		t.Fatalf("expected checks_started_at to be cleared, got %v", converged.ChecksStartedAt)
+	}
+
+	// Verify event was recorded
+	events, err := s.ListEvents(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("failed to list events: %v", err)
+	}
+	var foundTransitionEvent bool
+	for _, evt := range events {
+		if evt.Kind == "transition" && evt.Note != nil && *evt.Note == "PR https://github.com/owner/repo/pull/456 merged outside the board" {
+			foundTransitionEvent = true
+			break
+		}
+	}
+	if !foundTransitionEvent {
+		t.Error("transition event not found")
+	}
+}
+
 func TestSupersededTaskInheritsAwaitChecks(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())

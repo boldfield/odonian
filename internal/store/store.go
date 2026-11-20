@@ -4899,7 +4899,7 @@ func (s *sqliteStore) ConvergeExternallyMergedTask(ctx context.Context, taskID, 
 	}
 
 	// Only allowed from these states
-	allowedStates := map[string]bool{"ready": true, "in_progress": true, "review": true, "blocked": true, "approved": true}
+	allowedStates := map[string]bool{"ready": true, "in_progress": true, "checks": true, "review": true, "blocked": true, "approved": true}
 	if !allowedStates[taskState] {
 		return Task{}, ErrConflict
 	}
@@ -4942,7 +4942,7 @@ func (s *sqliteStore) ConvergeExternallyMergedTask(ctx context.Context, taskID, 
 	result, err := tx.ExecContext(ctx, `
 		UPDATE task
 		SET state='done', updated_at=?, landing_round=NULL, landing_commit=NULL, landing_attempt=NULL,
-		    assignee=NULL, lease_expires_at=NULL
+		    assignee=NULL, lease_expires_at=NULL, checks_started_at=NULL
 		WHERE id=? AND state=?
 	`, now, taskID, taskState)
 	if err != nil {
