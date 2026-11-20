@@ -2480,7 +2480,7 @@ func (s *sqliteStore) submitTask(ctx context.Context, taskID, agentID, result st
 		nextState = "review"
 		// An opted-in submission carrying a pr link (and not a no_op resolution) waits for the
 		// PR's checks before review (docs/features/checks-gate.md, C3).
-		if awaitChecks {
+		if awaitChecks && taskKind == "implement" {
 			hasPR, hasNoOp := false, false
 			for _, link := range links {
 				switch link.Kind {

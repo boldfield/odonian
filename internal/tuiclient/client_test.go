@@ -1400,7 +1400,7 @@ func TestSubmitTaskWithManifest(t *testing.T) {
 
 	client := NewHTTPClient(server.URL, "testtoken")
 	links := []LinkInput{{Kind: "pr", Value: "https://github.com/test/pr"}}
-	if err := client.SubmitTaskWithManifest(context.Background(), "task123", "agent123", "done", nil, links, nil, nil, manifest); err != nil {
+	if _, err := client.SubmitTaskWithManifest(context.Background(), "task123", "agent123", "done", nil, links, nil, nil, manifest); err != nil {
 		t.Fatalf("SubmitTaskWithManifest failed: %v", err)
 	}
 	if !sawManifest {

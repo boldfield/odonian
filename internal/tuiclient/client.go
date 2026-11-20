@@ -914,12 +914,14 @@ func (c *HTTPClient) SubmitTaskWithFindings(ctx context.Context, id, agentID, re
 // links, structured findings (review-kind tasks), and disputes (research-track
 // implement rework, per docs/features/research-track.md section 5).
 func (c *HTTPClient) SubmitTaskWithDisputesAndFindings(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage) error {
-	return c.SubmitTaskWithManifest(ctx, id, agentID, result, verdict, links, findings, disputes, nil)
+	_, err := c.SubmitTaskWithManifest(ctx, id, agentID, result, verdict, links, findings, disputes, nil)
+	return err
 }
 
 // SubmitTaskWithManifest is SubmitTaskWithDisputesAndFindings plus an optional research
 // continuation manifest (research-track implement, per docs/features/research-continuations.md).
-func (c *HTTPClient) SubmitTaskWithManifest(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) error {
+// It returns the task's resulting state as reported by the server ("" if the response carries none).
+func (c *HTTPClient) SubmitTaskWithManifest(ctx context.Context, id, agentID, result string, verdict *string, links []LinkInput, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) (string, error) {
 	body := submitTaskRequest{
 		AgentID:   agentID,
 		AttemptID: c.AttemptID(id),
@@ -933,11 +935,16 @@ func (c *HTTPClient) SubmitTaskWithManifest(ctx context.Context, id, agentID, re
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/submit", id), body)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	return nil
+	var out struct {
+		State string `json:"state"`
+	}
+	// The submit already succeeded; an unreadable body only loses the state report.
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.State, nil
 }
 
 // ArchiveTask archives a task.
