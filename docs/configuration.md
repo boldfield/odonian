@@ -279,6 +279,21 @@ not authenticate the server or merger. The merger reads only its per-owner token
 It does not fall back to `gh` authentication or `GH_TOKEN`; a
 missing owner entry results in an unauthenticated merge request, which cannot merge the PR.
 
+## Checkwatch reconciler
+
+Checkwatch runs on the same runner and watches `checks` tasks with pull requests. It polls each PR
+for the head commit's check status and transitions the task when checks complete, fail, or timeout.
+See `docs/features/checks-gate.md` section C7 for the full design. Checkwatch shares the GitHub
+rate limiter with PR-watch, so rate limits from either reconciler affect both. Checkwatch reads the same
+`FORGE_TOKENS` file as PR-watch and skips owners with no token, as PR-watch does.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHECKS_POLL_INTERVAL` | `2m` | Minimum time between passes of the reconciler. The reconciler will not run more often than this. |
+| `CHECKS_SETTLE` | `2m` | Minimum time a task must stay in `checks` before a green result passes it to `review`. Protects against fast workflows finishing before slow ones register. |
+| `CHECKS_NO_RUNS_GRACE` | `5m` | How long to wait after entering `checks` for the first check to appear before passing with "no checks reported". A repository with no CI or a path-filtered push that triggers nothing must not hang forever. |
+| `CHECKS_TIMEOUT` | `3h` | Longest a task may stay in `checks` before timing out and moving to `blocked`. Prevents tasks from hanging indefinitely on stuck or missing CI. |
+
 ## CLI (`odonian <command>`)
 
 | Variable | Default | Meaning |

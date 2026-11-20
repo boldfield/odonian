@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/boldfield/odonian/internal/api"
+	"github.com/boldfield/odonian/internal/checkwatch"
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/localcommit"
 	"github.com/boldfield/odonian/internal/notify"
@@ -354,6 +355,42 @@ func runServer() {
 		log.Fatalf("failed to parse NOTIFY_FAILED_WINDOW: %v", err)
 	}
 
+	checksPollIntervalStr := os.Getenv("CHECKS_POLL_INTERVAL")
+	if checksPollIntervalStr == "" {
+		checksPollIntervalStr = "2m"
+	}
+	checksPollInterval, err := time.ParseDuration(checksPollIntervalStr)
+	if err != nil {
+		log.Fatalf("failed to parse CHECKS_POLL_INTERVAL: %v", err)
+	}
+
+	checksSettleStr := os.Getenv("CHECKS_SETTLE")
+	if checksSettleStr == "" {
+		checksSettleStr = "2m"
+	}
+	checksSettle, err := time.ParseDuration(checksSettleStr)
+	if err != nil {
+		log.Fatalf("failed to parse CHECKS_SETTLE: %v", err)
+	}
+
+	checksNoRunsGraceStr := os.Getenv("CHECKS_NO_RUNS_GRACE")
+	if checksNoRunsGraceStr == "" {
+		checksNoRunsGraceStr = "5m"
+	}
+	checksNoRunsGrace, err := time.ParseDuration(checksNoRunsGraceStr)
+	if err != nil {
+		log.Fatalf("failed to parse CHECKS_NO_RUNS_GRACE: %v", err)
+	}
+
+	checksTimeoutStr := os.Getenv("CHECKS_TIMEOUT")
+	if checksTimeoutStr == "" {
+		checksTimeoutStr = "3h"
+	}
+	checksTimeout, err := time.ParseDuration(checksTimeoutStr)
+	if err != nil {
+		log.Fatalf("failed to parse CHECKS_TIMEOUT: %v", err)
+	}
+
 	rateLimitFloorStr := os.Getenv("PRWATCH_RATE_LIMIT_FLOOR")
 	if rateLimitFloorStr == "" {
 		rateLimitFloorStr = "1500"
@@ -422,6 +459,19 @@ func runServer() {
 	// One limiter shared by every reconciler that calls GitHub.
 	githubLimiter := ratelimit.New(notifyInterval, rateLimitFloor)
 	reconcilers = append(reconcilers, prwatch.NewPRWatchReconciler(s, notifier, forge.OwnerToken, notifyInterval, rateLimitFloor, logger).WithLimiter(githubLimiter))
+
+	checksConfig := checkwatch.Config{
+		Settle:      checksSettle,
+		NoRunsGrace: checksNoRunsGrace,
+		Timeout:     checksTimeout,
+	}
+	checksOptions := checkwatch.Options{
+		MaxReviewRounds:              maxReviewRounds,
+		EscalationThresholds:         escalationThresholds,
+		ResearchEscalationThresholds: researchEscalationThresholds,
+	}
+	reconcilers = append(reconcilers, checkwatch.NewReconciler(s, forge.OwnerToken, githubLimiter, checksConfig, checksOptions, checksPollInterval, logger))
+
 	runner := reconcile.NewRunner(notifyInterval, logger, reconcilers...)
 
 	go func() {
