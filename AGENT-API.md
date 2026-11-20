@@ -64,7 +64,7 @@ Never work a task you did not win.
 ### 3. Read the full spec
 
 ```bash
-curl -s "${A[@]}" "$ODONIAN_URL/tasks/$TASK_ID" | jq '{title, spec, model, review_models, agent_merge, depends_on, links}'
+curl -s "${A[@]}" "$ODONIAN_URL/tasks/$TASK_ID" | jq '{title, spec, model, review_models, agent_merge, await_checks, depends_on, links}'
 ```
 
 The `spec` is your contract — build exactly what it says, no more. Read the design/feature document
@@ -671,11 +671,10 @@ curl -X PATCH -H "Authorization: Bearer $ODONIAN_TOKEN" -H 'Content-Type: applic
   slot; a reviewer of a model new to the list starts with no dispute lineage.
   CLI: `odonian update <id> --review-models a,b`. `POST /tasks/{id}/supersede` takes the same optional
   `review_models` for the replacement.
-- `await_checks` a boolean: sets whether the task waits for CI checks before entering review. Accepted
-  in `backlog`, `ready`, `in_progress`, `blocked` and `review`; `400 FIELD_NOT_UPDATABLE` on a
-  `review`/`merge` task, `409` on `approved` and terminal tasks. When true on a `research`-track
-  task, `PATCH` returns `400 AWAIT_CHECKS_RESEARCH`. A change while the task is in `checks` does not
-  move the task; it stays in `checks` and the reconciler uses the updated value on the next poll.
+- `await_checks` a boolean: sets whether the task waits for CI checks before entering review. When
+  sent alone, accepted in any state. When true on a `research`-track task, `PATCH` returns
+  `400 AWAIT_CHECKS_RESEARCH`. When sent alongside `review_models` or `depends_on`, the state
+  restrictions for those fields apply.
 - Any other field (`spec`, `title`, `state`, unknown names): `400 FIELD_NOT_UPDATABLE` naming the
   field; nothing is changed, even if `depends_on` was sent alongside. Specs are immutable after
   creation; state changes go through `/transition`.
