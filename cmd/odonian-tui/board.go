@@ -85,7 +85,7 @@ type BoardModel struct {
 	tasks          map[string][]tuiclient.Task // keyed by state
 	selectedTaskID string                      // current selection, keyed by ID
 	selectedIndex  int                         // index position within selected column, for nearest-selection on disappear
-	selectedColumn int                         // 0=backlog, 1=ready, 2=in_progress, 3=review, 4=done
+	selectedColumn int                         // index into stateOrder
 	scrollOffset   int                         // vertical scroll offset for the task list
 	loading        bool
 	error          string
@@ -140,6 +140,7 @@ const (
 	stateBacklog    = "backlog"
 	stateReady      = "ready"
 	stateInProgress = "in_progress"
+	stateChecks     = "checks"
 	stateReview     = "review"
 	stateApproved   = "approved"
 	stateDone       = "done"
@@ -148,17 +149,28 @@ const (
 	stateAbandoned  = "abandoned"
 )
 
-var stateOrder = []string{stateBacklog, stateReady, stateInProgress, stateReview, stateApproved, stateDone, stateBlocked, stateFailed, stateAbandoned}
+var stateOrder = []string{stateBacklog, stateReady, stateInProgress, stateChecks, stateReview, stateApproved, stateDone, stateBlocked, stateFailed, stateAbandoned}
 var stateColors = map[string]lipgloss.Color{
 	stateBacklog:    lipgloss.Color("8"),
 	stateReady:      lipgloss.Color("4"),
 	stateInProgress: lipgloss.Color("3"),
+	stateChecks:     lipgloss.Color("11"),
 	stateReview:     lipgloss.Color("5"),
 	stateApproved:   lipgloss.Color("6"),
 	stateDone:       lipgloss.Color("2"),
 	stateBlocked:    lipgloss.Color("1"),
 	stateFailed:     lipgloss.Color("9"),
 	stateAbandoned:  lipgloss.Color("8"),
+}
+
+// columnIndex returns the position of state in stateOrder (the board's column order).
+func columnIndex(state string) int {
+	for i, s := range stateOrder {
+		if s == state {
+			return i
+		}
+	}
+	return -1
 }
 
 // NewBoardModel creates a new board model and starts the initial fetch.
@@ -171,7 +183,7 @@ func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tu
 		config:         config,
 		project:        project,
 		tasks:          make(map[string][]tuiclient.Task),
-		selectedColumn: 2, // in_progress by default
+		selectedColumn: columnIndex(stateInProgress), // in_progress by default
 		loading:        true,
 		reviewInput:    inputWidget,
 		urlOpener:      defaultURLOpener,
@@ -727,7 +739,7 @@ func (m *BoardModel) fetchTasksInline(ctx context.Context, errPrefix string) rev
 
 // activeStates are the states re-fetched on every poll tick. Terminal states change
 // far less often, so they are excluded from the steady-state poll to keep it cheap.
-var activeStates = []string{stateBacklog, stateReady, stateInProgress, stateReview, stateApproved, stateBlocked}
+var activeStates = []string{stateBacklog, stateReady, stateInProgress, stateChecks, stateReview, stateApproved, stateBlocked}
 
 // terminalStates are fetched only at startup, on manual refresh, and after project switches.
 var terminalStates = []string{stateDone, stateFailed, stateAbandoned}
@@ -1052,7 +1064,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Approve: only on review column tasks
 		case "a":
-			if m.selectedColumn == 3 && m.selectedTaskID != "" {
+			if m.selectedColumn == columnIndex(stateReview) && m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
 				m.reviewInput.Placeholder = "optional note (enter to skip)"
 				m.reviewInput.SetValue("")
@@ -1066,7 +1078,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Reject: only on review column tasks
 		case "x":
-			if m.selectedColumn == 3 && m.selectedTaskID != "" {
+			if m.selectedColumn == columnIndex(stateReview) && m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
 				m.reviewInput.Placeholder = "rejection reason (required)"
 				m.reviewInput.SetValue("")
@@ -1080,7 +1092,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Bounce back: only on approved column tasks
 		case "b":
-			if m.selectedColumn == 4 && m.selectedTaskID != "" {
+			if m.selectedColumn == columnIndex(stateApproved) && m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
 				m.reviewInput.Placeholder = "optional note (enter to skip)"
 				m.reviewInput.SetValue("")
@@ -1094,7 +1106,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Unblock: only on blocked column tasks
 		case "u":
-			if m.selectedColumn == 6 && m.selectedTaskID != "" {
+			if m.selectedColumn == columnIndex(stateBlocked) && m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
 				m.reviewInput.Placeholder = "optional note (enter to skip)"
 				m.reviewInput.SetValue("")
@@ -1107,7 +1119,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "f":
-			if m.selectedColumn == 6 && m.selectedTaskID != "" {
+			if m.selectedColumn == columnIndex(stateBlocked) && m.selectedTaskID != "" {
 				m.pendingTaskID = m.selectedTaskID
 				m.reviewInput.Placeholder = "optional note (enter to skip)"
 				m.reviewInput.SetValue("")
@@ -1542,7 +1554,7 @@ func (m *BoardModel) updateProjectSwitchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd
 				// Reset all board state to avoid leaking data across projects
 				m.selectedTaskID = ""
 				m.selectedIndex = 0
-				m.selectedColumn = 2 // Reset to in_progress column
+				m.selectedColumn = columnIndex(stateInProgress) // Reset to in_progress column
 				m.tasks = make(map[string][]tuiclient.Task)
 				m.detailTask = tuiclient.TaskDetail{}
 				m.detailDocuments = nil
@@ -2460,7 +2472,7 @@ func (m *BoardModel) renderColumnTasks() string {
 		b.WriteString(fmt.Sprintf("%s %s %s%s%s%s  %s\n", prefix, taskIDDisplay, modelBadge, held, priority, anchor, task.Title))
 
 		// Show assignee for in_progress, review, approved, and done states
-		shouldShowAssignee := task.State == stateInProgress || task.State == stateReview ||
+		shouldShowAssignee := task.State == stateInProgress || task.State == stateChecks || task.State == stateReview ||
 			task.State == stateApproved || task.State == stateDone
 		if shouldShowAssignee && task.Assignee != nil {
 			assignee := *task.Assignee
@@ -2476,6 +2488,8 @@ func (m *BoardModel) renderColumnTasks() string {
 					leaseStatus = m.formatLeaseCountdown(*task.LeaseExpiresAt)
 				}
 				b.WriteString(fmt.Sprintf("    @%s · lease %s · updated %s ago\n", assignee, leaseStatus, m.formatTime(task.UpdatedAt)))
+			} else if task.State == stateChecks {
+				b.WriteString(fmt.Sprintf("    @%s · in checks %s · updated %s ago\n", assignee, formatChecksDuration(task.ChecksStartedAt, time.Now()), m.formatTime(task.UpdatedAt)))
 			} else {
 				// For other states, just show assignee and updated time
 				b.WriteString(fmt.Sprintf("    @%s · updated %s ago\n", assignee, m.formatTime(task.UpdatedAt)))
@@ -2544,16 +2558,39 @@ func (m *BoardModel) renderHelpBar() string {
 		return "esc cancel"
 	}
 	priorityKeys := "   i set priority   w move to front   e reset priority"
-	switch m.selectedColumn {
-	case 0: // backlog
+	switch stateOrder[m.selectedColumn] {
+	case stateBacklog:
 		return "←/→ column   ↑/↓ select   enter detail   p promote   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	case 3: // review
+	case stateReview:
 		return "←/→ column   ↑/↓ select   enter detail   a approve   x reject   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	case 4: // approved
+	case stateApproved:
 		return "←/→ column   ↑/↓ select   enter detail   b bounce   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	case 6: // blocked
+	case stateBlocked:
 		return "←/→ column   ↑/↓ select   enter detail   u unblock   f fail   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
 	default:
 		return "←/→ column   ↑/↓ select   enter detail   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
+	}
+}
+
+// formatChecksDuration renders how long a task has been in checks, from checks_started_at.
+func formatChecksDuration(startedAt *string, now time.Time) string {
+	if startedAt == nil {
+		return "unknown"
+	}
+	t, err := time.Parse(time.RFC3339Nano, *startedAt)
+	if err != nil {
+		return "unknown"
+	}
+	d := now.Sub(t)
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 }

@@ -24,6 +24,8 @@ the API-only design: humans and agents drive the same single source of truth.
 - **See the board** as five states — `backlog`, `ready`, `in_progress`, `review`, `done` —
   from a single `GET /projects/{id}/tasks` call, bucketed by state client-side.
 - **Watch agents work**: `in_progress` cards show `assignee` and a live lease countdown.
+- **Watch the checks gate**: a `checks` column sits between `in_progress` and `review`; its cards
+  and the task detail show how long the task has been in `checks` (from `checks_started_at`).
 - **Promote** a `backlog` task to `ready` (`p`).
 - **Work the human gate** from the `review` column: approve (`a`) and reject (`x`). The API
   already supports this end to end (`POST /tasks/{id}/review`, `POST /tasks/{id}/transition`,
