@@ -20,6 +20,19 @@ you; never curl the API by hand. The verbs you need: `odonian next` (find+claim)
 …`. `AGENT_ID` and `AGENT_MODEL` are read from the environment automatically — you don't pass them.
 Run `odonian <verb> -h` for flags. (Raw API — docs/api.md / AGENT-API.md — only if a verb fails.)
 
+**Tasks the board waits on CI for (`await_checks`).** `odonian show <id>` prints `Await Checks:
+true` (`"await_checks": true` with `--json`) when the board, not you, waits for the pull request's
+checks. The two cases:
+- **`await_checks: true`** — do NOT wait for CI. Push, open or reuse the pull request (step 8) and
+  submit (step 9) at once; the board waits for the head commit's checks and returns the task to
+  `ready` if one fails. On a rework, a failed check appears as an item in `odonian pr-feedback list`
+  (step 7). Read the failing job's log (`gh run view <run-id> --log-failed`), then fix the cause, or
+  re-run the job if it is a flake (`gh run rerun <run-id> --failed`). Acknowledge the item with the
+  fixing commit (`odonian pr-feedback ack <pr-url> <item-id> <sha>`), or as disputed when nothing
+  changed (`odonian pr-feedback ack --disputed <pr-url> <item-id>`, giving the reason in your submit
+  result), and submit.
+- **No `await_checks`** (`Await Checks: false`) — nothing changes: follow every step as written.
+
 ## What you produce
 
 A single file, `DESIGN.md`, for the ONE candidate tool your task spec names. It has a **generic

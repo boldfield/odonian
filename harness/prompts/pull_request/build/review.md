@@ -21,6 +21,7 @@ scheduled wakeup or monitor will resume it. Never end your turn while your task 
 wait for CI or a long command, wait in the foreground: for example, `gh run watch <id> --exit-status
 --interval 60` or a polling loop, each call kept under the tool timeout and repeated until done. Then
 submit, or block with a reason. Anything you start in the background is killed when your session ends.
+(A parent task with `await_checks: true` is the exception: never wait for its CI — see step 3.)
 
 ## Your iteration
 
@@ -89,8 +90,14 @@ submit, or block with a reason. Anything you start in the background is killed w
      `gh pr checks "<pr-url>"`. If any check has **FAILED**, reject (note which check + the failure):
      your local environment differs from CI (CI's git defaults `init.defaultBranch` to `master`, has
      no `gh` auth, etc.), so a green local run over a red CI means the test is non-portable — a defect
-     to reject, not approve. If checks are still **pending**, wait and re-check before deciding; never
-     approve over a known-red CI.
+     to reject, not approve. If checks are still **pending** and the parent has no `await_checks`,
+     wait and re-check before deciding; never approve over a known-red CI.
+   - **Parent with `await_checks: true`** (`odonian show <target_task_id>` prints `Await Checks:
+     true`): the board created this review only after the head commit's checks were green. Still run
+     `gh pr checks "<pr-url>"`. If the head commit's checks are not all green now (failed, pending, or
+     re-running), reject with note "head changed after the checks gate" plus each check that is not
+     green and its state. Never wait for pending checks on such a task. A parent without
+     `await_checks` follows the bullet above unchanged.
    - **Interactive / terminal-UI changes (e.g. `cmd/odonian-tui`, any Bubble Tea `Update`/`View`
      code): reading the diff + green `make check`/`make test` is NOT sufficient** — a TUI routinely
      passes both while rendering a blank screen, because logic and *display* are separate paths. You

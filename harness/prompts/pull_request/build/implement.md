@@ -32,6 +32,20 @@ wait for CI or a long command, wait in the foreground: for example, `gh run watc
 --interval 60` or a polling loop, each call kept under the tool timeout and repeated until done. Then
 submit, or block with a reason. Anything you start in the background is killed when your session ends.
 
+**Tasks the board waits on CI for (`await_checks`).** `odonian show <id>` prints `Await Checks:
+true` (`"await_checks": true` with `--json`) when the board, not you, waits for the pull request's
+checks. The two cases:
+- **`await_checks: true`** — do NOT wait for CI. Push, open or reuse the pull request (step 8) and
+  submit (step 9) at once; the board waits for the head commit's checks and returns the task to
+  `ready` if one fails. On a rework, a failed check appears as an item in `odonian pr-feedback list`
+  (step 7). Read the failing job's log (`gh run view <run-id> --log-failed`), then fix the cause, or
+  re-run the job if it is a flake (`gh run rerun <run-id> --failed`). Acknowledge the item with the
+  fixing commit (`odonian pr-feedback ack <pr-url> <item-id> <sha>`), or as disputed when nothing
+  changed (`odonian pr-feedback ack --disputed <pr-url> <item-id>`, giving the reason in your submit
+  result), and submit.
+- **No `await_checks`** (`Await Checks: false`) — nothing changes: follow every step as written,
+  including waiting for CI in the foreground when you need its result.
+
 1. Find work. Run `odonian next --project "$ODONIAN_PROJECT" --model "$AGENT_MODEL" --kind implement`.
    It prints the id of the first claimable `implement`-kind task for your model tier — `--kind implement`
    excludes `review`-kind tasks (a reviewer's job; never claim one). Exit code 2 / "nothing claimable"

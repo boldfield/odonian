@@ -136,6 +136,12 @@ not an acceptable reject. Approve only when all four hold for the design as writ
      checks explicitly. Confirm the design also embedded the `## Coherence requirements` block
      verbatim (the worker is required to copy it word-for-word). Any one of the four failing → reject,
      naming the specific incoherence. All four holding → approve.
+   - **Parent with `await_checks: true`** (`odonian show <target_task_id>` prints `Await Checks:
+     true`): the board created this review only after the head commit's checks were green. Still run
+     `gh pr checks "<pr-url>"`. If the head commit's checks are not all green now (failed, pending, or
+     re-running), reject with note "head changed after the checks gate" plus each check that is not
+     green and its state. Never wait for pending checks on such a task. A parent without
+     `await_checks` keeps the review above unchanged.
 4. **Provide feedback with inline + global comments.** When you find incoherence or have notes, you
    MAY leave **inline (path+line) review comments** on specific lines in addition to your global
    summary comment. **Reviewers do NOT resolve their own review threads** — resolution is the worker's
