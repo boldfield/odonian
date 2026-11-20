@@ -5582,48 +5582,10 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		return Task{}, fmt.Errorf("error iterating links: %w", err)
 	}
 
-	// Fetch disputes from the submit event if this is an await_checks rework
+	// Disputes only occur on research-track submissions, but await_checks is rejected on research
+	// tracks at create, update, supersede and escalate. So no disputes are possible on an
+	// await_checks task. Pass an empty map to createReviewTasks.
 	disputesByLineage := make(map[string][]disputeContextEntry)
-	if t.AwaitChecks && t.Track == "research" {
-		// Fetch the most recent submit event's disputes
-		var disputesText string
-		err := tx.QueryRowContext(ctx, `
-			SELECT disputes FROM event WHERE task_id = ? AND kind = 'submit' ORDER BY created_at DESC LIMIT 1
-		`, taskID).Scan(&disputesText)
-		if err != nil && err != sql.ErrNoRows {
-			return Task{}, fmt.Errorf("failed to fetch submit event disputes: %w", err)
-		}
-
-		if err == nil {
-			var parsedDisputes []Dispute
-			if err := json.Unmarshal([]byte(disputesText), &parsedDisputes); err == nil {
-				// Get all findings to map dispute targets to full findings
-				allFindings, _, cerr := s.collectResearchReviewReports(ctx, tx, taskID, currentReviewRound)
-				if cerr != nil {
-					return Task{}, fmt.Errorf("failed to collect review findings for disputes: %w", cerr)
-				}
-
-				// Map findings by their ID and lineage
-				findingsByID := make(map[string][]researchCollectedFinding)
-				for _, cf := range allFindings {
-					if cf.round == currentReviewRound {
-						findingsByID[cf.ID] = append(findingsByID[cf.ID], cf)
-					}
-				}
-
-				// Build disputesByLineage by matching disputes to findings
-				for _, d := range parsedDisputes {
-					if targets, ok := findingsByID[d.FindingID]; ok && len(targets) > 0 {
-						target := targets[0]
-						disputesByLineage[target.lineage] = append(disputesByLineage[target.lineage], disputeContextEntry{
-							Finding:  target.Finding,
-							Evidence: d.Evidence,
-						})
-					}
-				}
-			}
-		}
-	}
 
 	// Create review tasks
 	if err := s.createReviewTasks(ctx, tx, t, newReviewRound, currentReviewRound, links, disputesByLineage, now); err != nil {

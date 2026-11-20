@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -242,7 +244,7 @@ func TestPassChecksReviewTasksMatchDirectSubmit(t *testing.T) {
 		t.Fatalf("no review tasks created")
 	}
 
-	// Compare review task fields
+	// Compare review task fields - should match exactly except for target task ID
 	task1 := reviewTasks1[0]
 	task2 := reviewTasks2[0]
 
@@ -254,6 +256,16 @@ func TestPassChecksReviewTasksMatchDirectSubmit(t *testing.T) {
 	}
 	if task1.Priority != task2.Priority {
 		t.Errorf("priority mismatch: PassChecks=%d, direct submit=%d", task1.Priority, task2.Priority)
+	}
+	if task1.Title != task2.Title {
+		t.Errorf("title mismatch: PassChecks=%q, direct submit=%q", task1.Title, task2.Title)
+	}
+
+	// Compare spec text, normalized for different parent task IDs
+	spec1 := normalizeSpec(task1.Spec, h1.taskID, "PARENT_ID")
+	spec2 := normalizeSpec(task2.Spec, h2.taskID, "PARENT_ID")
+	if spec1 != spec2 {
+		t.Errorf("spec mismatch (after normalization):\nPassChecks=%q\ndirect submit=%q", spec1, spec2)
 	}
 }
 
@@ -270,15 +282,33 @@ func TestPassChecksSecondCallReturnsConflict(t *testing.T) {
 		t.Fatalf("first PassChecks: %v", err)
 	}
 
-	// Second call should return ErrConflict
+	// Count events and review tasks after first call
+	firstEvents, _ := h.store.ListEvents(ctx, h.taskID)
+	firstReviewCount := reviewTaskCount(t, h)
+	firstSpawnReviewCount := spawnReviewEvents(t, h)
+
+	// Second call should return ErrConflict and not change state
 	_, err = h.store.PassChecks(ctx, h.taskID, "abc123", "All checks passed")
-	if err != ErrConflict {
+	if !errors.Is(err, ErrConflict) {
 		t.Errorf("second PassChecks returned %v, want ErrConflict", err)
 	}
 
+	// Verify state is still review
+	task := h.task()
+	if task.State != "review" {
+		t.Errorf("state after second call = %q, want review", task.State)
+	}
+
 	// Verify no additional events or review tasks were created
-	if n := reviewTaskCount(t, h); n != 1 {
-		t.Errorf("review tasks = %d, want 1", n)
+	secondEvents, _ := h.store.ListEvents(ctx, h.taskID)
+	if len(secondEvents) != len(firstEvents) {
+		t.Errorf("events after second call = %d, want %d (no change)", len(secondEvents), len(firstEvents))
+	}
+	if n := reviewTaskCount(t, h); n != firstReviewCount {
+		t.Errorf("review tasks after second call = %d, want %d (no change)", n, firstReviewCount)
+	}
+	if n := spawnReviewEvents(t, h); n != firstSpawnReviewCount {
+		t.Errorf("spawn_review events after second call = %d, want %d (no change)", n, firstSpawnReviewCount)
 	}
 }
 
@@ -292,9 +322,13 @@ func TestPassChecksNonChecksStateReturnsConflict(t *testing.T) {
 			t.Fatalf("initial state = %q, want ready", task.State)
 		}
 
+		// Count initial events and review tasks
+		initialEvents, _ := h.store.ListEvents(ctx, h.taskID)
+		initialReviewTasks := reviewTaskCount(t, h)
+
 		// PassChecks on ready state should return ErrConflict
 		_, err := h.store.PassChecks(ctx, h.taskID, "abc123", "All checks passed")
-		if err != ErrConflict {
+		if !errors.Is(err, ErrConflict) {
 			t.Errorf("PassChecks on ready state returned %v, want ErrConflict", err)
 		}
 
@@ -302,6 +336,15 @@ func TestPassChecksNonChecksStateReturnsConflict(t *testing.T) {
 		updatedTask := h.task()
 		if updatedTask.State != "ready" {
 			t.Errorf("state changed to %q after PassChecks conflict", updatedTask.State)
+		}
+
+		// Verify no review tasks or events were added
+		finalEvents, _ := h.store.ListEvents(ctx, h.taskID)
+		if len(finalEvents) != len(initialEvents) {
+			t.Errorf("events changed from %d to %d", len(initialEvents), len(finalEvents))
+		}
+		if n := reviewTaskCount(t, h); n != initialReviewTasks {
+			t.Errorf("review tasks changed from %d to %d", initialReviewTasks, n)
 		}
 	})
 
@@ -316,9 +359,13 @@ func TestPassChecksNonChecksStateReturnsConflict(t *testing.T) {
 			t.Fatalf("initial state = %q, want in_progress", task.State)
 		}
 
+		// Count initial events and review tasks
+		initialEvents, _ := h.store.ListEvents(ctx, h.taskID)
+		initialReviewTasks := reviewTaskCount(t, h)
+
 		// PassChecks on in_progress state should return ErrConflict
 		_, err := h.store.PassChecks(ctx, h.taskID, "abc123", "All checks passed")
-		if err != ErrConflict {
+		if !errors.Is(err, ErrConflict) {
 			t.Errorf("PassChecks on in_progress state returned %v, want ErrConflict", err)
 		}
 
@@ -326,6 +373,15 @@ func TestPassChecksNonChecksStateReturnsConflict(t *testing.T) {
 		updatedTask := h.task()
 		if updatedTask.State != "in_progress" {
 			t.Errorf("state changed to %q after PassChecks conflict", updatedTask.State)
+		}
+
+		// Verify no review tasks or events were added
+		finalEvents, _ := h.store.ListEvents(ctx, h.taskID)
+		if len(finalEvents) != len(initialEvents) {
+			t.Errorf("events changed from %d to %d", len(initialEvents), len(finalEvents))
+		}
+		if n := reviewTaskCount(t, h); n != initialReviewTasks {
+			t.Errorf("review tasks changed from %d to %d", initialReviewTasks, n)
 		}
 	})
 
@@ -338,9 +394,13 @@ func TestPassChecksNonChecksStateReturnsConflict(t *testing.T) {
 			t.Fatalf("initial state = %q, want review", task.State)
 		}
 
+		// Count initial events and review tasks
+		initialEvents, _ := h.store.ListEvents(ctx, h.taskID)
+		initialReviewTasks := reviewTaskCount(t, h)
+
 		// PassChecks on review state should return ErrConflict
 		_, err := h.store.PassChecks(ctx, h.taskID, "abc123", "All checks passed")
-		if err != ErrConflict {
+		if !errors.Is(err, ErrConflict) {
 			t.Errorf("PassChecks on review state returned %v, want ErrConflict", err)
 		}
 
@@ -348,6 +408,15 @@ func TestPassChecksNonChecksStateReturnsConflict(t *testing.T) {
 		updatedTask := h.task()
 		if updatedTask.State != "review" {
 			t.Errorf("state changed to %q after PassChecks conflict", updatedTask.State)
+		}
+
+		// Verify no review tasks or events were added
+		finalEvents, _ := h.store.ListEvents(ctx, h.taskID)
+		if len(finalEvents) != len(initialEvents) {
+			t.Errorf("events changed from %d to %d", len(initialEvents), len(finalEvents))
+		}
+		if n := reviewTaskCount(t, h); n != initialReviewTasks {
+			t.Errorf("review tasks changed from %d to %d", initialReviewTasks, n)
 		}
 	})
 }
@@ -384,18 +453,31 @@ func TestPassChecksLinksRestrictedToCurrentRound(t *testing.T) {
 	ctx := context.Background()
 	h := newChecksSubmitHarness(t, true)
 
-	oldPRLink := LinkInput{Kind: "pr", Value: "https://github.com/o/r/pull/1"}
+	// Submit with PR link to enter checks
+	currentPRLink := LinkInput{Kind: "pr", Value: "https://github.com/o/r/pull/42"}
+	submitReturning(t, h, currentPRLink)
 
-	// Submit with old PR link to enter checks
-	submitReturning(t, h, oldPRLink)
+	// Get the task to access its current review_round
+	task := h.task()
+	currentRound := task.ReviewRound
+
+	// Manually insert a stale link from an earlier round to test filtering
+	stalePRLink := "https://github.com/o/r/pull/1"
+	_, err := h.store.Conn().ExecContext(ctx, `
+		INSERT INTO task_link (id, task_id, review_round, kind, value)
+		VALUES (?, ?, ?, ?, ?)
+	`, "stale-link-id", h.taskID, currentRound-1, "pr", stalePRLink)
+	if err != nil {
+		t.Fatalf("failed to insert stale link: %v", err)
+	}
 
 	// Call PassChecks
-	_, err := h.store.PassChecks(ctx, h.taskID, "abc123", "All checks passed")
+	_, err = h.store.PassChecks(ctx, h.taskID, "abc123", "All checks passed")
 	if err != nil {
 		t.Fatalf("PassChecks: %v", err)
 	}
 
-	// Get the review task and verify it has the correct PR link
+	// Get the review task and verify it has only the current round's PR link
 	allReviewTasks, err := h.store.ListTasks(ctx, h.projectID, TaskListFilter{Kind: ptrStr("review")})
 	if err != nil {
 		t.Fatalf("ListTasks: %v", err)
@@ -410,17 +492,18 @@ func TestPassChecksLinksRestrictedToCurrentRound(t *testing.T) {
 		t.Fatalf("expected 1 review task, got %d", len(reviewTasks))
 	}
 
-	// Verify the review task spec includes the correct PR link
-	if !contains(reviewTasks[0].Spec, oldPRLink.Value) {
-		t.Errorf("review task spec does not contain PR link %q", oldPRLink.Value)
+	// Verify the review task spec includes the current PR link
+	if !strings.Contains(reviewTasks[0].Spec, currentPRLink.Value) {
+		t.Errorf("review task spec does not contain current PR link %q", currentPRLink.Value)
+	}
+
+	// Verify the review task spec does NOT include the stale PR link
+	if strings.Contains(reviewTasks[0].Spec, stalePRLink) {
+		t.Errorf("review task spec incorrectly contains stale PR link %q", stalePRLink)
 	}
 }
 
-func contains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+func normalizeSpec(spec, taskID, replacement string) string {
+	// Replace the task ID with a placeholder so we can compare specs from different tasks
+	return strings.ReplaceAll(spec, taskID, replacement)
 }
