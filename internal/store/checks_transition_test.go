@@ -337,48 +337,103 @@ func TestOperatorBypassReviewTasksMatchPassChecks(t *testing.T) {
 
 	// Test PassChecks path
 	store1, projectID1, docID1 := newBranchTestStore(t)
-	tasks1, _ := store1.CreateTasks(ctx, projectID1, []TaskInput{
+	tasks1, err := store1.CreateTasks(ctx, projectID1, []TaskInput{
 		{Title: "Task", Spec: "Spec", DocumentID: docID1, Model: "haiku", ReviewModels: []string{"opus"}, AwaitChecks: true},
 	})
+	if err != nil {
+		t.Fatalf("CreateTasks (PassChecks path): %v", err)
+	}
 	taskID1 := tasks1[0].ID
-	store1.PromoteTask(ctx, taskID1)
-	store1.ClaimTask(ctx, taskID1, "worker", "haiku", 5*time.Minute)
-	store1.SubmitTask(ctx, taskID1, "worker", "done", nil, []LinkInput{
-		{Kind: "pr", Value: "https://github.com/o/r/pull/1"},
-	}, 5, nil, nil, testUnlimitedResearchBudget)
-	_, _ = store1.PassChecks(ctx, taskID1, "abc123", "All checks passed")
 
-	reviewTasks1, _ := store1.ListTasks(ctx, projectID1, TaskListFilter{Kind: ptrStr("review")})
+	if _, err := store1.PromoteTask(ctx, taskID1); err != nil {
+		t.Fatalf("PromoteTask (PassChecks path): %v", err)
+	}
+	if _, err := store1.ClaimTask(ctx, taskID1, "worker", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("ClaimTask (PassChecks path): %v", err)
+	}
+	if _, err := store1.SubmitTask(ctx, taskID1, "worker", "done", nil, []LinkInput{
+		{Kind: "pr", Value: "https://github.com/o/r/pull/1"},
+	}, 5, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("SubmitTask (PassChecks path): %v", err)
+	}
+	parentAfterPassChecks, err := store1.PassChecks(ctx, taskID1, "abc123", "All checks passed")
+	if err != nil {
+		t.Fatalf("PassChecks: %v", err)
+	}
+
+	reviewTasks1, err := store1.ListTasks(ctx, projectID1, TaskListFilter{Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("ListTasks (PassChecks path): %v", err)
+	}
 
 	// Test operator bypass path
 	store2, projectID2, docID2 := newBranchTestStore(t)
-	tasks2, _ := store2.CreateTasks(ctx, projectID2, []TaskInput{
+	tasks2, err := store2.CreateTasks(ctx, projectID2, []TaskInput{
 		{Title: "Task", Spec: "Spec", DocumentID: docID2, Model: "haiku", ReviewModels: []string{"opus"}, AwaitChecks: true},
 	})
+	if err != nil {
+		t.Fatalf("CreateTasks (bypass path): %v", err)
+	}
 	taskID2 := tasks2[0].ID
-	store2.PromoteTask(ctx, taskID2)
-	store2.ClaimTask(ctx, taskID2, "worker", "haiku", 5*time.Minute)
-	store2.SubmitTask(ctx, taskID2, "worker", "done", nil, []LinkInput{
-		{Kind: "pr", Value: "https://github.com/o/r/pull/1"},
-	}, 5, nil, nil, testUnlimitedResearchBudget)
-	_, _ = store2.TransitionTask(ctx, taskID2, "review", nil)
 
-	reviewTasks2, _ := store2.ListTasks(ctx, projectID2, TaskListFilter{Kind: ptrStr("review")})
+	if _, err := store2.PromoteTask(ctx, taskID2); err != nil {
+		t.Fatalf("PromoteTask (bypass path): %v", err)
+	}
+	if _, err := store2.ClaimTask(ctx, taskID2, "worker", "haiku", 5*time.Minute); err != nil {
+		t.Fatalf("ClaimTask (bypass path): %v", err)
+	}
+	if _, err := store2.SubmitTask(ctx, taskID2, "worker", "done", nil, []LinkInput{
+		{Kind: "pr", Value: "https://github.com/o/r/pull/1"},
+	}, 5, nil, nil, testUnlimitedResearchBudget); err != nil {
+		t.Fatalf("SubmitTask (bypass path): %v", err)
+	}
+	parentAfterBypass, err := store2.TransitionTask(ctx, taskID2, "review", nil)
+	if err != nil {
+		t.Fatalf("TransitionTask: %v", err)
+	}
+
+	reviewTasks2, err := store2.ListTasks(ctx, projectID2, TaskListFilter{Kind: ptrStr("review")})
+	if err != nil {
+		t.Fatalf("ListTasks (bypass path): %v", err)
+	}
 
 	// Both should create the same number of review tasks
 	if len(reviewTasks1) != len(reviewTasks2) {
 		t.Errorf("PassChecks created %d review tasks, operator bypass created %d", len(reviewTasks1), len(reviewTasks2))
 	}
 
-	// All review tasks should have same review_round as the parent
-	for _, rt := range reviewTasks1 {
-		if rt.ReviewRound != 1 {
-			t.Errorf("PassChecks review task has review_round=%d, want 1", rt.ReviewRound)
+	// Compare all review task fields (except target_task_id which points to different parents)
+	if len(reviewTasks1) > 0 && len(reviewTasks2) > 0 {
+		for i := range reviewTasks1 {
+			rt1 := reviewTasks1[i]
+			rt2 := reviewTasks2[i]
+
+			if rt1.Model != rt2.Model {
+				t.Errorf("Review task %d model: PassChecks=%s, bypass=%s", i, rt1.Model, rt2.Model)
+			}
+			// target_task_id differs because they point to different parents (taskID1 vs taskID2)
+			if rt1.TargetTaskID == nil || rt2.TargetTaskID == nil {
+				t.Errorf("Review task %d target_task_id is nil", i)
+			}
+			if rt1.ReviewRound != rt2.ReviewRound {
+				t.Errorf("Review task %d review_round: PassChecks=%d, bypass=%d", i, rt1.ReviewRound, rt2.ReviewRound)
+			}
+			if rt1.Priority != rt2.Priority {
+				t.Errorf("Review task %d priority: PassChecks=%d, bypass=%d", i, rt1.Priority, rt2.Priority)
+			}
+			// Spec includes parent task PR links, which differ across the two paths. Both should
+			// contain the base spec and their respective parent's PR links.
+			if rt1.Spec == "" || rt2.Spec == "" {
+				t.Errorf("Review task %d spec is empty", i)
+			}
 		}
 	}
-	for _, rt := range reviewTasks2 {
-		if rt.ReviewRound != 1 {
-			t.Errorf("Operator bypass review task has review_round=%d, want 1", rt.ReviewRound)
-		}
+
+	// Both parents should be in review state
+	if parentAfterPassChecks.State != "review" {
+		t.Errorf("Parent after PassChecks state: got %q, want 'review'", parentAfterPassChecks.State)
+	}
+	if parentAfterBypass.State != "review" {
+		t.Errorf("Parent after bypass state: got %q, want 'review'", parentAfterBypass.State)
 	}
 }

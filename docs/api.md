@@ -1389,16 +1389,16 @@ research rounds instead use the structured blocking-findings rules documented un
 - `approved` → `ready` (human disagrees with reviewers, requests rework)
 - `blocked` → `ready` (human unblocks / retries; clears stale assignee and lease)
 - `blocked` → `failed` (retire a dead blocked task without re-entering the queue)
-- Any active state → `blocked` (off-ramp: external blocker; from `checks`, clears `checks_started_at` and assignee)
-- Any active state → `failed` (off-ramp: task cannot be done as specified; from `checks`, clears `checks_started_at`)
-- Any active state → `superseded` (retire without creating a replacement; use `POST /tasks/{id}/supersede` to create one; from `checks`, clears `checks_started_at`)
+- Any active state → `blocked` (off-ramp: external blocker; clears assignee)
+- Any active state → `failed` (off-ramp: task cannot be done as specified)
+- Any active state → `superseded` (retire without creating a replacement; use `POST /tasks/{id}/supersede` to create one)
 - `approved` → `abandoned` (retire without merging)
 - `in_progress` → `done` for `merge` tasks only
 - `ready` → `done`, `in_progress` → `done`, `review` → `done`, `blocked` → `done` (PR-watch only: when the PR is merged outside the board; clears assignee, retires in-flight review children, appends transition event)
 - `checks` → `blocked` (operator abort, timeouts, or manual override; clears `checks_started_at` and assignee)
 - `checks` → `failed` (operator-initiated task failure; clears `checks_started_at`)
 - `checks` → `superseded` (operator-initiated task supersession; clears `checks_started_at`)
-- `checks` → `review` (operator bypass: creates review tasks as if checks passed)
+- `checks` → `review` (operator bypass: creates review tasks exactly as `PassChecks` does; records `operator_bypass` event with actor `operator`)
 
 The operator `/transition` endpoint does not permit `review` → `done`. Review aggregation does
 perform that direct transition for the verified current-round no-op case above, in a single
