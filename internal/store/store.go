@@ -81,6 +81,7 @@ type Store interface {
 	ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string, reviewModelsOverride []string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
+	UpdateTaskAwaitChecks(ctx context.Context, taskID string, awaitChecks bool) (Task, error)
 	SetTaskPriority(ctx context.Context, req SetPriorityRequest) (PriorityChange, error)
 	MoveTaskToFront(ctx context.Context, req FrontPriorityRequest) (PriorityChange, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
@@ -5490,6 +5491,62 @@ func (s *sqliteStore) UpdateTaskEscalate(ctx context.Context, taskID string, esc
 	}
 
 	t.Escalate = escalate
+	t.UpdatedAt = now
+	return t, nil
+}
+
+// UpdateTaskAwaitChecks sets a task's await_checks flag. It is rejected with a
+// validation error if the task is on the research track. It never moves the task
+// to another state, even if it is in the checks state. Setting the flag to its
+// current value is a no-op: the task is returned unchanged.
+func (s *sqliteStore) UpdateTaskAwaitChecks(ctx context.Context, taskID string, awaitChecks bool) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var t Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, ErrNotFound
+	}
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch task: %w", err)
+	}
+
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	if awaitChecks && t.Track == "research" {
+		return Task{}, invalid("AWAIT_CHECKS_RESEARCH", "await_checks is not allowed on a research-track task")
+	}
+
+	if t.AwaitChecks == awaitChecks {
+		if err := tx.Commit(); err != nil {
+			return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return t, nil
+	}
+
+	now := nowTimestamp()
+	if _, err := tx.ExecContext(ctx, `UPDATE task SET await_checks = ?, updated_at = ? WHERE id = ?`, awaitChecks, now, taskID); err != nil {
+		return Task{}, fmt.Errorf("failed to update task await_checks flag: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	t.AwaitChecks = awaitChecks
 	t.UpdatedAt = now
 	return t, nil
 }

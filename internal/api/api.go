@@ -1236,7 +1236,7 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		sort.Strings(unsupported)
 		s.errorResponse(w, http.StatusBadRequest, "FIELD_NOT_UPDATABLE",
 			"Field(s) cannot be changed through PATCH /tasks/{id}: "+strings.Join(unsupported, ", ")+
-				" (only depends_on and review_models are updatable; task specs are immutable and state changes use /transition)")
+				" (only depends_on, review_models, and await_checks are updatable; task specs are immutable and state changes use /transition)")
 		return
 	}
 
@@ -1273,12 +1273,21 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var awaitChecks *bool
+	if rawAwaitChecks, ok := fields["await_checks"]; ok {
+		var val bool
+		if err := json.Unmarshal(rawAwaitChecks, &val); err != nil {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_AWAIT_CHECKS", "await_checks must be a boolean")
+			return
+		}
+		awaitChecks = &val
+	}
 
-	if hasModels || hasDeps {
+	if hasModels || hasDeps || awaitChecks != nil {
 		var err error
 		if hasModels {
 			_, err = s.store.UpdateTaskReviewModelsAndDeps(r.Context(), taskID, models, deps, actor, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget)
-		} else {
+		} else if hasDeps {
 			_, err = s.store.UpdateTaskDependsOn(r.Context(), taskID, deps)
 		}
 		if err != nil {
@@ -1303,6 +1312,23 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 			s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
 			return
 		}
+
+		if awaitChecks != nil {
+			_, err = s.store.UpdateTaskAwaitChecks(r.Context(), taskID, *awaitChecks)
+			if err != nil {
+				var validationErr *store.ValidationError
+				if errors.As(err, &validationErr) {
+					s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
+					return
+				}
+				if errors.Is(err, store.ErrNotFound) {
+					s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+					return
+				}
+				s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
+				return
+			}
+		}
 	}
 
 	// Respond with the task as stored (including depends_on) so callers can confirm the write.
@@ -1319,7 +1345,7 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 }
 
 // patchableTaskFields is the set of body fields PATCH /tasks/{id} accepts.
-var patchableTaskFields = map[string]bool{"depends_on": true, "review_models": true, "actor": true}
+var patchableTaskFields = map[string]bool{"depends_on": true, "review_models": true, "actor": true, "await_checks": true}
 
 // handleUpdateEscalation handles PATCH /tasks/{id}/escalation to update a task's escalation policy.
 func (s *Server) handleUpdateEscalation(w http.ResponseWriter, r *http.Request) {

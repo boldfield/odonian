@@ -586,6 +586,7 @@ Bulk-create tasks for a project.
 - `depends_on` (optional): Array of task IDs or keys (if using intra-batch references) that must be done before this task is claimable
 - `agent_merge` (optional, default `false`): Allow automatic completion after review; for work with a PR, spawn a non-LLM merge task.
 - `escalate` (optional, default `true`): Allow replacement by a higher model tier after the review threshold is exceeded.
+- `await_checks` (optional, default `false`): Wait for CI checks to pass before moving to review. Allowed only on `build` and `design` tracks; `research` tasks return `400 AWAIT_CHECKS_RESEARCH` if set to true. PATCH /tasks/{id} can change this field; a task in `checks` state is not affected by the change.
 - `track` (optional, default `build`): `build`, `design`, or `research`; other values return `400 UNKNOWN_TRACK`. Omitted or empty values default to `build`. The track selects the harness prompt directory; supported delivery combinations are listed below.
 - `priority` (optional, default `500`): Manual priority (1–1000); default is 500. Values outside this range return `400 INVALID_PRIORITY`. The priority determines task ordering in the queue (higher priority first, then by creation time).
 - `branch` (optional, `local_commit` only): Name of an MR branch shared across tasks. Every task with the same `branch` starts its worktree from, and freezes onto, `wi/<branch>`, so a dependent task builds on earlier tasks' approved work without anything landing on `main`. Omitted or empty keeps the default: the task gets its own `wi/<slug of its title>`. Must be lowercase letters, digits, and single dashes (e.g. `event-platform`); otherwise `400 INVALID_BRANCH`. A task superseded or escalated to a new model keeps its branch. Each task still works on its own `wip/<id>` branch, so tasks sharing a branch can run concurrently: on approve, a task fast-forwards `wi/<branch>` when nothing else has landed on it since the task started, and is otherwise merged into it. A merge runs the repository's `make check` and `make test` on the merged result first, because the combination was never built or reviewed together. The gate runs the tasks' code, so it gets a scrubbed environment (no tokens or credentials) and refuses to run outside a sandbox (`SANDBOX_NAME` unset) unless `odonian approve --allow-host-gate` is passed; `--gate-timeout` (default 8m) bounds it. The scrubbed environment keeps the basics and the usual Go, Rust, Python, Node and Java toolchain variables; name any others the repository's `make` needs in `ODONIAN_GATE_ENV` (comma-separated). A merge conflict, a failing gate, or a gate that cannot run refuses the approve and leaves the task `approved` and the branch unchanged. After the gate, approve reserves the task for landing (`POST /tasks/{id}/landing`), conditional on it still being approved in the review round it prepared, so a task reworked and re-approved while the gate ran is never landed with its old version; it then moves `wi/<branch>`, and only then marks the task `done`, so dependents become claimable only once the work is on the branch they start from. It holds a per-branch lock in the repository (`refs/odonian/locks/<branch>`) throughout, so approves on one branch run one at a time. Use `depends_on` when a task needs another task's code to exist before it starts.
@@ -1452,7 +1453,7 @@ See [event retention configuration](./configuration.md#server-odonian-server).
 #### `PATCH /tasks/{id}`
 
 Partial update of a task. Present fields are applied and absent fields are left unchanged. Only
-`depends_on` and `review_models` are updatable (`actor` is also accepted, naming who made the change in
+`depends_on`, `review_models`, and `await_checks` are updatable (`actor` is also accepted, naming who made the change in
 the event); any other field (`spec`, `title`, `state`, unknown names) returns
 `400 FIELD_NOT_UPDATABLE` naming it and changes nothing.
 
@@ -1484,8 +1485,13 @@ Research dispute lineage is keyed by reviewer model and slot. A replacement for 
 same model takes that child's slot, lineage and spec, so no other reviewer's slot shifts. A reviewer of a
 model new to the list starts with no lineage: the removed reviewer's disputes do not carry over to it.
 
-**Response:** `200 OK` with the updated task, including `depends_on`. Errors include
-`400 INVALID_REVIEW_MODELS`, `400 SELF_DEPENDENCY`, `400 JSON_DECODE_ERROR`, `409 CYCLE_DETECTED`, and `404 NOT_FOUND`. Invalid
+`await_checks` is a boolean controlling whether the task waits for CI checks to pass before moving to
+review. It is allowed only on `build` and `design` track tasks (`research` returns `400 AWAIT_CHECKS_RESEARCH`
+if set to true). Omitting the field leaves the value unchanged. Changing it while the task is in `checks`
+state does not move the task. Setting it to its current value is a no-op.
+
+**Response:** `200 OK` with the updated task, including `depends_on` and `await_checks`. Errors include
+`400 INVALID_REVIEW_MODELS`, `400 INVALID_AWAIT_CHECKS`, `400 AWAIT_CHECKS_RESEARCH`, `400 SELF_DEPENDENCY`, `400 JSON_DECODE_ERROR`, `409 CYCLE_DETECTED`, and `404 NOT_FOUND`. Invalid
 dependency IDs, duplicates, or other storage failures currently return `500 UPDATE_ERROR`.
 
 #### `PATCH /tasks/{id}/escalation`
