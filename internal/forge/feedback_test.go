@@ -1836,20 +1836,57 @@ func TestListUnaddressedFeedback_WorkerAndReconcilerStatusNotFeedback(t *testing
 	}
 }
 
-// TestListUnaddressedFeedback_ChecksCommentIsActionable tests that checks-marked comments are actionable feedback.
+// TestListUnaddressedFeedback_ChecksCommentIsActionable tests that checks-marked comments are actionable feedback
+// and that reconciler comments are not listed.
 func TestListUnaddressedFeedback_ChecksCommentIsActionable(t *testing.T) {
 	nodes := strings.Join([]string{
 		globalComment("comment-checks", 1, "human", "2024-01-01T10:00:00Z",
-			"haiku-checks: failed check: job-compile (https://github.com/example/repo/actions/runs/123)"),
+			"odonian-checks: failed check: job-compile (https://github.com/example/repo/actions/runs/123)"),
+		globalComment("comment-reconciler", 2, "human", "2024-01-01T10:05:00Z",
+			"odonian-reconciler: bounced back to ready"),
 	}, ",")
 
 	items := listGlobalFeedback(t, "human", nodes)
 
 	if len(items) != 1 {
-		t.Fatalf("returned %d items, want 1 (checks comments are actionable feedback): %+v", len(items), items)
+		t.Fatalf("returned %d items, want 1 (checks comments are actionable, reconciler is not): %+v", len(items), items)
 	}
 	if items[0].ID != "comment-checks" {
 		t.Errorf("returned item ID %q, want comment-checks", items[0].ID)
+	}
+}
+
+// TestListUnaddressedFeedback_ChecksCommentAcknowledgedWithAddressedFormat tests that
+// a checks comment is cleared when acknowledged with "addressed in <sha> (see comment <id>)" format.
+func TestListUnaddressedFeedback_ChecksCommentAcknowledgedWithAddressedFormat(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-checks", 1, "human", "2024-01-01T10:00:00Z",
+			"odonian-checks: failed check: job-compile (https://github.com/example/repo/actions/runs/123)"),
+		globalComment("comment-ack", 2, "human", "2024-01-01T10:05:00Z",
+			"haiku-worker: addressed in abc123 (see comment comment-checks)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 0 {
+		t.Fatalf("returned %d items, want 0 (addressed acknowledgment clears checks comment): %+v", len(items), items)
+	}
+}
+
+// TestListUnaddressedFeedback_ChecksCommentAcknowledgedWithDisputedFormat tests that
+// a checks comment is cleared when acknowledged with "disputed (see comment <id>)" format.
+func TestListUnaddressedFeedback_ChecksCommentAcknowledgedWithDisputedFormat(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-checks", 1, "human", "2024-01-01T10:00:00Z",
+			"odonian-checks: failed check: job-compile (https://github.com/example/repo/actions/runs/123)"),
+		globalComment("comment-dispute", 2, "human", "2024-01-01T10:05:00Z",
+			"haiku-worker: disputed (see comment comment-checks): finding disputed with source evidence in this round's submission; not fixed"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 0 {
+		t.Fatalf("returned %d items, want 0 (disputed acknowledgment clears checks comment): %+v", len(items), items)
 	}
 }
 

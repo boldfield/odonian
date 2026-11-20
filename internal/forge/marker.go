@@ -21,7 +21,7 @@ func IsAgentAuthoredComment(body string) bool {
 }
 
 // AgentCommentRole returns the role encoded in a comment's agent marker prefix —
-// one of "worker", "reviewer", "merger", or "reconciler" — and whether the comment
+// one of "worker", "reviewer", "merger", "reconciler", or "checks" — and whether the comment
 // is agent-authored at all. It is an authorship/role parser; a false ok means the
 // comment is unmarked (e.g. plain human feedback).
 func AgentCommentRole(body string) (string, bool) {
