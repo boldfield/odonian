@@ -83,6 +83,7 @@ type Store interface {
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	UpdateTaskAwaitChecks(ctx context.Context, taskID string, awaitChecks bool) (Task, error)
 	PassChecks(ctx context.Context, taskID, headSHA, summary string) (Task, error)
+	FailChecks(ctx context.Context, taskID, headSHA, summary string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (Task, error)
 	SetTaskPriority(ctx context.Context, req SetPriorityRequest) (PriorityChange, error)
 	MoveTaskToFront(ctx context.Context, req FrontPriorityRequest) (PriorityChange, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
@@ -5206,7 +5207,7 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 	} else {
 		rows, err := tx.QueryContext(ctx, `
 			SELECT actor, verdict, note FROM event
-			WHERE task_id = ? AND kind IN ('review', 'submit') AND verdict = 'reject'
+			WHERE task_id = ? AND ((kind IN ('review', 'submit') AND verdict = 'reject') OR kind = 'checks_failed')
 			ORDER BY created_at ASC
 		`, taskID)
 		if err != nil {
@@ -5229,7 +5230,11 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 				hasFeedback = true
 			}
 
-			feedbackBlock.WriteString(fmt.Sprintf("**%s (verdict: %s)**\n", actor, *verdict))
+			if verdict == nil {
+				feedbackBlock.WriteString(fmt.Sprintf("**%s (checks failed)**\n", actor))
+			} else {
+				feedbackBlock.WriteString(fmt.Sprintf("**%s (verdict: %s)**\n", actor, *verdict))
+			}
 			if note != nil && *note != "" {
 				feedbackBlock.WriteString(fmt.Sprintf("%s\n", *note))
 			}
@@ -5622,6 +5627,90 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 	}
 
 	return updatedTask, nil
+}
+
+// FailChecks records a failed checks run on a task in 'checks' and decides its next state with
+// the same circuit breaker a rejected review round uses, at the task's current review_round. The
+// task returns to 'ready', is blocked, or is superseded by an escalated copy promoted to 'ready'.
+// review_round is not changed. Returns ErrConflict if the task is not in 'checks'.
+func (s *sqliteStore) FailChecks(ctx context.Context, taskID, headSHA, summary string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := nowTimestamp()
+
+	var state, track, model string
+	var escalate bool
+	var reviewRound int
+	err = tx.QueryRowContext(ctx, `SELECT state, track, model, escalate, review_round FROM task WHERE id = ?`, taskID).
+		Scan(&state, &track, &model, &escalate, &reviewRound)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Task{}, ErrNotFound
+		}
+		return Task{}, fmt.Errorf("failed to load task: %w", err)
+	}
+	if state != "checks" {
+		return Task{}, ErrConflict
+	}
+
+	// Record the failure before the breaker: supersede builds the replacement spec's
+	// "Prior attempt feedback" block from the events, so this one must already exist.
+	note := sanitizeFreeText(fmt.Sprintf("head commit: %s, summary: %s", headSHA, summary))
+	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "checks_failed", nil, &note); err != nil {
+		return Task{}, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE task SET checks_started_at=NULL, updated_at=? WHERE id=?`, now, taskID); err != nil {
+		return Task{}, fmt.Errorf("failed to clear checks_started_at: %w", err)
+	}
+
+	newState, err := s.applyRoundCircuitBreaker(ctx, tx, taskID, track, model, escalate, reviewRound, maxReviewRounds, escalationThresholds, s.researchEscalationLadder, researchEscalationThresholds, now)
+	if err != nil {
+		return Task{}, err
+	}
+
+	// An empty state means the task was superseded by an escalated copy; leave it alone.
+	if newState != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE task SET state=?, assignee=NULL, lease_expires_at=NULL, updated_at=? WHERE id=? AND state='checks'
+		`, newState, now, taskID); err != nil {
+			return Task{}, fmt.Errorf("failed to update task state: %w", err)
+		}
+		var eventNote string
+		if newState == "blocked" {
+			eventNote = fmt.Sprintf("auto-blocked: %d consecutive review rounds without approval — needs human attention", reviewRound)
+		} else {
+			eventNote = "checks failed: returned to ready"
+		}
+		if _, err := s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, &eventNote); err != nil {
+			return Task{}, fmt.Errorf("failed to append transition event: %w", err)
+		}
+	}
+
+	var t Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch updated task: %w", err)
+	}
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return t, nil
 }
 
 // closeSupersededPR closes the old task's recorded pull request (if any and still
