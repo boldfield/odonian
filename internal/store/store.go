@@ -4737,100 +4737,10 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 
 	// Special handling for checks → review operator bypass
 	if to == "review" && taskState == "checks" {
-		now := nowTimestamp()
-
-		// Load current task state and other needed fields
-		var t Task
-		var reviewModelsJSON *string
-		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
-			FROM task WHERE id = ?
-		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+		// Use helper to do the transition, with "operator" as the actor to distinguish from PassChecks
+		updatedTask, err := s.transitionChecksToReviewHelper(ctx, tx, taskID, "operator", "operator_bypass", note)
 		if err != nil {
-			return Task{}, fmt.Errorf("failed to load task state: %w", err)
-		}
-
-		// Unmarshal review_models from JSON
-		t.ReviewModels = []string{}
-		if reviewModelsJSON != nil {
-			if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
-				return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
-			}
-		}
-
-		// Update state to 'review' and clear checks_started_at
-		result, err := tx.ExecContext(ctx, `
-			UPDATE task
-			SET state='review', checks_started_at=NULL, updated_at=?
-			WHERE id=? AND state='checks'
-		`, now, taskID)
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to transition task: %w", err)
-		}
-		rowsAffected, err := result.RowsAffected()
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
-		}
-		if rowsAffected != 1 {
-			return Task{}, ErrConflict
-		}
-
-		// review_round was already incremented by submitTask when entering checks;
-		// use t.ReviewRound as-is for the review tasks, and t.ReviewRound-1 as currentReviewRound
-		newReviewRound := t.ReviewRound
-		currentReviewRound := t.ReviewRound - 1
-
-		// Fetch the links for createReviewTasks, restricted to the current round
-		linkRows, err := tx.QueryContext(ctx, `
-			SELECT kind, value FROM task_link WHERE task_id = ? AND review_round = ? AND tombstoned_at IS NULL
-		`, taskID, newReviewRound)
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to query links: %w", err)
-		}
-		defer linkRows.Close()
-
-		var links []LinkInput
-		for linkRows.Next() {
-			var kind, value string
-			if err := linkRows.Scan(&kind, &value); err != nil {
-				return Task{}, fmt.Errorf("failed to scan link: %w", err)
-			}
-			links = append(links, LinkInput{Kind: kind, Value: value})
-		}
-		if err := linkRows.Err(); err != nil {
-			return Task{}, fmt.Errorf("error iterating links: %w", err)
-		}
-
-		// No disputes on checks tasks
-		disputesByLineage := make(map[string][]disputeContextEntry)
-
-		// Create review tasks
-		if err := s.createReviewTasks(ctx, tx, t, newReviewRound, currentReviewRound, links, disputesByLineage, now); err != nil {
 			return Task{}, err
-		}
-
-		// Append operator bypass event without specific head commit info
-		if _, err := s.AppendEvent(ctx, tx, taskID, "system", "checks_passed", nil, note); err != nil {
-			return Task{}, err
-		}
-
-		// Fetch the updated task
-		var updatedTask Task
-		var updatedReviewModelsJSON *string
-		err = tx.QueryRowContext(ctx, `
-			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
-			FROM task WHERE id = ?
-		`, taskID).Scan(&updatedTask.ID, &updatedTask.ProjectID, &updatedTask.DocumentID, &updatedTask.Title, &updatedTask.Spec, &updatedTask.State, &updatedTask.Assignee, &updatedTask.LeaseExpiresAt, &updatedTask.Result, &updatedTask.Model, &updatedTask.Kind, &updatedReviewModelsJSON, &updatedTask.ReviewRound, &updatedTask.TargetTaskID, &updatedTask.Verdict, &updatedTask.AgentMerge, &updatedTask.Held, &updatedTask.Escalate, &updatedTask.Track, &updatedTask.Branch, &updatedTask.AwaitChecks, &updatedTask.ChecksStartedAt, &updatedTask.Priority, &updatedTask.TopicAnchorID, &updatedTask.CreatedAt, &updatedTask.UpdatedAt, &updatedTask.ArchivedAt, &updatedTask.SupersededBy)
-		if err != nil {
-			return Task{}, fmt.Errorf("failed to fetch updated task: %w", err)
-		}
-
-		// Unmarshal review_models from JSON
-		updatedTask.ReviewModels = []string{}
-		if updatedReviewModelsJSON != nil {
-			if err := json.Unmarshal([]byte(*updatedReviewModelsJSON), &updatedTask.ReviewModels); err != nil {
-				return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
-			}
 		}
 
 		if err := tx.Commit(); err != nil {
@@ -5619,29 +5529,20 @@ func (s *sqliteStore) UpdateTaskAwaitChecks(ctx context.Context, taskID string, 
 	return t, nil
 }
 
-// PassChecks transitions a task from 'checks' to 'review' and creates review tasks.
-// A second call returns ErrConflict and changes nothing. It returns ErrConflict
-// if the task is not in 'checks' state.
-func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary string) (Task, error) {
-	tx, err := s.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
+// transitionChecksToReviewHelper transitions a task in 'checks' to 'review' within a transaction,
+// creating review tasks and appending an event with the given actor and event kind.
+// The caller is responsible for committing the transaction.
+func (s *sqliteStore) transitionChecksToReviewHelper(ctx context.Context, tx *sql.Tx, taskID, actor, eventKind string, note *string) (Task, error) {
 	now := nowTimestamp()
 
-	// Load current state and other needed fields
+	// Load current task state and other needed fields
 	var t Task
 	var reviewModelsJSON *string
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
 	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return Task{}, ErrNotFound
-		}
 		return Task{}, fmt.Errorf("failed to load task state: %w", err)
 	}
 
@@ -5651,11 +5552,6 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
 			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
 		}
-	}
-
-	// Only allowed from 'checks' state
-	if t.State != "checks" {
-		return Task{}, ErrConflict
 	}
 
 	// Update state to 'review' and clear checks_started_at
@@ -5701,9 +5597,7 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		return Task{}, fmt.Errorf("error iterating links: %w", err)
 	}
 
-	// Disputes only occur on research-track submissions, but await_checks is rejected on research
-	// tracks at create, update, supersede and escalate. So no disputes are possible on an
-	// await_checks task. Pass an empty map to createReviewTasks.
+	// No disputes on checks tasks
 	disputesByLineage := make(map[string][]disputeContextEntry)
 
 	// Create review tasks
@@ -5711,9 +5605,8 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		return Task{}, err
 	}
 
-	// Append checks_passed event with head commit and summary in the note
-	note := fmt.Sprintf("head commit: %s, summary: %s", headSHA, summary)
-	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "checks_passed", nil, &note); err != nil {
+	// Append event with the given actor and event kind
+	if _, err := s.AppendEvent(ctx, tx, taskID, actor, eventKind, nil, note); err != nil {
 		return Task{}, err
 	}
 
@@ -5734,6 +5627,39 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		if err := json.Unmarshal([]byte(*updatedReviewModelsJSON), &updatedTask.ReviewModels); err != nil {
 			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
 		}
+	}
+
+	return updatedTask, nil
+}
+
+// PassChecks transitions a task from 'checks' to 'review' and creates review tasks.
+// A second call returns ErrConflict and changes nothing. It returns ErrConflict
+// if the task is not in 'checks' state.
+func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary string) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Check task exists and is in checks state
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT state FROM task WHERE id = ?`, taskID).Scan(&state)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Task{}, ErrNotFound
+		}
+		return Task{}, fmt.Errorf("failed to load task state: %w", err)
+	}
+	if state != "checks" {
+		return Task{}, ErrConflict
+	}
+
+	// Use helper to do the transition
+	note := fmt.Sprintf("head commit: %s, summary: %s", headSHA, summary)
+	updatedTask, err := s.transitionChecksToReviewHelper(ctx, tx, taskID, "system", "checks_passed", &note)
+	if err != nil {
+		return Task{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
