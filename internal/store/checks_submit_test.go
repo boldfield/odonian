@@ -620,15 +620,15 @@ func TestFailChecksEscalationIncludesHeadCommitInSpec(t *testing.T) {
 	if got.State != "superseded" || got.SupersededBy == nil {
 		t.Fatalf("state = %q superseded_by = %v, want superseded with replacement", got.State, got.SupersededBy)
 	}
-	
+
 	repl, err := h.store.GetTask(ctx, *got.SupersededBy)
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
 	}
-	
+
 	// Debug output
 	t.Logf("Replacement spec:\n%s\n", repl.Spec)
-	
+
 	// Verify the replacement spec contains both the head commit and the summary
 	if !strings.Contains(repl.Spec, "Prior attempt feedback") {
 		t.Errorf("replacement spec lacks 'Prior attempt feedback' block")
