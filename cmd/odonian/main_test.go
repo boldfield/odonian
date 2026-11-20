@@ -696,6 +696,23 @@ func TestExecuteTransitionSuccess(t *testing.T) {
 	}
 }
 
+func TestExecuteTransitionSendsActor(t *testing.T) {
+	var body map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	err := executeTransition(context.Background(), server.URL, "test-token", []string{"task-123", "--to", "review", "--actor", "alice"})
+	if err != nil {
+		t.Fatalf("executeTransition failed: %v", err)
+	}
+	if body["actor"] != "alice" || body["to"] != "review" {
+		t.Errorf("expected actor=alice to=review in request body, got %v", body)
+	}
+}
+
 func TestExecuteTransitionMissingTo(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

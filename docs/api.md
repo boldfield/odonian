@@ -1343,6 +1343,7 @@ to drain the `approved` lane by merging and marking done, or to override an appr
 **Parameters:**
 - `to` (required): Target state (`done`, `blocked`, `ready`, `failed`, `superseded`, `abandoned`, or `review`)
 - `note` (optional): Reason or context for the transition
+- `actor` (optional): Caller identity, recorded only on the `operator_bypass` event of a `checks` → `review` transition; defaults to `operator`. The CLI passes it with `odonian transition <id> --to review --actor <name>`
 
 **Response (200 OK):**
 ```json
@@ -1389,7 +1390,7 @@ research rounds instead use the structured blocking-findings rules documented un
 - `approved` → `ready` (human disagrees with reviewers, requests rework)
 - `blocked` → `ready` (human unblocks / retries; clears stale assignee and lease)
 - `blocked` → `failed` (retire a dead blocked task without re-entering the queue)
-- Any active state → `blocked` (off-ramp: external blocker; clears assignee)
+- Any active state → `blocked` (off-ramp: external blocker; the assignee is kept)
 - Any active state → `failed` (off-ramp: task cannot be done as specified)
 - Any active state → `superseded` (retire without creating a replacement; use `POST /tasks/{id}/supersede` to create one)
 - `approved` → `abandoned` (retire without merging)

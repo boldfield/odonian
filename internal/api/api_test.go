@@ -3657,6 +3657,9 @@ func TestTransitionChecksToBlockedClearsChecksStartedAt(t *testing.T) {
 	if task.ChecksStartedAt != nil {
 		t.Errorf("expected checks_started_at=nil after transition, got %v", task.ChecksStartedAt)
 	}
+	if (task.Assignee == nil) != (taskBefore.Assignee == nil) || (task.Assignee != nil && *task.Assignee != *taskBefore.Assignee) {
+		t.Errorf("expected assignee to be kept after checks -> blocked, before=%v after=%v", taskBefore.Assignee, task.Assignee)
+	}
 }
 
 func TestTransitionChecksToFailedClearsChecksStartedAt(t *testing.T) {

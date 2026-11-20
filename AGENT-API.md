@@ -849,7 +849,7 @@ backlog ─promote→ ready ─claim→ in_progress ─submit→ checks (when aw
                                                         ├─red (reconciler)────→ ready
                                                         ├─timeout (reconciler)→ blocked
                                                         └─operator bypass────→ review
-                                                     
+
                                              ─submit→ review (when not await_checks or no PR)
                                                         ↓
                                            passes review→ approved ─merge gate→ done
