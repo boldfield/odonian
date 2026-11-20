@@ -84,6 +84,7 @@ type Store interface {
 	UpdateTaskAwaitChecks(ctx context.Context, taskID string, awaitChecks bool) (Task, error)
 	PassChecks(ctx context.Context, taskID, headSHA, summary string) (Task, error)
 	FailChecks(ctx context.Context, taskID, headSHA, summary string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (Task, error)
+	TimeoutChecks(ctx context.Context, taskID, note string) (Task, error)
 	SetTaskPriority(ctx context.Context, req SetPriorityRequest) (PriorityChange, error)
 	MoveTaskToFront(ctx context.Context, req FrontPriorityRequest) (PriorityChange, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
@@ -4630,9 +4631,9 @@ func (s *sqliteStore) CompleteLanding(ctx context.Context, taskID, attempt strin
 // transitionTask is TransitionTask, or with landingAttempt set, CompleteLanding.
 func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, note *string, landingAttempt *string) (Task, error) {
 	// Validate 'to' state
-	validTargets := map[string]bool{"done": true, "ready": true, "blocked": true, "failed": true, "superseded": true, "abandoned": true}
+	validTargets := map[string]bool{"done": true, "ready": true, "blocked": true, "failed": true, "superseded": true, "abandoned": true, "review": true}
 	if !validTargets[to] {
-		return Task{}, invalid("INVALID_TARGET_STATE", "target state must be one of: done, ready, blocked, failed, superseded, abandoned")
+		return Task{}, invalid("INVALID_TARGET_STATE", "target state must be one of: done, ready, blocked, failed, superseded, abandoned, review")
 	}
 
 	// Strip raw control characters from the free-text note before storage.
@@ -4677,23 +4678,29 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 		}
 
 	case "blocked":
-		// Allowed from any active state (backlog, ready, in_progress, review, approved)
-		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true}
+		// Allowed from any active state (backlog, ready, in_progress, review, approved, checks)
+		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true, "checks": true}
 		if activeStates[taskState] {
 			canTransition = true
 		}
 
 	case "failed":
 		// Allowed from any active state or blocked (retire a dead blocked task)
-		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true}
+		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true, "checks": true}
 		if activeStates[taskState] || taskState == "blocked" {
 			canTransition = true
 		}
 
 	case "superseded":
-		// Allowed from any active state (backlog, ready, in_progress, review, approved)
-		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true}
+		// Allowed from any active state (backlog, ready, in_progress, review, approved, checks)
+		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true, "checks": true}
 		if activeStates[taskState] {
+			canTransition = true
+		}
+
+	case "review":
+		// Allowed only from 'checks' (operator bypass: checks → review)
+		if taskState == "checks" {
 			canTransition = true
 		}
 
@@ -4728,17 +4735,124 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 		return Task{}, conflict("NOT_APPROVED", fmt.Sprintf("task is in %q state, expected approved", taskState))
 	}
 
+	// Special handling for checks → review operator bypass
+	if to == "review" && taskState == "checks" {
+		now := nowTimestamp()
+
+		// Load current task state and other needed fields
+		var t Task
+		var reviewModelsJSON *string
+		err = tx.QueryRowContext(ctx, `
+			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+			FROM task WHERE id = ?
+		`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to load task state: %w", err)
+		}
+
+		// Unmarshal review_models from JSON
+		t.ReviewModels = []string{}
+		if reviewModelsJSON != nil {
+			if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+				return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+			}
+		}
+
+		// Update state to 'review' and clear checks_started_at
+		result, err := tx.ExecContext(ctx, `
+			UPDATE task
+			SET state='review', checks_started_at=NULL, updated_at=?
+			WHERE id=? AND state='checks'
+		`, now, taskID)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to transition task: %w", err)
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
+		}
+		if rowsAffected != 1 {
+			return Task{}, ErrConflict
+		}
+
+		// review_round was already incremented by submitTask when entering checks;
+		// use t.ReviewRound as-is for the review tasks, and t.ReviewRound-1 as currentReviewRound
+		newReviewRound := t.ReviewRound
+		currentReviewRound := t.ReviewRound - 1
+
+		// Fetch the links for createReviewTasks, restricted to the current round
+		linkRows, err := tx.QueryContext(ctx, `
+			SELECT kind, value FROM task_link WHERE task_id = ? AND review_round = ? AND tombstoned_at IS NULL
+		`, taskID, newReviewRound)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to query links: %w", err)
+		}
+		defer linkRows.Close()
+
+		var links []LinkInput
+		for linkRows.Next() {
+			var kind, value string
+			if err := linkRows.Scan(&kind, &value); err != nil {
+				return Task{}, fmt.Errorf("failed to scan link: %w", err)
+			}
+			links = append(links, LinkInput{Kind: kind, Value: value})
+		}
+		if err := linkRows.Err(); err != nil {
+			return Task{}, fmt.Errorf("error iterating links: %w", err)
+		}
+
+		// No disputes on checks tasks
+		disputesByLineage := make(map[string][]disputeContextEntry)
+
+		// Create review tasks
+		if err := s.createReviewTasks(ctx, tx, t, newReviewRound, currentReviewRound, links, disputesByLineage, now); err != nil {
+			return Task{}, err
+		}
+
+		// Append operator bypass event without specific head commit info
+		if _, err := s.AppendEvent(ctx, tx, taskID, "system", "checks_passed", nil, note); err != nil {
+			return Task{}, err
+		}
+
+		// Fetch the updated task
+		var updatedTask Task
+		var updatedReviewModelsJSON *string
+		err = tx.QueryRowContext(ctx, `
+			SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+			FROM task WHERE id = ?
+		`, taskID).Scan(&updatedTask.ID, &updatedTask.ProjectID, &updatedTask.DocumentID, &updatedTask.Title, &updatedTask.Spec, &updatedTask.State, &updatedTask.Assignee, &updatedTask.LeaseExpiresAt, &updatedTask.Result, &updatedTask.Model, &updatedTask.Kind, &updatedReviewModelsJSON, &updatedTask.ReviewRound, &updatedTask.TargetTaskID, &updatedTask.Verdict, &updatedTask.AgentMerge, &updatedTask.Held, &updatedTask.Escalate, &updatedTask.Track, &updatedTask.Branch, &updatedTask.AwaitChecks, &updatedTask.ChecksStartedAt, &updatedTask.Priority, &updatedTask.TopicAnchorID, &updatedTask.CreatedAt, &updatedTask.UpdatedAt, &updatedTask.ArchivedAt, &updatedTask.SupersededBy)
+		if err != nil {
+			return Task{}, fmt.Errorf("failed to fetch updated task: %w", err)
+		}
+
+		// Unmarshal review_models from JSON
+		updatedTask.ReviewModels = []string{}
+		if updatedReviewModelsJSON != nil {
+			if err := json.Unmarshal([]byte(*updatedReviewModelsJSON), &updatedTask.ReviewModels); err != nil {
+				return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+
+		return updatedTask, nil
+	}
+
 	// Perform the conditional UPDATE
 	// On blocked→ready, also clear assignee and lease_expires_at to make it freshly claimable.
+	// On transitions from checks, also clear checks_started_at.
 	// Any transition ends an approve's landing reservation.
 	now := nowTimestamp()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE task
 		SET state=?, updated_at=?, landing_round=NULL, landing_commit=NULL, landing_attempt=NULL,
 		    assignee=CASE WHEN ? = 'blocked' THEN NULL ELSE assignee END,
-		    lease_expires_at=CASE WHEN ? = 'blocked' THEN NULL ELSE lease_expires_at END
+		    lease_expires_at=CASE WHEN ? = 'blocked' THEN NULL ELSE lease_expires_at END,
+		    checks_started_at=CASE WHEN ? = 'checks' THEN NULL ELSE checks_started_at END
 		WHERE id=? AND state=?
-	`, to, now, taskState, taskState, taskID, taskState)
+	`, to, now, taskState, taskState, taskState, taskID, taskState)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to transition task: %w", err)
 	}
@@ -5710,6 +5824,84 @@ func (s *sqliteStore) FailChecks(ctx context.Context, taskID, headSHA, summary s
 	if err := tx.Commit(); err != nil {
 		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
 	}
+	return t, nil
+}
+
+// TimeoutChecks moves a task from 'checks' to 'blocked' when checks timeout,
+// clears checks_started_at, and records a transition event. Returns ErrConflict
+// if the task is not in 'checks'.
+func (s *sqliteStore) TimeoutChecks(ctx context.Context, taskID, note string) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := nowTimestamp()
+
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT state FROM task WHERE id = ?`, taskID).
+		Scan(&state)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Task{}, ErrNotFound
+		}
+		return Task{}, fmt.Errorf("failed to load task: %w", err)
+	}
+
+	if state != "checks" {
+		return Task{}, ErrConflict
+	}
+
+	// Update state to 'blocked' and clear checks_started_at
+	result, err := tx.ExecContext(ctx, `
+		UPDATE task
+		SET state='blocked', checks_started_at=NULL, assignee=NULL, lease_expires_at=NULL, updated_at=?
+		WHERE id=? AND state='checks'
+	`, now, taskID)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to transition task: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected != 1 {
+		return Task{}, ErrConflict
+	}
+
+	// Sanitize the note to remove control characters
+	cleanedNote := sanitizeFreeText(note)
+
+	// Append transition event with the note
+	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, &cleanedNote); err != nil {
+		return Task{}, err
+	}
+
+	// Fetch the updated task
+	var t Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch updated task: %w", err)
+	}
+
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	return t, nil
 }
 
