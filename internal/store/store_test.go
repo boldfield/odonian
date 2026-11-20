@@ -9486,7 +9486,7 @@ func TestUpdateTaskDependsOn(t *testing.T) {
 	taskD := tasks[3]
 
 	// Test 1: Successfully update task B to depend on C
-	updatedTask, err := store.UpdateTaskDependsOn(ctx, taskB.ID, []string{taskC.ID})
+	updatedTask, err := store.UpdateTaskDependsOn(ctx, taskB.ID, []string{taskC.ID}, nil)
 	if err != nil {
 		t.Errorf("UpdateTaskDependsOn should succeed for valid deps, got error: %v", err)
 	}
@@ -9504,7 +9504,7 @@ func TestUpdateTaskDependsOn(t *testing.T) {
 	}
 
 	// Test 2: Reject self-dependency
-	_, err = store.UpdateTaskDependsOn(ctx, taskA.ID, []string{taskA.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, taskA.ID, []string{taskA.ID}, nil)
 	if err == nil {
 		t.Error("UpdateTaskDependsOn should reject self-dependency")
 	}
@@ -9515,12 +9515,12 @@ func TestUpdateTaskDependsOn(t *testing.T) {
 
 	// Test 3: Reject cycle creation
 	// First set A -> B
-	_, err = store.UpdateTaskDependsOn(ctx, taskA.ID, []string{taskB.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, taskA.ID, []string{taskB.ID}, nil)
 	if err != nil {
 		t.Fatalf("failed to set A depends on B: %v", err)
 	}
 	// Now try to make B -> A (would create cycle since A -> B -> A)
-	_, err = store.UpdateTaskDependsOn(ctx, taskB.ID, []string{taskA.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, taskB.ID, []string{taskA.ID}, nil)
 	if err == nil {
 		t.Error("UpdateTaskDependsOn should reject cycle creation")
 	}
@@ -9530,7 +9530,7 @@ func TestUpdateTaskDependsOn(t *testing.T) {
 	}
 
 	// Test 4: Update to multiple dependencies
-	_, err = store.UpdateTaskDependsOn(ctx, taskD.ID, []string{taskA.ID, taskB.ID, taskC.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, taskD.ID, []string{taskA.ID, taskB.ID, taskC.ID}, nil)
 	if err != nil {
 		t.Errorf("UpdateTaskDependsOn should succeed for multiple valid deps, got error: %v", err)
 	}
@@ -9544,7 +9544,7 @@ func TestUpdateTaskDependsOn(t *testing.T) {
 	}
 
 	// Test 5: Clear dependencies (update with empty list)
-	_, err = store.UpdateTaskDependsOn(ctx, taskD.ID, []string{})
+	_, err = store.UpdateTaskDependsOn(ctx, taskD.ID, []string{}, nil)
 	if err != nil {
 		t.Errorf("UpdateTaskDependsOn should succeed for empty deps, got error: %v", err)
 	}
@@ -9591,13 +9591,13 @@ func TestSupersededTask(t *testing.T) {
 	dependent := tasks[2]
 
 	// Set oldTask -> upstreamDep
-	_, err = store.UpdateTaskDependsOn(ctx, oldTask.ID, []string{upstreamDep.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, oldTask.ID, []string{upstreamDep.ID}, nil)
 	if err != nil {
 		t.Fatalf("failed to set oldTask dependency: %v", err)
 	}
 
 	// Set dependent -> oldTask
-	_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{oldTask.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{oldTask.ID}, nil)
 	if err != nil {
 		t.Fatalf("failed to set dependent: %v", err)
 	}
@@ -9794,7 +9794,7 @@ func TestSupersededTaskTerminalState(t *testing.T) {
 			dependent := tasks[1]
 
 			// Set dependent to depend on task
-			_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{task.ID})
+			_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{task.ID}, nil)
 			if err != nil {
 				t.Fatalf("failed to set dependency: %v", err)
 			}
@@ -9863,7 +9863,7 @@ func TestSupersededTaskNonTerminal(t *testing.T) {
 	dependent := tasks[1]
 
 	// Set dependent to depend on task
-	_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{task.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{task.ID}, nil)
 	if err != nil {
 		t.Fatalf("failed to set dependency: %v", err)
 	}
@@ -10068,7 +10068,7 @@ func TestSupersedeDependentClaimability(t *testing.T) {
 	dependent := tasks[1]
 
 	// Set dependent -> oldTask
-	_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{oldTask.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, dependent.ID, []string{oldTask.ID}, nil)
 	if err != nil {
 		t.Fatalf("failed to set dependency: %v", err)
 	}
@@ -10257,12 +10257,12 @@ func TestSupersededLineageTracingWithMultipleDependents(t *testing.T) {
 	dep2 := tasks[2]
 
 	// Set up dependencies
-	_, err = store.UpdateTaskDependsOn(ctx, dep1.ID, []string{oldTask.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, dep1.ID, []string{oldTask.ID}, nil)
 	if err != nil {
 		t.Fatalf("failed to set dep1 dependency: %v", err)
 	}
 
-	_, err = store.UpdateTaskDependsOn(ctx, dep2.ID, []string{oldTask.ID})
+	_, err = store.UpdateTaskDependsOn(ctx, dep2.ID, []string{oldTask.ID}, nil)
 	if err != nil {
 		t.Fatalf("failed to set dep2 dependency: %v", err)
 	}
@@ -10556,7 +10556,7 @@ func TestEscalateRoundTrip(t *testing.T) {
 	task4ID := tasks4[0].ID
 
 	// Test UpdateTaskDependsOn preserves escalate
-	updatedTask, err := store.UpdateTaskDependsOn(ctx, task3ID, []string{task4ID})
+	updatedTask, err := store.UpdateTaskDependsOn(ctx, task3ID, []string{task4ID}, nil)
 	if err != nil {
 		t.Fatalf("failed to update task dependencies: %v", err)
 	}

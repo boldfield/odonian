@@ -11264,17 +11264,23 @@ func TestPatchTaskAwaitChecksMixedFieldRefusal(t *testing.T) {
 		t.Fatalf("error should contain AWAIT_CHECKS_RESEARCH: %s", w.Body.String())
 	}
 
-	// Verify that the task was NOT changed (atomicity requirement)
-	var got store.Task
+	// Verify that the task was NOT changed (atomicity requirement).
+	// Get the task with deps and links to check both await_checks and depends_on.
 	getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
 	getReq.Header.Set("Authorization", authHeader)
 	getW := httptest.NewRecorder()
 	server.mux.ServeHTTP(getW, getReq)
+	var got store.TaskWithDepsAndLinks
 	if err := json.NewDecoder(getW.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode get response: %v", err)
 	}
 	if got.AwaitChecks != false {
 		t.Fatalf("await_checks should be unchanged at false, got %v", got.AwaitChecks)
+	}
+
+	// The key atomicity check: depends_on should still be empty (unchanged from the failed PATCH)
+	if len(got.DependsOn) > 0 {
+		t.Fatalf("depends_on should be empty (not changed by the failed PATCH), got %v", got.DependsOn)
 	}
 }
 

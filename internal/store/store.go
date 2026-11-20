@@ -61,10 +61,11 @@ type Store interface {
 	ResolveTaskID(ctx context.Context, id string) (string, error)
 	GetTask(ctx context.Context, id string) (TaskWithDepsAndLinks, error)
 	ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error)
+	ListDependencies(ctx context.Context, taskID string) ([]string, error)
 	ListDependents(ctx context.Context, taskID string) ([]string, error)
-	UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string) (Task, error)
+	UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string, awaitChecks *bool) (Task, error)
 	UpdateTaskReviewModels(ctx context.Context, taskID string, models []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error)
-	UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID string, models []string, deps []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error)
+	UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID string, models []string, deps []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, awaitChecks *bool) (Task, error)
 	ClaimTask(ctx context.Context, taskID, agentID, model string, leaseTTL time.Duration) (Task, error)
 	ClaimResearchTask(ctx context.Context, req ResearchClaim) (ResearchClaimResult, error)
 	SetResearchPolicy(ctx context.Context, now time.Time, cfg policy.Config) error
@@ -1897,6 +1898,32 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 	}
 
 	return tasks, nil
+}
+
+// ListDependencies returns all task IDs that the given taskID depends on.
+// Returns an empty slice if the task has no dependencies.
+func (s *sqliteStore) ListDependencies(ctx context.Context, taskID string) ([]string, error) {
+	rows, err := s.readConn.QueryContext(ctx, `
+		SELECT depends_on_id FROM task_dep WHERE task_id = ? ORDER BY depends_on_id
+	`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query dependencies: %w", err)
+	}
+	defer rows.Close()
+
+	dependencies := make([]string, 0)
+	for rows.Next() {
+		var depID string
+		if err := rows.Scan(&depID); err != nil {
+			return nil, fmt.Errorf("failed to scan dependency: %w", err)
+		}
+		dependencies = append(dependencies, depID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating dependencies: %w", err)
+	}
+
+	return dependencies, nil
 }
 
 // ListDependents returns all task IDs that depend on the given taskID (reverse dependencies).
@@ -6257,15 +6284,36 @@ func (s *sqliteStore) applyDependsOn(ctx context.Context, tx *sql.Tx, taskID str
 // UpdateTaskDependsOn updates the depends_on edges for a task.
 // Returns ValidationError if self-dependency is detected.
 // Returns ConflictError if a cycle would be created.
-func (s *sqliteStore) UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string) (Task, error) {
+func (s *sqliteStore) UpdateTaskDependsOn(ctx context.Context, taskID string, depIDs []string, awaitChecks *bool) (Task, error) {
 	tx, err := s.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
+	var currentAwaitChecks bool
+	var track string
+	err = tx.QueryRowContext(ctx, `SELECT await_checks, track FROM task WHERE id = ?`, taskID).Scan(&currentAwaitChecks, &track)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, ErrNotFound
+	}
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch task: %w", err)
+	}
+
+	if awaitChecks != nil && *awaitChecks && track == "research" {
+		return Task{}, invalid("AWAIT_CHECKS_RESEARCH", "await_checks is not allowed on a research-track task")
+	}
+
 	if err := s.applyDependsOn(ctx, tx, taskID, depIDs); err != nil {
 		return Task{}, err
+	}
+
+	if awaitChecks != nil && *awaitChecks != currentAwaitChecks {
+		now := nowTimestamp()
+		if _, err := tx.ExecContext(ctx, `UPDATE task SET await_checks = ?, updated_at = ? WHERE id = ?`, *awaitChecks, now, taskID); err != nil {
+			return Task{}, fmt.Errorf("failed to update await_checks: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -6322,12 +6370,13 @@ func (s *sqliteStore) validateReviewModels(models []string) error {
 // (replaces_review_task_id), while a reviewer of a model new to the list starts with no
 // lineage, so the removed reviewer's disputes do not carry over to it.
 func (s *sqliteStore) UpdateTaskReviewModels(ctx context.Context, taskID string, models []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error) {
-	return s.UpdateTaskReviewModelsAndDeps(ctx, taskID, models, nil, actor, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget)
+	return s.UpdateTaskReviewModelsAndDeps(ctx, taskID, models, nil, actor, maxReviewRounds, escalationThresholds, researchEscalationThresholds, researchRoundBudget, nil)
 }
 
 // UpdateTaskReviewModelsAndDeps is UpdateTaskReviewModels plus, when deps is non-nil, a
 // depends_on replacement in the same transaction: either both take effect or neither does.
-func (s *sqliteStore) UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID string, models []string, deps []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int) (Task, error) {
+// When awaitChecks is non-nil, it is also updated in the same transaction.
+func (s *sqliteStore) UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID string, models []string, deps []string, actor string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, awaitChecks *bool) (Task, error) {
 	if err := s.validateReviewModels(models); err != nil {
 		return Task{}, err
 	}
@@ -6344,9 +6393,10 @@ func (s *sqliteStore) UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID 
 	var kind, state, projectID, documentID, title, track string
 	var priority, reviewRound int
 	var reviewModelsJSON *string
+	var currentAwaitChecks bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT kind, state, project_id, document_id, title, track, priority, review_round, review_models FROM task WHERE id = ?
-	`, taskID).Scan(&kind, &state, &projectID, &documentID, &title, &track, &priority, &reviewRound, &reviewModelsJSON)
+		SELECT kind, state, project_id, document_id, title, track, priority, review_round, review_models, await_checks FROM task WHERE id = ?
+	`, taskID).Scan(&kind, &state, &projectID, &documentID, &title, &track, &priority, &reviewRound, &reviewModelsJSON, &currentAwaitChecks)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Task{}, ErrNotFound
 	}
@@ -6364,6 +6414,10 @@ func (s *sqliteStore) UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID 
 		return Task{}, conflict("TERMINAL_STATE", fmt.Sprintf("cannot change review_models on task in terminal state %q", state))
 	}
 
+	if awaitChecks != nil && *awaitChecks && track == "research" {
+		return Task{}, invalid("AWAIT_CHECKS_RESEARCH", "await_checks is not allowed on a research-track task")
+	}
+
 	oldModels := []string{}
 	if reviewModelsJSON != nil {
 		if err := json.Unmarshal([]byte(*reviewModelsJSON), &oldModels); err != nil {
@@ -6378,13 +6432,32 @@ func (s *sqliteStore) UpdateTaskReviewModelsAndDeps(ctx context.Context, taskID 
 	}
 
 	now := nowTimestamp()
+
+	// Build the UPDATE query dynamically for fields that are being updated
+	updateFields := []string{}
+	updateArgs := []interface{}{}
+
 	data, err := json.Marshal(models)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to marshal review_models: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE task SET review_models = ?, updated_at = ? WHERE id = ?`, string(data), now, taskID); err != nil {
-		return Task{}, fmt.Errorf("failed to update review_models: %w", err)
+	updateFields = append(updateFields, "review_models = ?")
+	updateArgs = append(updateArgs, string(data))
+
+	if awaitChecks != nil && *awaitChecks != currentAwaitChecks {
+		updateFields = append(updateFields, "await_checks = ?")
+		updateArgs = append(updateArgs, *awaitChecks)
 	}
+
+	updateFields = append(updateFields, "updated_at = ?")
+	updateArgs = append(updateArgs, now)
+	updateArgs = append(updateArgs, taskID)
+
+	updateSQL := "UPDATE task SET " + strings.Join(updateFields, ", ") + " WHERE id = ?"
+	if _, err := tx.ExecContext(ctx, updateSQL, updateArgs...); err != nil {
+		return Task{}, fmt.Errorf("failed to update task: %w", err)
+	}
+
 	oldJSON, _ := json.Marshal(oldModels)
 	note := fmt.Sprintf("review_models changed by %s: %s -> %s", actor, oldJSON, data)
 	if _, err := s.AppendEvent(ctx, tx, taskID, actor, "review_models_changed", nil, &note); err != nil {

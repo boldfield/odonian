@@ -691,7 +691,18 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	if fieldsSummary {
 		summaries := make([]map[string]interface{}, len(tasks))
 		for i, task := range tasks {
-			summaries[i] = taskToSummary(task)
+			summary := taskToSummary(task)
+			// Load depends_on for each task
+			deps, err := s.store.ListDependencies(r.Context(), task.ID)
+			if err != nil {
+				s.errorResponse(w, http.StatusInternalServerError, "LIST_ERROR", "Failed to load task dependencies")
+				return
+			}
+			if deps == nil {
+				deps = make([]string, 0)
+			}
+			summary["depends_on"] = deps
+			summaries[i] = summary
 		}
 		s.encodeJSON(w, http.StatusOK, summaries)
 		return
@@ -1287,29 +1298,14 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		awaitChecks = &val
 	}
 
-	// Validate all fields before writing anything, so a refusal of any field leaves the task unchanged.
-	if awaitChecks != nil && *awaitChecks {
-		task, err := s.store.GetTask(r.Context(), taskID)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
-				return
-			}
-			s.errorResponse(w, http.StatusInternalServerError, "GET_ERROR", "Failed to load task")
-			return
-		}
-		if task.Track == "research" {
-			s.errorResponse(w, http.StatusBadRequest, "AWAIT_CHECKS_RESEARCH", "await_checks is not allowed on a research-track task")
-			return
-		}
-	}
-
 	if hasModels || hasDeps || awaitChecks != nil {
 		var err error
 		if hasModels {
-			_, err = s.store.UpdateTaskReviewModelsAndDeps(r.Context(), taskID, models, deps, actor, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget)
+			_, err = s.store.UpdateTaskReviewModelsAndDeps(r.Context(), taskID, models, deps, actor, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget, awaitChecks)
 		} else if hasDeps {
-			_, err = s.store.UpdateTaskDependsOn(r.Context(), taskID, deps)
+			_, err = s.store.UpdateTaskDependsOn(r.Context(), taskID, deps, awaitChecks)
+		} else if awaitChecks != nil {
+			_, err = s.store.UpdateTaskAwaitChecks(r.Context(), taskID, *awaitChecks)
 		}
 		if err != nil {
 			var validationErr *store.ValidationError
@@ -1332,23 +1328,6 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 			}
 			s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
 			return
-		}
-
-		if awaitChecks != nil {
-			_, err = s.store.UpdateTaskAwaitChecks(r.Context(), taskID, *awaitChecks)
-			if err != nil {
-				var validationErr *store.ValidationError
-				if errors.As(err, &validationErr) {
-					s.errorResponse(w, http.StatusBadRequest, validationErr.Code, validationErr.Message)
-					return
-				}
-				if errors.Is(err, store.ErrNotFound) {
-					s.errorResponse(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
-					return
-				}
-				s.errorResponse(w, http.StatusInternalServerError, "UPDATE_ERROR", "Failed to update task")
-				return
-			}
 		}
 	}
 
