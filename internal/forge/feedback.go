@@ -314,6 +314,7 @@ func listUnacknowledgedGlobalComments(ctx context.Context, owner, repo string, p
 //   - reviewer comments are actionable unless they are a canonical approval status
 //     (an approval must never clear another reviewer's outstanding request), so
 //     reviewer CHANGES REQUESTED and unknown reviewer messages remain visible;
+//   - checks comments are actionable feedback from the CI reconciler;
 //   - worker acknowledgment/status and merger/reconciler status are not new
 //     reviewer requests and are not surfaced.
 func isActionableGlobalComment(body string) bool {
@@ -324,6 +325,10 @@ func isActionableGlobalComment(body string) bool {
 	}
 	if role == "reviewer" {
 		return !isReviewerApproval(body)
+	}
+	if role == "checks" {
+		// CI feedback from the checks reconciler.
+		return true
 	}
 	// worker, merger, reconciler: fleet status/acknowledgment, not new feedback.
 	return false

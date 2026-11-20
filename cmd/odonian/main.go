@@ -30,6 +30,7 @@ import (
 	"github.com/boldfield/odonian/internal/notify"
 	"github.com/boldfield/odonian/internal/policy"
 	"github.com/boldfield/odonian/internal/prwatch"
+	"github.com/boldfield/odonian/internal/ratelimit"
 	"github.com/boldfield/odonian/internal/reconcile"
 	"github.com/boldfield/odonian/internal/store"
 	"github.com/boldfield/odonian/internal/tuiclient"
@@ -418,7 +419,9 @@ func runServer() {
 		reconcilers = append(reconcilers, notify.NewNotifyReconciler(s, notifyClient, notifyFailedWindow, time.Now, logger))
 	}
 
-	reconcilers = append(reconcilers, prwatch.NewPRWatchReconciler(s, notifier, forge.OwnerToken, notifyInterval, rateLimitFloor, logger))
+	// One limiter shared by every reconciler that calls GitHub.
+	githubLimiter := ratelimit.New(notifyInterval, rateLimitFloor)
+	reconcilers = append(reconcilers, prwatch.NewPRWatchReconciler(s, notifier, forge.OwnerToken, notifyInterval, rateLimitFloor, logger).WithLimiter(githubLimiter))
 	runner := reconcile.NewRunner(notifyInterval, logger, reconcilers...)
 
 	go func() {

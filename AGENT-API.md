@@ -238,6 +238,27 @@ When `agent_merge` is `false`, work requiring a merge waits in `approved` for th
 gate. Verified current-round no-ops with no active PR finalize directly regardless of this flag.
 In no case does a reviewer run `gh pr merge` or transition the parent.
 
+## Agent comment markers
+
+PR comments from agents are marked with a prefix to identify their role:
+
+```
+<model>-<role>: <message>
+```
+
+where `<model>` is the agent's model (e.g. `haiku`, `opus`) and `<role>` is one of:
+- `worker`: Implementation status and rework acknowledgments.
+- `reviewer`: Code review feedback.
+- `merger`: Merge operation status.
+- `checks`: CI feedback from the checks reconciler (failed checks, test failures, etc.).
+- `reconciler`: Task state changes and other administrative status.
+
+Of these roles, only `reviewer` and `checks` comments are actionable feedback that must be
+addressed before a rework is submitted. Worker/merger/reconciler comments report status, not
+requests. `odonian pr-feedback list` returns unaddressed `reviewer` and `checks` comments;
+a `checks` comment must be acknowledged via `odonian pr-feedback ack` with the fixing commit
+or as disputed, the same as a reviewer request.
+
 ## Research continuation manifests (opt-in)
 
 A research-track parent can propose follow-on work as a **continuation manifest**. Reviewers

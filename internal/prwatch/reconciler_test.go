@@ -15,6 +15,7 @@ import (
 
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/notify"
+	"github.com/boldfield/odonian/internal/ratelimit"
 	"github.com/boldfield/odonian/internal/store"
 )
 
@@ -2498,5 +2499,74 @@ func TestNonApprovedTaskSkipsTombstonedPRLinkForActiveMergedOne(t *testing.T) {
 	}
 	if len(ts.convergeExternallyMergedCalls) != 1 {
 		t.Errorf("expected 1 convergence call, got %d", len(ts.convergeExternallyMergedCalls))
+	}
+}
+
+// TestSharedLimiterBetweenTwoReconcilers proves the sharing mechanism itself:
+// two reconcilers built with WithLimiter(shared) each hold the one instance, so
+// a rate limit seen by the first stops the second calling GitHub for that owner
+// until the reset, and it resumes afterwards.
+func TestSharedLimiterBetweenTwoReconcilers(t *testing.T) {
+	ctx := context.Background()
+	newTS := func() *fakeTaskSource {
+		return &fakeTaskSource{
+			projects: []store.Project{{ID: "proj-1"}},
+			tasks: map[string][]store.Task{
+				"proj-1": {{ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z"}},
+			},
+			taskWithDepsAndLinks: map[string]store.TaskWithDepsAndLinks{
+				"task-1": {
+					ID: "task-1", State: "approved", UpdatedAt: "2024-01-01T00:00:00Z",
+					Links: []store.TaskLink{{ID: "link-1", Kind: "pr", Value: "https://github.com/owner1/repo/pull/1"}},
+				},
+			},
+		}
+	}
+	t0 := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+	resetAt := t0.Add(5 * time.Minute)
+	nowVal := t0
+	tokenLookup := func(owner string) (string, error) { return "token", nil }
+	review := func(ctx context.Context, owner, repo string, prNumber int, token string) (string, time.Time, error) {
+		return "approved", time.Time{}, nil
+	}
+
+	shared := ratelimit.New(10*time.Second, 0)
+	var callsA, callsB int
+	a := NewPRWatchReconciler(newTS(), &fakeNotifierForReconciler{}, tokenLookup, time.Minute, 0, newTestLogger()).WithLimiter(shared)
+	a.getPRState = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		callsA++
+		return "", &forge.RateLimitError{StatusCode: 403, Body: "API rate limit exceeded", Reset: resetAt}
+	}
+	a.getReviewDecision = review
+	a.now = func() time.Time { return nowVal }
+	b := NewPRWatchReconciler(newTS(), &fakeNotifierForReconciler{}, tokenLookup, time.Minute, 0, newTestLogger()).WithLimiter(shared)
+	b.getPRState = func(ctx context.Context, owner, repo string, prNumber int, token string) (string, error) {
+		callsB++
+		return "open", nil
+	}
+	b.getReviewDecision = review
+	b.now = func() time.Time { return nowVal }
+
+	if err := a.Reconcile(ctx); err != nil {
+		t.Fatalf("a: %v", err)
+	}
+	if callsA != 1 {
+		t.Fatalf("a: expected 1 call, got %d", callsA)
+	}
+
+	nowVal = t0.Add(time.Minute)
+	if err := b.Reconcile(ctx); err != nil {
+		t.Fatalf("b before reset: %v", err)
+	}
+	if callsB != 0 {
+		t.Errorf("b made %d GitHub calls for a backed-off owner, want 0", callsB)
+	}
+
+	nowVal = resetAt.Add(time.Second)
+	if err := b.Reconcile(ctx); err != nil {
+		t.Fatalf("b after reset: %v", err)
+	}
+	if callsB != 1 {
+		t.Errorf("b after reset: expected 1 call, got %d", callsB)
 	}
 }

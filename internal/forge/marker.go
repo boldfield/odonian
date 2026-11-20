@@ -5,11 +5,11 @@ import (
 	"strings"
 )
 
-var agentMarkerRegex = regexp.MustCompile(`^[a-z0-9.-]+-(worker|reviewer|merger|reconciler):`)
+var agentMarkerRegex = regexp.MustCompile(`^[a-z0-9.-]+-(worker|reviewer|merger|reconciler|checks):`)
 
 // IsAgentAuthoredComment reports whether a PR comment body is agent-authored.
 // A comment is agent-authored iff, after leading whitespace, it matches:
-// <token>-(worker|reviewer|merger|reconciler): where <token> is one or more of [a-z0-9.-]
+// <token>-(worker|reviewer|merger|reconciler|checks): where <token> is one or more of [a-z0-9.-]
 //
 // This is an authorship/role predicate only. It reports who wrote a comment, never
 // whether the feedback in a comment has been addressed. Callers deciding whether a
@@ -21,7 +21,7 @@ func IsAgentAuthoredComment(body string) bool {
 }
 
 // AgentCommentRole returns the role encoded in a comment's agent marker prefix —
-// one of "worker", "reviewer", "merger", or "reconciler" — and whether the comment
+// one of "worker", "reviewer", "merger", "reconciler", or "checks" — and whether the comment
 // is agent-authored at all. It is an authorship/role parser; a false ok means the
 // comment is unmarked (e.g. plain human feedback).
 func AgentCommentRole(body string) (string, bool) {
