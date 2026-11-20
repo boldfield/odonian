@@ -507,3 +507,105 @@ func normalizeSpec(spec, taskID, replacement string) string {
 	// Replace the task ID with a placeholder so we can compare specs from different tasks
 	return strings.ReplaceAll(spec, taskID, replacement)
 }
+
+func failChecksHarness(t *testing.T, escalate bool) *reviewRoundHarness {
+	t.Helper()
+	ctx := context.Background()
+	store, projectID, docID := newBranchTestStore(t)
+	tasks, err := store.CreateTasks(ctx, projectID, []TaskInput{
+		{Title: "Task", Spec: "Spec", DocumentID: docID, Model: "haiku", ReviewModels: []string{"opus"}, AwaitChecks: true, Escalate: &escalate},
+	})
+	if err != nil {
+		t.Fatalf("CreateTasks: %v", err)
+	}
+	if _, err := store.PromoteTask(ctx, tasks[0].ID); err != nil {
+		t.Fatalf("PromoteTask: %v", err)
+	}
+	h := &reviewRoundHarness{t: t, store: store, projectID: projectID, taskID: tasks[0].ID}
+	submitReturning(t, h, LinkInput{Kind: "pr", Value: "https://github.com/o/r/pull/1"})
+	if h.task().State != "checks" {
+		t.Fatalf("state = %q, want checks", h.task().State)
+	}
+	return h
+}
+
+func TestFailChecksBelowThresholdReturnsToReady(t *testing.T) {
+	ctx := context.Background()
+	h := failChecksHarness(t, true)
+	got, err := h.store.FailChecks(ctx, h.taskID, "abc123", "lint (https://ci/1)", 5, nil, nil)
+	if err != nil {
+		t.Fatalf("FailChecks: %v", err)
+	}
+	if got.State != "ready" || got.Assignee != nil || got.LeaseExpiresAt != nil || got.ChecksStartedAt != nil {
+		t.Errorf("task = state %q assignee %v lease %v checks_started_at %v; want ready, unassigned, no lease, no checks_started_at", got.State, got.Assignee, got.LeaseExpiresAt, got.ChecksStartedAt)
+	}
+	if got.ReviewRound != 1 {
+		t.Errorf("review_round = %d, want 1", got.ReviewRound)
+	}
+	events, err := h.store.ListEvents(ctx, h.taskID)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := false
+	for _, e := range events {
+		if e.Kind == "checks_failed" {
+			found = true
+			if e.Note == nil || *e.Note != "head commit: abc123, summary: lint (https://ci/1)" {
+				t.Errorf("checks_failed note = %v", e.Note)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("checks_failed event not found")
+	}
+}
+
+func TestFailChecksPastThresholdBlocksWithoutEscalation(t *testing.T) {
+	h := failChecksHarness(t, false)
+	got, err := h.store.FailChecks(context.Background(), h.taskID, "abc123", "lint", 5, map[string]int{"haiku": 0}, nil)
+	if err != nil {
+		t.Fatalf("FailChecks: %v", err)
+	}
+	if got.State != "blocked" || got.ReviewRound != 1 {
+		t.Errorf("state = %q review_round = %d, want blocked and 1", got.State, got.ReviewRound)
+	}
+}
+
+func TestFailChecksPastThresholdEscalates(t *testing.T) {
+	ctx := context.Background()
+	h := failChecksHarness(t, true)
+	got, err := h.store.FailChecks(ctx, h.taskID, "abc123", "lint (https://ci/1)", 5, map[string]int{"haiku": 0}, nil)
+	if err != nil {
+		t.Fatalf("FailChecks: %v", err)
+	}
+	if got.State != "superseded" || got.SupersededBy == nil {
+		t.Fatalf("state = %q superseded_by = %v, want superseded with replacement", got.State, got.SupersededBy)
+	}
+	repl, err := h.store.GetTask(ctx, *got.SupersededBy)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if repl.State != "ready" || repl.Model != "sonnet" {
+		t.Errorf("replacement state = %q model = %q, want ready sonnet", repl.State, repl.Model)
+	}
+	if !strings.Contains(repl.Spec, "Prior attempt feedback") || !strings.Contains(repl.Spec, "lint (https://ci/1)") {
+		t.Errorf("replacement spec lacks failure summary: %q", repl.Spec)
+	}
+}
+
+func TestFailChecksOutsideChecksConflicts(t *testing.T) {
+	ctx := context.Background()
+	h := newChecksSubmitHarness(t, true)
+	if _, err := h.store.FailChecks(ctx, h.taskID, "abc123", "lint", 5, nil, nil); !errors.Is(err, ErrConflict) {
+		t.Fatalf("err = %v, want ErrConflict", err)
+	}
+	if h.task().State != "ready" {
+		t.Errorf("state changed to %q", h.task().State)
+	}
+	events, _ := h.store.ListEvents(ctx, h.taskID)
+	for _, e := range events {
+		if e.Kind == "checks_failed" {
+			t.Errorf("checks_failed event recorded on conflict")
+		}
+	}
+}
