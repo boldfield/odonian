@@ -19448,3 +19448,227 @@ func TestConvergeExternallyMergedTaskFromApproved(t *testing.T) {
 		t.Fatalf("expected done state, got %s", converged.State)
 	}
 }
+
+func TestSupersededTaskInheritsAwaitChecks(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	proj, err := store.CreateProject(ctx, "Test Project", "test-repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Doc", "main", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Test 1: await_checks = true
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:       "Task with await_checks true",
+			Spec:        "Spec",
+			DocumentID:  doc.ID,
+			AwaitChecks: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	oldTaskID := tasks[0].ID
+	oldTask, err := store.GetTask(ctx, oldTaskID)
+	if err != nil {
+		t.Fatalf("failed to get old task: %v", err)
+	}
+
+	if !oldTask.AwaitChecks {
+		t.Errorf("expected oldTask.AwaitChecks to be true, got false")
+	}
+
+	newTask, err := store.SupersedeTask(ctx, oldTaskID, nil, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+
+	if !newTask.AwaitChecks {
+		t.Errorf("expected newTask.AwaitChecks to be true (inherited), got false")
+	}
+
+	// Test 2: await_checks = false
+	tasks, err = store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:       "Task with await_checks false",
+			Spec:        "Spec",
+			DocumentID:  doc.ID,
+			AwaitChecks: false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+
+	oldTaskID = tasks[0].ID
+	oldTask, err = store.GetTask(ctx, oldTaskID)
+	if err != nil {
+		t.Fatalf("failed to get old task: %v", err)
+	}
+
+	if oldTask.AwaitChecks {
+		t.Errorf("expected oldTask.AwaitChecks to be false, got true")
+	}
+
+	newTask, err = store.SupersedeTask(ctx, oldTaskID, nil, nil)
+	if err != nil {
+		t.Fatalf("SupersedeTask failed: %v", err)
+	}
+
+	if newTask.AwaitChecks {
+		t.Errorf("expected newTask.AwaitChecks to be false (inherited), got true")
+	}
+}
+
+func TestEscalatedTaskInheritsAwaitChecks(t *testing.T) {
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "test-doc", "test.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	escalateTrue := true
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
+		{
+			Title:        "Implement feature",
+			Spec:         "Do the thing",
+			DocumentID:   doc.ID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			Escalate:     &escalateTrue,
+			AwaitChecks:  true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	taskID := tasks[0].ID
+	maxReviewRounds := 2
+	escalationThresholds := map[string]int{"haiku": 1} // Escalate after 1 round
+
+	// Verify original task has await_checks true
+	origTask, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get original task: %v", err)
+	}
+	if !origTask.AwaitChecks {
+		t.Errorf("expected original task AwaitChecks to be true, got false")
+	}
+
+	// Submit and reject twice to trigger escalation
+	// Round 1: submit + reject -> task returns to ready
+	// Round 2: submit + reject -> task exceeds threshold and is escalated
+	for round := 1; round <= 2; round++ {
+		task, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			t.Fatalf("failed to get task (round %d): %v", round, err)
+		}
+
+		if task.State == "backlog" {
+			_, err := store.PromoteTask(ctx, taskID)
+			if err != nil {
+				t.Fatalf("failed to promote task (round %d): %v", round, err)
+			}
+		}
+
+		_, err = store.ClaimTask(ctx, taskID, "agent-1", "haiku", 5*time.Minute)
+		if err != nil {
+			t.Fatalf("failed to claim task (round %d): %v", round, err)
+		}
+
+		_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, maxReviewRounds, escalationThresholds, nil, testUnlimitedResearchBudget)
+		if err != nil {
+			t.Fatalf("failed to submit implement task (round %d): %v", round, err)
+		}
+
+		allTasks, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+		if err != nil {
+			t.Fatalf("failed to list tasks (round %d): %v", round, err)
+		}
+
+		var reviewTask *Task
+		for i := range allTasks {
+			if allTasks[i].Kind == "review" && allTasks[i].TargetTaskID != nil && *allTasks[i].TargetTaskID == taskID && allTasks[i].State == "ready" {
+				reviewTask = &allTasks[i]
+				break
+			}
+		}
+		if reviewTask == nil {
+			t.Fatalf("review task not found (round %d)", round)
+		}
+
+		_, err = store.ClaimTask(ctx, reviewTask.ID, "opus-reviewer", "opus", 5*time.Minute)
+		if err != nil {
+			t.Fatalf("failed to claim review task (round %d): %v", round, err)
+		}
+
+		reject := "reject"
+		_, err = store.SubmitTask(ctx, reviewTask.ID, "opus-reviewer", "Issues found", &reject, nil, maxReviewRounds, escalationThresholds, nil, testUnlimitedResearchBudget)
+		if err != nil {
+			t.Fatalf("failed to submit review task (round %d): %v", round, err)
+		}
+
+		if round < 2 {
+			// After round 1, task should return to ready
+			task, err := store.GetTask(ctx, taskID)
+			if err != nil {
+				t.Fatalf("failed to get task after rejection (round %d): %v", round, err)
+			}
+			if task.State != "ready" {
+				t.Fatalf("expected task state to be ready after rejection (round %d), got %s", round, task.State)
+			}
+		}
+	}
+
+	// After round 2, the original task should be escalated to sonnet (the next tier)
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("failed to get task after escalation: %v", err)
+	}
+
+	if task.State != "superseded" {
+		t.Fatalf("expected original task state to be superseded, got %s", task.State)
+	}
+	if task.SupersededBy == nil {
+		t.Fatalf("expected task to be superseded by another task")
+	}
+
+	escalatedTask, err := store.GetTask(ctx, *task.SupersededBy)
+	if err != nil {
+		t.Fatalf("failed to get escalated task: %v", err)
+	}
+
+	if escalatedTask.State != "ready" {
+		t.Fatalf("expected escalated task state to be ready, got %s", escalatedTask.State)
+	}
+	if escalatedTask.Model != "sonnet" {
+		t.Fatalf("expected escalated task model to be sonnet, got %s", escalatedTask.Model)
+	}
+	if !escalatedTask.AwaitChecks {
+		t.Errorf("expected escalated task AwaitChecks to be true (inherited), got false")
+	}
+}
