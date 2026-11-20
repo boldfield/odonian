@@ -32,6 +32,11 @@ func TestIsAgentAuthoredComment(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "haiku-checks",
+			body: "haiku-checks: CI failed",
+			want: true,
+		},
+		{
 			name: "leading space",
 			body: " haiku-worker: Comment",
 			want: true,
@@ -110,6 +115,7 @@ func TestAgentCommentRole(t *testing.T) {
 		{name: "reviewer", body: "gpt-5.5-reviewer: CHANGES REQUESTED", wantRole: "reviewer", wantOK: true},
 		{name: "merger", body: "fable-merger: merged", wantRole: "merger", wantOK: true},
 		{name: "reconciler", body: "odonian-reconciler: bounced", wantRole: "reconciler", wantOK: true},
+		{name: "checks", body: "haiku-checks: CI failed", wantRole: "checks", wantOK: true},
 		{name: "leading whitespace", body: "  \n\thaiku-worker: hi", wantRole: "worker", wantOK: true},
 		{name: "unmarked human", body: "Please fix the off-by-one", wantRole: "", wantOK: false},
 		{name: "marker mid-body", body: "note: haiku-worker: hi", wantRole: "", wantOK: false},
