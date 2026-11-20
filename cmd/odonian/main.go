@@ -819,6 +819,12 @@ func executeShow(ctx context.Context, baseURL, token string, jsonOutput bool, ar
 		if task.TopicAnchorID != nil {
 			fmt.Fprintf(out, "Topic Anchor ID: %s\n", *task.TopicAnchorID)
 		}
+		fmt.Fprintf(out, "Await Checks: %t\n", task.AwaitChecks)
+		if task.ChecksStartedAt != nil {
+			fmt.Fprintf(out, "Checks Started At: %s\n", *task.ChecksStartedAt)
+		} else {
+			fmt.Fprintf(out, "Checks Started At: null\n")
+		}
 		fmt.Fprintf(out, "Title: %s\n", task.Title)
 		fmt.Fprintf(out, "Spec: %s\n", task.Spec)
 		if task.ReviewRound > 0 {
