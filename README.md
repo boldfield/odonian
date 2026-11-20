@@ -147,6 +147,7 @@ holds, dependencies, model availability or admission limits. See [operations](./
 | `backlog` | Created, not yet claimable. A human promotes it. |
 | `ready` | Claimable, subject to dependencies, hold, and model. |
 | `in_progress` | Claimed and leased. |
+| `checks` | Submitted with `await_checks: true` and a pull request. Awaiting CI on the PR's head commit. The reconciler polls and transitions to `review` (if green) or `ready` (if red). No agent can claim a task in `checks`. |
 | `review` | Submitted. One review task per required reviewer model is in flight. |
 | `approved` | Passed the track's review rules. Awaits landing or the merge gate. |
 | `blocked` | Circuit breaker or operator. Unblocking returns it to `ready` with a cleared lease. The review round is not reset yet, so a re-rejection re-trips the breaker; a fix is specced in `docs/specs/`. |
@@ -251,12 +252,14 @@ missed tick is caught by the next one.
 |---|---|
 | Worker crashes mid-task | Lease lapses; any worker of that model can claim it. The rework lands on the same deterministic branch. |
 | Worker finds the work already on `main` | Submits a `no_op` link and no PR; passing review completes the task without a merge. |
+| CI fails while task waits in `checks` | The reconciler detects failure, posts a `checks:` comment on the PR, records a `checks_failed` event, and runs the circuit breaker (rework, block, or escalate) as if a review round failed. The worker acknowledges the feedback and reworks or the operator overrides. |
+| CI times out in `checks` | After `CHECKS_TIMEOUT` (default 3h) with no green result, the reconciler moves the task to `blocked`. The operator unblocks to `ready` for a rework decision. |
 | Reviewer rejects repeatedly | Build/design can escalate or block. Research has separate rules and a chain-wide budget that blocks for decomposition. |
 | Human requests changes on GitHub after approval | PR-watch bounces the task to `ready` and posts a marker comment; the worker must ack every open item before resubmitting. |
-| PR merged or closed outside the board | PR-watch converges: approved tasks to `done` (merged) or `abandoned` (closed); other states to `done` if PR merged, leaving open or closed PRs alone. |
+| PR merged or closed outside the board | PR-watch converges: approved tasks to `done` (merged) or `abandoned` (closed); checks tasks to `done` if PR merged, leaving open or closed PRs alone. |
 | Server restarts | Reconcilers re-derive from state. Writers wait on SQLite's 5s busy timeout instead of failing fast. |
 | Webhook endpoint down | Logged. Level-triggered, so the next tick resends. |
-| Forge token missing for an owner | PR-watch skips that owner's repositories, including public ones, and logs when the skipped count changes. Configure the server's per-owner token to resume convergence. |
+| Forge token missing for an owner | PR-watch and checkwatch skip that owner's repositories, including public ones, and log when the skipped count changes. Configure the server's per-owner token to resume convergence. |
 | A backend fails during dispatch | Known failures trigger account/model backoff and owner-fenced claim handback; other eligible work can proceed. |
 | A task is wedged | Hold it via the API/TUI; supersede an abandoned approach and revise the replacement spec if needed, or use an allowed operator transition. See the operations guide. |
 
