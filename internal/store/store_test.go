@@ -19600,7 +19600,7 @@ func TestEscalatedTaskInheritsAwaitChecks(t *testing.T) {
 			t.Fatalf("failed to claim task (round %d): %v", round, err)
 		}
 
-		_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "pr", Value: "#100"}}, maxReviewRounds, escalationThresholds, nil, testUnlimitedResearchBudget)
+		_, err = store.SubmitTask(ctx, taskID, "agent-1", "Implementation", nil, []LinkInput{{Kind: "commit", Value: "c100"}}, maxReviewRounds, escalationThresholds, nil, testUnlimitedResearchBudget)
 		if err != nil {
 			t.Fatalf("failed to submit implement task (round %d): %v", round, err)
 		}

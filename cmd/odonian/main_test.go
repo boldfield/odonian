@@ -7632,3 +7632,34 @@ func TestExecuteShowAwaitChecks(t *testing.T) {
 		})
 	}
 }
+
+func TestExecuteSubmitReportsResultingState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "GET" && r.URL.Path == "/tasks/task-chk" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task-chk", "review_round": 0, "links": []map[string]string{}})
+			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/tasks/task-chk/submit" {
+			json.NewEncoder(w).Encode(map[string]interface{}{"id": "task-chk", "state": "checks"})
+		}
+	}))
+	defer server.Close()
+	t.Setenv("AGENT_ID", "test-agent")
+
+	var err error
+	out := captureStdout(t, func() {
+		err = executeSubmit(context.Background(), server.URL, "test-token", []string{
+			"--result", "done",
+			"--pr", "https://github.com/example/repo/pull/1",
+			"--branch", "mr/a1b2c3d4",
+			"task-chk",
+		})
+	})
+	if err != nil {
+		t.Fatalf("executeSubmit failed: %v", err)
+	}
+	if !strings.Contains(out, "submitted task-chk: state=checks") {
+		t.Errorf("output %q does not report the resulting state", out)
+	}
+}

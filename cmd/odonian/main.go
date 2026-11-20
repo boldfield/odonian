@@ -1289,10 +1289,14 @@ func executeSubmit(ctx context.Context, baseURL, token string, args []string) er
 	}
 
 	loadAttempt(client, taskID, *attemptFlag)
-	if err := client.SubmitTaskWithManifest(ctx, taskID, agentID, *resultFlag, verdict, links, findings, disputes, manifestBody); err != nil {
+	state, err := client.SubmitTaskWithManifest(ctx, taskID, agentID, *resultFlag, verdict, links, findings, disputes, manifestBody)
+	if err != nil {
 		return fmt.Errorf("failed to submit task: %w", err)
 	}
 	clearAttempt(taskID)
+	if state != "" {
+		fmt.Printf("submitted %s: state=%s\n", taskID, state)
+	}
 
 	return nil
 }
