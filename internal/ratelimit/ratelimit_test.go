@@ -46,15 +46,17 @@ func TestBelowFloor(t *testing.T) {
 	}
 }
 
-func TestSharedInstanceBetweenHolders(t *testing.T) {
-	shared := New(time.Minute, 0)
-	a, b := shared, shared
-	reset := t0.Add(5 * time.Minute)
-	a.Enter("o", reset, t0)
-	if backed, _ := b.Check("o", t0.Add(time.Minute)); !backed {
-		t.Fatal("second holder not told to skip owner")
+func TestBelowFloorEntersBackoffUntilReset(t *testing.T) {
+	l := New(time.Minute, 100)
+	reset := t0.Add(20 * time.Minute)
+	if !l.BelowFloor(50) {
+		t.Fatal("50 remaining should be below floor 100")
 	}
-	if backed, resumed := b.Check("o", reset); backed || !resumed {
-		t.Fatal("second holder should resume at reset")
+	l.Enter("o", reset, t0)
+	if b, _ := l.Check("o", t0.Add(10*time.Minute)); !b {
+		t.Fatal("owner below floor should be skipped until reset")
+	}
+	if b, r := l.Check("o", reset); b || !r {
+		t.Fatalf("at reset: backedOff=%v resumed=%v", b, r)
 	}
 }
