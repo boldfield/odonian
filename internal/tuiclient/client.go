@@ -815,15 +815,26 @@ func (c *HTTPClient) ReviewTask(ctx context.Context, id, actor, verdict string, 
 
 // transitionTaskRequest is the request body for TransitionTask.
 type transitionTaskRequest struct {
-	To   string  `json:"to"`
-	Note *string `json:"note,omitempty"`
+	To    string  `json:"to"`
+	Note  *string `json:"note,omitempty"`
+	Actor *string `json:"actor,omitempty"`
 }
 
 // TransitionTask moves a task to a new state.
 func (c *HTTPClient) TransitionTask(ctx context.Context, id, to string, note *string) error {
+	return c.TransitionTaskWithActor(ctx, id, to, note, "")
+}
+
+// TransitionTaskWithActor moves a task to a new state, optionally specifying the actor.
+func (c *HTTPClient) TransitionTaskWithActor(ctx context.Context, id, to string, note *string, actor string) error {
+	var actorPtr *string
+	if actor != "" {
+		actorPtr = &actor
+	}
 	body := transitionTaskRequest{
-		To:   to,
-		Note: note,
+		To:    to,
+		Note:  note,
+		Actor: actorPtr,
 	}
 
 	resp, err := c.do(ctx, "POST", fmt.Sprintf("/tasks/%s/transition", id), body)

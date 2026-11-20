@@ -78,12 +78,14 @@ type Store interface {
 	SubmitTaskWithManifest(ctx context.Context, taskID, agentID, result string, verdict *string, links []LinkInput, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int, researchRoundBudget int, findings json.RawMessage, disputes json.RawMessage, manifest json.RawMessage) (TaskWithDepsAndLinks, error)
 	AddReview(ctx context.Context, taskID, actor, verdict string, note *string) (Event, error)
 	TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error)
+	TransitionTaskWithActor(ctx context.Context, taskID, to, actor string, note *string) (Task, error)
 	ConvergeExternallyMergedTask(ctx context.Context, taskID, prURL string) (Task, error)
 	SupersedeTask(ctx context.Context, taskID string, modelOverride *string, reviewModelsOverride []string) (Task, error)
 	UpdateTaskEscalate(ctx context.Context, taskID string, escalate bool) (Task, error)
 	UpdateTaskAwaitChecks(ctx context.Context, taskID string, awaitChecks bool) (Task, error)
 	PassChecks(ctx context.Context, taskID, headSHA, summary string) (Task, error)
 	FailChecks(ctx context.Context, taskID, headSHA, summary string, maxReviewRounds int, escalationThresholds map[string]int, researchEscalationThresholds map[string]int) (Task, error)
+	TimeoutChecks(ctx context.Context, taskID, note string) (Task, error)
 	SetTaskPriority(ctx context.Context, req SetPriorityRequest) (PriorityChange, error)
 	MoveTaskToFront(ctx context.Context, req FrontPriorityRequest) (PriorityChange, error)
 	HoldTask(ctx context.Context, taskID string) (Task, error)
@@ -4615,7 +4617,13 @@ func (s *sqliteStore) AddReview(ctx context.Context, taskID, actor, verdict stri
 // Returns ErrConflict if the transition is not allowed.
 // Returns ValidationError if 'to' state is invalid.
 func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, note *string) (Task, error) {
-	return s.transitionTask(ctx, taskID, to, note, nil)
+	return s.TransitionTaskWithActor(ctx, taskID, to, "", note)
+}
+
+// TransitionTaskWithActor is like TransitionTask but allows specifying the actor for the bypass event.
+// If actor is empty, defaults to "operator" for the checks→review bypass.
+func (s *sqliteStore) TransitionTaskWithActor(ctx context.Context, taskID, to, actor string, note *string) (Task, error) {
+	return s.transitionTask(ctx, taskID, to, note, nil, actor)
 }
 
 // CompleteLanding marks an approved task done for the approve attempt that holds its landing
@@ -4624,15 +4632,15 @@ func (s *sqliteStore) TransitionTask(ctx context.Context, taskID, to string, not
 // done: TransitionTask refuses that, so dependents can never unblock before the work has landed.
 // Returns NOT_RESERVED or LANDING_ATTEMPT_MISMATCH conflicts unless attempt owns the reservation.
 func (s *sqliteStore) CompleteLanding(ctx context.Context, taskID, attempt string, note *string) (Task, error) {
-	return s.transitionTask(ctx, taskID, "done", note, &attempt)
+	return s.transitionTask(ctx, taskID, "done", note, &attempt, "")
 }
 
-// transitionTask is TransitionTask, or with landingAttempt set, CompleteLanding.
-func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, note *string, landingAttempt *string) (Task, error) {
+// transitionTask is TransitionTask (or TransitionTaskWithActor), or with landingAttempt set, CompleteLanding.
+func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, note *string, landingAttempt *string, actor string) (Task, error) {
 	// Validate 'to' state
-	validTargets := map[string]bool{"done": true, "ready": true, "blocked": true, "failed": true, "superseded": true, "abandoned": true}
+	validTargets := map[string]bool{"done": true, "ready": true, "blocked": true, "failed": true, "superseded": true, "abandoned": true, "review": true}
 	if !validTargets[to] {
-		return Task{}, invalid("INVALID_TARGET_STATE", "target state must be one of: done, ready, blocked, failed, superseded, abandoned")
+		return Task{}, invalid("INVALID_TARGET_STATE", "target state must be one of: done, ready, blocked, failed, superseded, abandoned, review")
 	}
 
 	// Strip raw control characters from the free-text note before storage.
@@ -4677,23 +4685,29 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 		}
 
 	case "blocked":
-		// Allowed from any active state (backlog, ready, in_progress, review, approved)
-		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true}
+		// Allowed from any active state (backlog, ready, in_progress, review, approved, checks)
+		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true, "checks": true}
 		if activeStates[taskState] {
 			canTransition = true
 		}
 
 	case "failed":
 		// Allowed from any active state or blocked (retire a dead blocked task)
-		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true}
+		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true, "checks": true}
 		if activeStates[taskState] || taskState == "blocked" {
 			canTransition = true
 		}
 
 	case "superseded":
-		// Allowed from any active state (backlog, ready, in_progress, review, approved)
-		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true}
+		// Allowed from any active state (backlog, ready, in_progress, review, approved, checks)
+		activeStates := map[string]bool{"backlog": true, "ready": true, "in_progress": true, "review": true, "approved": true, "checks": true}
 		if activeStates[taskState] {
+			canTransition = true
+		}
+
+	case "review":
+		// Allowed only from 'checks' (operator bypass: checks → review)
+		if taskState == "checks" {
 			canTransition = true
 		}
 
@@ -4728,17 +4742,38 @@ func (s *sqliteStore) transitionTask(ctx context.Context, taskID, to string, not
 		return Task{}, conflict("NOT_APPROVED", fmt.Sprintf("task is in %q state, expected approved", taskState))
 	}
 
+	// Special handling for checks → review operator bypass
+	if to == "review" && taskState == "checks" {
+		// Use helper to do the transition, with the provided actor (or "operator" as default)
+		bypassActor := actor
+		if bypassActor == "" {
+			bypassActor = "operator"
+		}
+		updatedTask, err := s.transitionChecksToReviewHelper(ctx, tx, taskID, bypassActor, "operator_bypass", note)
+		if err != nil {
+			return Task{}, err
+		}
+
+		if err := tx.Commit(); err != nil {
+			return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+
+		return updatedTask, nil
+	}
+
 	// Perform the conditional UPDATE
 	// On blocked→ready, also clear assignee and lease_expires_at to make it freshly claimable.
+	// On transitions from checks, also clear checks_started_at.
 	// Any transition ends an approve's landing reservation.
 	now := nowTimestamp()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE task
 		SET state=?, updated_at=?, landing_round=NULL, landing_commit=NULL, landing_attempt=NULL,
 		    assignee=CASE WHEN ? = 'blocked' THEN NULL ELSE assignee END,
-		    lease_expires_at=CASE WHEN ? = 'blocked' THEN NULL ELSE lease_expires_at END
+		    lease_expires_at=CASE WHEN ? = 'blocked' THEN NULL ELSE lease_expires_at END,
+		    checks_started_at=CASE WHEN ? = 'checks' THEN NULL ELSE checks_started_at END
 		WHERE id=? AND state=?
-	`, to, now, taskState, taskState, taskID, taskState)
+	`, to, now, taskState, taskState, taskState, taskID, taskState)
 	if err != nil {
 		return Task{}, fmt.Errorf("failed to transition task: %w", err)
 	}
@@ -5505,29 +5540,20 @@ func (s *sqliteStore) UpdateTaskAwaitChecks(ctx context.Context, taskID string, 
 	return t, nil
 }
 
-// PassChecks transitions a task from 'checks' to 'review' and creates review tasks.
-// A second call returns ErrConflict and changes nothing. It returns ErrConflict
-// if the task is not in 'checks' state.
-func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary string) (Task, error) {
-	tx, err := s.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
+// transitionChecksToReviewHelper transitions a task in 'checks' to 'review' within a transaction,
+// creating review tasks and appending an event with the given actor and event kind.
+// The caller is responsible for committing the transaction.
+func (s *sqliteStore) transitionChecksToReviewHelper(ctx context.Context, tx *sql.Tx, taskID, actor, eventKind string, note *string) (Task, error) {
 	now := nowTimestamp()
 
-	// Load current state and other needed fields
+	// Load current task state and other needed fields
 	var t Task
 	var reviewModelsJSON *string
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
 		FROM task WHERE id = ?
 	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return Task{}, ErrNotFound
-		}
 		return Task{}, fmt.Errorf("failed to load task state: %w", err)
 	}
 
@@ -5537,11 +5563,6 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
 			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
 		}
-	}
-
-	// Only allowed from 'checks' state
-	if t.State != "checks" {
-		return Task{}, ErrConflict
 	}
 
 	// Update state to 'review' and clear checks_started_at
@@ -5587,9 +5608,7 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		return Task{}, fmt.Errorf("error iterating links: %w", err)
 	}
 
-	// Disputes only occur on research-track submissions, but await_checks is rejected on research
-	// tracks at create, update, supersede and escalate. So no disputes are possible on an
-	// await_checks task. Pass an empty map to createReviewTasks.
+	// No disputes on checks tasks
 	disputesByLineage := make(map[string][]disputeContextEntry)
 
 	// Create review tasks
@@ -5597,9 +5616,8 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		return Task{}, err
 	}
 
-	// Append checks_passed event with head commit and summary in the note
-	note := fmt.Sprintf("head commit: %s, summary: %s", headSHA, summary)
-	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "checks_passed", nil, &note); err != nil {
+	// Append event with the given actor and event kind
+	if _, err := s.AppendEvent(ctx, tx, taskID, actor, eventKind, nil, note); err != nil {
 		return Task{}, err
 	}
 
@@ -5620,6 +5638,39 @@ func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary s
 		if err := json.Unmarshal([]byte(*updatedReviewModelsJSON), &updatedTask.ReviewModels); err != nil {
 			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
 		}
+	}
+
+	return updatedTask, nil
+}
+
+// PassChecks transitions a task from 'checks' to 'review' and creates review tasks.
+// A second call returns ErrConflict and changes nothing. It returns ErrConflict
+// if the task is not in 'checks' state.
+func (s *sqliteStore) PassChecks(ctx context.Context, taskID, headSHA, summary string) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Check task exists and is in checks state
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT state FROM task WHERE id = ?`, taskID).Scan(&state)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Task{}, ErrNotFound
+		}
+		return Task{}, fmt.Errorf("failed to load task state: %w", err)
+	}
+	if state != "checks" {
+		return Task{}, ErrConflict
+	}
+
+	// Use helper to do the transition
+	note := fmt.Sprintf("head commit: %s, summary: %s", headSHA, summary)
+	updatedTask, err := s.transitionChecksToReviewHelper(ctx, tx, taskID, "system", "checks_passed", &note)
+	if err != nil {
+		return Task{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -5710,6 +5761,84 @@ func (s *sqliteStore) FailChecks(ctx context.Context, taskID, headSHA, summary s
 	if err := tx.Commit(); err != nil {
 		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
 	}
+	return t, nil
+}
+
+// TimeoutChecks moves a task from 'checks' to 'blocked' when checks timeout,
+// clears checks_started_at, and records a transition event. Returns ErrConflict
+// if the task is not in 'checks'.
+func (s *sqliteStore) TimeoutChecks(ctx context.Context, taskID, note string) (Task, error) {
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := nowTimestamp()
+
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT state FROM task WHERE id = ?`, taskID).
+		Scan(&state)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Task{}, ErrNotFound
+		}
+		return Task{}, fmt.Errorf("failed to load task: %w", err)
+	}
+
+	if state != "checks" {
+		return Task{}, ErrConflict
+	}
+
+	// Update state to 'blocked' and clear checks_started_at
+	result, err := tx.ExecContext(ctx, `
+		UPDATE task
+		SET state='blocked', checks_started_at=NULL, assignee=NULL, lease_expires_at=NULL, updated_at=?
+		WHERE id=? AND state='checks'
+	`, now, taskID)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to transition task: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected != 1 {
+		return Task{}, ErrConflict
+	}
+
+	// Sanitize the note to remove control characters
+	cleanedNote := sanitizeFreeText(note)
+
+	// Append transition event with the note
+	if _, err := s.AppendEvent(ctx, tx, taskID, "system", "transition", nil, &cleanedNote); err != nil {
+		return Task{}, err
+	}
+
+	// Fetch the updated task
+	var t Task
+	var reviewModelsJSON *string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, `+taskTopicColumns+`, created_at, updated_at, archived_at, superseded_by
+		FROM task WHERE id = ?
+	`, taskID).Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy)
+	if err != nil {
+		return Task{}, fmt.Errorf("failed to fetch updated task: %w", err)
+	}
+
+	t.ReviewModels = []string{}
+	if reviewModelsJSON != nil {
+		if err := json.Unmarshal([]byte(*reviewModelsJSON), &t.ReviewModels); err != nil {
+			return Task{}, fmt.Errorf("failed to unmarshal review_models: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Task{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	return t, nil
 }
 

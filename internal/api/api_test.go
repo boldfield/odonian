@@ -3551,6 +3551,412 @@ func TestTransitionToBlockedFromActiveStateSucceeds(t *testing.T) {
 	}
 }
 
+// Helper to create a task in checks state
+func createTaskInChecksState(t *testing.T, server *Server, authHeader string) string {
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Test checks task",
+			Spec:         "Test spec",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			AwaitChecks:  true,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Promote and claim
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "test-agent", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	// Submit to enter checks state
+	submitPayload := map[string]interface{}{
+		"agent_id": "test-agent",
+		"result":   "done",
+		"links": []map[string]string{
+			{"kind": "pr", "value": "https://github.com/o/r/pull/1"},
+		},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	if submitW.Code != http.StatusOK {
+		t.Fatalf("failed to submit task to checks state: %d", submitW.Code)
+	}
+
+	return taskID
+}
+
+func TestTransitionChecksToBlockedClearsChecksStartedAt(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	taskID := createTaskInChecksState(t, server, authHeader)
+
+	// Get task before transition to verify checks_started_at is set
+	getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+	var taskBefore store.Task
+	json.NewDecoder(getW.Body).Decode(&taskBefore)
+
+	if taskBefore.State != "checks" {
+		t.Fatalf("expected state 'checks', got %q", taskBefore.State)
+	}
+	if taskBefore.ChecksStartedAt == nil {
+		t.Fatalf("expected checks_started_at to be set")
+	}
+
+	// Transition to blocked
+	transitionPayload := map[string]interface{}{
+		"to":   "blocked",
+		"note": "Manual block from checks",
+	}
+	transitionBody, _ := json.Marshal(transitionPayload)
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader(transitionBody))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", transitionW.Code)
+	}
+
+	var task store.Task
+	json.NewDecoder(transitionW.Body).Decode(&task)
+
+	if task.State != "blocked" {
+		t.Errorf("expected state 'blocked', got %q", task.State)
+	}
+	if task.ChecksStartedAt != nil {
+		t.Errorf("expected checks_started_at=nil after transition, got %v", task.ChecksStartedAt)
+	}
+	if (task.Assignee == nil) != (taskBefore.Assignee == nil) || (task.Assignee != nil && *task.Assignee != *taskBefore.Assignee) {
+		t.Errorf("expected assignee to be kept after checks -> blocked, before=%v after=%v", taskBefore.Assignee, task.Assignee)
+	}
+}
+
+func TestTransitionChecksToFailedClearsChecksStartedAt(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	taskID := createTaskInChecksState(t, server, authHeader)
+
+	transitionPayload := map[string]interface{}{
+		"to":   "failed",
+		"note": "Failed from checks",
+	}
+	transitionBody, _ := json.Marshal(transitionPayload)
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader(transitionBody))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", transitionW.Code)
+	}
+
+	var task store.Task
+	json.NewDecoder(transitionW.Body).Decode(&task)
+
+	if task.State != "failed" {
+		t.Errorf("expected state 'failed', got %q", task.State)
+	}
+	if task.ChecksStartedAt != nil {
+		t.Errorf("expected checks_started_at=nil after transition, got %v", task.ChecksStartedAt)
+	}
+}
+
+func TestTransitionChecksToSupersededClearsChecksStartedAt(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	taskID := createTaskInChecksState(t, server, authHeader)
+
+	transitionPayload := map[string]interface{}{
+		"to":   "superseded",
+		"note": "Superseded from checks",
+	}
+	transitionBody, _ := json.Marshal(transitionPayload)
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader(transitionBody))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", transitionW.Code)
+	}
+
+	var task store.Task
+	json.NewDecoder(transitionW.Body).Decode(&task)
+
+	if task.State != "superseded" {
+		t.Errorf("expected state 'superseded', got %q", task.State)
+	}
+	if task.ChecksStartedAt != nil {
+		t.Errorf("expected checks_started_at=nil after transition, got %v", task.ChecksStartedAt)
+	}
+}
+
+func TestTransitionChecksToReviewCreatesReviewTasks(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Test checks task",
+			Spec:         "Test spec",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			AwaitChecks:  true,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Promote and claim
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "test-agent", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	// Submit to enter checks state
+	submitPayload := map[string]interface{}{
+		"agent_id": "test-agent",
+		"result":   "done",
+		"links": []map[string]string{
+			{"kind": "pr", "value": "https://github.com/o/r/pull/1"},
+		},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	// Transition to review
+	transitionPayload := map[string]interface{}{
+		"to":   "review",
+		"note": "Operator bypass",
+	}
+	transitionBody, _ := json.Marshal(transitionPayload)
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader(transitionBody))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", transitionW.Code)
+	}
+
+	var task store.Task
+	json.NewDecoder(transitionW.Body).Decode(&task)
+
+	if task.State != "review" {
+		t.Errorf("expected state 'review', got %q", task.State)
+	}
+	if task.ChecksStartedAt != nil {
+		t.Errorf("expected checks_started_at=nil after transition, got %v", task.ChecksStartedAt)
+	}
+
+	// Verify review tasks were created
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?kind=review", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+
+	var reviewTasks []store.Task
+	json.NewDecoder(listW.Body).Decode(&reviewTasks)
+
+	if len(reviewTasks) == 0 {
+		t.Errorf("expected review tasks to be created")
+	}
+}
+
+func TestTransitionChecksToReviewRecordsCustomActor(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:        "Test checks task",
+			Spec:         "Test spec",
+			DocumentID:   docID,
+			Model:        "haiku",
+			ReviewModels: []string{"opus"},
+			AwaitChecks:  true,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Promote and claim
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+
+	claimPayload := map[string]string{"agent_id": "test-agent", "model": "haiku"}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+
+	// Submit to enter checks state
+	submitPayload := map[string]interface{}{
+		"agent_id": "test-agent",
+		"result":   "done",
+		"links": []map[string]string{
+			{"kind": "pr", "value": "https://github.com/o/r/pull/1"},
+		},
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+
+	// Transition to review with custom actor
+	transitionPayload := map[string]interface{}{
+		"to":    "review",
+		"note":  "Operator bypass",
+		"actor": "my-custom-operator",
+	}
+	transitionBody, _ := json.Marshal(transitionPayload)
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader(transitionBody))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", transitionW.Code)
+	}
+
+	// Get task events and verify operator_bypass event has correct actor
+	eventsReq := httptest.NewRequest("GET", "/tasks/"+taskID+"/events", nil)
+	eventsReq.Header.Set("Authorization", authHeader)
+	eventsW := httptest.NewRecorder()
+	server.mux.ServeHTTP(eventsW, eventsReq)
+
+	var events []store.Event
+	json.NewDecoder(eventsW.Body).Decode(&events)
+
+	var foundBypassEvent bool
+	for _, event := range events {
+		if event.Kind == "operator_bypass" {
+			foundBypassEvent = true
+			if event.Actor != "my-custom-operator" {
+				t.Errorf("operator_bypass event actor: expected 'my-custom-operator', got %q", event.Actor)
+			}
+			break
+		}
+	}
+
+	if !foundBypassEvent {
+		t.Errorf("operator_bypass event not found in task events")
+	}
+}
+
+func TestTransitionToReviewFromNonChecksStateReturns409(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	// Create a task in backlog state
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskPayload := []store.TaskInput{
+		{
+			Title:      "Task in backlog",
+			Spec:       "Test spec",
+			DocumentID: docID,
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	var createdTasks []store.Task
+	json.NewDecoder(createW.Body).Decode(&createdTasks)
+	taskID := createdTasks[0].ID
+
+	// Try to transition to review from backlog (should fail)
+	transitionPayload := map[string]interface{}{
+		"to": "review",
+	}
+	transitionBody, _ := json.Marshal(transitionPayload)
+	transitionReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/transition", bytes.NewReader(transitionBody))
+	transitionReq.Header.Set("Authorization", authHeader)
+	transitionReq.Header.Set("Content-Type", "application/json")
+	transitionW := httptest.NewRecorder()
+	server.mux.ServeHTTP(transitionW, transitionReq)
+
+	if transitionW.Code != http.StatusConflict {
+		t.Errorf("expected status 409, got %d", transitionW.Code)
+	}
+}
+
 // TestListProjectsReturnsAllProjects verifies that GET /projects returns all created projects ordered by created_at.
 func TestListProjectsReturnsAllProjects(t *testing.T) {
 	server := setupTestServer(t, "test-token")

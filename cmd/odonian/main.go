@@ -958,6 +958,7 @@ func executeTransition(ctx context.Context, baseURL, token string, args []string
 	taskID := args[0]
 	var toState string
 	var note *string
+	var actor string
 	var i int
 
 	for i = 1; i < len(args); i++ {
@@ -974,6 +975,12 @@ func executeTransition(ctx context.Context, baseURL, token string, args []string
 				return fmt.Errorf("--note requires a value")
 			}
 			note = &args[i]
+		case "--actor":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--actor requires a value")
+			}
+			actor = args[i]
 		case "--json":
 		default:
 			return fmt.Errorf("unknown flag: %s", args[i])
@@ -985,7 +992,7 @@ func executeTransition(ctx context.Context, baseURL, token string, args []string
 	}
 
 	client := tuiclient.NewHTTPClient(baseURL, token)
-	if err := client.TransitionTask(ctx, taskID, toState, note); err != nil {
+	if err := client.TransitionTaskWithActor(ctx, taskID, toState, note, actor); err != nil {
 		return fmt.Errorf("failed to transition task: %w", err)
 	}
 

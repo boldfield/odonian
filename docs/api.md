@@ -1341,8 +1341,9 @@ to drain the `approved` lane by merging and marking done, or to override an appr
 ```
 
 **Parameters:**
-- `to` (required): Target state (`done`, `blocked`, `ready`, `failed`, `superseded`, or `abandoned`)
+- `to` (required): Target state (`done`, `blocked`, `ready`, `failed`, `superseded`, `abandoned`, or `review`)
 - `note` (optional): Reason or context for the transition
+- `actor` (optional): Caller identity, recorded only on the `operator_bypass` event of a `checks` → `review` transition; defaults to `operator`. The CLI passes it with `odonian transition <id> --to review --actor <name>`
 
 **Response (200 OK):**
 ```json
@@ -1389,12 +1390,16 @@ research rounds instead use the structured blocking-findings rules documented un
 - `approved` → `ready` (human disagrees with reviewers, requests rework)
 - `blocked` → `ready` (human unblocks / retries; clears stale assignee and lease)
 - `blocked` → `failed` (retire a dead blocked task without re-entering the queue)
-- Any active state → `blocked` (off-ramp: external blocker)
+- Any active state → `blocked` (off-ramp: external blocker; the assignee is kept)
 - Any active state → `failed` (off-ramp: task cannot be done as specified)
 - Any active state → `superseded` (retire without creating a replacement; use `POST /tasks/{id}/supersede` to create one)
 - `approved` → `abandoned` (retire without merging)
 - `in_progress` → `done` for `merge` tasks only
 - `ready` → `done`, `in_progress` → `done`, `review` → `done`, `blocked` → `done` (PR-watch only: when the PR is merged outside the board; clears assignee, retires in-flight review children, appends transition event)
+- `checks` → `blocked` (operator-initiated abort or manual override; clears `checks_started_at`)
+- `checks` → `failed` (operator-initiated task failure; clears `checks_started_at`)
+- `checks` → `superseded` (operator-initiated task supersession; clears `checks_started_at`)
+- `checks` → `review` (operator bypass: creates review tasks exactly as `PassChecks` does; records `operator_bypass` event with the calling actor, or `operator` if no actor is provided)
 
 The operator `/transition` endpoint does not permit `review` → `done`. Review aggregation does
 perform that direct transition for the verified current-round no-op case above, in a single

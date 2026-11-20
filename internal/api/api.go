@@ -1108,8 +1108,9 @@ func (s *Server) handleTransition(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload struct {
-		To   string  `json:"to"`
-		Note *string `json:"note"`
+		To    string  `json:"to"`
+		Note  *string `json:"note"`
+		Actor *string `json:"actor"`
 	}
 
 	if err := s.decodeJSON(w, r, &payload); err != nil {
@@ -1117,7 +1118,11 @@ func (s *Server) handleTransition(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Transition the task
-	task, err := s.store.TransitionTask(r.Context(), taskID, payload.To, payload.Note)
+	actor := ""
+	if payload.Actor != nil {
+		actor = *payload.Actor
+	}
+	task, err := s.store.TransitionTaskWithActor(r.Context(), taskID, payload.To, actor, payload.Note)
 	if err != nil {
 		// Check if it's a ValidationError
 		var validationErr *store.ValidationError

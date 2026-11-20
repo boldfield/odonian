@@ -238,13 +238,42 @@ When `agent_merge` is `false`, work requiring a merge waits in `approved` for th
 gate. Verified current-round no-ops with no active PR finalize directly regardless of this flag.
 In no case does a reviewer run `gh pr merge` or transition the parent.
 
-## Checks gate: `await_checks` field (C2)
+## Checks gate: `checks` state and `await_checks` field
+
+### Field: `await_checks` (C2)
 
 `await_checks` is an **optional per-task boolean** (default `false`, settable at creation and
-mutable via `PATCH`). The field is part of C2 deliverables and is intended to work with a checks
-state and reconciler (C3/C4, not yet implemented). **C2 scope:** the field is set/read/returned; the
-gate lifecycle and task routing are deferred. The field is returned by `GET /tasks/{id}`, list
-responses, and `odonian show`.
+mutable via `PATCH`). The field is set/read/returned on `GET /tasks/{id}`, list responses, and
+`odonian show`.
+
+### State: `checks` (C3, C4, C9)
+
+When an `implement` task is submitted with `await_checks: true` and a pull request link, the
+task enters the `checks` state instead of `review`. The server waits for the PR's head commit
+CI checks to complete:
+
+```text
+in_progress --submit with PR--> checks --green--> review (review tasks spawn here)
+                                      --red------> ready (rework, with failed check feedback)
+                                      --timeout--> blocked
+```
+
+A task in `checks` is not claimable by any agent and is not returned by `GET /projects/{id}/tasks?claimable=true`.
+
+#### Transitions from `checks` (operator actions)
+
+An operator can transition a task in `checks` to `blocked`, `failed`, `superseded`, or `review`:
+
+- **`checks → blocked`** (operator abort or manual override): clears `checks_started_at`; records `transition` event.
+- **`checks → failed`** (operator-initiated task failure): clears `checks_started_at`; records `transition` event.
+- **`checks → superseded`** (operator-initiated task supersession): clears `checks_started_at`; records `transition` event.
+- **`checks → review`** (operator bypass): creates review tasks exactly as if checks passed; records `operator_bypass` event with the calling actor (or `operator` if not provided) and note (optional).
+
+#### Events
+
+- **`checks_passed`** (from reconciler, actor: `system`): The PR's head commit CI checks passed. Contains head commit SHA and a summary. Signals the transition from `checks` to `review` and review task creation.
+- **`checks_failed`** (from reconciler, actor: `system`): The PR's head commit CI checks failed. Contains head commit SHA and failed check names and URLs. Triggers the circuit breaker as if a review round failed; the task may go to `ready`, `blocked`, or be superseded.
+- **`operator_bypass`** (from operator transition, actor: supplied caller, default `operator`): An operator bypassed the checks gate, moving the task directly from `checks` to `review`. Review tasks are created. The event's `note` field holds the operator's reason (if provided). The actor field identifies the caller who initiated the bypass.
 
 ## Agent comment markers
 
@@ -815,8 +844,22 @@ Both priority endpoints:
 ## State machine
 
 ```text
-backlog ─promote→ ready ─claim→ in_progress ─submit→ review ─passes review→ approved ─merge gate→ done
+backlog ─promote→ ready ─claim→ in_progress ─submit→ checks (when await_checks=true and PR present)
+                                                        ├─green (reconciler)──→ review
+                                                        ├─red (reconciler)────→ ready
+                                                        ├─timeout (reconciler)→ blocked
+                                                        └─operator bypass────→ review
+
+                                             ─submit→ review (when not await_checks or no PR)
+                                                        ↓
+                                           passes review→ approved ─merge gate→ done
 ```
+
+For tasks with `await_checks: true` and a PR link, submit moves them to `checks` instead of `review`.
+The reconciler watches the PR's head commit CI and resolves the state: green → `review` (review tasks
+spawn here), red → `ready` (rework, with failed check feedback), timeout or PR-closed → `blocked`.
+An operator can bypass the wait with `POST /tasks/{id}/transition {"to":"review"}` from `checks`,
+which creates review tasks immediately.
 
 Lease expiry makes `in_progress` work reclaimable without changing its state to `ready`.
 Review aggregation waits for all reviewers, then approves or sends the parent to rework,
