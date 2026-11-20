@@ -1836,6 +1836,23 @@ func TestListUnaddressedFeedback_WorkerAndReconcilerStatusNotFeedback(t *testing
 	}
 }
 
+// TestListUnaddressedFeedback_ChecksCommentIsActionable tests that checks-marked comments are actionable feedback.
+func TestListUnaddressedFeedback_ChecksCommentIsActionable(t *testing.T) {
+	nodes := strings.Join([]string{
+		globalComment("comment-checks", 1, "human", "2024-01-01T10:00:00Z",
+			"haiku-checks: failed check: job-compile (https://github.com/example/repo/actions/runs/123)"),
+	}, ",")
+
+	items := listGlobalFeedback(t, "human", nodes)
+
+	if len(items) != 1 {
+		t.Fatalf("returned %d items, want 1 (checks comments are actionable feedback): %+v", len(items), items)
+	}
+	if items[0].ID != "comment-checks" {
+		t.Errorf("returned item ID %q, want comment-checks", items[0].ID)
+	}
+}
+
 // TestBodyAcknowledgesComment_DisputedFormat tests that the disputed format is recognized.
 func TestBodyAcknowledgesComment_DisputedFormat(t *testing.T) {
 	tests := []struct {
