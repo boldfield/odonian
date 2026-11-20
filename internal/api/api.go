@@ -1236,7 +1236,7 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 		sort.Strings(unsupported)
 		s.errorResponse(w, http.StatusBadRequest, "FIELD_NOT_UPDATABLE",
 			"Field(s) cannot be changed through PATCH /tasks/{id}: "+strings.Join(unsupported, ", ")+
-				" (only depends_on and review_models are updatable; task specs are immutable and state changes use /transition)")
+				" (only depends_on, review_models, and await_checks are updatable; task specs are immutable and state changes use /transition)")
 		return
 	}
 
@@ -1273,13 +1273,28 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var awaitChecks *bool
+	if rawAwaitChecks, ok := fields["await_checks"]; ok {
+		if bytes.Equal(bytes.TrimSpace(rawAwaitChecks), []byte("null")) {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_AWAIT_CHECKS", "await_checks must be a boolean; null is not allowed")
+			return
+		}
+		var val bool
+		if err := json.Unmarshal(rawAwaitChecks, &val); err != nil {
+			s.errorResponse(w, http.StatusBadRequest, "INVALID_AWAIT_CHECKS", "await_checks must be a boolean")
+			return
+		}
+		awaitChecks = &val
+	}
 
-	if hasModels || hasDeps {
+	if hasModels || hasDeps || awaitChecks != nil {
 		var err error
 		if hasModels {
-			_, err = s.store.UpdateTaskReviewModelsAndDeps(r.Context(), taskID, models, deps, actor, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget)
-		} else {
-			_, err = s.store.UpdateTaskDependsOn(r.Context(), taskID, deps)
+			_, err = s.store.UpdateTaskReviewModelsAndDeps(r.Context(), taskID, models, deps, actor, s.maxReviewRounds, s.escalationThresholds, s.researchEscalationThresholds, s.researchRoundBudget, awaitChecks)
+		} else if hasDeps {
+			_, err = s.store.UpdateTaskDependsOn(r.Context(), taskID, deps, awaitChecks)
+		} else if awaitChecks != nil {
+			_, err = s.store.UpdateTaskAwaitChecks(r.Context(), taskID, *awaitChecks)
 		}
 		if err != nil {
 			var validationErr *store.ValidationError
@@ -1319,7 +1334,7 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 }
 
 // patchableTaskFields is the set of body fields PATCH /tasks/{id} accepts.
-var patchableTaskFields = map[string]bool{"depends_on": true, "review_models": true, "actor": true}
+var patchableTaskFields = map[string]bool{"depends_on": true, "review_models": true, "actor": true, "await_checks": true}
 
 // handleUpdateEscalation handles PATCH /tasks/{id}/escalation to update a task's escalation policy.
 func (s *Server) handleUpdateEscalation(w http.ResponseWriter, r *http.Request) {

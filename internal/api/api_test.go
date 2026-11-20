@@ -11034,6 +11034,293 @@ func TestPatchTaskReviewModelsAndDependsOnIsAtomic(t *testing.T) {
 	}
 }
 
+func TestPatchTaskAwaitChecks(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a build track task with await_checks=false (default)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader([]byte(`[{
+		"title": "Test task",
+		"spec": "Test spec",
+		"document_id": "`+docID+`",
+		"model": "haiku",
+		"track": "build"
+	}]`)))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	var tasks []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Verify initial await_checks is false
+	var got store.Task
+	getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+	if err := json.NewDecoder(getW.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode get response: %v", err)
+	}
+	if got.AwaitChecks != false {
+		t.Fatalf("initial await_checks = %v, want false", got.AwaitChecks)
+	}
+
+	// PATCH to set await_checks=true
+	w := patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{"await_checks": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("set true: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode patch response: %v", err)
+	}
+	if got.AwaitChecks != true {
+		t.Fatalf("after PATCH true: await_checks = %v, want true", got.AwaitChecks)
+	}
+
+	// Verify stored value
+	storedTask := storedTask(t, server, taskID)
+	if storedTask.AwaitChecks != true {
+		t.Fatalf("stored await_checks = %v, want true", storedTask.AwaitChecks)
+	}
+
+	// PATCH to set await_checks=false
+	w = patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{"await_checks": false})
+	if w.Code != http.StatusOK {
+		t.Fatalf("set false: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode patch response: %v", err)
+	}
+	if got.AwaitChecks != false {
+		t.Fatalf("after PATCH false: await_checks = %v, want false", got.AwaitChecks)
+	}
+
+	// PATCH to set await_checks=true again
+	w = patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{"await_checks": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("set true again: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// PATCH with omitted await_checks should not change it while changing another field
+	// Create another task to depend on
+	createReq2 := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader([]byte(`[{
+		"title": "Dependency task",
+		"spec": "Test spec",
+		"document_id": "`+docID+`",
+		"model": "haiku",
+		"track": "build"
+	}]`)))
+	createReq2.Header.Set("Authorization", authHeader)
+	createReq2.Header.Set("Content-Type", "application/json")
+	createW2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW2, createReq2)
+	var depTasks []store.Task
+	if err := json.NewDecoder(createW2.Body).Decode(&depTasks); err != nil {
+		t.Fatalf("failed to decode dependency task response: %v", err)
+	}
+	depTaskID := depTasks[0].ID
+
+	// PATCH to change depends_on while omitting await_checks (which should stay true)
+	w = patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{"depends_on": []string{depTaskID}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("omit await_checks: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode patch response: %v", err)
+	}
+	if got.AwaitChecks != true {
+		t.Fatalf("after PATCH omit await_checks while changing depends_on: await_checks = %v, want true", got.AwaitChecks)
+	}
+
+	// Verify it's in the summary
+	listReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary", nil)
+	listReq.Header.Set("Authorization", authHeader)
+	listW := httptest.NewRecorder()
+	server.mux.ServeHTTP(listW, listReq)
+	if listW.Code != http.StatusOK {
+		t.Fatalf("list summary: expected 200, got %d: %s", listW.Code, listW.Body.String())
+	}
+	var summaries []map[string]interface{}
+	if err := json.NewDecoder(listW.Body).Decode(&summaries); err != nil {
+		t.Fatalf("failed to decode summary list: %v", err)
+	}
+	found := false
+	for _, s := range summaries {
+		if s["id"] == taskID {
+			found = true
+			if awaitChecks, ok := s["await_checks"].(bool); !ok || awaitChecks != true {
+				t.Fatalf("summary await_checks = %v, want true", s["await_checks"])
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("task not found in summary list")
+	}
+}
+
+func TestPatchTaskAwaitChecksRejectResearch(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a research track task
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader([]byte(`[{
+		"title": "Test research task",
+		"spec": "Test spec",
+		"document_id": "`+docID+`",
+		"model": "haiku",
+		"track": "research"
+	}]`)))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	var tasks []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Try to PATCH to set await_checks=true on research task
+	w := patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{"await_checks": true})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "AWAIT_CHECKS_RESEARCH") {
+		t.Fatalf("error should contain AWAIT_CHECKS_RESEARCH: %s", w.Body.String())
+	}
+
+	// Verify the task is unchanged
+	var got store.Task
+	getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+	if err := json.NewDecoder(getW.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode get response: %v", err)
+	}
+	if got.AwaitChecks != false {
+		t.Fatalf("await_checks should be unchanged at false, got %v", got.AwaitChecks)
+	}
+}
+
+func TestPatchTaskAwaitChecksMixedFieldRefusal(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a research track task
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader([]byte(`[{
+		"title": "Test research task",
+		"spec": "Test spec",
+		"document_id": "`+docID+`",
+		"model": "haiku",
+		"track": "research"
+	}]`)))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	var tasks []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Create a build task to depend on
+	createReq2 := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader([]byte(`[{
+		"title": "Dependency task",
+		"spec": "Test spec",
+		"document_id": "`+docID+`",
+		"model": "haiku",
+		"track": "build"
+	}]`)))
+	createReq2.Header.Set("Authorization", authHeader)
+	createReq2.Header.Set("Content-Type", "application/json")
+	createW2 := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW2, createReq2)
+	var depTasks []store.Task
+	if err := json.NewDecoder(createW2.Body).Decode(&depTasks); err != nil {
+		t.Fatalf("failed to decode dependency task response: %v", err)
+	}
+	depTaskID := depTasks[0].ID
+
+	// Try to PATCH with both depends_on and await_checks=true on research task
+	// Should fail on await_checks and not modify depends_on
+	w := patchReviewModels(t, server, authHeader, taskID, map[string]interface{}{
+		"depends_on":   []string{depTaskID},
+		"await_checks": true,
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "AWAIT_CHECKS_RESEARCH") {
+		t.Fatalf("error should contain AWAIT_CHECKS_RESEARCH: %s", w.Body.String())
+	}
+
+	// Verify that the task was NOT changed (atomicity requirement).
+	// Get the task with deps and links to check both await_checks and depends_on.
+	getReq := httptest.NewRequest("GET", "/tasks/"+taskID, nil)
+	getReq.Header.Set("Authorization", authHeader)
+	getW := httptest.NewRecorder()
+	server.mux.ServeHTTP(getW, getReq)
+	var got store.TaskWithDepsAndLinks
+	if err := json.NewDecoder(getW.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode get response: %v", err)
+	}
+	if got.AwaitChecks != false {
+		t.Fatalf("await_checks should be unchanged at false, got %v", got.AwaitChecks)
+	}
+
+	// The key atomicity check: depends_on should still be empty (unchanged from the failed PATCH)
+	if len(got.DependsOn) > 0 {
+		t.Fatalf("depends_on should be empty (not changed by the failed PATCH), got %v", got.DependsOn)
+	}
+}
+
+func TestPatchTaskAwaitChecksRejectNull(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a build track task
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader([]byte(`[{
+		"title": "Test task",
+		"spec": "Test spec",
+		"document_id": "`+docID+`",
+		"model": "haiku",
+		"track": "build"
+	}]`)))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	var tasks []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&tasks); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+	taskID := tasks[0].ID
+
+	// Try to PATCH with await_checks=null
+	req := httptest.NewRequest("PATCH", "/tasks/"+taskID, bytes.NewReader([]byte(`{"await_checks": null}`)))
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "INVALID_AWAIT_CHECKS") {
+		t.Fatalf("error should contain INVALID_AWAIT_CHECKS: %s", w.Body.String())
+	}
+}
+
 // mustListTasks lists the tasks of the project that holds taskID.
 func mustListTasks(t *testing.T, server *Server, authHeader, taskID string) []store.Task {
 	t.Helper()
