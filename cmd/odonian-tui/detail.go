@@ -206,6 +206,10 @@ func (m *BoardModel) buildDetailContent(task tuiclient.TaskDetail) string {
 		b.WriteString(fmt.Sprintf("Model: %s\n", task.Model))
 	}
 
+	if task.State == stateChecks {
+		b.WriteString(fmt.Sprintf("In checks: %s\n", formatChecksDuration(task.ChecksStartedAt, time.Now())))
+	}
+
 	// Lease countdown
 	if task.LeaseExpiresAt != nil {
 		b.WriteString(fmt.Sprintf("Lease: %s\n", m.formatLeaseCountdown(*task.LeaseExpiresAt)))

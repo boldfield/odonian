@@ -361,7 +361,7 @@ func TestBoardModel_AssigneeOnReviewApprovedDone(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Navigate to review column
-	for model.selectedColumn < 3 {
+	for model.selectedColumn < columnIndex(stateReview) {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
@@ -1133,12 +1133,14 @@ func buildReviewModel(t *testing.T, reviewClient *tuiclient.MockClient) *BoardMo
 	m, _ = model.Update(tasksFetchedMsg{tasks: reviewTestBucketed("review-task-1")})
 	model = m.(*BoardModel)
 
-	// Navigate to the review column (index 3). Starting from in_progress (index 2), press right once.
+	// Navigate to the review column (index 4). Starting from in_progress (index 2), press right twice (past checks).
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 
-	if model.selectedColumn != 3 {
-		t.Fatalf("buildReviewModel: expected selectedColumn 3 (review), got %d", model.selectedColumn)
+	if model.selectedColumn != columnIndex(stateReview) {
+		t.Fatalf("buildReviewModel: expected selectedColumn %d (review), got %d", columnIndex(stateReview), model.selectedColumn)
 	}
 	if model.selectedTaskID != "review-task-1" {
 		t.Fatalf("buildReviewModel: expected selectedTaskID review-task-1, got %q", model.selectedTaskID)
@@ -1652,7 +1654,7 @@ func TestBoardModel_ApproveTransition409(t *testing.T) {
 }
 
 // TestBoardModel_ReviewActionsNoopOutsideReviewColumn tests that pressing 'a' or 'x'
-// when the active column is NOT review (index 3) does nothing — no API calls, no mode change.
+// when the active column is NOT review (index 4) does nothing — no API calls, no mode change.
 func TestBoardModel_ReviewActionsNoopOutsideReviewColumn(t *testing.T) {
 	reviewCalled := false
 	transitionCalled := false
@@ -1692,8 +1694,8 @@ func TestBoardModel_ReviewActionsNoopOutsideReviewColumn(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Sanity check: model starts in in_progress (index 2).
-	if model.selectedColumn != 2 {
-		t.Fatalf("Expected selectedColumn 2 (in_progress), got %d", model.selectedColumn)
+	if model.selectedColumn != columnIndex(stateInProgress) {
+		t.Fatalf("Expected selectedColumn %d (in_progress), got %d", columnIndex(stateInProgress), model.selectedColumn)
 	}
 
 	// Press 'a' in in_progress — must be a no-op.
@@ -2349,7 +2351,9 @@ func TestDetail_ReviewApproveFromDetail(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: boardTasks})
 	model = m.(*BoardModel)
 
-	// Navigate to review column (index 3): one right from in_progress (index 2).
+	// Navigate to review column (index 4): two rights from in_progress (index 2), passing checks (index 3).
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 
@@ -2487,6 +2491,8 @@ func TestDetail_ReviewApproveFromDetail_409Visible(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Navigate to review column and open detail.
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 	model.selectedTaskID = "review-detail-409"
@@ -2652,12 +2658,14 @@ func TestBoardModel_ReviewHelpBar(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to review column (index 3): one right from in_progress (index 2).
+	// Navigate to review column (index 4): two rights from in_progress (index 2), passing checks (index 3).
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 
-	if model.selectedColumn != 3 {
-		t.Fatalf("Expected review column (3), got %d", model.selectedColumn)
+	if model.selectedColumn != columnIndex(stateReview) {
+		t.Fatalf("Expected review column (%d), got %d", columnIndex(stateReview), model.selectedColumn)
 	}
 
 	reviewOutput := model.View()
@@ -2825,7 +2833,7 @@ func TestBoardModel_ProjectSwitch(t *testing.T) {
 		t.Errorf("Expected selectedIndex to be 0 after project switch, got %d", model.selectedIndex)
 	}
 
-	if model.selectedColumn != 2 {
+	if model.selectedColumn != columnIndex(stateInProgress) {
 		t.Errorf("Expected selectedColumn to be 2 after project switch, got %d", model.selectedColumn)
 	}
 
@@ -3166,15 +3174,15 @@ func buildBlockedModel(t *testing.T, blockedClient *tuiclient.MockClient) *Board
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to the blocked column (index 6).
-	// Starting from in_progress (index 2), press right 4 times.
-	for i := 0; i < 4; i++ {
+	// Navigate to the blocked column (index 7).
+	// Starting from in_progress (index 2), press right 5 times.
+	for i := 0; i < 5; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
-	if model.selectedColumn != 6 {
-		t.Fatalf("buildBlockedModel: expected selectedColumn 6 (blocked), got %d", model.selectedColumn)
+	if model.selectedColumn != columnIndex(stateBlocked) {
+		t.Fatalf("buildBlockedModel: expected selectedColumn %d (blocked), got %d", columnIndex(stateBlocked), model.selectedColumn)
 	}
 	if model.selectedTaskID != "blocked-task-1" {
 		t.Fatalf("buildBlockedModel: expected selectedTaskID blocked-task-1, got %q", model.selectedTaskID)
@@ -3407,9 +3415,9 @@ func TestBoardModel_AbandonedTaskVisible(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to the abandoned column (index 8).
-	// Starting from in_progress (index 2), press right 6 times.
-	for i := 0; i < 6; i++ {
+	// Navigate to the abandoned column (index 9).
+	// Starting from in_progress (index 2), press right 7 times.
+	for i := 0; i < 7; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
@@ -3588,14 +3596,14 @@ func TestBoardModel_ColumnScrolling(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to done column (5 rights from in_progress at index 2)
-	for i := 0; i < 3; i++ {
+	// Navigate to done column (4 rights from in_progress at index 2)
+	for i := 0; i < 4; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
-	if model.selectedColumn != 5 {
-		t.Fatalf("Expected selectedColumn 5 (done), got %d", model.selectedColumn)
+	if model.selectedColumn != columnIndex(stateDone) {
+		t.Fatalf("Expected selectedColumn %d (done), got %d", columnIndex(stateDone), model.selectedColumn)
 	}
 
 	// Check initial state: should be at first task with scrollOffset 0
@@ -3671,8 +3679,8 @@ func TestBoardModel_DoneTabScrollingRendering(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to done column (3 rights from in_progress at index 2)
-	for i := 0; i < 3; i++ {
+	// Navigate to done column (4 rights from in_progress at index 2)
+	for i := 0; i < 4; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
@@ -3757,7 +3765,7 @@ func TestBoardModel_ScrollResetOnColumnChange(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Navigate to done column
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
@@ -4654,15 +4662,15 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	// Navigate to done column (5 right presses from in_progress at index 2)
-	for i := 0; i < 3; i++ {
+	// Navigate to done column (4 right presses from in_progress at index 2)
+	for i := 0; i < 4; i++ {
 		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
 	// Verify we're in the done column
-	if model.selectedColumn != 5 {
-		t.Fatalf("Expected selectedColumn 5 (done), got %d", model.selectedColumn)
+	if model.selectedColumn != columnIndex(stateDone) {
+		t.Fatalf("Expected selectedColumn %d (done), got %d", columnIndex(stateDone), model.selectedColumn)
 	}
 
 	// Verify getVisibleTaskHeight returns 4 (not 9).
@@ -6127,5 +6135,83 @@ func TestBoardModel_SuccessfulPriorityActionKeepsRefreshedListVisible(t *testing
 				t.Errorf("Status should clear on next keypress")
 			}
 		})
+	}
+}
+
+func TestStateOrder_ChecksBetweenInProgressAndReview(t *testing.T) {
+	ip, ch, rv := columnIndex(stateInProgress), columnIndex(stateChecks), columnIndex(stateReview)
+	if ch != ip+1 || rv != ch+1 {
+		t.Fatalf("expected in_progress < checks < review adjacent, got %d %d %d", ip, ch, rv)
+	}
+	found := false
+	for _, s := range activeStates {
+		if s == stateChecks {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("checks missing from activeStates")
+	}
+	if _, ok := stateColors[stateChecks]; !ok {
+		t.Fatal("checks has no colour")
+	}
+}
+
+func TestFormatChecksDuration(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	ts := func(d time.Duration) *string { s := now.Add(-d).Format(time.RFC3339Nano); return &s }
+	bad := "nope"
+	cases := []struct {
+		in   *string
+		want string
+	}{
+		{nil, "unknown"},
+		{&bad, "unknown"},
+		{ts(30 * time.Second), "30s"},
+		{ts(5 * time.Minute), "5m"},
+		{ts(90 * time.Minute), "1h30m"},
+		{ts(-time.Minute), "0s"},
+	}
+	for _, c := range cases {
+		if got := formatChecksDuration(c.in, now); got != c.want {
+			t.Errorf("got %q want %q", got, c.want)
+		}
+	}
+}
+
+func TestChecksTask_RenderedOutput(t *testing.T) {
+	config := &tuiconfig.Config{URL: "http://test", Token: "test", Actor: "testuser", PollInterval: 100 * time.Millisecond}
+	model := NewBoardModel(&tuiclient.MockClient{}, config, tuiclient.Project{ID: "project-1", Name: "Test Project"})
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = m.(*BoardModel)
+
+	started := time.Now().Add(-7 * time.Minute).UTC().Format(time.RFC3339Nano)
+	agent := "w1"
+	bucketed := map[string][]tuiclient.Task{
+		"in_progress": {},
+		"checks": {
+			{ID: "task-c1", Title: "With assignee", State: "checks", Assignee: &agent, ChecksStartedAt: &started},
+			{ID: "task-c2", Title: "No assignee", State: "checks", ChecksStartedAt: &started},
+		},
+		"review": {},
+	}
+	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
+	model = m.(*BoardModel)
+	for model.selectedColumn < columnIndex(stateChecks) {
+		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		model = m.(*BoardModel)
+	}
+	out := model.View()
+	ip, ch, rv := strings.Index(out, "in_progress("), strings.Index(out, "checks(2)"), strings.Index(out, "review(")
+	if ip < 0 || ch < ip || rv < ch {
+		t.Fatalf("expected tabs in_progress < checks(2) < review, got:\n%s", out)
+	}
+	if got := strings.Count(out, "in checks 7m"); got != 2 {
+		t.Fatalf("expected 2 rows with 'in checks 7m', got %d:\n%s", got, out)
+	}
+
+	detail := model.buildDetailContent(tuiclient.TaskDetail{ID: "task-c1", State: "checks", ChecksStartedAt: &started})
+	if !strings.Contains(detail, "In checks: 7m") {
+		t.Fatalf("expected 'In checks: 7m' in detail, got:\n%s", detail)
 	}
 }

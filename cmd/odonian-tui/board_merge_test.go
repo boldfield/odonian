@@ -51,14 +51,17 @@ func buildApprovedModel(t *testing.T, approvedClient *tuiclient.MockClient) *Boa
 	m, _ = model.Update(tasksFetchedMsg{tasks: approvedTestBucketed("approved-task-1")})
 	model = m.(*BoardModel)
 
-	// Navigate to the approved column (index 4). Starting from in_progress (index 2), press right twice.
+	// Navigate to the approved column. Starting from in_progress, press right once per
+	// column in stateOrder: checks, review, then approved.
+	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model = m.(*BoardModel)
 
-	if model.selectedColumn != 4 {
-		t.Fatalf("buildApprovedModel: expected selectedColumn 4 (approved), got %d", model.selectedColumn)
+	if model.selectedColumn != columnIndex(stateApproved) {
+		t.Fatalf("buildApprovedModel: expected selectedColumn %d (approved), got %d", columnIndex(stateApproved), model.selectedColumn)
 	}
 	if model.selectedTaskID != "approved-task-1" {
 		t.Fatalf("buildApprovedModel: expected selectedTaskID approved-task-1, got %q", model.selectedTaskID)
