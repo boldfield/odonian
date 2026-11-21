@@ -132,8 +132,8 @@ commit CI checks and transitions the task when they complete.
 
 ```
 in_progress --submit with await_checks: true--> checks --green--> review (review tasks spawn)
-                                                          --red----> ready (rework, with feedback)
-                                                          --timeout-> blocked
+                                                          --red----> ready / blocked / superseded (circuit breaker)
+                                                          --timeout / PR closed-> blocked
 ```
 
 A task in `checks`:
@@ -162,7 +162,9 @@ When CI fails or times out:
 - Checkwatch posts an `odonian-checks:` comment listing the head commit and failed checks
 - Records a `checks_failed` event and runs the circuit breaker: task may return to `ready` for rework,
   go to `blocked` if the threshold is exceeded, or be escalated to a higher model tier
-- The worker acknowledges the feedback via `odonian pr-feedback ack`, fixes the issue, and re-submits
+- If the task returns to `ready`: the worker acknowledges the feedback via `odonian pr-feedback ack`,
+  fixes the issue, and re-submits. If `blocked`: an operator must unblock it. If escalated: a worker
+  with the higher model tier takes over.
 - Configuration: `CHECKS_POLL_INTERVAL` (default 2m), `CHECKS_SETTLE` (default 2m, min time before
   green passes), `CHECKS_NO_RUNS_GRACE` (default 5m, max wait for first check to appear)
 
