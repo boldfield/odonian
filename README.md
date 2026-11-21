@@ -147,7 +147,7 @@ holds, dependencies, model availability or admission limits. See [operations](./
 | `backlog` | Created, not yet claimable. A human promotes it. |
 | `ready` | Claimable, subject to dependencies, hold, and model. |
 | `in_progress` | Claimed and leased. |
-| `checks` | Submitted with `await_checks: true` and a pull request. Awaiting CI on the PR's head commit. The reconciler polls and transitions to `review` (if green) or `ready` (if red). No agent can claim a task in `checks`. |
+| `checks` | Submitted with `await_checks: true` and a pull request. Awaiting CI on the PR's head commit. The reconciler polls and transitions to `review` when green. When red, the circuit breaker sends it to `ready`, `blocked` or an escalated replacement. A timeout or a PR closed unmerged sends it to `blocked`. No agent can claim a task in `checks`. |
 | `review` | Submitted. One review task per required reviewer model is in flight. |
 | `approved` | Passed the track's review rules. Awaits landing or the merge gate. |
 | `blocked` | Circuit breaker or operator. Unblocking returns it to `ready` with a cleared lease. The review round is not reset yet, so a re-rejection re-trips the breaker; a fix is specced in `docs/specs/`. |

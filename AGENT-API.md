@@ -831,9 +831,10 @@ Both priority endpoints:
 - **Never self-merge** unless the task is `agent_merge` and you merged it via the contract above.
   Otherwise your terminal state is `checks` (implement with `await_checks: true`; do not wait for CI),
   `review` (implement), or a submitted verdict (review). If a task with `await_checks: true` moves to
-  `checks`, the reconciler polls the PR's CI and transitions it to `review` (green) or `ready` (red).
-  On red, the task appears in `odonian pr-feedback list` with an `odonian-checks:` item you must
-  acknowledge before resubmitting.
+  `checks`, the reconciler polls the PR's CI and transitions it to `review` when green. On red, the
+  circuit breaker may send it to `ready` for rework, to `blocked`, or supersede it with an escalated
+  copy. If the task returns to `ready`, the `odonian-checks:` item appears in the PR's feedback list,
+  and you must acknowledge it before resubmitting.
 
 ## Status / HTTP code reference
 
