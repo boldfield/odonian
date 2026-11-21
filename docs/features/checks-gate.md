@@ -1,6 +1,6 @@
 # Checks gate: wait for CI on the board, not in a worker
 
-Status: draft specification, 2026-11-20. Nothing here is implemented.
+Status: Implemented as of 2026-11-20. Implemented: C1–C10. C11 (project default) is optional and not built.
 
 ## Problem
 

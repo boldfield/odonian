@@ -122,6 +122,74 @@ Operators mainly need it for work claimed outside the harness. Full contract:
   not a missing merge: do not "fix" it by looking for a PR or reopening the task. See
   [`AGENT-API.md`](../AGENT-API.md) and [`docs/api.md`](api.md).
 
+## Checks gate (`checks` state)
+
+When a task is submitted with `await_checks: true` and a pull request link, the task enters
+the `checks` state instead of moving directly to `review`. The server watches the PR's head
+commit CI checks and transitions the task when they complete.
+
+### Understanding `checks`
+
+```
+in_progress --submit with await_checks: true--> checks --green--> review (review tasks spawn)
+                                                          --red----> ready / blocked / superseded (circuit breaker)
+                                                          --timeout / PR closed-> blocked
+```
+
+A task in `checks`:
+- Is **not claimable** by any agent (`claimable=true` queries exclude it)
+- Waits for the reconciler (checkwatch) to poll the PR's CI status
+- Times out after `CHECKS_TIMEOUT` (default 3 hours) with no result
+- Records `checks_passed`, `checks_failed` or `operator_bypass` events
+
+### Recovery: bypass an unfinished check
+
+An operator can manually transition `checks → review` without waiting for CI:
+
+```bash
+odonian transition <task-id> --to review --note "<reason>" [--actor <name>]
+```
+
+This creates review tasks immediately, as if the checks had passed. The event `operator_bypass`
+records the transition and the actor (default `operator`). Use this to unblock tasks stuck on
+flaky CI or when you want to override the checks gate.
+
+### Recovery: a failed or timed-out check
+
+When CI fails or times out:
+
+**Red check (failed on the head commit):**
+- Checkwatch posts an `odonian-checks:` comment listing the head commit and failed checks
+- Records a `checks_failed` event and runs the circuit breaker: task may return to `ready` for rework,
+  go to `blocked` if the threshold is exceeded, or be escalated to a higher model tier
+- If the task returns to `ready`: the worker acknowledges the feedback via `odonian pr-feedback ack`,
+  fixes the issue, and re-submits. If `blocked`: an operator must unblock it. If escalated: a worker
+  with the higher model tier takes over.
+- Configuration: `CHECKS_POLL_INTERVAL` (default 2m), `CHECKS_SETTLE` (default 2m, min time before
+  green passes), `CHECKS_NO_RUNS_GRACE` (default 5m, max wait for first check to appear)
+
+**Timeout (stuck in `checks` for `CHECKS_TIMEOUT`, default 3h):**
+- Checkwatch moves the task to `blocked` with a note
+- An operator must unblock it: `odonian transition <task-id> --to ready --note "<reason>"`
+  or investigate why CI never reported and handle as needed
+
+**Closed PR (pull request closed unmerged while in `checks`):**
+- Checkwatch detects the closed PR and moves the task to `blocked` with a note
+- Recovery: reopen the PR on GitHub or create a replacement PR, then unblock the task to `ready`:
+  `odonian transition <task-id> --to ready --note "PR reopened/replaced"`
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHECKS_POLL_INTERVAL` | `2m` | Minimum time between reconciler passes. |
+| `CHECKS_SETTLE` | `2m` | Minimum time in `checks` before a green result passes. |
+| `CHECKS_NO_RUNS_GRACE` | `5m` | How long to wait for a first check to appear. |
+| `CHECKS_TIMEOUT` | `3h` | Longest stay in `checks` before blocking. |
+
+Detail: [`docs/features/checks-gate.md`](features/checks-gate.md), [`AGENT-API.md`](../AGENT-API.md),
+[`docs/api.md`](api.md).
+
 ## What is not built: stall alerting
 
 There is **no stall alert today**. The notifier publishes only `approved` / `blocked` /

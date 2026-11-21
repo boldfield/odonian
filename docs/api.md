@@ -700,7 +700,7 @@ curl -H "Authorization: Bearer token" \
 ```
 
 **Query Parameters:**
-- `state` (optional): Filter by task state (`backlog`, `ready`, `in_progress`, `review`, `approved`, `done`, `blocked`, `failed`, `superseded`, `abandoned`)
+- `state` (optional): Filter by task state (`backlog`, `ready`, `in_progress`, `checks`, `review`, `approved`, `done`, `blocked`, `failed`, `superseded`, `abandoned`)
 - `model` (optional): Filter by assigned model (e.g., `haiku`, `sonnet`, `opus`)
 - `kind` (optional): Filter by task kind (`implement`, `review`, or `merge`)
 - `assignee` (optional): Filter by agent ID
@@ -1448,6 +1448,18 @@ findings (see `POST /tasks/{id}/submit` above); it is `null` on every other even
 `source_task_id` is non-null only on a `review` event that a review task appended to its parent; it
 holds the id of that review task. It is `null` on events from other sources, such as `POST
 /tasks/{id}/review`.
+
+**Event kinds include:**
+
+- `claim`: Agent claimed the task. `actor` is the agent ID.
+- `submit`: Agent submitted the task. `actor` is the agent ID; `verdict` is for review tasks only.
+- `review`: Reviewer submitted a verdict on a review task (or via `/tasks/{id}/review`). `actor` is the reviewer.
+- `checks_passed`: The PR's head-commit CI checks passed. Task moves from `checks` to `review`. `actor` is `system`; `note` contains a summary.
+- `checks_failed`: The PR's head-commit CI checks failed. Task moves from `checks` to `ready` (or escalates/blocks). `actor` is `system`; `note` contains failed check names and URLs.
+- `operator_bypass`: An operator bypassed the checks gate. Task moves from `checks` to `review`. `actor` is the caller (default `operator`); `note` is the operator's optional reason.
+- `transition`: Manual state change via `/tasks/{id}/transition`. `actor` is `operator` by default.
+- `claim_released`: Agent unclaimed the task via `/tasks/{id}/unclaim`. `actor` is the agent.
+- `review_models_changed`: Reviewer list changed via `PATCH /tasks/{id}`. `actor` names the caller; `note` contains the old and new lists.
 
 Returns `[]` when there are no retained events, including for an unknown full-length task UUID.
 An unmatched or too-short prefix returns `404 NOT_FOUND`; an ambiguous prefix returns
