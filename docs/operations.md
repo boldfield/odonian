@@ -140,7 +140,7 @@ A task in `checks`:
 - Is **not claimable** by any agent (`claimable=true` queries exclude it)
 - Waits for the reconciler (checkwatch) to poll the PR's CI status
 - Times out after `CHECKS_TIMEOUT` (default 3 hours) with no result
-- Records `checks_passed`, `checks_failed` or `operator_bypass` events (never review events at submit time)
+- Records `checks_passed`, `checks_failed` or `operator_bypass` events
 
 ### Recovery: bypass an unfinished check
 
@@ -159,10 +159,10 @@ flaky CI or when you want to override the checks gate.
 When CI fails or times out:
 
 **Red check (failed on the head commit):**
-- Checkwatch posts a `<model>-checks:` comment listing the head commit and failed checks
-- Records a `checks_failed` event and runs the circuit breaker (rework, block, or escalate)
-- Task returns to `ready`. The worker acknowledges the feedback via `odonian pr-feedback ack`,
-  fixes the issue, and re-submits
+- Checkwatch posts an `odonian-checks:` comment listing the head commit and failed checks
+- Records a `checks_failed` event and runs the circuit breaker: task may return to `ready` for rework,
+  go to `blocked` if the threshold is exceeded, or be escalated to a higher model tier
+- The worker acknowledges the feedback via `odonian pr-feedback ack`, fixes the issue, and re-submits
 - Configuration: `CHECKS_POLL_INTERVAL` (default 2m), `CHECKS_SETTLE` (default 2m, min time before
   green passes), `CHECKS_NO_RUNS_GRACE` (default 5m, max wait for first check to appear)
 
@@ -170,6 +170,11 @@ When CI fails or times out:
 - Checkwatch moves the task to `blocked` with a note
 - An operator must unblock it: `odonian transition <task-id> --to ready --note "<reason>"`
   or investigate why CI never reported and handle as needed
+
+**Closed PR (pull request closed unmerged while in `checks`):**
+- Checkwatch detects the closed PR and moves the task to `blocked` with a note
+- Recovery: reopen the PR on GitHub or create a replacement PR, then unblock the task to `ready`:
+  `odonian transition <task-id> --to ready --note "PR reopened/replaced"`
 
 ### Configuration
 

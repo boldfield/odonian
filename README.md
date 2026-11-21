@@ -252,11 +252,11 @@ missed tick is caught by the next one.
 |---|---|
 | Worker crashes mid-task | Lease lapses; any worker of that model can claim it. The rework lands on the same deterministic branch. |
 | Worker finds the work already on `main` | Submits a `no_op` link and no PR; passing review completes the task without a merge. |
-| CI fails while task waits in `checks` | The reconciler detects failure, posts a `checks:` comment on the PR, records a `checks_failed` event, and runs the circuit breaker (rework, block, or escalate) as if a review round failed. The worker acknowledges the feedback and reworks or the operator overrides. |
+| CI fails while task waits in `checks` | The reconciler detects failure, posts an `odonian-checks:` comment on the PR, records a `checks_failed` event, and runs the circuit breaker (rework, block, or escalate) as if a review round failed. The worker acknowledges the feedback and reworks or the operator overrides. |
 | CI times out in `checks` | After `CHECKS_TIMEOUT` (default 3h) with no green result, the reconciler moves the task to `blocked`. The operator unblocks to `ready` for a rework decision. |
 | Reviewer rejects repeatedly | Build/design can escalate or block. Research has separate rules and a chain-wide budget that blocks for decomposition. |
 | Human requests changes on GitHub after approval | PR-watch bounces the task to `ready` and posts a marker comment; the worker must ack every open item before resubmitting. |
-| PR merged or closed outside the board | PR-watch converges: approved tasks to `done` (merged) or `abandoned` (closed); checks tasks to `done` if PR merged, leaving open or closed PRs alone. |
+| PR merged or closed outside the board | PR-watch converges other states (including `checks`) to `done` on merge. When a checks task's PR is closed unmerged, checkwatch blocks it; the operator must reopen or replace the PR, then unblock to `ready` to retry. Approved tasks closed unmerged are marked `abandoned`. |
 | Server restarts | Reconcilers re-derive from state. Writers wait on SQLite's 5s busy timeout instead of failing fast. |
 | Webhook endpoint down | Logged. Level-triggered, so the next tick resends. |
 | Forge token missing for an owner | PR-watch and checkwatch skip that owner's repositories, including public ones, and log when the skipped count changes. Configure the server's per-owner token to resume convergence. |

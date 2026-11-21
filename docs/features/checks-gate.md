@@ -1,6 +1,6 @@
 # Checks gate: wait for CI on the board, not in a worker
 
-Status: Implemented as of 2026-11-20. C1-C9 (schema, field, submit, checks decision, reconciler, operator surface) are complete. C10 (harness prompts) and C11 (project default) remain optional.
+Status: Implemented as of 2026-11-20. Implemented: C1–C10. C11 (project default) is optional and not built.
 
 ## Problem
 

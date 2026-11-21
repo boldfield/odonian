@@ -829,7 +829,11 @@ Both priority endpoints:
 - **Heartbeat** before the lease expires on long work.
 - **Review the merged-with-main result**, never the branch alone.
 - **Never self-merge** unless the task is `agent_merge` and you merged it via the contract above.
-  Otherwise your terminal state is `review` (implement) or a submitted verdict (review).
+  Otherwise your terminal state is `checks` (implement with `await_checks: true`; do not wait for CI),
+  `review` (implement), or a submitted verdict (review). If a task with `await_checks: true` moves to
+  `checks`, the reconciler polls the PR's CI and transitions it to `review` (green) or `ready` (red).
+  On red, the task appears in `odonian pr-feedback list` with an `odonian-checks:` item you must
+  acknowledge before resubmitting.
 
 ## Status / HTTP code reference
 
