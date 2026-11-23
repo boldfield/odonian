@@ -88,7 +88,8 @@ current guide disagree, the current guide and the code win.
   `harness-lease-renewal`, `urgent-work-queue`, `dispatch-failure-handling`, `research-track`,
   `research-track-verification`, `research-continuations`,
   `research-pacing-and-reviewer-evaluation`, `checks-gate` (wait for CI in a board state, not in
-  a worker session).
+  a worker session). Not yet built: `tui-redesign` (three panes, cross-project,
+  grouped by work item).
 - [`specs/`](./specs/): dated specs and postmortems, indexed with their status in
   [`specs/README.md`](./specs/README.md). This is where the incident write-ups live
   (`2026-07-20-stall-detection.md` for the July review-queue deadlock; the October rate-limit
