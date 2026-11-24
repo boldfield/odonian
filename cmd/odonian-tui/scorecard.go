@@ -154,20 +154,6 @@ func (m *BoardModel) updateScorecardMode(msg tea.KeyPressMsg) (*BoardModel, tea.
 		m.scorecardLoading = true
 		return m, m.fetchScorecardCmd()
 
-	case "P":
-		m.mode = modeProjectSwitch
-		m.projectSwitchIndex = 0
-		for i, proj := range m.projects {
-			if proj.ID == m.project.ID {
-				m.projectSwitchIndex = i
-				break
-			}
-		}
-		m.scorecardViewport.SetContent("")
-		m.lastScorecards = nil
-		m.scorecardLoading = false
-		return m, m.fetchProjects()
-
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	}

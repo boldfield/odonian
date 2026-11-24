@@ -1,6 +1,6 @@
 # TUI redesign: three panes, cross-project, grouped by work item
 
-Status: **draft for review, not built.** Supersedes the layout in [`tui.md`](./tui.md); the
+Status: **Phase 1 built.** Supersedes the layout in [`tui.md`](./tui.md); the
 actions and their server calls described there are kept.
 
 ## Problem

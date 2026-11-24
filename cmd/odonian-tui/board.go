@@ -43,8 +43,6 @@ const (
 	modeRejectReason
 	// modeMergeConfirm is the "Merge PR and complete? [y/N]" confirmation step.
 	modeMergeConfirm
-	// modeProjectSwitch is the project selection overlay.
-	modeProjectSwitch
 	// modeApprovedRejectNote is the optional note input step for approved→ready send-back.
 	modeApprovedRejectNote
 	// modeApprovedRejectConfirm is the "Send back to ready? [y/N]" confirmation step.
@@ -135,9 +133,8 @@ type BoardModel struct {
 	scorecardLoading  bool                          // true when a fetch is in progress
 	lastScorecards    *tuiclient.ReviewerScorecards // cached for rebuild on resize
 
-	// Project switcher state
-	projects           []tuiclient.Project // cached list of all projects
-	projectSwitchIndex int                 // current selection in project switcher
+	// Project cache for the detail view and other non-shell views
+	projects []tuiclient.Project
 
 	// shell is the three-pane layout; nil renders the old tab layout, which a later task deletes.
 	shell *shellState
@@ -1011,11 +1008,6 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateScorecardMode(msg)
 		}
 
-		// Project switcher mode: all keys go to the switcher handler.
-		if m.mode == modeProjectSwitch {
-			return m.updateProjectSwitchMode(msg)
-		}
-
 		// When a text-input or confirm mode is active, route keys to the review flow
 		// instead of the normal navigation handlers.
 		if m.mode != modeNormal {
@@ -1154,21 +1146,9 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case projectsFetchedMsg:
 		if msg.err != nil {
 			m.error = fmt.Sprintf("Error fetching projects: %v", msg.err)
-			if m.mode == modeProjectSwitch {
-				m.mode = modeNormal
-			}
 			return m, nil
 		}
 		m.projects = msg.projects
-		// If we're in project switcher mode, preserve the current project selection by ID
-		if m.mode == modeProjectSwitch {
-			for i, proj := range m.projects {
-				if proj.ID == m.project.ID {
-					m.projectSwitchIndex = i
-					break
-				}
-			}
-		}
 		return m, nil
 
 	case projectArchiveMsg:
@@ -1300,19 +1280,6 @@ func (m *BoardModel) boardAction(act action) (tea.Model, tea.Cmd) {
 		if m.selectedColumn == 0 && m.selectedTaskID != "" {
 			return m, m.promoteTask(m.selectedTaskID)
 		}
-
-	// Switch project
-	case actSwitchProject:
-		m.mode = modeProjectSwitch
-		m.projectSwitchIndex = 0
-		// Find the current project's index for re-selection purposes
-		for i, proj := range m.projects {
-			if proj.ID == m.project.ID {
-				m.projectSwitchIndex = i
-				break
-			}
-		}
-		return m, m.fetchProjects()
 
 	// Approve: only on review column tasks
 	case actApprove:
@@ -1615,77 +1582,6 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		m.reviewInput, cmd = m.reviewInput.Update(nil)
 		return m, cmd
 
-	// Switch project from detail view
-	case actSwitchProject:
-		// Exit detail view and enter project switcher mode
-		m.mode = modeProjectSwitch
-		m.projectSwitchIndex = 0
-		// Find the current project's index for re-selection purposes
-		for i, proj := range m.projects {
-			if proj.ID == m.project.ID {
-				m.projectSwitchIndex = i
-				break
-			}
-		}
-		return m, m.fetchProjects()
-	}
-
-	return m, nil
-}
-
-// updateProjectSwitchMode handles key events while the project switcher overlay is active.
-func (m *BoardModel) updateProjectSwitchMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		// Cancel and return to normal mode
-		m.mode = modeNormal
-		return m, nil
-
-	case "up", "k":
-		if m.projectSwitchIndex > 0 {
-			m.projectSwitchIndex--
-		}
-		return m, nil
-
-	case "down", "j":
-		if m.projectSwitchIndex < len(m.projects)-1 {
-			m.projectSwitchIndex++
-		}
-		return m, nil
-
-	case "enter":
-		if m.projectSwitchIndex >= 0 && m.projectSwitchIndex < len(m.projects) {
-			selectedProject := m.projects[m.projectSwitchIndex]
-			// Only switch if it's a different project
-			if selectedProject.ID != m.project.ID {
-				m.project = selectedProject
-				// Reset all board state to avoid leaking data across projects
-				m.selectedTaskID = ""
-				m.selectedIndex = 0
-				m.selectedColumn = columnIndex(stateInProgress) // Reset to in_progress column
-				m.tasks = make(map[string][]tuiclient.Task)
-				m.detailTask = tuiclient.TaskDetail{}
-				m.detailDocuments = nil
-				m.detailEvents = nil
-				m.mode = modeNormal
-				m.loading = true
-				// Refetch tasks for the new project; use the full refresh so the
-				// terminal columns (done, failed, abandoned) are populated too.
-				return m, m.fetchTasksFullRefresh()
-			}
-			// Same project selected: just close the switcher
-			m.mode = modeNormal
-		}
-		return m, nil
-
-	case "z":
-		// Archive the selected project
-		if m.projectSwitchIndex >= 0 && m.projectSwitchIndex < len(m.projects) {
-			selectedProject := m.projects[m.projectSwitchIndex]
-			m.pendingProjectID = selectedProject.ID
-			m.mode = modeArchiveProjectConfirm
-		}
-		return m, nil
 	}
 
 	return m, nil
@@ -2288,7 +2184,7 @@ func (m *BoardModel) viewContent() string {
 		return b.String()
 	}
 
-	if m.shell != nil && m.mode != modeScorecards && m.mode != modeProjectSwitch {
+	if m.shell != nil && m.mode != modeScorecards {
 		return m.shellView()
 	}
 
@@ -2300,22 +2196,6 @@ func (m *BoardModel) viewContent() string {
 		b.WriteString(strings.Repeat("─", m.width))
 		b.WriteString("\n")
 		b.WriteString(m.renderScorecardHelpBar())
-		return b.String()
-	}
-
-	// Project switcher overlay.
-	if m.mode == modeProjectSwitch {
-		var b strings.Builder
-		if m.project.Name != "" {
-			projName := truncateString(m.project.Name, m.width)
-			b.WriteString(projName)
-			b.WriteString("\n")
-		}
-		b.WriteString(m.renderTabs())
-		b.WriteString("\n")
-		b.WriteString(strings.Repeat("─", m.width))
-		b.WriteString("\n")
-		b.WriteString(m.renderProjectSwitchOverlay())
 		return b.String()
 	}
 
@@ -2491,20 +2371,6 @@ func (m *BoardModel) renderReviewOverlay() string {
 	case modeArchiveProjectConfirm:
 		b.WriteString("Archive project? [y/N] ")
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
-	}
-	return b.String()
-}
-
-// renderProjectSwitchOverlay renders the project switcher overlay.
-func (m *BoardModel) renderProjectSwitchOverlay() string {
-	var b strings.Builder
-	b.WriteString("Switch project (↑/↓ or k/j to select, enter to switch, z to archive, esc to cancel):\n\n")
-	for i, p := range m.projects {
-		cursor := "  "
-		if i == m.projectSwitchIndex {
-			cursor = "> "
-		}
-		b.WriteString(fmt.Sprintf("%s%s\n", cursor, p.Name))
 	}
 	return b.String()
 }
