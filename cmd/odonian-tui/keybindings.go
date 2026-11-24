@@ -2,15 +2,29 @@ package main
 
 import (
 	keybind "charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
 )
 
+// matchesBinding checks if a KeyPressMsg matches a key binding by comparing the
+// message string against the binding's configured keys.
+func matchesBinding(msg tea.KeyPressMsg, binding keybind.Binding) bool {
+	for _, key := range binding.Keys() {
+		if msg.String() == key {
+			return true
+		}
+	}
+	return false
+}
+
 // KeyBindings defines all key bindings for the TUI.
-// Bindings are grouped by context (board, detail) and state.
+// Bindings are grouped by context (board, detail, shell) and state.
 type KeyBindings struct {
 	// Board navigation
 	Board boardKeyMap
 	// Detail view
 	Detail detailKeyMap
+	// Shell navigation
+	Shell shellKeyMap
 }
 
 // boardKeyMap defines key bindings for the board view.
@@ -75,6 +89,52 @@ type detailKeyMap struct {
 
 	// Help
 	Help keybind.Binding
+}
+
+// shellKeyMap defines key bindings for the shell (three-pane) layout.
+type shellKeyMap struct {
+	// Pane navigation
+	NextPane keybind.Binding
+	PrevPane keybind.Binding
+
+	// Navigation within panes
+	Up    keybind.Binding
+	Down  keybind.Binding
+	Left  keybind.Binding
+	Right keybind.Binding
+
+	// Enter detail view
+	EnterDetail keybind.Binding
+
+	// Pane toggles
+	TogglePreview keybind.Binding
+	ToggleProject keybind.Binding
+
+	// Project pane actions
+	OpenProject    keybind.Binding
+	ArchiveProject keybind.Binding
+
+	// Item actions (state-independent)
+	Hold          keybind.Binding
+	SetPriority   keybind.Binding
+	MoveToFront   keybind.Binding
+	ResetPriority keybind.Binding
+	Archive       keybind.Binding
+	Scorecards    keybind.Binding
+	Refresh       keybind.Binding
+
+	// Item actions (state-dependent)
+	Promote keybind.Binding
+	Approve keybind.Binding
+	Reject  keybind.Binding
+	Bounce  keybind.Binding
+	Unblock keybind.Binding
+	Fail    keybind.Binding
+	Merge   keybind.Binding
+
+	// Help
+	Help keybind.Binding
+	Quit keybind.Binding
 }
 
 // DefaultKeyBindings returns the default key bindings.
@@ -252,6 +312,131 @@ func DefaultKeyBindings() KeyBindings {
 				keybind.WithHelp("?", "help"),
 			),
 		},
+		Shell: shellKeyMap{
+			// Pane navigation
+			NextPane: keybind.NewBinding(
+				keybind.WithKeys("tab"),
+				keybind.WithHelp("tab", "next pane"),
+			),
+			PrevPane: keybind.NewBinding(
+				keybind.WithKeys("shift+tab"),
+				keybind.WithHelp("shift+tab", "prev pane"),
+			),
+
+			// Navigation within panes
+			Up: keybind.NewBinding(
+				keybind.WithKeys("up"),
+				keybind.WithHelp("↑", "move up"),
+			),
+			Down: keybind.NewBinding(
+				keybind.WithKeys("down"),
+				keybind.WithHelp("↓", "move down"),
+			),
+			Left: keybind.NewBinding(
+				keybind.WithKeys("left"),
+				keybind.WithHelp("←", "scroll left"),
+			),
+			Right: keybind.NewBinding(
+				keybind.WithKeys("right"),
+				keybind.WithHelp("→", "scroll right"),
+			),
+
+			// Enter detail view
+			EnterDetail: keybind.NewBinding(
+				keybind.WithKeys("enter"),
+				keybind.WithHelp("enter", "detail"),
+			),
+
+			// Pane toggles
+			TogglePreview: keybind.NewBinding(
+				keybind.WithKeys("v"),
+				keybind.WithHelp("v", "preview"),
+			),
+			ToggleProject: keybind.NewBinding(
+				keybind.WithKeys("V"),
+				keybind.WithHelp("V", "projects"),
+			),
+
+			// Project pane actions
+			OpenProject: keybind.NewBinding(
+				keybind.WithKeys("enter"),
+				keybind.WithHelp("enter", "open"),
+			),
+			ArchiveProject: keybind.NewBinding(
+				keybind.WithKeys("z"),
+				keybind.WithHelp("z", "archive"),
+			),
+
+			// Item actions (state-independent)
+			Hold: keybind.NewBinding(
+				keybind.WithKeys("t"),
+				keybind.WithHelp("t", "hold/release"),
+			),
+			SetPriority: keybind.NewBinding(
+				keybind.WithKeys("i"),
+				keybind.WithHelp("i", "set priority"),
+			),
+			MoveToFront: keybind.NewBinding(
+				keybind.WithKeys("w"),
+				keybind.WithHelp("w", "move to front"),
+			),
+			ResetPriority: keybind.NewBinding(
+				keybind.WithKeys("e"),
+				keybind.WithHelp("e", "reset priority"),
+			),
+			Archive: keybind.NewBinding(
+				keybind.WithKeys("z"),
+				keybind.WithHelp("z", "archive"),
+			),
+			Scorecards: keybind.NewBinding(
+				keybind.WithKeys("c"),
+				keybind.WithHelp("c", "scorecards"),
+			),
+			Refresh: keybind.NewBinding(
+				keybind.WithKeys("r"),
+				keybind.WithHelp("r", "refresh"),
+			),
+
+			// Item actions (state-dependent)
+			Promote: keybind.NewBinding(
+				keybind.WithKeys("p"),
+				keybind.WithHelp("p", "promote"),
+			),
+			Approve: keybind.NewBinding(
+				keybind.WithKeys("a"),
+				keybind.WithHelp("a", "approve"),
+			),
+			Reject: keybind.NewBinding(
+				keybind.WithKeys("x"),
+				keybind.WithHelp("x", "reject"),
+			),
+			Bounce: keybind.NewBinding(
+				keybind.WithKeys("b"),
+				keybind.WithHelp("b", "bounce"),
+			),
+			Unblock: keybind.NewBinding(
+				keybind.WithKeys("u"),
+				keybind.WithHelp("u", "unblock"),
+			),
+			Fail: keybind.NewBinding(
+				keybind.WithKeys("f"),
+				keybind.WithHelp("f", "fail"),
+			),
+			Merge: keybind.NewBinding(
+				keybind.WithKeys("m"),
+				keybind.WithHelp("m", "merge"),
+			),
+
+			// Help
+			Help: keybind.NewBinding(
+				keybind.WithKeys("?"),
+				keybind.WithHelp("?", "help"),
+			),
+			Quit: keybind.NewBinding(
+				keybind.WithKeys("q"),
+				keybind.WithHelp("q", "quit"),
+			),
+		},
 	}
 }
 
@@ -338,6 +523,89 @@ func (kb *KeyBindings) getDetailBindingsForState(state string) []keybind.Binding
 
 	// Help is always available
 	bindings = append(bindings, kb.Detail.Help)
+
+	return bindings
+}
+
+// getShellProjectsBindings returns the bindings valid in the projects pane.
+func (kb *KeyBindings) getShellProjectsBindings() []keybind.Binding {
+	return []keybind.Binding{
+		kb.Shell.NextPane,
+		kb.Shell.PrevPane,
+		kb.Shell.Up,
+		kb.Shell.Down,
+		kb.Shell.TogglePreview,
+		kb.Shell.ToggleProject,
+		kb.Shell.OpenProject,
+		kb.Shell.ArchiveProject,
+		kb.Shell.Refresh,
+		kb.Shell.Help,
+		kb.Shell.Quit,
+	}
+}
+
+// getShellPreviewBindings returns the bindings valid in the preview pane.
+func (kb *KeyBindings) getShellPreviewBindings() []keybind.Binding {
+	return []keybind.Binding{
+		kb.Shell.NextPane,
+		kb.Shell.PrevPane,
+		kb.Shell.Up,
+		kb.Shell.Down,
+		kb.Shell.Left,
+		kb.Shell.Right,
+		kb.Shell.TogglePreview,
+		kb.Shell.ToggleProject,
+		kb.Shell.Refresh,
+		kb.Shell.Help,
+		kb.Shell.Quit,
+	}
+}
+
+// getShellItemsBindingsForState returns the bindings valid in the items pane for a given state.
+// State-specific actions are listed first so they're visible at narrow widths.
+func (kb *KeyBindings) getShellItemsBindingsForState(state string) []keybind.Binding {
+	var bindings []keybind.Binding
+
+	// State-specific bindings first (listed first so they don't get truncated at narrow widths)
+	switch state {
+	case stateBacklog:
+		bindings = append(bindings, kb.Shell.Promote)
+	case stateReview:
+		bindings = append(bindings,
+			kb.Shell.Approve,
+			kb.Shell.Reject,
+		)
+	case stateApproved:
+		bindings = append(bindings,
+			kb.Shell.Merge,
+			kb.Shell.Bounce,
+		)
+	case stateBlocked:
+		bindings = append(bindings,
+			kb.Shell.Unblock,
+			kb.Shell.Fail,
+		)
+	}
+
+	// Navigation and state-independent actions
+	bindings = append(bindings,
+		kb.Shell.NextPane,
+		kb.Shell.PrevPane,
+		kb.Shell.Up,
+		kb.Shell.Down,
+		kb.Shell.EnterDetail,
+		kb.Shell.TogglePreview,
+		kb.Shell.ToggleProject,
+		kb.Shell.Hold,
+		kb.Shell.SetPriority,
+		kb.Shell.MoveToFront,
+		kb.Shell.ResetPriority,
+		kb.Shell.Archive,
+		kb.Shell.Scorecards,
+		kb.Shell.Refresh,
+		kb.Shell.Help,
+		kb.Shell.Quit,
+	)
 
 	return bindings
 }

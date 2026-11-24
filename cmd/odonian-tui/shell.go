@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	keybind "charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
@@ -187,33 +188,52 @@ func (m *BoardModel) cycleFocus(delta int) {
 // keys it leaves to the existing actions.
 func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd tea.Cmd, handled bool) {
 	s := m.shell
-	switch msg.String() {
-	case "q", "ctrl+c":
-		return m, tea.Quit, true
+	kb := m.keyBindings
 
-	case "tab":
+	// Quit
+	if matchesBinding(msg, kb.Shell.Quit) {
+		return m, tea.Quit, true
+	}
+
+	// If full help is open, only allow ? to toggle it off and swallow other keys
+	if m.showFullHelp {
+		if matchesBinding(msg, kb.Shell.Help) {
+			m.showFullHelp = false
+			return m, nil, true
+		}
+		return m, nil, true
+	}
+
+	// Pane navigation
+	if matchesBinding(msg, kb.Shell.NextPane) {
 		m.cycleFocus(1)
 		return m, nil, true
-	case "shift+tab":
+	}
+	if matchesBinding(msg, kb.Shell.PrevPane) {
 		m.cycleFocus(-1)
 		return m, nil, true
+	}
 
-	case "v":
+	// Pane toggles
+	if matchesBinding(msg, kb.Shell.TogglePreview) {
 		s.previewHidden = !s.previewHidden
 		if s.previewHidden && s.focus == panePreview {
 			s.focus = paneItems
 		}
 		return m, nil, true
-	case "V":
+	}
+	if matchesBinding(msg, kb.Shell.ToggleProject) {
 		s.projectHidden = !s.projectHidden
 		if s.projectHidden && s.focus == paneProjects {
 			s.focus = paneItems
 		}
 		return m, nil, true
+	}
 
-	case "up", "k", "down", "j":
+	// Navigation within panes
+	if matchesBinding(msg, kb.Shell.Up) || matchesBinding(msg, kb.Shell.Down) {
 		if s.focus == panePreview && m.shellLayout().PreviewWidth > 0 {
-			if k := msg.String(); k == "up" || k == "k" {
+			if matchesBinding(msg, kb.Shell.Up) {
 				s.preview.Scroll(-1)
 			} else {
 				s.preview.Scroll(1)
@@ -225,8 +245,22 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 			m.syncShellSelection()
 		}
 		return m, cmd, true
+	}
 
-	case "enter":
+	// Scroll in preview pane
+	if matchesBinding(msg, kb.Shell.Left) || matchesBinding(msg, kb.Shell.Right) {
+		if s.focus == panePreview && m.shellLayout().PreviewWidth > 0 {
+			if matchesBinding(msg, kb.Shell.Left) {
+				s.preview.Scroll(-1)
+			} else {
+				s.preview.Scroll(1)
+			}
+		}
+		return m, nil, true
+	}
+
+	// Enter detail view or open project
+	if matchesBinding(msg, kb.Shell.EnterDetail) {
 		if s.focus == paneProjects && s.projectsVisible(m) {
 			_, cmd = s.projects.Update(msg)
 			s.focus = paneItems
@@ -238,8 +272,10 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 			return m, m.fetchDetailCmd(m.selectedTaskID), true
 		}
 		return m, nil, true
+	}
 
-	case "z":
+	// Archive project
+	if matchesBinding(msg, kb.Shell.ArchiveProject) {
 		if m.effectiveFocus() == paneProjects {
 			if id := s.projects.SelectedProjectID(); id != "" {
 				m.pendingProjectID = id
@@ -250,8 +286,12 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 		if m.effectiveFocus() != paneItems {
 			return m, nil, true
 		}
+		// Fall through to let updateTabs handle archive for items
+		return m, nil, false
+	}
 
-	case "m":
+	// Merge (items only)
+	if matchesBinding(msg, kb.Shell.Merge) {
 		if m.effectiveFocus() != paneItems {
 			return m, nil, true
 		}
@@ -259,22 +299,41 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 			return m, m.mergeSelectedCmd(wi.Implement.ID), true
 		}
 		return m, nil, true
+	}
 
-	case "?":
+	// Help toggle
+	if matchesBinding(msg, kb.Shell.Help) {
 		m.showFullHelp = !m.showFullHelp
 		return m, nil, true
-
-	// The remaining task actions apply only with the work-items pane focused.
-	case "p", "a", "x", "b", "u", "f", "t", "i", "w", "e":
-		if m.effectiveFocus() != paneItems {
-			return m, nil, true
-		}
-		return m, nil, false
-
-	// The tab layout's column and project-switcher keys have no meaning here.
-	case "left", "right", "h", "l", "P":
-		return m, nil, true
 	}
+
+	// Item-specific action keys - only let updateTabs handle them if in items pane
+	if matchesBinding(msg, kb.Shell.Promote) ||
+		matchesBinding(msg, kb.Shell.Approve) ||
+		matchesBinding(msg, kb.Shell.Reject) ||
+		matchesBinding(msg, kb.Shell.Bounce) ||
+		matchesBinding(msg, kb.Shell.Unblock) ||
+		matchesBinding(msg, kb.Shell.Fail) ||
+		matchesBinding(msg, kb.Shell.Hold) ||
+		matchesBinding(msg, kb.Shell.SetPriority) ||
+		matchesBinding(msg, kb.Shell.MoveToFront) ||
+		matchesBinding(msg, kb.Shell.ResetPriority) {
+		if m.effectiveFocus() != paneItems {
+			return m, nil, true // consume and ignore in other panes
+		}
+		return m, nil, false // let updateTabs handle in items pane
+	}
+
+	// Scorecards and Refresh can be handled in items pane OR projects pane
+	if matchesBinding(msg, kb.Shell.Scorecards) ||
+		matchesBinding(msg, kb.Shell.Refresh) {
+		if m.effectiveFocus() == paneItems {
+			return m, nil, false // let updateTabs handle in items pane
+		}
+		// In projects pane or preview, let updateTabs handle these
+		return m, nil, false
+	}
+
 	return m, nil, false
 }
 
@@ -459,27 +518,29 @@ func (m *BoardModel) shellHelpBar() string {
 // shellKeyHints lists the keys valid now: the focused pane's, and for the work-items pane
 // those the selected item's state allows, built from the bindings.
 func (m *BoardModel) shellKeyHints() string {
+	var bindings []keybind.Binding
+	kb := m.keyBindings
+
 	switch m.effectiveFocus() {
 	case paneProjects:
-		return "tab pane · ↑↓ move · enter open · z archive · r refresh · q quit"
+		bindings = kb.getShellProjectsBindings()
 	case panePreview:
-		return "tab pane · ↑↓ scroll · v preview · r refresh · q quit"
+		bindings = kb.getShellPreviewBindings()
+	default: // paneItems
+		if wi := m.shell.items.SelectedItem(); wi != nil {
+			bindings = kb.getShellItemsBindingsForState(wi.Implement.State)
+		} else {
+			bindings = kb.getShellItemsBindingsForState("")
+		}
 	}
+
 	var parts []string
-	if wi := m.shell.items.SelectedItem(); wi != nil {
-		bindings := m.keyBindings.getBoardBindingsForState(wi.Implement.State)
-		for _, b := range bindings {
-			help := b.Help()
-			if help.Key != "" && help.Desc != "" {
-				part := help.Key + " " + help.Desc
-				parts = append(parts, part)
-			}
+	for _, b := range bindings {
+		help := b.Help()
+		if help.Key != "" && help.Desc != "" {
+			part := help.Key + " " + help.Desc
+			parts = append(parts, part)
 		}
-		if wi.Implement.State == stateApproved {
-			parts = append(parts, "m merge")
-		}
-	} else {
-		parts = append(parts, "tab pane", "↑↓ move", "enter detail")
 	}
 	return strings.Join(parts, " · ")
 }

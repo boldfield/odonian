@@ -449,3 +449,50 @@ func TestShellHelpBarBlockedState(t *testing.T) {
 		t.Errorf("blocked help bar should not have 'approve': %q", helpBar)
 	}
 }
+
+func TestShellHelpBarReviewWidthsAndOrder(t *testing.T) {
+	for _, w := range []int{60, 100, 160} {
+		t.Run(fmt.Sprintf("width_%d", w), func(t *testing.T) {
+			f := newShellFixture(t, w, 24)
+			f.mu.Lock()
+			f.listed["p1"] = []tuiclient.Task{
+				{ID: "a1", Title: "Review task", State: "review", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
+			}
+			f.mu.Unlock()
+			f.send(tea.WindowSizeMsg{Width: w, Height: 24})
+			f.send(tickMsg{}) // trigger fetch with new data
+			view := f.model.View().Content
+			lines := strings.Split(view, "\n")
+			if len(lines) == 0 {
+				t.Fatal("no view output")
+			}
+			helpBar := lines[len(lines)-1]
+			// Check width limit
+			if len([]rune(helpBar)) > w {
+				t.Errorf("help bar width %d > %d: %q", len([]rune(helpBar)), w, helpBar)
+			}
+			// Check that approve and reject are present
+			if !strings.Contains(helpBar, "approve") {
+				t.Errorf("review help bar missing 'approve': %q", helpBar)
+			}
+			if !strings.Contains(helpBar, "reject") {
+				t.Errorf("review help bar missing 'reject': %q", helpBar)
+			}
+			// Check that approve and reject are listed first (before other keys)
+			// Find the positions of approve and other keys
+			approveIdx := strings.Index(helpBar, "approve")
+			rejectIdx := strings.Index(helpBar, "reject")
+			tabIdx := strings.Index(helpBar, "tab")
+			enterIdx := strings.Index(helpBar, "detail")
+			if approveIdx < 0 || rejectIdx < 0 {
+				t.Errorf("approve/reject not in help bar: %q", helpBar)
+			}
+			if tabIdx >= 0 && (approveIdx > tabIdx || rejectIdx > tabIdx) {
+				t.Errorf("approve/reject not listed first at width %d: %q", w, helpBar)
+			}
+			if enterIdx >= 0 && (approveIdx > enterIdx || rejectIdx > enterIdx) {
+				t.Errorf("approve/reject not listed first at width %d: %q", w, helpBar)
+			}
+		})
+	}
+}
