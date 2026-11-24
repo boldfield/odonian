@@ -627,23 +627,23 @@ func TestRenderRowInProgressDetail(t *testing.T) {
 
 	row := RenderRow(wi, 100, now, theme, false)
 
-	// Should show model, holder, and time held (not lease countdown)
+	// updated_at is rewritten by every heartbeat, so it must not drive the
+	// value; the lease countdown (labelled) is shown instead.
 	if !hasSubstring(row, "haiku") {
 		t.Errorf("missing model in row: %q", row)
 	}
 	if !hasSubstring(row, "@worker-example") {
 		t.Errorf("missing holder in row: %q", row)
 	}
-	if !hasSubstring(row, "15m") {
-		t.Errorf("missing time held (15m) in row: %q", row)
+	if !hasSubstring(row, "lease 10m") {
+		t.Errorf("missing labelled lease countdown in row: %q", row)
 	}
-	// Should NOT show 10m (the lease countdown)
-	if hasSubstring(row, "10m") {
-		t.Errorf("should not show lease countdown in row: %q", row)
+	if hasSubstring(row, "15m") {
+		t.Errorf("UpdatedAt (heartbeat-mutated) must not drive the duration: %q", row)
 	}
 }
 
-func TestRenderRowPendingReviewerWithTime(t *testing.T) {
+func TestRenderRowPendingReviewerMark(t *testing.T) {
 	theme := newMockTheme()
 	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 	reviewUpdatedAt := now.Add(-8 * time.Minute).Format(time.RFC3339Nano)
@@ -684,12 +684,12 @@ func TestRenderRowPendingReviewerWithTime(t *testing.T) {
 	row := RenderRow(wi, 100, now, theme, false)
 	lines := splitLines(row)
 
-	// Check reviewer line contains time for pending reviewer
-	if len(lines) >= 2 {
-		reviewerLine := lines[1]
-		if !hasSubstring(reviewerLine, "8m") {
-			t.Errorf("pending reviewer should show elapsed time, got: %q", reviewerLine)
-		}
+	if len(lines) < 2 {
+		t.Fatalf("expected reviewer line, got: %q", row)
+	}
+	reviewerLine := lines[1]
+	if !hasSubstring(reviewerLine, "haiku …") || hasSubstring(reviewerLine, "8m") {
+		t.Errorf("pending reviewer should show bare pending mark, got: %q", reviewerLine)
 	}
 }
 

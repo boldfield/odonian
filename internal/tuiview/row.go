@@ -172,12 +172,14 @@ func buildDetailString(task *tuiclient.Task, now time.Time) string {
 			}
 			holder = "@" + holder
 		}
-		// Show time held (elapsed time since task was updated)
-		timeHeld := FormatTime(task.UpdatedAt, now)
+		// The API exposes no claim time (updated_at is rewritten by every lease
+		// heartbeat), so elapsed time held cannot be shown honestly. Show the
+		// lease time remaining instead, labelled as such.
+		lease := "lease " + FormatLeaseCountdown(task.LeaseExpiresAt, now)
 		if holder == "" {
-			return fmt.Sprintf("%s %s", task.Model, timeHeld)
+			return fmt.Sprintf("%s %s", task.Model, lease)
 		}
-		return fmt.Sprintf("%s %s %s", task.Model, holder, timeHeld)
+		return fmt.Sprintf("%s %s %s", task.Model, holder, lease)
 
 	case "checks":
 		return fmt.Sprintf("checks %s", FormatChecksDuration(task.ChecksStartedAt, now))
@@ -230,11 +232,8 @@ func buildReviewerLine(reviews []*tuiclient.Task, now time.Time, width int) stri
 		case "reject":
 			verdictGlyph = "✖"
 		default:
-			// For pending reviewers, show pending mark plus elapsed time if available
+			// updated_at changes on every heartbeat, so no elapsed time is shown.
 			verdictGlyph = "…"
-			if review.UpdatedAt != "" {
-				verdictGlyph = "… " + FormatTime(review.UpdatedAt, now)
-			}
 		}
 
 		reviewerParts = append(reviewerParts, fmt.Sprintf("%s %s", review.Model, verdictGlyph))
