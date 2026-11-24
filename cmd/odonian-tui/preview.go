@@ -184,13 +184,16 @@ func (p *PreviewPane) Render() string {
 	if maxScroll := len(lines) - p.height; p.scroll > maxScroll {
 		p.scroll = max(maxScroll, 0)
 	}
-	lines = lines[p.scroll:]
-	if len(lines) > p.height {
-		lines = lines[:p.height]
+	// The first line stays pinned as a header so the focus marker survives
+	// scrolling; only the body below it moves.
+	header, body := lines[0], lines[1+p.scroll:]
+	if len(body) > p.height-1 {
+		body = body[:p.height-1]
 	}
-	if p.focused && p.theme != nil && p.scroll == 0 && len(lines) > 0 {
-		lines[0] = p.theme.PaneTitleFocused.Render(lines[0])
+	if p.focused && p.theme != nil {
+		header = p.theme.PaneTitleFocused.Render(header)
 	}
+	lines = append([]string{header}, body...)
 	return strings.Join(lines, "\n")
 }
 

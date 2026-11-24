@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -214,25 +215,64 @@ func TestShellTabCyclesFocus(t *testing.T) {
 func TestShellPreviewFocusRendersAndTakesArrows(t *testing.T) {
 	f := newShellFixture(t, 120, 24)
 	s := f.model.shell
-	unfocused := f.model.View().Content
+	bold := func(text string) string { return s.preview.theme.PaneTitleFocused.Render(text) }
+	if strings.Contains(f.model.View().Content, bold("Alpha")) {
+		t.Fatal("preview title is bold before it has focus")
+	}
+	var events []tuiclient.Event
+	for i := 0; i < 60; i++ {
+		events = append(events, tuiclient.Event{ID: fmt.Sprint(i), TaskID: "a1", Kind: "note", CreatedAt: fmt.Sprintf("2026-01-01T00:%02d:00Z", i)})
+	}
+	s.preview.SetEvents(events)
+
 	f.send(key("tab"))
 	if s.focus != panePreview {
 		t.Fatalf("focus = %v, want preview", s.focus)
 	}
-	focused := f.model.View().Content
-	if focused == unfocused {
-		t.Error("view did not change when the preview took focus")
-	}
-	if !strings.Contains(focused, "\x1b[1m") {
-		t.Error("focused preview title is not rendered bold")
+	atTop := f.model.View().Content
+	if !strings.Contains(atTop, bold("Alpha")) {
+		t.Error("focused preview title is not bold")
 	}
 	sel := s.items.SelectedTaskID()
+	f.send(key("down"))
 	f.send(key("down"))
 	if s.items.SelectedTaskID() != sel {
 		t.Error("down moved the item selection while the preview was focused")
 	}
-	if s.preview.scroll < 0 {
-		t.Errorf("scroll = %d", s.preview.scroll)
+	if s.preview.scroll != 2 {
+		t.Fatalf("scroll = %d, want 2", s.preview.scroll)
+	}
+	scrolled := f.model.View().Content
+	if scrolled == atTop {
+		t.Error("rendered preview did not change after scrolling down")
+	}
+	if !strings.Contains(scrolled, bold("Alpha")) {
+		t.Error("preview focus marker scrolled away")
+	}
+	for i := 0; i < 200; i++ {
+		f.send(key("down"))
+	}
+	f.model.View() // rendering clamps the scroll to the content
+	end := s.preview.scroll
+	if end <= 2 {
+		t.Fatalf("scroll did not advance, got %d", end)
+	}
+	f.send(key("down"))
+	f.model.View()
+	if s.preview.scroll != end {
+		t.Errorf("scroll not clamped: %d then %d", end, s.preview.scroll)
+	}
+	if !strings.Contains(f.model.View().Content, bold("Alpha")) {
+		t.Error("preview focus marker missing at the end of the scroll")
+	}
+	for i := 0; i < 300; i++ {
+		f.send(key("up"))
+	}
+	if s.preview.scroll != 0 {
+		t.Errorf("scroll after up = %d, want 0", s.preview.scroll)
+	}
+	if f.model.View().Content != atTop {
+		t.Error("view after scrolling back differs from the top view")
 	}
 	f.send(key("v"))
 	if s.focus != paneItems {
