@@ -1295,6 +1295,10 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		// A shell merge resolves asynchronously; drop the answer if the user has moved on.
+		if m.shell != nil && !fromDetail && (m.mode != modeNormal || m.shell.items.SelectedTaskID() != msg.taskID) {
+			return m, nil
+		}
 		// Enter merge confirm mode with the resolved PR.
 		m.pendingTaskID = msg.taskID
 		m.pendingPRURL = msg.prURL
@@ -2216,7 +2220,7 @@ func (m *BoardModel) viewContent() string {
 		return b.String()
 	}
 
-	if m.shell != nil && m.mode == modeNormal {
+	if m.shell != nil && m.mode != modeScorecards && m.mode != modeProjectSwitch {
 		return m.shellView()
 	}
 

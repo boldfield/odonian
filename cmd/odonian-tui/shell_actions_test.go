@@ -28,6 +28,7 @@ func newActionFixture(t *testing.T) *actionFixture {
 		{ID: "t-review", Title: "Review", State: "review", Kind: "implement", CreatedAt: "2026-01-01T00:00:02Z"},
 		{ID: "t-approved", Title: "Approved", State: "approved", Kind: "implement", CreatedAt: "2026-01-01T00:00:03Z"},
 		{ID: "t-blocked", Title: "Blocked", State: "blocked", Kind: "implement", CreatedAt: "2026-01-01T00:00:04Z"},
+		{ID: "t-held", Title: "Held", State: "ready", Held: true, Kind: "implement", CreatedAt: "2026-01-01T00:00:05Z"},
 	}
 	rec := func(s string) {
 		f.mu.Lock()
@@ -69,6 +70,7 @@ func newActionFixture(t *testing.T) *actionFixture {
 		},
 		ArchiveTaskFunc:    func(ctx context.Context, id string) error { rec("archive " + id); return nil },
 		ArchiveProjectFunc: func(ctx context.Context, id string) error { rec("archive-project " + id); return nil },
+		ReleaseTaskFunc:    func(ctx context.Context, id string) error { rec("release " + id); return nil },
 		HoldTaskFunc:       func(ctx context.Context, id string) error { rec("hold " + id); return nil },
 		SetTaskPriorityFunc: func(ctx context.Context, id string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
 			rec("priority " + id)
@@ -153,6 +155,7 @@ func TestShellActions(t *testing.T) {
 		{"fail", "t-blocked", []string{"f", "enter", "y"}, "transition t-blocked failed"},
 		{"archive", "t-ready", []string{"z", "y"}, "archive t-ready"},
 		{"hold", "t-ready", []string{"t", "y"}, "hold t-ready"},
+		{"release", "t-held", []string{"t", "y"}, "release t-held"},
 		{"set priority", "t-ready", []string{"i", "750", "enter", "why", "enter", "y"}, "priority t-ready"},
 		{"move to front", "t-ready", []string{"w", "why", "enter", "y"}, "front t-ready"},
 		{"reset priority", "t-ready", []string{"e", "why", "enter", "y"}, "priority t-ready"},
@@ -250,5 +253,57 @@ func TestShellHelpBarFollowsSelectedState(t *testing.T) {
 	f.selectItem(t, "t-ready")
 	if bar := f.model.shellKeyHints(); strings.Contains(bar, "promote") || strings.Contains(bar, "approve") {
 		t.Errorf("ready item help offers other states' keys: %q", bar)
+	}
+}
+
+func TestShellPromptsRenderInsideShell(t *testing.T) {
+	f := newActionFixture(t)
+	f.selectItem(t, "t-approved")
+	f.press("m")
+	view := f.model.viewContent()
+	if !strings.Contains(view, "merge https://github.com/o/r/pull/9") {
+		t.Errorf("merge confirm not visible:\n%s", view)
+	}
+	if !strings.Contains(view, "Approved") || !strings.Contains(view, "│") {
+		t.Errorf("shell panes not visible during merge confirm:\n%s", view)
+	}
+	f.press("n")
+
+	f.press("tab", "tab", "z")
+	view = f.model.viewContent()
+	if !strings.Contains(strings.ToLower(view), "archive") || !strings.Contains(view, "│") {
+		t.Errorf("archive-project confirm not visible in shell:\n%s", view)
+	}
+}
+
+func TestShellProjectsPaneRefreshAndQuit(t *testing.T) {
+	f := newActionFixture(t)
+	f.press("tab", "tab")
+	_, cmd := f.model.Update(key("r"))
+	if cmd == nil {
+		t.Fatal("r in projects pane returned no refetch command")
+	}
+	_, cmd = f.model.Update(key("q"))
+	if cmd == nil {
+		t.Fatal("q returned no command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("q did not quit")
+	}
+}
+
+func TestShellStaleMergeResolutionIgnored(t *testing.T) {
+	f := newActionFixture(t)
+	f.selectItem(t, "t-approved")
+	f.selectItem(t, "t-ready")
+	f.send(prResolvedMsg{taskID: "t-approved", prURL: "https://github.com/o/r/pull/9"})
+	if f.model.mode != modeNormal {
+		t.Errorf("stale resolution after selection change: mode %d", f.model.mode)
+	}
+	f.press("i")
+	prompt := f.model.mode
+	f.send(prResolvedMsg{taskID: "t-ready", prURL: "https://github.com/o/r/pull/9"})
+	if f.model.mode != prompt {
+		t.Errorf("resolution during another prompt changed mode to %d", f.model.mode)
 	}
 }

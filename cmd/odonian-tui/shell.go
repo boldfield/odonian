@@ -448,6 +448,12 @@ func (m *BoardModel) shellView() string {
 	s := m.shell
 	layout := m.shellLayout()
 	bodyHeight := m.height - 2
+	// An active prompt takes the help bar's place and as many rows above it as it needs.
+	prompt := ""
+	if m.mode != modeNormal {
+		prompt = strings.TrimRight(m.renderReviewOverlay(), "\n")
+		bodyHeight -= strings.Count(prompt, "\n")
+	}
 	if bodyHeight < 1 {
 		bodyHeight = 1
 	}
@@ -480,6 +486,10 @@ func (m *BoardModel) shellView() string {
 		cols = append(cols, sep, box(layout.PreviewWidth, s.preview.Render()))
 	}
 
+	footer := m.shellHelpBar()
+	if prompt != "" {
+		footer = prompt
+	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, cols...) + "\n" +
-		strings.Repeat("─", m.width) + "\n" + m.shellHelpBar()
+		strings.Repeat("─", m.width) + "\n" + footer
 }
