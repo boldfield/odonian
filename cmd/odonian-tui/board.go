@@ -135,6 +135,9 @@ type BoardModel struct {
 	// Project switcher state
 	projects           []tuiclient.Project // cached list of all projects
 	projectSwitchIndex int                 // current selection in project switcher
+
+	// shell is the three-pane layout; nil renders the old tab layout, which a later task deletes.
+	shell *shellState
 }
 
 const (
@@ -215,6 +218,9 @@ func (m *BoardModel) defaultTickCmd() tea.Cmd {
 // Init starts the initial fetch and the polling loop.
 // Exactly one tick chain is started here; it perpetuates itself in the tickMsg handler.
 func (m *BoardModel) Init() tea.Cmd {
+	if m.shell != nil {
+		return tea.Batch(m.fetchShellTasks(), m.fetchProjects(), m.newTickCmd())
+	}
 	return tea.Batch(
 		m.fetchTasksFullRefresh(),
 		m.fetchProjects(),
@@ -939,6 +945,14 @@ type tickMsg struct{}
 
 // Update handles messages from Bubble Tea.
 func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.shell == nil {
+		return m.updateTabs(msg)
+	}
+	return m.updateShell(msg)
+}
+
+// updateTabs is the update of the old tab layout.
+func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -1385,6 +1399,9 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
+		if m.shell != nil {
+			return m, tea.Batch(m.fetchShellTasks(), m.newTickCmd())
+		}
 		// Re-arm exactly one next tick and issue a fetch.
 		// This is the ONLY place (besides Init) where a new tick is armed.
 		// The fetch merges freshly-polled active states with the existing terminal
@@ -2192,6 +2209,10 @@ func (m *BoardModel) viewContent() string {
 		b.WriteString("\n")
 		b.WriteString(m.renderDetailHelpBar())
 		return b.String()
+	}
+
+	if m.shell != nil && m.mode == modeNormal {
+		return m.shellView()
 	}
 
 	// Full-screen scorecard view.
