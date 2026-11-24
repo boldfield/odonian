@@ -1286,14 +1286,19 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case prResolvedMsg:
+		fromDetail := m.mode == modeDetail
 		if msg.err != "" {
-			m.detailMessage = msg.err
+			if fromDetail {
+				m.detailMessage = msg.err
+			} else {
+				m.error = msg.err
+			}
 			return m, nil
 		}
 		// Enter merge confirm mode with the resolved PR.
 		m.pendingTaskID = msg.taskID
 		m.pendingPRURL = msg.prURL
-		m.reviewFromDetail = true
+		m.reviewFromDetail = fromDetail
 		m.reviewInput.Placeholder = fmt.Sprintf("merge %s and complete? [y/N]", msg.prURL)
 		m.reviewInput.SetValue("")
 		m.reviewInput.Focus()
