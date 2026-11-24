@@ -183,95 +183,83 @@ func (m *BoardModel) cycleFocus(delta int) {
 	m.shell.focus = panes[(cur+delta+len(panes))%len(panes)]
 }
 
-// updateShellKey handles the keys the shell owns in normal mode. handled is false for
-// keys it leaves to the existing actions.
+// updateShellKey handles the keys of normal mode in the shell. Every key resolves through the
+// shell's bindings, the same ones the help bar lists; a key with no live binding is swallowed.
 func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd tea.Cmd, handled bool) {
 	s := m.shell
-	switch msg.String() {
-	case "q", "ctrl+c":
+	act, ok := m.keyBindings.Shell.lookup(msg, m.shellKeyCtx())
+	if !ok {
+		return m, nil, true
+	}
+	if act == actQuit {
 		return m, tea.Quit, true
+	}
+	// While the full key list is open it takes the keys: ? closes it, the rest are swallowed.
+	if m.showFullHelp {
+		if act == actHelp {
+			m.showFullHelp = false
+		}
+		return m, nil, true
+	}
 
-	case "tab":
+	switch act {
+	case actHelp:
+		m.showFullHelp = true
+	case actNextPane:
 		m.cycleFocus(1)
-		return m, nil, true
-	case "shift+tab":
+	case actPrevPane:
 		m.cycleFocus(-1)
-		return m, nil, true
-
-	case "v":
+	case actTogglePreview:
 		s.previewHidden = !s.previewHidden
 		if s.previewHidden && s.focus == panePreview {
 			s.focus = paneItems
 		}
-		return m, nil, true
-	case "V":
+	case actToggleProjects:
 		s.projectHidden = !s.projectHidden
 		if s.projectHidden && s.focus == paneProjects {
 			s.focus = paneItems
 		}
-		return m, nil, true
-
-	case "up", "k", "down", "j":
+	case actUp, actDown:
+		delta := 1
+		if act == actUp {
+			delta = -1
+		}
 		if s.focus == panePreview && m.shellLayout().PreviewWidth > 0 {
-			if k := msg.String(); k == "up" || k == "k" {
-				s.preview.Scroll(-1)
-			} else {
-				s.preview.Scroll(1)
-			}
-		} else if s.focus == paneProjects && s.projectsVisible(m) {
-			_, cmd = s.projects.Update(msg)
+			s.preview.Scroll(delta)
+		} else if m.effectiveFocus() == paneProjects {
+			cmd = s.projects.Move(delta)
 		} else {
-			_, cmd = s.items.Update(msg)
+			cmd = s.items.Move(delta)
 			m.syncShellSelection()
 		}
 		return m, cmd, true
-
-	case "enter":
-		if s.focus == paneProjects && s.projectsVisible(m) {
-			_, cmd = s.projects.Update(msg)
+	case actOpenProject:
+		if s.projectsVisible(m) {
+			cmd = s.projects.Open()
 			s.focus = paneItems
-			return m, cmd, true
 		}
+		return m, cmd, true
+	case actEnter:
 		if m.selectedTaskID != "" {
 			m.mode = modeDetail
 			m.detailMessage = ""
 			return m, m.fetchDetailCmd(m.selectedTaskID), true
 		}
-		return m, nil, true
-
-	case "z":
-		if m.effectiveFocus() == paneProjects {
-			if id := s.projects.SelectedProjectID(); id != "" {
-				m.pendingProjectID = id
-				m.mode = modeArchiveProjectConfirm
-			}
-			return m, nil, true
+	case actArchiveProject:
+		if id := s.projects.SelectedProjectID(); id != "" {
+			m.pendingProjectID = id
+			m.mode = modeArchiveProjectConfirm
 		}
-		if m.effectiveFocus() != paneItems {
-			return m, nil, true
-		}
-
-	case "m":
-		if m.effectiveFocus() != paneItems {
-			return m, nil, true
-		}
-		if wi := s.items.SelectedItem(); wi != nil && wi.Implement.State == stateApproved {
+	case actMerge:
+		if wi := s.items.SelectedItem(); wi != nil {
 			return m, m.mergeSelectedCmd(wi.Implement.ID), true
 		}
-		return m, nil, true
-
-	// The remaining task actions apply only with the work-items pane focused.
-	case "p", "a", "x", "b", "u", "f", "t", "i", "w", "e":
-		if m.effectiveFocus() != paneItems {
-			return m, nil, true
-		}
-		return m, nil, false
-
-	// The tab layout's column and project-switcher keys have no meaning here.
-	case "left", "right", "h", "l", "P":
-		return m, nil, true
+	default:
+		// The task actions and the refresh and scorecards keys run the shared action code.
+		model, cmd = m.boardAction(act)
+		return model, cmd, true
 	}
-	return m, nil, false
+	return m, nil, true
 }
 
 // effectiveFocus is the pane that has focus at the current layout (a hidden pane cannot).
@@ -447,37 +435,25 @@ func (m *BoardModel) shellHelpBar() string {
 	case m.statusMessage != "":
 		text = m.statusMessage
 	default:
-		text = m.shellKeyHints()
+		return m.helpLine(m.keyBindings.Shell.help(m.shellKeyCtx()), m.width)
 	}
 	return ansi.Truncate(text, m.width, "…")
 }
 
-// shellKeyHints lists the keys valid now: the focused pane's, and for the work-items pane
-// those the selected item's state allows.
-func (m *BoardModel) shellKeyHints() string {
-	const tail = "r refresh · c scorecards · q quit"
-	switch m.effectiveFocus() {
-	case paneProjects:
-		return "tab pane · ↑↓ move · enter open · z archive project · " + tail
-	case panePreview:
-		return "tab pane · ↑↓ scroll · v preview · " + tail
-	}
-	parts := []string{"tab pane", "↑↓ move", "enter detail"}
+// shellKeyCtx is the context the shell's keys resolve in: the focused pane and the state of
+// the selected work item.
+func (m *BoardModel) shellKeyCtx() keyCtx {
+	c := keyCtx{pane: m.effectiveFocus()}
 	if wi := m.shell.items.SelectedItem(); wi != nil {
-		switch wi.Implement.State {
-		case stateBacklog:
-			parts = append(parts, "p promote")
-		case stateReview:
-			parts = append(parts, "a approve", "x reject")
-		case stateApproved:
-			parts = append(parts, "b bounce", "m merge")
-		case stateBlocked:
-			parts = append(parts, "u unblock", "f fail")
-		}
-		parts = append(parts, "t hold/release", "i priority", "w front", "e reset", "z archive")
+		c.state = wi.Implement.State
 	}
-	parts = append(parts, "v preview", "V projects", tail)
-	return strings.Join(parts, " · ")
+	return c
+}
+
+// shellKeyHints lists the keys valid now: the focused pane's, and for the work-items pane
+// those the selected item's state allows. It is the bar's text before truncation.
+func (m *BoardModel) shellKeyHints() string {
+	return m.helpLine(m.keyBindings.Shell.help(m.shellKeyCtx()), 0)
 }
 
 // shellView renders the three panes, joined, with a help bar.

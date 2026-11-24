@@ -195,25 +195,29 @@ func (p *WorkItemsPane) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return p, nil
 	}
-	idx := p.indexOf(p.selectedID)
-	if idx < 0 {
-		return p, nil
-	}
 	switch keyMsg.String() {
 	case "up", "k":
-		idx--
+		return p, p.Move(-1)
 	case "down", "j":
-		idx++
-	default:
-		return p, nil
+		return p, p.Move(1)
 	}
+	return p, nil
+}
+
+// Move shifts the selection by delta rows and reports the new selection.
+func (p *WorkItemsPane) Move(delta int) tea.Cmd {
+	idx := p.indexOf(p.selectedID)
+	if idx < 0 {
+		return nil
+	}
+	idx += delta
 	if idx < 0 || idx >= len(p.items) {
-		return p, nil
+		return nil
 	}
 	p.selectedID = p.items[idx].Implement.ID
 	p.ensureSelectionVisible()
 	id := p.selectedID
-	return p, func() tea.Msg { return WorkItemSelected{TaskID: id} }
+	return func() tea.Msg { return WorkItemSelected{TaskID: id} }
 }
 
 // View renders the pane.
