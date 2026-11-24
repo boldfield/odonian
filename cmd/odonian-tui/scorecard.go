@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 // scorecardFetchedMsg carries the result of a GetResearchReviewerScorecards call.
@@ -101,7 +101,7 @@ func (m *BoardModel) initScorecardViewport(scorecards tuiclient.ReviewerScorecar
 		vpHeight = 3
 	}
 
-	vp := viewport.New(m.width, vpHeight)
+	vp := viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(vpHeight))
 	vp.SetContent(content)
 	m.scorecardViewport = vp
 }
@@ -129,17 +129,17 @@ func (m *BoardModel) renderScorecardHelpBar() string {
 }
 
 // updateScorecardMode handles key presses while in scorecard view.
-func (m *BoardModel) updateScorecardMode(msg tea.KeyMsg) (*BoardModel, tea.Cmd) {
+func (m *BoardModel) updateScorecardMode(msg tea.KeyPressMsg) (*BoardModel, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeNormal
 		return m, nil
 
 	case "up", "k":
-		m.scorecardViewport.LineUp(1)
+		m.scorecardViewport.ScrollUp(1)
 
 	case "down", "j":
-		m.scorecardViewport.LineDown(1)
+		m.scorecardViewport.ScrollDown(1)
 
 	case "pgup":
 		m.scorecardViewport.PageUp()

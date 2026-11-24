@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 // approvedTestBucketed returns a bucketed task map with one approved task.
@@ -53,11 +53,11 @@ func buildApprovedModel(t *testing.T, approvedClient *tuiclient.MockClient) *Boa
 
 	// Navigate to the approved column. Starting from in_progress, press right once per
 	// column in stateOrder: checks, review, then approved.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
 
 	if model.selectedColumn != columnIndex(stateApproved) {
@@ -93,7 +93,7 @@ func TestBoardModel_MergePRConfirmFlow(t *testing.T) {
 	model := buildApprovedModel(t, mockClient)
 
 	// Enter detail mode by pressing enter on the approved task.
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeDetail {
@@ -104,7 +104,7 @@ func TestBoardModel_MergePRConfirmFlow(t *testing.T) {
 	model = executeReviewCmd(t, model, detailCmd)
 
 	// Press 'm' to start merge flow.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'm', Text: "m"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeMergeConfirm {
@@ -116,7 +116,7 @@ func TestBoardModel_MergePRConfirmFlow(t *testing.T) {
 	}
 
 	// Verify the output contains the merge confirmation prompt.
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "owner/repo#123") {
 		t.Errorf("Expected PR URL in merge confirmation, got:\n%s", output)
 	}
@@ -161,13 +161,13 @@ func TestBoardModel_MergePRNoPRLink(t *testing.T) {
 	model := buildApprovedModel(t, mockClient)
 
 	// Enter detail mode and try to merge.
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Execute the detail fetch command to load the task detail.
 	model = executeReviewCmd(t, model, detailCmd)
 
-	m, resolveCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m, resolveCmd := model.Update(tea.KeyPressMsg{Code: 'm', Text: "m"})
 	model = m.(*BoardModel)
 
 	// Should return a command to resolve the PR.
@@ -223,17 +223,17 @@ func TestBoardModel_MergePRSuccess(t *testing.T) {
 	model := buildApprovedModel(t, mockClient)
 
 	// Enter detail mode and initiate merge.
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Execute the detail fetch command to load the task detail.
 	model = executeReviewCmd(t, model, detailCmd)
 
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'm', Text: "m"})
 	model = m.(*BoardModel)
 
 	// Confirm with 'y'.
-	m, mergeCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, mergeCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// After confirming, mode goes back to modeDetail (via cancelReviewMode).
@@ -318,17 +318,17 @@ func TestBoardModel_MergePRFailure(t *testing.T) {
 	model := buildApprovedModel(t, mockClient)
 
 	// Enter detail mode and initiate merge.
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Execute the detail fetch command to load the task detail.
 	model = executeReviewCmd(t, model, detailCmd)
 
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'm', Text: "m"})
 	model = m.(*BoardModel)
 
 	// Confirm with 'y'.
-	m, mergeCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, mergeCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// Inject a failing ghMerger.
@@ -355,7 +355,7 @@ func TestBoardModel_MergePRFailure(t *testing.T) {
 	}
 
 	// Verify the task is still in approved state (refetch happened but no transition).
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "approved(1)") {
 		t.Errorf("Expected task to remain in approved state, got:\n%s", output)
 	}
@@ -384,23 +384,23 @@ func TestBoardModel_ApprovedHelpBar(t *testing.T) {
 	model := buildApprovedModel(t, mockClient)
 
 	// Enter detail mode on approved task.
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Execute the detail fetch command to load the task detail.
 	model = executeReviewCmd(t, model, detailCmd)
 
-	approvedOutput := model.View()
+	approvedOutput := model.View().Content
 	if !strings.Contains(approvedOutput, "m merge & complete") {
 		t.Errorf("Expected 'm merge & complete' in help bar for approved task, got:\n%s", approvedOutput)
 	}
 
 	// Exit detail mode and return to board.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
 	model = m.(*BoardModel)
 
 	// The help bar on the board should not show the merge action.
-	boardOutput := model.View()
+	boardOutput := model.View().Content
 	if strings.Contains(boardOutput, "m merge") {
 		t.Errorf("Did not expect 'm merge' in board help bar, got:\n%s", boardOutput)
 	}
@@ -434,7 +434,7 @@ func TestBoardModel_ApprovedSendBackSuccess(t *testing.T) {
 	model := buildApprovedModel(t, mockClient)
 
 	// Press 'b' to start the send-back flow.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'b', Text: "b"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeApprovedRejectNote {
@@ -447,7 +447,7 @@ func TestBoardModel_ApprovedSendBackSuccess(t *testing.T) {
 
 	// Enter a note and press enter to move to confirmation.
 	model.reviewInput.SetValue("Conflict with main")
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeApprovedRejectConfirm {
@@ -459,7 +459,7 @@ func TestBoardModel_ApprovedSendBackSuccess(t *testing.T) {
 	}
 
 	// Confirm with 'y'.
-	m, bounceCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, bounceCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// Execute the bounce command.
@@ -493,7 +493,7 @@ func TestBoardModel_ApprovedSendBackSuccess(t *testing.T) {
 	}
 
 	// Verify the task is now in the ready column.
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "ready(1)") {
 		t.Errorf("Expected task to be in ready column, got:\n%s", output)
 	}
@@ -518,11 +518,11 @@ func TestBoardModel_ApprovedSendBackNoNote(t *testing.T) {
 	model := buildApprovedModel(t, mockClient)
 
 	// Press 'b' to start the send-back flow.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'b', Text: "b"})
 	model = m.(*BoardModel)
 
 	// Press enter without entering a note (empty string).
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// pendingNote should be nil when empty.
@@ -531,7 +531,7 @@ func TestBoardModel_ApprovedSendBackNoNote(t *testing.T) {
 	}
 
 	// Confirm with 'y'.
-	m, bounceCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, bounceCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// Execute the bounce command.

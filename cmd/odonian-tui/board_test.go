@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 // TestBoardModel_RenderLayout tests that the board renders with all five columns and counts.
@@ -50,7 +50,7 @@ func TestBoardModel_RenderLayout(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify the tabs are present with correct counts
 	if !strings.Contains(output, "backlog(2)") {
@@ -104,23 +104,23 @@ func TestBoardModel_Navigation(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Initially in in_progress column (index 2)
-	initialOutput := model.View()
+	initialOutput := model.View().Content
 	if !strings.Contains(initialOutput, "in_progress(1)") {
 		t.Errorf("Expected active column to show in_progress(1), got:\n%s", initialOutput)
 	}
 
 	// Move left to ready
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	model = m.(*BoardModel)
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "ready(1)") {
 		t.Errorf("Expected active column to be ready after left, got:\n%s", output)
 	}
 
 	// Move left to backlog
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	model = m.(*BoardModel)
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "backlog(1)") {
 		t.Errorf("Expected active column to be backlog after left, got:\n%s", output)
 	}
@@ -162,7 +162,7 @@ func TestBoardModel_SelectionStability(t *testing.T) {
 	}
 
 	// Move down to select task-2
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 	if model.selectedTaskID != "task-2" {
 		t.Errorf("Expected selection to be task-2 after down, got %s", model.selectedTaskID)
@@ -216,7 +216,7 @@ func TestBoardModel_ErrorState(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{err: errors.New("test error message")})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Error:") || !strings.Contains(output, "test error message") {
 		t.Errorf("Expected error message in output, got:\n%s", output)
 	}
@@ -258,10 +258,10 @@ func TestBoardModel_EmptyColumn(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Navigate from in_progress (index 2) to ready (index 1): one left
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "(empty)") {
 		t.Errorf("Expected '(empty)' message in output, got:\n%s", output)
 	}
@@ -303,7 +303,7 @@ func TestBoardModel_InProgressCardDetails(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "alice") {
 		t.Errorf("Expected assignee 'alice' in output, got:\n%s", output)
 	}
@@ -362,29 +362,29 @@ func TestBoardModel_AssigneeOnReviewApprovedDone(t *testing.T) {
 
 	// Navigate to review column
 	for model.selectedColumn < columnIndex(stateReview) {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "alice") {
 		t.Errorf("Expected assignee 'alice' in review column output, got:\n%s", output)
 	}
 
 	// Navigate to approved column
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
 
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "bob") {
 		t.Errorf("Expected assignee 'bob' in approved column output, got:\n%s", output)
 	}
 
 	// Navigate to done column
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
 
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "charlie") {
 		t.Errorf("Expected assignee 'charlie' in done column output, got:\n%s", output)
 	}
@@ -424,7 +424,7 @@ func TestBoardModel_NoAssigneeShown(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 	// Should not contain "null" or "(unassigned)" or "@"
 	if strings.Contains(output, "null") {
 		t.Errorf("Expected no 'null' in output for unassigned task, got:\n%s", output)
@@ -474,7 +474,7 @@ func TestBoardModel_DisappearedTaskSelection(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Select task-2 (index 1)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 	if model.selectedTaskID != "task-2" {
 		t.Errorf("Expected selection to be task-2, got %s", model.selectedTaskID)
@@ -656,7 +656,7 @@ func TestBoardModel_PromoteTask(t *testing.T) {
 
 	// Move to backlog column (it starts at in_progress)
 	for i := 0; i < 2; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 		model = m.(*BoardModel)
 	}
 
@@ -669,7 +669,7 @@ func TestBoardModel_PromoteTask(t *testing.T) {
 	}
 
 	// Press 'p' to promote
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
 	model = m.(*BoardModel)
 
 	// Execute the promote command
@@ -689,7 +689,7 @@ func TestBoardModel_PromoteTask(t *testing.T) {
 
 	// After refetch, task-1 should now be in ready column
 	// and the board should show updated state
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "ready(1)") {
 		t.Errorf("Expected 'ready(1)' after promotion, got:\n%s", output)
 	}
@@ -732,12 +732,12 @@ func promoteWithError(t *testing.T, returnedErr error) *BoardModel {
 
 	// Navigate from in_progress (index 2) to backlog (index 0): two lefts
 	for i := 0; i < 2; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 		model = m.(*BoardModel)
 	}
 
 	// Press 'p' to promote
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
 	model = m.(*BoardModel)
 
 	if cmd != nil {
@@ -772,7 +772,7 @@ func TestBoardModel_PromoteTask409(t *testing.T) {
 	}
 
 	// Verify we didn't crash and the model is still usable
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "backlog(1)") {
 		t.Errorf("Expected board to still be functional, got:\n%s", output)
 	}
@@ -838,7 +838,7 @@ func TestBoardModel_PromoteOnNonBacklogIsNoOp(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Move to ready column (from in_progress at index 2)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	model = m.(*BoardModel)
 
 	// Verify we're in ready column
@@ -847,7 +847,7 @@ func TestBoardModel_PromoteOnNonBacklogIsNoOp(t *testing.T) {
 	}
 
 	// Press 'p' on ready column (should be no-op)
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
 	model = m.(*BoardModel)
 
 	// Verify promote was NOT called
@@ -914,7 +914,7 @@ func TestBoardModel_TickGeneration(t *testing.T) {
 
 	// --- 'r' (manual refresh) arms ZERO ticks ---
 	*tickCount = 0
-	m, refreshCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m, refreshCmd := model.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
 	model = m.(*BoardModel)
 
 	if *tickCount != 0 {
@@ -1085,7 +1085,7 @@ func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
 
 	// --- Manual refresh ('r') fetches all 9 states ---
 	calls = nil
-	m, refreshCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m, refreshCmd := model.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
 	model = m.(*BoardModel)
 	if refreshCmd == nil {
 		t.Fatalf("expected a refresh command from 'r', got nil")
@@ -1134,9 +1134,9 @@ func buildReviewModel(t *testing.T, reviewClient *tuiclient.MockClient) *BoardMo
 	model = m.(*BoardModel)
 
 	// Navigate to the review column (index 4). Starting from in_progress (index 2), press right twice (past checks).
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
 
 	if model.selectedColumn != columnIndex(stateReview) {
@@ -1209,7 +1209,7 @@ func TestBoardModel_ApproveFlow_ConfirmY(t *testing.T) {
 	model := buildReviewModel(t, mockClient)
 
 	// Press 'a' to start approve flow.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeApproveNote {
@@ -1218,12 +1218,12 @@ func TestBoardModel_ApproveFlow_ConfirmY(t *testing.T) {
 
 	// Type a note.
 	for _, ch := range "LGTM" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Press enter to advance to confirm step.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeApproveConfirm {
@@ -1231,13 +1231,13 @@ func TestBoardModel_ApproveFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Confirm the output contains the confirm prompt.
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "→ done?") {
 		t.Errorf("Expected confirm prompt in view, got:\n%s", output)
 	}
 
 	// Press 'y' to confirm.
-	m, approveCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, approveCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -1287,7 +1287,7 @@ func TestBoardModel_ApproveFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Board should now show the task in done.
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "done(1)") {
 		t.Errorf("Expected done(1) after approve, got:\n%s", output)
 	}
@@ -1316,13 +1316,13 @@ func TestBoardModel_ApproveFlow_EmptyNote(t *testing.T) {
 	model := buildReviewModel(t, mockClient)
 
 	// Press 'a' → skip note (press enter immediately) → confirm 'y'.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
 
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
-	m, approveCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, approveCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	model = executeReviewCmd(t, model, approveCmd)
@@ -1357,14 +1357,14 @@ func TestBoardModel_ApproveFlow_CancelWithEscAtNote(t *testing.T) {
 	model := buildReviewModel(t, mockClient)
 
 	// Press 'a' then esc.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeApproveNote {
 		t.Fatalf("Expected modeApproveNote, got %d", model.mode)
 	}
 
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -1401,16 +1401,16 @@ func TestBoardModel_ApproveFlow_CancelWithN(t *testing.T) {
 	model := buildReviewModel(t, mockClient)
 
 	// 'a' → enter (skip note) → 'n' (decline confirm).
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeApproveConfirm {
 		t.Fatalf("Expected modeApproveConfirm, got %d", model.mode)
 	}
 
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'n', Text: "n"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -1424,6 +1424,31 @@ func TestBoardModel_ApproveFlow_CancelWithN(t *testing.T) {
 	}
 	if transitionCalled {
 		t.Errorf("TransitionTask was called but should not have been (declined)")
+	}
+}
+
+// TestBoardModel_PasteGoesToTextInput tests that a bracketed paste is typed into the text
+// input in a reason mode and ignored on the board.
+func TestBoardModel_PasteGoesToTextInput(t *testing.T) {
+	model := buildReviewModel(t, &tuiclient.MockClient{})
+
+	// A paste on the board does nothing.
+	m, _ := model.Update(tea.PasteMsg{Content: "x"})
+	model = m.(*BoardModel)
+	if model.mode != modeNormal {
+		t.Fatalf("Expected modeNormal after paste on the board, got %d", model.mode)
+	}
+
+	// Press 'x' to start reject flow, then paste a reason.
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	model = m.(*BoardModel)
+	if model.mode != modeRejectReason {
+		t.Fatalf("Expected modeRejectReason after 'x', got %d", model.mode)
+	}
+	m, _ = model.Update(tea.PasteMsg{Content: "pasted reason"})
+	model = m.(*BoardModel)
+	if got := model.reviewInput.Value(); got != "pasted reason" {
+		t.Errorf("Expected pasted text in input, got %q", got)
 	}
 }
 
@@ -1447,7 +1472,7 @@ func TestBoardModel_RejectFlow_EmptyReasonBlocked(t *testing.T) {
 	model := buildReviewModel(t, mockClient)
 
 	// Press 'x' to start reject flow.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeRejectReason {
@@ -1455,7 +1480,7 @@ func TestBoardModel_RejectFlow_EmptyReasonBlocked(t *testing.T) {
 	}
 
 	// Press enter immediately with no reason typed.
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Must still be in input mode.
@@ -1475,7 +1500,7 @@ func TestBoardModel_RejectFlow_EmptyReasonBlocked(t *testing.T) {
 	}
 
 	// Hint should be visible in the view.
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "reason is required") {
 		t.Errorf("Expected 'reason is required' hint in view, got:\n%s", output)
 	}
@@ -1518,17 +1543,17 @@ func TestBoardModel_RejectFlow_NonEmptyReason(t *testing.T) {
 	model := buildReviewModel(t, mockClient)
 
 	// Press 'x' to start reject flow.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	model = m.(*BoardModel)
 
 	// Type a reason.
 	for _, ch := range "needs tests" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Submit with enter.
-	m, rejectCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, rejectCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -1578,7 +1603,7 @@ func TestBoardModel_RejectFlow_NonEmptyReason(t *testing.T) {
 	}
 
 	// Board should reflect the refetch.
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "ready(1)") {
 		t.Errorf("Expected ready(1) after reject refetch, got:\n%s", output)
 	}
@@ -1615,11 +1640,11 @@ func TestBoardModel_ApproveTransition409(t *testing.T) {
 	model := buildReviewModel(t, mockClient)
 
 	// Walk through the approve flow.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter}) // skip note
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter}) // skip note
 	model = m.(*BoardModel)
-	m, approveCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}}) // confirm
+	m, approveCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"}) // confirm
 	model = m.(*BoardModel)
 
 	// Execute the command.
@@ -1642,7 +1667,7 @@ func TestBoardModel_ApproveTransition409(t *testing.T) {
 	}
 
 	// Model must still be usable — View must not panic.
-	output := model.View()
+	output := model.View().Content
 	if output == "" {
 		t.Errorf("Expected non-empty view after 409 error, got empty")
 	}
@@ -1699,7 +1724,7 @@ func TestBoardModel_ReviewActionsNoopOutsideReviewColumn(t *testing.T) {
 	}
 
 	// Press 'a' in in_progress — must be a no-op.
-	m, cmdA := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, cmdA := model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
 	if model.mode != modeNormal {
 		t.Errorf("'a' in in_progress: expected modeNormal, got %d", model.mode)
@@ -1709,7 +1734,7 @@ func TestBoardModel_ReviewActionsNoopOutsideReviewColumn(t *testing.T) {
 	}
 
 	// Press 'x' in in_progress — must be a no-op.
-	m, cmdX := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m, cmdX := model.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	model = m.(*BoardModel)
 	if model.mode != modeNormal {
 		t.Errorf("'x' in in_progress: expected modeNormal, got %d", model.mode)
@@ -1720,10 +1745,10 @@ func TestBoardModel_ReviewActionsNoopOutsideReviewColumn(t *testing.T) {
 
 	// Navigate to backlog (two lefts), press 'a' — still a no-op.
 	for i := 0; i < 2; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 		model = m.(*BoardModel)
 	}
-	m, cmdABacklog := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, cmdABacklog := model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
 	if model.mode != modeNormal {
 		t.Errorf("'a' in backlog: expected modeNormal, got %d", model.mode)
@@ -1798,7 +1823,7 @@ func buildDetailModel(
 
 	// Trigger detail mode by pressing enter (with the task selected).
 	model.selectedTaskID = taskDetail.ID
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Execute the fetchDetailCmd.
@@ -1852,7 +1877,7 @@ func TestDetail_EnterOpensDetail(t *testing.T) {
 		t.Fatalf("Expected modeDetail after enter + fetch, got mode %d", model.mode)
 	}
 
-	output := model.View()
+	output := model.View().Content
 
 	// Title and state.
 	if !strings.Contains(output, "My Feature Task") {
@@ -1911,7 +1936,7 @@ func TestDetail_EscReturnsToBoard(t *testing.T) {
 	}
 
 	// Press esc.
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -1922,7 +1947,7 @@ func TestDetail_EscReturnsToBoard(t *testing.T) {
 	}
 
 	// Should render the board, not the detail view.
-	output := model.View()
+	output := model.View().Content
 	if strings.Contains(output, "Task:") && strings.Contains(output, "State:") && !strings.Contains(output, "‹") {
 		t.Errorf("Expected board view after esc, got something else:\n%s", output)
 	}
@@ -1949,7 +1974,7 @@ func TestDetail_BoardNavKeysIgnoredInDetail(t *testing.T) {
 	originalColumn := model.selectedColumn
 
 	// Press left/right — should NOT change the selected column.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	model = m.(*BoardModel)
 	if model.selectedColumn != originalColumn {
 		t.Errorf("Left key in detail changed column from %d to %d", originalColumn, model.selectedColumn)
@@ -1958,7 +1983,7 @@ func TestDetail_BoardNavKeysIgnoredInDetail(t *testing.T) {
 		t.Errorf("Expected to remain in modeDetail after left key, got %d", model.mode)
 	}
 
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
 	if model.selectedColumn != originalColumn {
 		t.Errorf("Right key in detail changed column from %d to %d", originalColumn, model.selectedColumn)
@@ -1989,7 +2014,7 @@ func TestDetail_OpenPRLink(t *testing.T) {
 	}
 
 	// Press 'o' to open PR.
-	m, openCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	m, openCmd := model.Update(tea.KeyPressMsg{Code: 'o', Text: "o"})
 	model = m.(*BoardModel)
 
 	if openCmd == nil {
@@ -2029,7 +2054,7 @@ func TestDetail_OpenPRLink_NoPR(t *testing.T) {
 		return nil
 	}
 
-	m, openCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	m, openCmd := model.Update(tea.KeyPressMsg{Code: 'o', Text: "o"})
 	model = m.(*BoardModel)
 
 	if openCmd == nil {
@@ -2082,7 +2107,7 @@ func TestDetail_OpenSourceDoc_RefPath(t *testing.T) {
 		return nil
 	}
 
-	m, srcCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m, srcCmd := model.Update(tea.KeyPressMsg{Code: 's', Text: "s"})
 	model = m.(*BoardModel)
 
 	if srcCmd == nil {
@@ -2134,7 +2159,7 @@ func TestDetail_OpenSourceDoc_CommitPin(t *testing.T) {
 		return nil
 	}
 
-	m, srcCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m, srcCmd := model.Update(tea.KeyPressMsg{Code: 's', Text: "s"})
 	model = m.(*BoardModel)
 
 	resultMsg := srcCmd()
@@ -2179,7 +2204,7 @@ func TestDetail_OpenSourceDoc_RefIsURL(t *testing.T) {
 		return nil
 	}
 
-	m, srcCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m, srcCmd := model.Update(tea.KeyPressMsg{Code: 's', Text: "s"})
 	model = m.(*BoardModel)
 
 	resultMsg := srcCmd()
@@ -2228,7 +2253,7 @@ func TestDetail_OpenDesignDoc(t *testing.T) {
 		return nil
 	}
 
-	m, designCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m, designCmd := model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
 	model = m.(*BoardModel)
 
 	resultMsg := designCmd()
@@ -2271,7 +2296,7 @@ func TestDetail_OpenDesignDoc_NoDesignDoc(t *testing.T) {
 		return nil
 	}
 
-	m, designCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m, designCmd := model.Update(tea.KeyPressMsg{Code: 'd', Text: "d"})
 	model = m.(*BoardModel)
 
 	resultMsg := designCmd()
@@ -2352,15 +2377,15 @@ func TestDetail_ReviewApproveFromDetail(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Navigate to review column (index 4): two rights from in_progress (index 2), passing checks (index 3).
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
 
 	model.selectedTaskID = "review-detail-task-1"
 
 	// Press enter to open detail.
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 	if detailCmd != nil {
 		m, _ = model.Update(detailCmd())
@@ -2372,7 +2397,7 @@ func TestDetail_ReviewApproveFromDetail(t *testing.T) {
 	}
 
 	// Press 'a' to start approve flow from detail.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeApproveNote {
@@ -2383,7 +2408,7 @@ func TestDetail_ReviewApproveFromDetail(t *testing.T) {
 	}
 
 	// Skip note (press enter).
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeApproveConfirm {
@@ -2391,7 +2416,7 @@ func TestDetail_ReviewApproveFromDetail(t *testing.T) {
 	}
 
 	// Confirm with 'y'.
-	m, approveCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, approveCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// After cancel, should return to modeDetail.
@@ -2420,7 +2445,7 @@ func TestDetail_ReviewApproveFromDetail(t *testing.T) {
 	}
 
 	// The board should show the task in its new state (done(1)).
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "done(1)") {
 		t.Errorf("Expected done(1) in board view after from-detail approve, got:\n%s", output)
 	}
@@ -2491,13 +2516,13 @@ func TestDetail_ReviewApproveFromDetail_409Visible(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Navigate to review column and open detail.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
 	model.selectedTaskID = "review-detail-409"
 
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 	if detailCmd != nil {
 		m, _ = model.Update(detailCmd())
@@ -2508,11 +2533,11 @@ func TestDetail_ReviewApproveFromDetail_409Visible(t *testing.T) {
 	}
 
 	// Start approve flow from detail.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter}) // skip note
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter}) // skip note
 	model = m.(*BoardModel)
-	m, approveCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}}) // confirm
+	m, approveCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"}) // confirm
 	model = m.(*BoardModel)
 
 	// Execute the approve command (which triggers a 409 from TransitionTask).
@@ -2528,7 +2553,7 @@ func TestDetail_ReviewApproveFromDetail_409Visible(t *testing.T) {
 		t.Errorf("Expected non-empty error after 409 from-detail action, got empty")
 	}
 
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "409") && !strings.Contains(output, "task already transitioned") {
 		t.Errorf("Expected 409 error in board view output, got:\n%s", output)
 	}
@@ -2564,24 +2589,24 @@ func TestDetail_SpecViewportScrolls(t *testing.T) {
 	}
 
 	// Initial viewport should be at the top.
-	if model.detailViewport.YOffset != 0 {
-		t.Errorf("Expected initial YOffset=0, got %d", model.detailViewport.YOffset)
+	if model.detailViewport.YOffset() != 0 {
+		t.Errorf("Expected initial YOffset=0, got %d", model.detailViewport.YOffset())
 	}
 
 	// Press down to scroll.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 
-	if model.detailViewport.YOffset != 1 {
-		t.Errorf("Expected YOffset=1 after one down, got %d", model.detailViewport.YOffset)
+	if model.detailViewport.YOffset() != 1 {
+		t.Errorf("Expected YOffset=1 after one down, got %d", model.detailViewport.YOffset())
 	}
 
 	// Press up to scroll back.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	model = m.(*BoardModel)
 
-	if model.detailViewport.YOffset != 0 {
-		t.Errorf("Expected YOffset=0 after up, got %d", model.detailViewport.YOffset)
+	if model.detailViewport.YOffset() != 0 {
+		t.Errorf("Expected YOffset=0 after up, got %d", model.detailViewport.YOffset())
 	}
 }
 
@@ -2659,16 +2684,16 @@ func TestBoardModel_ReviewHelpBar(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Navigate to review column (index 4): two rights from in_progress (index 2), passing checks (index 3).
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 	model = m.(*BoardModel)
 
 	if model.selectedColumn != columnIndex(stateReview) {
 		t.Fatalf("Expected review column (%d), got %d", columnIndex(stateReview), model.selectedColumn)
 	}
 
-	reviewOutput := model.View()
+	reviewOutput := model.View().Content
 	if !strings.Contains(reviewOutput, "a approve") {
 		t.Errorf("Expected 'a approve' in help bar when in review column, got:\n%s", reviewOutput)
 	}
@@ -2677,10 +2702,10 @@ func TestBoardModel_ReviewHelpBar(t *testing.T) {
 	}
 
 	// Navigate away to in_progress.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	model = m.(*BoardModel)
 
-	nonReviewOutput := model.View()
+	nonReviewOutput := model.View().Content
 	if strings.Contains(nonReviewOutput, "a approve") {
 		t.Errorf("Did not expect 'a approve' in help bar when NOT in review column, got:\n%s", nonReviewOutput)
 	}
@@ -2795,7 +2820,7 @@ func TestBoardModel_ProjectSwitch(t *testing.T) {
 	}
 
 	// Press 'P' to open project switcher
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'P', Text: "P"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeProjectSwitch {
@@ -2803,7 +2828,7 @@ func TestBoardModel_ProjectSwitch(t *testing.T) {
 	}
 
 	// Navigate to second project
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 
 	if model.projectSwitchIndex != 1 {
@@ -2811,7 +2836,7 @@ func TestBoardModel_ProjectSwitch(t *testing.T) {
 	}
 
 	// Select the second project (press enter)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Verify project switched
@@ -2884,11 +2909,11 @@ func TestBoardModel_ProjectSwitchSameProject(t *testing.T) {
 	model.selectedIndex = 0
 
 	// Open project switcher
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'P', Text: "P"})
 	model = m.(*BoardModel)
 
 	// Select the same project (first one is already selected)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Verify project is still project1
@@ -2957,12 +2982,12 @@ func TestBoardModel_ProjectSwitchFetchesTerminalColumns(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Open the project switcher, move to project2, and select it.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'P', Text: "P"})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 	calls = nil
-	m, switchCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, switchCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if switchCmd == nil {
@@ -3024,7 +3049,7 @@ func TestBoardModel_ProjectNameInHeader(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify project name is in the header
 	if !strings.Contains(output, "My Test Project") {
@@ -3066,7 +3091,7 @@ func TestBoardModel_ProjectNameTruncation(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify the full name is truncated (should have ellipsis)
 	if strings.Contains(output, longName) {
@@ -3130,7 +3155,7 @@ func TestBoardModel_ProjectNameInDetailView(t *testing.T) {
 
 	// Open detail view
 	model.selectedTaskID = "task-detail-1"
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if detailCmd != nil {
@@ -3139,7 +3164,7 @@ func TestBoardModel_ProjectNameInDetailView(t *testing.T) {
 		model = m.(*BoardModel)
 	}
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify project name is in the detail view
 	if !strings.Contains(output, "Detail Test Project") {
@@ -3177,7 +3202,7 @@ func buildBlockedModel(t *testing.T, blockedClient *tuiclient.MockClient) *Board
 	// Navigate to the blocked column (index 7).
 	// Starting from in_progress (index 2), press right 5 times.
 	for i := 0; i < 5; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
@@ -3217,7 +3242,7 @@ func TestBoardModel_UnblockFlow(t *testing.T) {
 	model := buildBlockedModel(t, mockClient)
 
 	// Press 'u' to start unblock flow.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'u', Text: "u"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeUnblockNote {
@@ -3226,12 +3251,12 @@ func TestBoardModel_UnblockFlow(t *testing.T) {
 
 	// Type a note.
 	for _, ch := range "Dependency resolved" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Press enter to advance to confirm step.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeUnblockConfirm {
@@ -3239,7 +3264,7 @@ func TestBoardModel_UnblockFlow(t *testing.T) {
 	}
 
 	// Verify the render output contains the confirm prompt (non-empty).
-	output := model.View()
+	output := model.View().Content
 	if output == "" {
 		t.Errorf("Expected non-empty render output in modeUnblockConfirm, got blank")
 	}
@@ -3248,7 +3273,7 @@ func TestBoardModel_UnblockFlow(t *testing.T) {
 	}
 
 	// Press 'y' to confirm.
-	m, unblockCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, unblockCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -3281,7 +3306,7 @@ func TestBoardModel_UnblockFlow(t *testing.T) {
 	}
 
 	// Board should now show the task in ready.
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "ready(1)") {
 		t.Errorf("Expected ready(1) after unblock, got:\n%s", output)
 	}
@@ -3313,7 +3338,7 @@ func TestBoardModel_FailFlow(t *testing.T) {
 	model := buildBlockedModel(t, mockClient)
 
 	// Press 'f' to start fail flow.
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'f', Text: "f"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeFailNote {
@@ -3322,12 +3347,12 @@ func TestBoardModel_FailFlow(t *testing.T) {
 
 	// Type a note.
 	for _, ch := range "Unresolvable" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Press enter to advance to confirm step.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeFailConfirm {
@@ -3335,7 +3360,7 @@ func TestBoardModel_FailFlow(t *testing.T) {
 	}
 
 	// Verify the render output contains the confirm prompt (non-empty).
-	output := model.View()
+	output := model.View().Content
 	if output == "" {
 		t.Errorf("Expected non-empty render output in modeFailConfirm, got blank")
 	}
@@ -3344,7 +3369,7 @@ func TestBoardModel_FailFlow(t *testing.T) {
 	}
 
 	// Press 'y' to confirm.
-	m, failCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, failCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -3377,7 +3402,7 @@ func TestBoardModel_FailFlow(t *testing.T) {
 	}
 
 	// Board should now show the task in failed (not visible in blocked column anymore).
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "blocked(0)") {
 		t.Errorf("Expected blocked(0) after fail, got:\n%s", output)
 	}
@@ -3418,11 +3443,11 @@ func TestBoardModel_AbandonedTaskVisible(t *testing.T) {
 	// Navigate to the abandoned column (index 9).
 	// Starting from in_progress (index 2), press right 7 times.
 	for i := 0; i < 7; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify the abandoned column is visible with the correct count
 	if !strings.Contains(output, "abandoned(1)") {
@@ -3495,7 +3520,7 @@ func TestDetail_ViewportOffsetClamping(t *testing.T) {
 
 	// Open the long task detail.
 	model.selectedTaskID = "long-task"
-	m, detailCmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 	if detailCmd != nil {
 		msg := detailCmd()
@@ -3510,22 +3535,22 @@ func TestDetail_ViewportOffsetClamping(t *testing.T) {
 
 	// Scroll down in the long task to set a large YOffset.
 	for i := 0; i < 10; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		model = m.(*BoardModel)
 	}
-	largeOffset := model.detailViewport.YOffset
+	largeOffset := model.detailViewport.YOffset()
 	if largeOffset == 0 {
 		t.Fatalf("Expected YOffset > 0 after scrolling, got 0")
 	}
 	t.Logf("Scrolled to offset %d in long task", largeOffset)
 
 	// Go back to board.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	model = m.(*BoardModel)
 
 	// Open the short task detail. This should clamp the carried-over YOffset.
 	model.selectedTaskID = "short-task"
-	m, detailCmd = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, detailCmd = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 	if detailCmd != nil {
 		msg := detailCmd()
@@ -3539,7 +3564,7 @@ func TestDetail_ViewportOffsetClamping(t *testing.T) {
 	}
 
 	// The critical test: verify that the offset is clamped and doesn't exceed the valid range.
-	clampedOffset := model.detailViewport.YOffset
+	clampedOffset := model.detailViewport.YOffset()
 	maxValidOffset := max(0, model.detailViewport.TotalLineCount()-model.detailViewport.VisibleLineCount())
 	if clampedOffset > maxValidOffset {
 		t.Errorf("YOffset %d exceeds max valid %d for content with %d lines and viewport height %d",
@@ -3549,7 +3574,7 @@ func TestDetail_ViewportOffsetClamping(t *testing.T) {
 
 	// The final test: render the view without panicking.
 	// This will panic if the slice bounds are out of range.
-	output := model.View()
+	output := model.View().Content
 	if output == "" {
 		t.Errorf("Expected non-empty view output, got empty")
 	}
@@ -3598,7 +3623,7 @@ func TestBoardModel_ColumnScrolling(t *testing.T) {
 
 	// Navigate to done column (4 rights from in_progress at index 2)
 	for i := 0; i < 4; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
@@ -3616,7 +3641,7 @@ func TestBoardModel_ColumnScrolling(t *testing.T) {
 
 	// Navigate down several times
 	for i := 0; i < 8; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		model = m.(*BoardModel)
 	}
 
@@ -3630,7 +3655,7 @@ func TestBoardModel_ColumnScrolling(t *testing.T) {
 	}
 
 	// Verify the selected task is visible in the rendered output
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Done Task 8") {
 		t.Errorf("Expected 'Done Task 8' (selected task) in view output, got:\n%s", output)
 	}
@@ -3681,12 +3706,12 @@ func TestBoardModel_DoneTabScrollingRendering(t *testing.T) {
 
 	// Navigate to done column (4 rights from in_progress at index 2)
 	for i := 0; i < 4; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
 	// Get initial rendering: should show tasks 0-1 (2 tasks visible with height=10)
-	initialOutput := model.View()
+	initialOutput := model.View().Content
 
 	// Verify initial state shows tasks 0-1
 	if !strings.Contains(initialOutput, "Done Task 0") {
@@ -3703,12 +3728,12 @@ func TestBoardModel_DoneTabScrollingRendering(t *testing.T) {
 
 	// Now scroll down by selecting a task further down (move down 2 times to reach task-done-2)
 	for i := 0; i < 2; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		model = m.(*BoardModel)
 	}
 
 	// Get rendering after scrolling
-	scrolledOutput := model.View()
+	scrolledOutput := model.View().Content
 
 	// After scrolling to task 2, the window should show tasks 1-2
 	if !strings.Contains(scrolledOutput, "Done Task 1") {
@@ -3766,13 +3791,13 @@ func TestBoardModel_ScrollResetOnColumnChange(t *testing.T) {
 
 	// Navigate to done column
 	for i := 0; i < 4; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
 	// Scroll down several times
 	for i := 0; i < 6; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		model = m.(*BoardModel)
 	}
 
@@ -3785,7 +3810,7 @@ func TestBoardModel_ScrollResetOnColumnChange(t *testing.T) {
 	}
 
 	// Now navigate left (back to review or approved column)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	model = m.(*BoardModel)
 
 	// Both scrollOffset and selectedIndex should be reset to 0
@@ -3847,7 +3872,7 @@ func TestBoardModel_ArchiveTaskFlow_ConfirmY(t *testing.T) {
 	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Press 'z' to start archive
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'z', Text: "z"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeArchiveTaskConfirm {
@@ -3855,13 +3880,13 @@ func TestBoardModel_ArchiveTaskFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Verify the confirm prompt is shown
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Archive") {
 		t.Errorf("Expected archive confirm prompt in view, got:\n%s", output)
 	}
 
 	// Press 'y' to confirm
-	m, archiveCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, archiveCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -3935,7 +3960,7 @@ func TestBoardModel_ArchiveTaskFlow_ConfirmN(t *testing.T) {
 	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Press 'z' to start archive
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'z', Text: "z"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeArchiveTaskConfirm {
@@ -3943,7 +3968,7 @@ func TestBoardModel_ArchiveTaskFlow_ConfirmN(t *testing.T) {
 	}
 
 	// Press 'n' to cancel
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'n', Text: "n"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -3997,7 +4022,7 @@ func TestBoardModel_ArchiveTaskNoBareKeypress(t *testing.T) {
 	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Pressing any key other than 'z' should not trigger archive
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'a', Text: "a"})
 	model = m.(*BoardModel)
 
 	if model.mode == modeArchiveTaskConfirm {
@@ -4048,7 +4073,7 @@ func TestBoardModel_ArchiveProjectFlow_ConfirmY(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Open project switcher with 'P'
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'P', Text: "P"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeProjectSwitch {
@@ -4056,11 +4081,11 @@ func TestBoardModel_ArchiveProjectFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Select project 2 with down arrow
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 
 	// Press 'z' to start archive
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'z', Text: "z"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeArchiveProjectConfirm {
@@ -4068,13 +4093,13 @@ func TestBoardModel_ArchiveProjectFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Verify the confirm prompt is shown
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Archive project?") {
 		t.Errorf("Expected 'Archive project?' prompt in view, got:\n%s", output)
 	}
 
 	// Press 'y' to confirm
-	m, archiveCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, archiveCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -4130,15 +4155,15 @@ func TestBoardModel_ArchiveProjectFlow_CancelWithN(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Open project switcher
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'P', Text: "P"})
 	model = m.(*BoardModel)
 
 	// Move to second project
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 
 	// Press 'z' to start archive
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'z', Text: "z"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeArchiveProjectConfirm {
@@ -4146,7 +4171,7 @@ func TestBoardModel_ArchiveProjectFlow_CancelWithN(t *testing.T) {
 	}
 
 	// Press 'n' to cancel
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'n', Text: "n"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -4208,7 +4233,7 @@ func TestBoardModel_HoldTaskFlow_ConfirmY(t *testing.T) {
 	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Press 't' to start hold
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 't', Text: "t"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeHoldTaskConfirm {
@@ -4216,13 +4241,13 @@ func TestBoardModel_HoldTaskFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Verify the confirm prompt is shown
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Hold") {
 		t.Errorf("Expected hold confirm prompt in view, got:\n%s", output)
 	}
 
 	// Press 'y' to confirm
-	m, holdCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, holdCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -4249,7 +4274,7 @@ func TestBoardModel_HoldTaskFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Verify [HELD] marker appears in the board view after hold and refetch
-	boardOutput := model.View()
+	boardOutput := model.View().Content
 	if !strings.Contains(boardOutput, "[HELD]") {
 		t.Errorf("Expected [HELD] marker to appear after hold and refetch.\nOutput:\n%s", boardOutput)
 	}
@@ -4305,13 +4330,13 @@ func TestBoardModel_ReleaseTaskFlow_ConfirmY(t *testing.T) {
 	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Verify [HELD] marker is visible before release
-	boardOutputBefore := model.View()
+	boardOutputBefore := model.View().Content
 	if !strings.Contains(boardOutputBefore, "[HELD]") {
 		t.Errorf("Expected [HELD] marker before release.\nOutput:\n%s", boardOutputBefore)
 	}
 
 	// Press 't' to start release (since task is held)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 't', Text: "t"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeReleaseTaskConfirm {
@@ -4319,13 +4344,13 @@ func TestBoardModel_ReleaseTaskFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Verify the confirm prompt is shown
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Release") {
 		t.Errorf("Expected release confirm prompt in view, got:\n%s", output)
 	}
 
 	// Press 'y' to confirm
-	m, releaseCmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, releaseCmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -4352,7 +4377,7 @@ func TestBoardModel_ReleaseTaskFlow_ConfirmY(t *testing.T) {
 	}
 
 	// Verify [HELD] marker disappears in the board view after release and refetch
-	boardOutputAfter := model.View()
+	boardOutputAfter := model.View().Content
 	if strings.Contains(boardOutputAfter, "[HELD]") {
 		t.Errorf("Expected [HELD] marker to disappear after release and refetch.\nOutput:\n%s", boardOutputAfter)
 	}
@@ -4402,7 +4427,7 @@ func TestBoardModel_HoldTaskFlow_ConfirmN(t *testing.T) {
 	model.selectedColumn = findColumnIndex(stateReady)
 
 	// Press 't' to start hold
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 't', Text: "t"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeHoldTaskConfirm {
@@ -4410,7 +4435,7 @@ func TestBoardModel_HoldTaskFlow_ConfirmN(t *testing.T) {
 	}
 
 	// Press 'n' to cancel
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'n', Text: "n"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -4461,10 +4486,10 @@ func TestBoardModel_ModelVisibilityInList(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Navigate to ready column
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify that model badges are visible in the list
 	if !strings.Contains(output, "[opus]") {
@@ -4508,7 +4533,7 @@ func TestDetailView_ModelVisibility(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Press enter to enter detail view mode (should set mode to modeDetail)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Now simulate task detail fetch
@@ -4525,7 +4550,7 @@ func TestDetailView_ModelVisibility(t *testing.T) {
 	})
 	model = m.(*BoardModel)
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify that model is visible in the detail view
 	if !strings.Contains(output, "Model: opus") {
@@ -4577,7 +4602,7 @@ func TestBoardModel_ProjectSwitcher_ShowsNewProjects(t *testing.T) {
 	}
 
 	// Press 'P' to open project switcher — this should issue a fetchProjects
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'P', Text: "P"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeProjectSwitch {
@@ -4609,7 +4634,7 @@ func TestBoardModel_ProjectSwitcher_ShowsNewProjects(t *testing.T) {
 	}
 
 	// Verify the rendered View contains the new project
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Project 3") {
 		t.Errorf("Expected 'Project 3' to appear in project switcher View(), got:\n%s", output)
 	}
@@ -4664,7 +4689,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 
 	// Navigate to done column (4 right presses from in_progress at index 2)
 	for i := 0; i < 4; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
 
@@ -4688,7 +4713,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 	}
 
 	// Verify initial render shows only tasks 0-3 (4 tasks, no overflow).
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "task-0") {
 		t.Errorf("Expected task-0 in initial render, got:\n%s", output)
 	}
@@ -4701,7 +4726,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 	}
 
 	// Navigate down to task-1 (no scroll yet, still in the window).
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 	if model.selectedTaskID != "task-1" {
 		t.Errorf("Expected selection task-1, got %s", model.selectedTaskID)
@@ -4712,7 +4737,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 
 	// Navigate down to task-4 (4 downs from task-0).
 	for i := 0; i < 3; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		model = m.(*BoardModel)
 	}
 	if model.selectedTaskID != "task-4" {
@@ -4726,7 +4751,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 	}
 
 	// Verify render now shows tasks 1-4 (window starts at scrollOffset=1).
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "task-1") {
 		t.Errorf("Expected task-1 in scrolled render, got:\n%s", output)
 	}
@@ -4744,7 +4769,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 
 	// Continue navigating down to task-9 (the last task).
 	for i := 0; i < 5; i++ {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		model = m.(*BoardModel)
 	}
 	if model.selectedTaskID != "task-9" {
@@ -4758,7 +4783,7 @@ func TestBoardModel_RenderWindowingAndScroll(t *testing.T) {
 		t.Errorf("Expected scrollOffset=%d at task-9, got %d", expectedScrollOffset, model.scrollOffset)
 	}
 
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "task-6") {
 		t.Errorf("Expected task-6 in final render, got:\n%s", output)
 	}
@@ -4849,7 +4874,7 @@ func TestBoardModel_HeldMarkerRendering(t *testing.T) {
 	model.selectedColumn = findColumnIndex(stateReady)
 	model.selectedTaskID = "ready-ta"
 
-	output := model.View()
+	output := model.View().Content
 
 	// Assert selected held row format: "▸ ready-ta [haiku] [HELD] P:500  Held Task"
 	if !strings.Contains(output, "▸ ready-ta [haiku] [HELD] P:500  Held Task") {
@@ -4898,7 +4923,7 @@ func TestBoardModel_HeldMarkerLongTitle(t *testing.T) {
 	model = m.(*BoardModel)
 	model.selectedColumn = findColumnIndex(stateReady)
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify [HELD] marker appears (it comes before the long title, so it won't be pushed off)
 	if !strings.Contains(output, "[HELD]") {
@@ -4949,7 +4974,7 @@ func TestBoardModel_HeldMarkerNonReadyState(t *testing.T) {
 	model = m.(*BoardModel)
 	model.selectedColumn = findColumnIndex(stateInProgress)
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify [HELD] marker appears in in_progress state
 	if !strings.Contains(output, "[HELD]") {
@@ -4994,7 +5019,7 @@ func TestBoardModel_SetPriorityFlow_ValidInput(t *testing.T) {
 	})
 
 	// Press 'i' to enter set priority input mode
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'i', Text: "i"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeSetPriorityInput {
@@ -5002,19 +5027,19 @@ func TestBoardModel_SetPriorityFlow_ValidInput(t *testing.T) {
 	}
 
 	// Verify view shows input prompt
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Set priority — enter a value (1-1000)") {
 		t.Errorf("Expected set priority prompt in view, got:\n%s", output)
 	}
 
 	// Type priority 750
 	for _, ch := range "750" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Press enter to move to reason input
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeSetPriorityReason {
@@ -5022,19 +5047,19 @@ func TestBoardModel_SetPriorityFlow_ValidInput(t *testing.T) {
 	}
 
 	// Verify view shows reason prompt
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "reason (required)") {
 		t.Errorf("Expected reason prompt in view, got:\n%s", output)
 	}
 
 	// Type reason
 	for _, ch := range "important feature" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Press enter to move to confirmation
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeSetPriorityConfirm {
@@ -5042,13 +5067,13 @@ func TestBoardModel_SetPriorityFlow_ValidInput(t *testing.T) {
 	}
 
 	// Verify confirm view shows the priority value
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "Set priority to 750") {
 		t.Errorf("Expected priority value 750 in confirm view, got:\n%s", output)
 	}
 
 	// Confirm with 'y'
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// Mode should be back to normal after confirmation
@@ -5120,17 +5145,17 @@ func TestBoardModel_SetPriorityFlow_InvalidInputs(t *testing.T) {
 			})
 
 			// Press 'i' to enter set priority mode
-			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+			m, _ := model.Update(tea.KeyPressMsg{Code: 'i', Text: "i"})
 			model = m.(*BoardModel)
 
 			// Type the invalid input
 			for _, ch := range tt.input {
-				m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+				m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 				model = m.(*BoardModel)
 			}
 
 			// Press enter (should reject)
-			m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 			model = m.(*BoardModel)
 
 			// Should still be in input mode with error hint
@@ -5142,7 +5167,7 @@ func TestBoardModel_SetPriorityFlow_InvalidInputs(t *testing.T) {
 			}
 
 			// Verify error is visible in view
-			output := model.View()
+			output := model.View().Content
 			if !strings.Contains(output, tt.wantErr) {
 				t.Errorf("Expected error %q in view output, got:\n%s", tt.wantErr, output)
 			}
@@ -5177,7 +5202,7 @@ func TestBoardModel_MoveToFrontFlow(t *testing.T) {
 	})
 
 	// Press 'w' to enter move to front reason mode
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'w', Text: "w"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeMoveToFrontReason {
@@ -5185,19 +5210,19 @@ func TestBoardModel_MoveToFrontFlow(t *testing.T) {
 	}
 
 	// Verify view shows reason prompt
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Move to front — reason (required)") {
 		t.Errorf("Expected move to front prompt in view, got:\n%s", output)
 	}
 
 	// Type reason
 	for _, ch := range "blocking other tasks" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Press enter to move to confirmation
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeMoveToFrontConfirm {
@@ -5205,13 +5230,13 @@ func TestBoardModel_MoveToFrontFlow(t *testing.T) {
 	}
 
 	// Verify confirm view
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "Move") || !strings.Contains(output, "to front?") {
 		t.Errorf("Expected move to front confirm prompt in view, got:\n%s", output)
 	}
 
 	// Confirm with 'y'
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// Mode should be back to normal
@@ -5252,7 +5277,7 @@ func TestBoardModel_PriorityDisplay(t *testing.T) {
 		{ID: "task-1500", Title: "Server assigned", State: "ready", Priority: intPtr(1500)}, // P:1500
 	})
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify default priority display
 	if !strings.Contains(output, "P:500") {
@@ -5294,29 +5319,29 @@ func TestBoardModel_ActionKeyPreservation(t *testing.T) {
 	})
 
 	// First attempt: press 'i' and go through the flow
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'i', Text: "i"})
 	model = m.(*BoardModel)
 
 	// Type priority
 	for _, ch := range "750" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Move to reason
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Type reason and confirm
 	for _, ch := range "test" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Confirm
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// Execute
@@ -5340,7 +5365,7 @@ func TestBoardModel_DetailViewKeyboardHelp(t *testing.T) {
 	})
 
 	// Navigate to detail view
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeDetail {
@@ -5348,7 +5373,7 @@ func TestBoardModel_DetailViewKeyboardHelp(t *testing.T) {
 	}
 
 	// Get the help bar
-	output := model.View()
+	output := model.View().Content
 
 	// Verify priority action keys are listed
 	if !strings.Contains(output, "i set priority") {
@@ -5389,7 +5414,7 @@ func TestBoardModel_ResetPriorityFlow(t *testing.T) {
 	})
 
 	// Press 'e' to enter reset priority reason mode
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: 'e', Text: "e"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeResetPriorityReason {
@@ -5397,30 +5422,30 @@ func TestBoardModel_ResetPriorityFlow(t *testing.T) {
 	}
 
 	// Verify view shows reset reason prompt
-	output := model.View()
+	output := model.View().Content
 	if !strings.Contains(output, "Reset priority to 500 — reason (required)") {
 		t.Errorf("Expected reset priority reason prompt in view, got:\n%s", output)
 	}
 
 	// Submitting an empty reason keeps the prompt and shows a hint
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 	if model.mode != modeResetPriorityReason {
 		t.Fatalf("Expected to remain in modeResetPriorityReason on empty reason, got %d", model.mode)
 	}
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "hint:") || !strings.Contains(output, "Reset priority to 500 — reason (required)") {
 		t.Errorf("Expected reset reason prompt with hint after empty reason, got:\n%s", output)
 	}
 
 	// Type reason
 	for _, ch := range "no longer urgent" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Press enter to move to confirmation
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	if model.mode != modeResetPriorityConfirm {
@@ -5428,7 +5453,7 @@ func TestBoardModel_ResetPriorityFlow(t *testing.T) {
 	}
 
 	// Verify confirm view
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "Reset priority to 500 for task-1? [y/N]") {
 		t.Errorf("Expected reset priority confirm prompt in view, got:\n%s", output)
 	}
@@ -5437,7 +5462,7 @@ func TestBoardModel_ResetPriorityFlow(t *testing.T) {
 	}
 
 	// Confirm with 'y'
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// Mode should be back to normal
@@ -5449,7 +5474,7 @@ func TestBoardModel_ResetPriorityFlow(t *testing.T) {
 	model = executeReviewCmd(t, model, cmd)
 
 	// Verify the refreshed board shows the reset value
-	output = model.View()
+	output = model.View().Content
 	if !strings.Contains(output, "P:500") {
 		t.Errorf("Expected refreshed list to show P:500 after reset, got:\n%s", output)
 	}
@@ -5500,11 +5525,11 @@ func TestDetailView_ResetPriorityFlow(t *testing.T) {
 	})
 
 	// Enter detail view
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Press 'e' for reset priority from detail
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'e', Text: "e"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeResetPriorityReason {
@@ -5513,14 +5538,14 @@ func TestDetailView_ResetPriorityFlow(t *testing.T) {
 
 	// Type reason
 	for _, ch := range "test" {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		model = m.(*BoardModel)
 	}
 
 	// Confirm
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	model = m.(*BoardModel)
 
 	// Execute
@@ -5603,7 +5628,7 @@ func TestDetailView_PriorityFlowsRenderPrompts(t *testing.T) {
 				model := buildBoardModelWithTasks(t, mockClient, []tuiclient.Task{
 					{ID: "task-1", Title: "Task", State: "ready", Priority: intPtr(750)},
 				})
-				m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+				m, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 				model = m.(*BoardModel)
 				if cmd != nil {
 					model = executeCmd(t, model, cmd)
@@ -5615,15 +5640,15 @@ func TestDetailView_PriorityFlowsRenderPrompts(t *testing.T) {
 			}
 			typeText := func(model *BoardModel, text string) *BoardModel {
 				for _, ch := range text {
-					m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+					m, _ := model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 					model = m.(*BoardModel)
 				}
-				m, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+				m, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 				return m.(*BoardModel)
 			}
 			assertView := func(model *BoardModel, want string) {
 				t.Helper()
-				output := model.View()
+				output := model.View().Content
 				if strings.TrimSpace(output) == "" {
 					t.Fatalf("Expected non-empty view while expecting %q", want)
 				}
@@ -5637,7 +5662,7 @@ func TestDetailView_PriorityFlowsRenderPrompts(t *testing.T) {
 			assertView(model, "Priority: 750")
 
 			// Walk the flow, asserting each overlay.
-			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{tt.startKey}})
+			m, _ := model.Update(tea.KeyPressMsg{Code: tt.startKey, Text: string(tt.startKey)})
 			model = m.(*BoardModel)
 			if tt.valuePrompt != "" {
 				assertView(model, tt.valuePrompt)
@@ -5649,7 +5674,7 @@ func TestDetailView_PriorityFlowsRenderPrompts(t *testing.T) {
 			assertView(model, "(y to confirm, n/esc to cancel)")
 
 			// Declining returns to the detail view with its content visible.
-			m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+			m, _ = model.Update(tea.KeyPressMsg{Code: 'n', Text: "n"})
 			model = m.(*BoardModel)
 			if model.mode != modeDetail {
 				t.Fatalf("Expected modeDetail after declining, got %d", model.mode)
@@ -5659,13 +5684,13 @@ func TestDetailView_PriorityFlowsRenderPrompts(t *testing.T) {
 
 			// Run the flow again and confirm: the refreshed board shows status and the new value.
 			model = enterDetail()
-			m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{tt.startKey}})
+			m, _ = model.Update(tea.KeyPressMsg{Code: tt.startKey, Text: string(tt.startKey)})
 			model = m.(*BoardModel)
 			if tt.valuePrompt != "" {
 				model = typeText(model, tt.value)
 			}
 			model = typeText(model, "operator request")
-			m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+			m, cmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 			model = m.(*BoardModel)
 			model = executeReviewCmd(t, model, cmd)
 			if model.mode != modeNormal {
@@ -5673,8 +5698,8 @@ func TestDetailView_PriorityFlowsRenderPrompts(t *testing.T) {
 			}
 			assertView(model, tt.wantStatus)
 			assertView(model, fmt.Sprintf("P:%d", tt.resultValue))
-			if strings.Contains(model.View(), "Error:") {
-				t.Errorf("Expected no error screen after successful detail action, got:\n%s", model.View())
+			if strings.Contains(model.View().Content, "Error:") {
+				t.Errorf("Expected no error screen after successful detail action, got:\n%s", model.View().Content)
 			}
 		})
 	}
@@ -5703,17 +5728,17 @@ func TestBoardModel_ManualInputErrors(t *testing.T) {
 			})
 
 			// Start set priority
-			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+			m, _ := model.Update(tea.KeyPressMsg{Code: 'i', Text: "i"})
 			model = m.(*BoardModel)
 
 			// Type invalid input
 			for _, ch := range tt.input {
-				m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+				m, _ = model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 				model = m.(*BoardModel)
 			}
 
 			// Try to proceed
-			m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 			model = m.(*BoardModel)
 
 			// Should still be in input mode (not moved to reason)
@@ -5722,7 +5747,7 @@ func TestBoardModel_ManualInputErrors(t *testing.T) {
 			}
 
 			// Check error hint is shown
-			output := model.View()
+			output := model.View().Content
 			if tt.wantError && !strings.Contains(output, tt.errorHint) {
 				t.Errorf("Expected error hint %q in output for input %q, got:\n%s", tt.errorHint, tt.input, output)
 			}
@@ -5739,7 +5764,7 @@ func TestBoardModel_PriorityDisplayWithTopicAnchor(t *testing.T) {
 		{ID: "task-2", Title: "Task without anchor", State: "ready", Priority: intPtr(500)},
 	})
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify topic anchor is displayed
 	if !strings.Contains(output, "[anchor:api-feat]") {
@@ -5771,7 +5796,7 @@ func TestDetailView_HeldPlusPriority(t *testing.T) {
 	})
 
 	// Enter detail view
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = m.(*BoardModel)
 
 	// Execute the fetch command
@@ -5779,7 +5804,7 @@ func TestDetailView_HeldPlusPriority(t *testing.T) {
 		model = executeCmd(t, model, cmd)
 	}
 
-	output := model.View()
+	output := model.View().Content
 
 	// Verify both priority and held status are shown
 	if !strings.Contains(output, "Priority: 750") {
@@ -5796,19 +5821,19 @@ func priorityTestFlow(t *testing.T, model *BoardModel, startKey rune, value, rea
 	t.Helper()
 	typeText := func(text string) {
 		for _, ch := range text {
-			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+			m, _ := model.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 			model = m.(*BoardModel)
 		}
-		m, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		model = m.(*BoardModel)
 	}
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{startKey}})
+	m, _ := model.Update(tea.KeyPressMsg{Code: startKey, Text: string(startKey)})
 	model = m.(*BoardModel)
 	if value != "" {
 		typeText(value)
 	}
 	typeText(reason)
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'y', Text: "y"})
 	return m.(*BoardModel), cmd
 }
 
@@ -5999,7 +6024,7 @@ func TestBoardModel_ActionKeyTiedToRequest(t *testing.T) {
 	// Different action on the same task, then the same action on a different task.
 	model, cmd = priorityTestFlow(t, model, 'w', "", "urgent")
 	model = executeReviewCmd(t, model, cmd)
-	m, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = m.(*BoardModel)
 	model, cmd = priorityTestFlow(t, model, 'w', "", "urgent")
 	model = executeReviewCmd(t, model, cmd)
@@ -6012,9 +6037,9 @@ func TestBoardModel_ActionKeyTiedToRequest(t *testing.T) {
 	}
 
 	// Explicit cancel clears the remembered attempt.
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	m, _ = model.Update(tea.KeyPressMsg{Code: 'i', Text: "i"})
 	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	model = m.(*BoardModel)
 	if model.lastPriorityAttempt.key != "" || model.pendingPriority != 0 || model.pendingPriorityReason != "" {
 		t.Errorf("Expected priority state cleared on cancel, got %+v", model.lastPriorityAttempt)
@@ -6119,7 +6144,7 @@ func TestBoardModel_SuccessfulPriorityActionKeepsRefreshedListVisible(t *testing
 			model, cmd := priorityTestFlow(t, model, tc.startKey, tc.value, "because")
 			model = executeReviewCmd(t, model, cmd)
 
-			output := model.View()
+			output := model.View().Content
 			if strings.Contains(output, "Error:") || strings.Contains(output, "Press 'r' to retry") {
 				t.Errorf("Success rendered as an error:\n%s", output)
 			}
@@ -6130,8 +6155,8 @@ func TestBoardModel_SuccessfulPriorityActionKeepsRefreshedListVisible(t *testing
 				t.Errorf("Expected refreshed list row with %q in view:\n%s", tc.wantRow, output)
 			}
 
-			m, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
-			if strings.Contains(m.(*BoardModel).View(), tc.wantStatus) {
+			m, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+			if strings.Contains(m.(*BoardModel).View().Content, tc.wantStatus) {
 				t.Errorf("Status should clear on next keypress")
 			}
 		})
@@ -6198,10 +6223,10 @@ func TestChecksTask_RenderedOutput(t *testing.T) {
 	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
 	model = m.(*BoardModel)
 	for model.selectedColumn < columnIndex(stateChecks) {
-		m, _ = model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
 		model = m.(*BoardModel)
 	}
-	out := model.View()
+	out := model.View().Content
 	ip, ch, rv := strings.Index(out, "in_progress("), strings.Index(out, "checks(2)"), strings.Index(out, "review(")
 	if ip < 0 || ch < ip || rv < ch {
 		t.Fatalf("expected tabs in_progress < checks(2) < review, got:\n%s", out)

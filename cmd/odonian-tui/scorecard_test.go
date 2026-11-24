@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 // TestBoardModel_ScorecardMode_Normal tests the normal scorecard flow: press 'c', loading state, then data display.
@@ -48,7 +48,7 @@ func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Press 'c' to enter scorecard mode
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
 	model = m.(*BoardModel)
 
 	// Check that we're in scorecard mode and showing loading state
@@ -56,7 +56,7 @@ func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
 		t.Errorf("expected mode to be modeScorecards, got %d", model.mode)
 	}
 
-	view := model.View()
+	view := model.View().Content
 	if !strings.Contains(view, "Loading scorecards…") {
 		t.Errorf("expected 'Loading scorecards…' in view during loading state, got:\n%s", view)
 	}
@@ -77,7 +77,7 @@ func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Check that the view now shows the scorecard content
-	view = model.View()
+	view = model.View().Content
 	if !strings.Contains(view, "opus") {
 		t.Errorf("expected 'opus' in view after fetch, got:\n%s", view)
 	}
@@ -89,7 +89,7 @@ func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
 	}
 
 	// Test pressing 'esc' to return to board
-	m, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	model = m.(*BoardModel)
 
 	if model.mode != modeNormal {
@@ -97,10 +97,10 @@ func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
 	}
 
 	// Test reopening scorecards after exiting - should show loading state
-	m, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m, cmd = model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
 	model = m.(*BoardModel)
 
-	view = model.View()
+	view = model.View().Content
 	if !strings.Contains(view, "Loading scorecards…") {
 		t.Errorf("expected 'Loading scorecards…' in view when reopening scorecards, got:\n%s", view)
 	}
@@ -129,7 +129,7 @@ func TestBoardModel_ScorecardMode_Empty(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Press 'c' to enter scorecard mode
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
 	model = m.(*BoardModel)
 
 	if cmd == nil {
@@ -147,7 +147,7 @@ func TestBoardModel_ScorecardMode_Empty(t *testing.T) {
 	m, _ = model.Update(scorecardMsg)
 	model = m.(*BoardModel)
 
-	view := model.View()
+	view := model.View().Content
 	if !strings.Contains(view, "No research tasks") {
 		t.Errorf("expected 'No research tasks' in view for empty scorecards, got:\n%s", view)
 	}
@@ -188,7 +188,7 @@ func TestBoardModel_ScorecardMode_Sparse(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Press 'c' to enter scorecard mode
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
 	model = m.(*BoardModel)
 
 	if cmd == nil {
@@ -206,7 +206,7 @@ func TestBoardModel_ScorecardMode_Sparse(t *testing.T) {
 	m, _ = model.Update(scorecardMsg)
 	model = m.(*BoardModel)
 
-	view := model.View()
+	view := model.View().Content
 	if !strings.Contains(view, "sonnet") {
 		t.Errorf("expected 'sonnet' in view for sparse data, got:\n%s", view)
 	}
@@ -239,7 +239,7 @@ func TestBoardModel_ScorecardMode_APIError(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Press 'c' to enter scorecard mode
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
 	model = m.(*BoardModel)
 
 	if model.mode != modeScorecards {
@@ -266,7 +266,7 @@ func TestBoardModel_ScorecardMode_APIError(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Check that the view shows the error message
-	view := model.View()
+	view := model.View().Content
 	if !strings.Contains(view, "Error:") {
 		t.Errorf("expected 'Error:' in view after API error, got:\n%s", view)
 	}
@@ -332,7 +332,7 @@ func TestBoardModel_ScorecardMode_Refresh(t *testing.T) {
 	model = m.(*BoardModel)
 
 	// Press 'c' to enter scorecard mode
-	m, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
 	model = m.(*BoardModel)
 
 	// Execute the fetch command
@@ -346,17 +346,17 @@ func TestBoardModel_ScorecardMode_Refresh(t *testing.T) {
 	m, _ = model.Update(scorecardMsg)
 	model = m.(*BoardModel)
 
-	view := model.View()
+	view := model.View().Content
 	if !strings.Contains(view, "opus") {
 		t.Errorf("expected 'opus' in view after initial fetch")
 	}
 
 	// Press 'r' to refresh
-	m, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m, cmd = model.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
 	model = m.(*BoardModel)
 
 	// Check that we're showing loading state during refresh
-	view = model.View()
+	view = model.View().Content
 	if !strings.Contains(view, "Loading scorecards…") {
 		t.Errorf("expected 'Loading scorecards…' in view during refresh, got:\n%s", view)
 	}
@@ -376,7 +376,7 @@ func TestBoardModel_ScorecardMode_Refresh(t *testing.T) {
 	m, _ = model.Update(scorecardMsg)
 	model = m.(*BoardModel)
 
-	view = model.View()
+	view = model.View().Content
 	if !strings.Contains(view, "sonnet") {
 		t.Errorf("expected 'sonnet' in view after refresh")
 	}

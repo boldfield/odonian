@@ -10,10 +10,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 // commandContextFunc is the function used to create exec commands (made mockable for testing).
@@ -396,12 +396,12 @@ func (m *BoardModel) initDetailViewport(task tuiclient.TaskDetail) {
 		vpHeight = 3
 	}
 
-	vp := viewport.New(m.width, vpHeight)
+	vp := viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(vpHeight))
 	vp.SetContent(content)
 	// Preserve scroll position on resize, but clamp to the new content's valid range.
-	if m.detailViewport.YOffset > 0 {
+	if m.detailViewport.YOffset() > 0 {
 		maxOffset := max(0, vp.TotalLineCount()-vp.VisibleLineCount())
-		clampedOffset := min(m.detailViewport.YOffset, maxOffset)
+		clampedOffset := min(m.detailViewport.YOffset(), maxOffset)
 		vp.SetYOffset(clampedOffset)
 	}
 	m.detailViewport = vp
