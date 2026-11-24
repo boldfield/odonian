@@ -200,7 +200,7 @@ func DefaultKeyBindings() KeyBindings {
 			bind(actUnblock, "u", "u", "unblock").inPanes(paneItems).inStates(stateBlocked),
 			bind(actFail, "f", "f", "fail").inPanes(paneItems).inStates(stateBlocked),
 
-			bind(actEnter, "enter", "enter", "detail").inPanes(paneItems),
+			bind(actEnter, "enter", "enter", "detail").inPanes(paneItems, panePreview),
 			bind(actOpenProject, "enter", "enter", "open").inPanes(paneProjects),
 			bind(actNextPane, "tab", "tab", "pane"),
 			bind(actPrevPane, "shift+tab", "", "").hidden(),

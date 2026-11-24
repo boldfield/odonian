@@ -104,35 +104,36 @@ func (p *ProjectsPane) Init() tea.Cmd {
 
 // Update handles user input for the projects pane.
 func (p *ProjectsPane) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyPressMsg:
+	if msg, ok := msg.(tea.KeyPressMsg); ok {
 		switch msg.String() {
 		case "up", "k":
-			if p.selectedIndex > 0 {
-				p.selectedIndex--
-				p.ensureSelectionVisible()
-				selectedID := p.SelectedProjectID()
-				return p, func() tea.Msg {
-					return ProjectSelected{ProjectID: selectedID}
-				}
-			}
+			return p, p.Move(-1)
 		case "down", "j":
-			if p.selectedIndex < len(p.projects)-1 {
-				p.selectedIndex++
-				p.ensureSelectionVisible()
-				selectedID := p.SelectedProjectID()
-				return p, func() tea.Msg {
-					return ProjectSelected{ProjectID: selectedID}
-				}
-			}
+			return p, p.Move(1)
 		case "enter":
-			selectedID := p.SelectedProjectID()
-			return p, func() tea.Msg {
-				return ProjectSelected{ProjectID: selectedID}
-			}
+			return p, p.Open()
 		}
 	}
 	return p, nil
+}
+
+// Move shifts the selection by delta rows and reports the new selection.
+func (p *ProjectsPane) Move(delta int) tea.Cmd {
+	next := p.selectedIndex + delta
+	if next < 0 || next >= len(p.projects) {
+		return nil
+	}
+	p.selectedIndex = next
+	p.ensureSelectionVisible()
+	return p.Open()
+}
+
+// Open reports the selected project as chosen.
+func (p *ProjectsPane) Open() tea.Cmd {
+	selectedID := p.SelectedProjectID()
+	return func() tea.Msg {
+		return ProjectSelected{ProjectID: selectedID}
+	}
 }
 
 // View renders the projects pane.

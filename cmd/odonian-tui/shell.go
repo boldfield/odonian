@@ -220,22 +220,22 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 			s.focus = paneItems
 		}
 	case actUp, actDown:
+		delta := 1
+		if act == actUp {
+			delta = -1
+		}
 		if s.focus == panePreview && m.shellLayout().PreviewWidth > 0 {
-			if act == actUp {
-				s.preview.Scroll(-1)
-			} else {
-				s.preview.Scroll(1)
-			}
+			s.preview.Scroll(delta)
 		} else if m.effectiveFocus() == paneProjects {
-			_, cmd = s.projects.Update(msg)
+			cmd = s.projects.Move(delta)
 		} else {
-			_, cmd = s.items.Update(msg)
+			cmd = s.items.Move(delta)
 			m.syncShellSelection()
 		}
 		return m, cmd, true
 	case actOpenProject:
 		if s.projectsVisible(m) {
-			_, cmd = s.projects.Update(msg)
+			cmd = s.projects.Open()
 			s.focus = paneItems
 		}
 		return m, cmd, true

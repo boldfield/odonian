@@ -303,3 +303,35 @@ func key2msg(s string) tea.KeyPressMsg {
 	}
 	return key(s)
 }
+
+func TestShellNavigationComesFromBindings(t *testing.T) {
+	f := newActionFixture(t)
+	for i := range f.model.keyBindings.Shell {
+		e := &f.model.keyBindings.Shell[i]
+		if e.act == actDown {
+			e.bind.SetKeys("y")
+		}
+	}
+	first := f.model.shell.items.SelectedTaskID()
+	f.press("j")
+	if f.model.shell.items.SelectedTaskID() != first {
+		t.Error("the old key still moves after rebinding")
+	}
+	f.press("y")
+	if f.model.shell.items.SelectedTaskID() == first {
+		t.Error("the rebound key did not move the selection")
+	}
+}
+
+func TestShellEnterOpensDetailFromPreviewPane(t *testing.T) {
+	f := newActionFixture(t)
+	f.selectItem(t, "t-review")
+	f.press("tab")
+	if f.model.shell.focus != panePreview {
+		t.Fatalf("focus = %v, want preview", f.model.shell.focus)
+	}
+	f.press("enter")
+	if f.model.mode != modeDetail {
+		t.Errorf("mode = %d, want detail", f.model.mode)
+	}
+}
