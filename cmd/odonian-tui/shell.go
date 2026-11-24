@@ -239,9 +239,6 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 		}
 		return m, nil, true
 
-	case "r":
-		return m, m.fetchShellTasks(), true
-
 	case "z":
 		if m.effectiveFocus() == paneProjects {
 			if id := s.projects.SelectedProjectID(); id != "" {
@@ -299,11 +296,16 @@ func (m *BoardModel) mergeSelectedCmd(taskID string) tea.Cmd {
 		if task, err := m.client.GetTask(ctx, taskID); err == nil {
 			for _, link := range task.Links {
 				if link.Kind == "pr" {
-					return prResolvedMsg{taskID: taskID, prURL: link.Value}
+					return prResolvedMsg{taskID: taskID, prURL: link.Value, fromShell: true}
 				}
 			}
 		}
-		return m.resolvePRAndMerge(taskID)()
+		msg := m.resolvePRAndMerge(taskID)()
+		if resolved, ok := msg.(prResolvedMsg); ok {
+			resolved.fromShell = true
+			return resolved
+		}
+		return msg
 	}
 }
 
@@ -356,6 +358,41 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 		cmd = m.setShellItems(msg.tasks, msg.claimable)
 		s.preview.SetItem(s.items.SelectedItem())
 		return cmd, true
+
+	case projectArchiveMsg:
+		if msg.err != "" {
+			m.error = msg.err
+			m.mode = modeNormal
+			return nil, true
+		}
+		m.error = ""
+		m.mode = modeNormal
+		m.projects = msg.projects
+		s.projects.SetProjects(m.projects)
+		for _, p := range m.projects {
+			if p.ID == m.project.ID {
+				s.projects.SelectProject(p.ID)
+				return nil, true
+			}
+		}
+		// The current project was archived: move to the first remaining one, or empty the view.
+		m.tasks = make(map[string][]tuiclient.Task)
+		s.preview.SetItem(nil)
+		if len(m.projects) == 0 {
+			m.project = tuiclient.Project{}
+			m.loading = false
+			s.items.SetProjectName("")
+			s.items.SetItems(nil, nil)
+			m.syncShellSelection()
+			return nil, true
+		}
+		m.project = m.projects[0]
+		m.loading = true
+		s.projects.SelectProject(m.project.ID)
+		s.items.SetProjectName(m.project.Name)
+		s.items.SetItems(nil, nil)
+		m.syncShellSelection()
+		return m.fetchShellTasks(), true
 
 	case ProjectSelected:
 		if msg.ProjectID == "" || msg.ProjectID == m.project.ID {

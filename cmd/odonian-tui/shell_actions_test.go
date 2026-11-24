@@ -14,9 +14,10 @@ import (
 
 // actionFixture is the three-pane shell over a recording client, one implement task per state.
 type actionFixture struct {
-	model *BoardModel
-	mu    sync.Mutex
-	calls []string
+	model  *BoardModel
+	mu     sync.Mutex
+	calls  []string
+	states []string // states requested by ListTasks
 }
 
 func newActionFixture(t *testing.T) *actionFixture {
@@ -44,6 +45,9 @@ func newActionFixture(t *testing.T) *actionFixture {
 			for _, opt := range opts {
 				opt(&o)
 			}
+			f.mu.Lock()
+			f.states = append(f.states, o.State)
+			f.mu.Unlock()
 			var out []tuiclient.Task
 			for _, task := range tasks {
 				if o.State != "" && task.State != o.State {
@@ -271,7 +275,7 @@ func TestShellPromptsRenderInsideShell(t *testing.T) {
 
 	f.press("tab", "tab", "z")
 	view = f.model.viewContent()
-	if !strings.Contains(strings.ToLower(view), "archive") || !strings.Contains(view, "│") {
+	if f.model.mode != modeArchiveProjectConfirm || !strings.Contains(view, "Archive project? [y/N]") || !strings.Contains(view, "│") {
 		t.Errorf("archive-project confirm not visible in shell:\n%s", view)
 	}
 }
@@ -279,9 +283,21 @@ func TestShellPromptsRenderInsideShell(t *testing.T) {
 func TestShellProjectsPaneRefreshAndQuit(t *testing.T) {
 	f := newActionFixture(t)
 	f.press("tab", "tab")
+	f.mu.Lock()
+	f.states = nil
+	f.mu.Unlock()
 	_, cmd := f.model.Update(key("r"))
 	if cmd == nil {
 		t.Fatal("r in projects pane returned no refetch command")
+	}
+	f.send(f.run(cmd)...)
+	f.mu.Lock()
+	states := strings.Join(f.states, ",")
+	f.mu.Unlock()
+	for _, want := range []string{"backlog", "ready", "review", "approved", "blocked", "done", "failed"} {
+		if !strings.Contains(states, want) {
+			t.Errorf("refresh did not list state %q: %s", want, states)
+		}
 	}
 	_, cmd = f.model.Update(key("q"))
 	if cmd == nil {
@@ -292,17 +308,48 @@ func TestShellProjectsPaneRefreshAndQuit(t *testing.T) {
 	}
 }
 
+func TestShellStaleMergeAfterDetailNavigation(t *testing.T) {
+	f := newActionFixture(t)
+	f.selectItem(t, "t-approved")
+	f.selectItem(t, "t-review")
+	f.model.mode = modeDetail
+	f.model.detailTask = tuiclient.TaskDetail{ID: "t-review"}
+	f.send(prResolvedMsg{taskID: "t-approved", prURL: "https://github.com/o/r/pull/9", fromShell: true})
+	if f.model.mode != modeDetail {
+		t.Errorf("stale shell resolution over detail changed mode to %d", f.model.mode)
+	}
+}
+
+func TestShellArchiveCurrentProjectSyncs(t *testing.T) {
+	f := newActionFixture(t)
+	other := tuiclient.Project{ID: "p2", Name: "Two"}
+	f.send(projectArchiveMsg{projects: []tuiclient.Project{other}})
+	if f.model.project.ID != "p2" {
+		t.Fatalf("project = %q, want p2", f.model.project.ID)
+	}
+	if got := f.model.shell.projects.SelectedProjectID(); got != "p2" {
+		t.Errorf("projects pane selects %q", got)
+	}
+	if view := f.model.viewContent(); !strings.Contains(view, "Two") {
+		t.Errorf("view does not show the new project:\n%s", view)
+	}
+	f.send(projectArchiveMsg{projects: nil})
+	if f.model.shell.items.SelectedTaskID() != "" || f.model.mode != modeNormal {
+		t.Errorf("empty project list left selection %q mode %d", f.model.shell.items.SelectedTaskID(), f.model.mode)
+	}
+}
+
 func TestShellStaleMergeResolutionIgnored(t *testing.T) {
 	f := newActionFixture(t)
 	f.selectItem(t, "t-approved")
 	f.selectItem(t, "t-ready")
-	f.send(prResolvedMsg{taskID: "t-approved", prURL: "https://github.com/o/r/pull/9"})
+	f.send(prResolvedMsg{taskID: "t-approved", prURL: "https://github.com/o/r/pull/9", fromShell: true})
 	if f.model.mode != modeNormal {
 		t.Errorf("stale resolution after selection change: mode %d", f.model.mode)
 	}
 	f.press("i")
 	prompt := f.model.mode
-	f.send(prResolvedMsg{taskID: "t-ready", prURL: "https://github.com/o/r/pull/9"})
+	f.send(prResolvedMsg{taskID: "t-ready", prURL: "https://github.com/o/r/pull/9", fromShell: true})
 	if f.model.mode != prompt {
 		t.Errorf("resolution during another prompt changed mode to %d", f.model.mode)
 	}

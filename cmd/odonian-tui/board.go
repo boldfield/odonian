@@ -292,6 +292,8 @@ type prResolvedMsg struct {
 	taskID string
 	prURL  string
 	err    string
+	// fromShell marks a resolution requested from the three-pane layout rather than the detail view.
+	fromShell bool
 }
 
 // reviewApprove creates a command that calls ReviewTask(approve) then TransitionTask(done),
@@ -1296,8 +1298,16 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// A shell merge resolves asynchronously; drop the answer if the user has moved on.
-		if m.shell != nil && !fromDetail && (m.mode != modeNormal || m.shell.items.SelectedTaskID() != msg.taskID) {
-			return m, nil
+		if m.shell != nil {
+			if msg.fromShell && (m.mode != modeNormal || m.shell.items.SelectedTaskID() != msg.taskID) {
+				return m, nil
+			}
+			if fromDetail && m.detailTask.ID != msg.taskID {
+				return m, nil
+			}
+			if !fromDetail && m.mode != modeNormal {
+				return m, nil
+			}
 		}
 		// Enter merge confirm mode with the resolved PR.
 		m.pendingTaskID = msg.taskID
