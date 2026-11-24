@@ -1106,8 +1106,11 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.promoteTask(m.selectedTaskID)
 			}
 
-		// Switch project
+		// Switch project (only in legacy board, not in shell)
 		case "P":
+			if m.shell != nil {
+				return m, nil
+			}
 			m.mode = modeProjectSwitch
 			m.projectSwitchIndex = 0
 			// Find the current project's index for re-selection purposes
@@ -1453,6 +1456,15 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 // updateDetailMode handles key events while the full-screen detail view is active.
 // Board navigation is fully suppressed in this mode.
 func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// If full help is open, only allow ? to toggle it off and swallow other keys
+	if m.showFullHelp {
+		if msg.String() == "?" {
+			m.showFullHelp = false
+			return m, nil
+		}
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "esc", "q":
 		// Return to the board.
@@ -1485,6 +1497,11 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 	// Open the project's base design document.
 	case "d":
 		return m, m.openDesignDocCmd(m.detailDocuments)
+
+	// Help toggle
+	case "?":
+		m.showFullHelp = !m.showFullHelp
+		return m, nil
 
 	// Approve / reject: only available for review tasks; reuse existing review flow.
 	case "a":
@@ -1584,8 +1601,11 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		m.reviewInput, cmd = m.reviewInput.Update(nil)
 		return m, cmd
 
-	// Switch project from detail view
+	// Switch project from detail view (only in legacy mode, not in shell)
 	case "P":
+		if m.shell != nil {
+			return m, nil
+		}
 		// Exit detail view and enter project switcher mode
 		m.mode = modeProjectSwitch
 		m.projectSwitchIndex = 0
@@ -2631,11 +2651,37 @@ func (m *BoardModel) renderDetailHelpBar() string {
 
 // renderFullHelp renders the full help view with all available key bindings grouped by context.
 func (m *BoardModel) renderFullHelp() string {
-	currentState := stateOrder[m.selectedColumn]
-	bindings := m.keyBindings.getBoardBindingsForState(currentState)
-
 	m.helpModel.SetWidth(m.width)
 
+	// In detail mode, use detail bindings
+	if m.mode == modeDetail && m.detailTask.State != "" {
+		bindings := m.keyBindings.getDetailBindingsForState(m.detailTask.State)
+		styled := m.helpModel.FullHelpView([][]keybind.Binding{bindings})
+		return ansi.Strip(styled)
+	}
+
+	// In shell mode, use shell bindings based on focused pane and selected item state
+	if m.shell != nil {
+		var groups [][]keybind.Binding
+		switch m.effectiveFocus() {
+		case paneProjects:
+			groups = append(groups, m.keyBindings.getShellProjectsBindings())
+		case panePreview:
+			groups = append(groups, m.keyBindings.getShellPreviewBindings())
+		default: // paneItems
+			if wi := m.shell.items.SelectedItem(); wi != nil {
+				groups = append(groups, m.keyBindings.getShellItemsBindingsForState(wi.Implement.State))
+			} else {
+				groups = append(groups, m.keyBindings.getShellItemsBindingsForState(""))
+			}
+		}
+		styled := m.helpModel.FullHelpView(groups)
+		return ansi.Strip(styled)
+	}
+
+	// Legacy board mode: use board bindings for the selected column
+	currentState := stateOrder[m.selectedColumn]
+	bindings := m.keyBindings.getBoardBindingsForState(currentState)
 	styled := m.helpModel.FullHelpView([][]keybind.Binding{bindings})
 	return ansi.Strip(styled)
 }

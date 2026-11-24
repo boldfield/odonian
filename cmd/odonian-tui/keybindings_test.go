@@ -174,3 +174,45 @@ func TestKeyBindingsAvailableForState(t *testing.T) {
 		})
 	}
 }
+
+// TestDetailModeFullHelpToggle tests that ? in detail mode toggles full help.
+func TestDetailModeFullHelpToggle(t *testing.T) {
+	config := &tuiconfig.Config{
+		PollInterval: 100 * time.Millisecond,
+	}
+	m := NewBoardModel(nil, config, tuiclient.Project{ID: "test", Name: "test"})
+	m.width = 100
+	m.height = 30
+	m.helpModel.SetWidth(m.width)
+
+	// Set up a task in review state and enter detail mode
+	reviewTask := tuiclient.TaskDetail{
+		ID:    "task1",
+		Title: "Test task",
+		State: stateReview,
+	}
+	m.mode = modeDetail
+	m.detailTask = reviewTask
+
+	// Initial state: full help should be false
+	if m.showFullHelp {
+		t.Errorf("showFullHelp should be false initially, got true")
+	}
+
+	// Press ?
+	msg := tea.KeyPressMsg{Code: '?', Text: "?"}
+	_, _ = m.updateDetailMode(msg)
+
+	// After first ?, full help should be true
+	if !m.showFullHelp {
+		t.Errorf("showFullHelp should be true after first ?, got false")
+	}
+
+	// Press ? again
+	_, _ = m.updateDetailMode(msg)
+
+	// After second ?, full help should be false
+	if m.showFullHelp {
+		t.Errorf("showFullHelp should be false after second ?, got true")
+	}
+}
