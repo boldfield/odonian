@@ -94,21 +94,14 @@ func (p *PreviewPane) Render() string {
 	lineLimit := p.height
 
 	// Title
-	wrappedTitle := wrapTextByDisplayWidth(p.workItem.Implement.Title, p.width)
-	for _, line := range strings.Split(wrappedTitle, "\n") {
-		if len(lines) >= lineLimit {
-			break
-		}
-		lines = append(lines, ensureWidthLimit(line, p.width))
-	}
-
+	addLineWithWrap(&lines, p.workItem.Implement.Title, "", p.width, lineLimit)
 	if len(lines) >= lineLimit {
 		return joinLines(lines, lineLimit)
 	}
 
 	// Status line: state, round, model
 	statusLine := fmt.Sprintf("%s · round %d · %s", p.workItem.Implement.State, p.workItem.Implement.ReviewRound, p.workItem.Implement.Model)
-	lines = append(lines, ensureWidthLimit(statusLine, p.width))
+	addLineWithWrap(&lines, statusLine, "", p.width, lineLimit)
 
 	if len(lines) >= lineLimit {
 		return joinLines(lines, lineLimit)
@@ -119,18 +112,7 @@ func (p *PreviewPane) Render() string {
 		for _, link := range p.detail.Links {
 			if link.Kind == "pr" {
 				prefix := "PR "
-				prefixWidth := runewidth.StringWidth(prefix)
-				availWidth := p.width - prefixWidth
-				if availWidth < 1 {
-					availWidth = 1
-				}
-				wrappedLink := wrapTextByDisplayWidth(link.Value, availWidth)
-				for _, linkLine := range strings.Split(wrappedLink, "\n") {
-					if len(lines) >= lineLimit {
-						break
-					}
-					lines = append(lines, ensureWidthLimit(prefix+linkLine, p.width))
-				}
+				addLineWithWrap(&lines, link.Value, prefix, p.width, lineLimit)
 				break
 			}
 		}
@@ -144,7 +126,7 @@ func (p *PreviewPane) Render() string {
 	if p.workItem.Implement.State == stateChecks && p.workItem.Implement.ChecksStartedAt != nil {
 		duration := formatChecksDuration(p.workItem.Implement.ChecksStartedAt, p.clock())
 		checksLine := fmt.Sprintf("in checks · %s", duration)
-		lines = append(lines, ensureWidthLimit(checksLine, p.width))
+		addLineWithWrap(&lines, checksLine, "", p.width, lineLimit)
 	}
 
 	if len(lines) >= lineLimit {
@@ -153,21 +135,23 @@ func (p *PreviewPane) Render() string {
 
 	// Reviews with verdicts for the current round
 	if len(p.workItem.Reviews) > 0 {
-		lines = append(lines, ensureWidthLimit("Reviews:", p.width))
+		if len(lines) < lineLimit {
+			lines = append(lines, truncateToDisplayWidth(fmt.Sprintf("Reviews: (round %d)", p.workItem.Implement.ReviewRound), p.width))
+		}
 		if len(lines) >= lineLimit {
 			return joinLines(lines, lineLimit)
 		}
 
 		for _, review := range p.workItem.Reviews {
+			if len(lines) >= lineLimit {
+				break
+			}
 			verdict := "pending"
 			if review.Verdict != nil {
 				verdict = *review.Verdict
 			}
 			reviewLine := fmt.Sprintf("  %s (%s)", review.Model, verdict)
-			lines = append(lines, ensureWidthLimit(reviewLine, p.width))
-			if len(lines) >= lineLimit {
-				return joinLines(lines, lineLimit)
-			}
+			addLineWithWrap(&lines, reviewLine, "", p.width, lineLimit)
 		}
 	}
 
@@ -178,12 +162,12 @@ func (p *PreviewPane) Render() string {
 	// Event history: most recent first, as many as fit
 	if !p.loaded {
 		// Loading line if events have not yet been loaded
-		lines = append(lines, ensureWidthLimit("History: loading...", p.width))
-	} else if len(p.events) == 0 {
-		// No history header if there are no events
-	} else {
 		if len(lines) < lineLimit {
-			lines = append(lines, ensureWidthLimit("History:", p.width))
+			lines = append(lines, truncateToDisplayWidth("History: loading...", p.width))
+		}
+	} else if len(p.events) > 0 {
+		if len(lines) < lineLimit {
+			lines = append(lines, truncateToDisplayWidth("History:", p.width))
 		}
 
 		// Reverse events to show newest first
@@ -191,23 +175,11 @@ func (p *PreviewPane) Render() string {
 			event := p.events[i]
 			timeStr := formatEventTime(event.CreatedAt)
 			prefix := fmt.Sprintf("  %s ", timeStr)
-			prefixWidth := runewidth.StringWidth(prefix)
-			availWidth := p.width - prefixWidth
-			if availWidth < 1 {
-				availWidth = 1
-			}
 			eventContent := event.Kind
 			if event.Verdict != nil {
 				eventContent += fmt.Sprintf(" (%s)", *event.Verdict)
 			}
-
-			wrappedEvent := wrapTextByDisplayWidth(eventContent, availWidth)
-			for _, eventLine := range strings.Split(wrappedEvent, "\n") {
-				if len(lines) >= lineLimit {
-					break
-				}
-				lines = append(lines, ensureWidthLimit(prefix+eventLine, p.width))
-			}
+			addLineWithWrap(&lines, eventContent, prefix, p.width, lineLimit)
 		}
 	}
 
@@ -223,66 +195,138 @@ func formatEventTime(timestamp string) string {
 	return t.Format("15:04")
 }
 
-// wrapTextByDisplayWidth wraps s to the given display width on word boundaries,
-// accounting for CJK and other wide characters using display cells.
-// Preserves existing newlines and hard-breaks long words.
-func wrapTextByDisplayWidth(s string, width int) string {
-	if width <= 0 {
-		return s
+// addLineWithWrap wraps text, adds prefix only to the first line, indents continuation lines,
+// and appends all lines to the output up to the line limit.
+func addLineWithWrap(lines *[]string, text, prefix string, width, lineLimit int) {
+	if len(*lines) >= lineLimit {
+		return
 	}
-	var out strings.Builder
-	for i, line := range strings.Split(s, "\n") {
-		if i > 0 {
-			out.WriteByte('\n')
+
+	prefixWidth := runewidth.StringWidth(prefix)
+	contentWidth := width - prefixWidth
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+
+	// Wrap the content to the available width by display cells
+	wrappedLines := wrapByDisplayWidth(text, contentWidth)
+
+	for i, line := range wrappedLines {
+		if len(*lines) >= lineLimit {
+			break
 		}
+
+		var fullLine string
+		if i == 0 {
+			// First line gets the prefix
+			fullLine = prefix + line
+		} else {
+			// Continuation lines get indented
+			indent := strings.Repeat(" ", prefixWidth)
+			fullLine = indent + line
+		}
+
+		// Ensure it fits in the pane width
+		fullLine = truncateToDisplayWidth(fullLine, width)
+		*lines = append(*lines, fullLine)
+	}
+}
+
+// wrapByDisplayWidth wraps s by display cells, returning a slice of wrapped lines.
+// Accounts for wide characters (CJK, etc.) and wraps on word boundaries when possible.
+func wrapByDisplayWidth(s string, width int) []string {
+	if width <= 0 {
+		return []string{s}
+	}
+
+	var result []string
+
+	for _, line := range strings.Split(s, "\n") {
+		if runewidth.StringWidth(line) <= width {
+			result = append(result, line)
+			continue
+		}
+
+		// Need to wrap this line
+		var currentLine strings.Builder
 		col := 0
-		for j, word := range strings.Fields(line) {
-			wwidth := runewidth.StringWidth(word)
-			if j > 0 {
-				if col+1+wwidth > width {
-					out.WriteByte('\n')
-					col = 0
-				} else {
-					out.WriteByte(' ')
-					col++
-				}
+
+		for _, word := range strings.Fields(line) {
+			wordWidth := runewidth.StringWidth(word)
+
+			// Check if we need to wrap
+			if col > 0 && col+1+wordWidth > width {
+				// Start a new line
+				result = append(result, currentLine.String())
+				currentLine.Reset()
+				col = 0
 			}
-			// If word exceeds width, hard-break it into chunks
-			if wwidth > width {
-				for col < width && len(word) > 0 {
-					remaSpace := width - col
-					var chunk string
+
+			// Add space if not at start of line
+			if col > 0 {
+				currentLine.WriteByte(' ')
+				col++
+			}
+
+			// If word exceeds width, hard-break it
+			if wordWidth > width {
+				// Flush current line if not empty
+				if col > 0 {
+					result = append(result, currentLine.String())
+					currentLine.Reset()
+					col = 0
+				}
+
+				// Hard-break the long word
+				for len(word) > 0 {
+					chunk := ""
+					chunkWidth := 0
+
 					for len(word) > 0 {
 						r, sz := utf8.DecodeRuneInString(word)
 						rw := runewidth.RuneWidth(r)
-						if runewidth.StringWidth(chunk)+rw > remaSpace {
+
+						if chunkWidth+rw > width {
 							break
 						}
+
 						chunk += string(r)
+						chunkWidth += rw
 						word = word[sz:]
 					}
-					if chunk == "" {
-						chunk = string(rune(word[0]))
-						if len(word) > 1 {
-							word = word[utf8.RuneLen(rune(word[0])):]
+
+					if chunk == "" && len(word) > 0 {
+						// Can't fit any rune in this width; skip the rune if width is too small
+						r, sz := utf8.DecodeRuneInString(word)
+						if runewidth.RuneWidth(r) > 1 && width < runewidth.RuneWidth(r) {
+							// Wide rune at too-narrow width; replace with placeholder
+							chunk = "?"
+							word = word[sz:]
 						} else {
-							word = ""
+							// Single-width rune; fit it anyway
+							chunk = string(r)
+							word = word[sz:]
 						}
 					}
-					out.WriteString(chunk)
-					col += runewidth.StringWidth(chunk)
-					if len(word) > 0 {
-						out.WriteByte('\n')
+
+					if chunk != "" {
+						result = append(result, chunk)
 						col = 0
 					}
 				}
 			} else {
-				out.WriteString(word)
-				col += wwidth
+				// Word fits, add it
+				currentLine.WriteString(word)
+				col += wordWidth
 			}
 		}
+
+		if currentLine.Len() > 0 {
+			result = append(result, currentLine.String())
+		}
 	}
-	return out.String()
+
+	return result
 }
 
 // truncateToDisplayWidth truncates s to fit within the given display width.
@@ -301,20 +345,6 @@ func truncateToDisplayWidth(s string, width int) string {
 		w += rw
 	}
 	return out.String()
-}
-
-// ensureWidthLimit wraps or truncates s to fit within the given display width.
-// First tries to wrap at word boundaries, then truncates if needed.
-func ensureWidthLimit(s string, width int) string {
-	if runewidth.StringWidth(s) <= width {
-		return s
-	}
-	wrapped := wrapTextByDisplayWidth(s, width)
-	lines := strings.Split(wrapped, "\n")
-	if len(lines) > 0 {
-		return truncateToDisplayWidth(lines[0], width)
-	}
-	return truncateToDisplayWidth(s, width)
 }
 
 // joinLines joins lines and truncates to lineLimit.

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiview"
@@ -453,9 +454,9 @@ func TestPreviewPaneRender_PaneTooShortForAllEvents(t *testing.T) {
 	events := make([]tuiclient.Event, 100)
 	for i := 0; i < 100; i++ {
 		events[i] = tuiclient.Event{
-			ID:        "event-" + string(rune(i)),
+			ID:        fmt.Sprintf("event-%d", i),
 			TaskID:    "task-123",
-			Kind:      "event",
+			Kind:      fmt.Sprintf("kind_%d", i),
 			CreatedAt: "2026-11-24T12:00:00Z",
 		}
 	}
@@ -469,12 +470,17 @@ func TestPreviewPaneRender_PaneTooShortForAllEvents(t *testing.T) {
 		t.Errorf("expected at most 5 lines, got %d", len(lines))
 	}
 
-	// Check that newest events are kept, not oldest (should have History: header and at least one event line)
+	// Check that newest events are kept, not oldest
 	if !strings.Contains(output, "History:") {
 		t.Errorf("expected History header in output")
 	}
-	if !strings.Contains(output, "event") {
-		t.Errorf("expected events in output")
+	// Newest event (kind_99) should be present
+	if !strings.Contains(output, "kind_99") {
+		t.Errorf("expected newest event (kind_99) in output, got: %s", output)
+	}
+	// Oldest event (kind_0) should not be present due to height limit
+	if strings.Contains(output, "kind_0") {
+		t.Errorf("expected oldest event (kind_0) to be dropped from output due to height limit")
 	}
 }
 
@@ -500,9 +506,11 @@ func TestFormatEventTime(t *testing.T) {
 
 func TestPreviewPaneRender_AllWidthsRespected(t *testing.T) {
 	tests := []struct {
-		name     string
-		scenario func() (*tuiview.WorkItem, *tuiclient.TaskDetail, []tuiclient.Event)
-		widths   []int
+		name              string
+		scenario          func() (*tuiview.WorkItem, *tuiclient.TaskDetail, []tuiclient.Event)
+		widths            []int
+		contentChecksWide []string // required content at all widths
+		contentChecksNorm []string // required content at normal widths (12+)
 	}{
 		{
 			name: "checks scenario with narrow widths",
@@ -518,7 +526,9 @@ func TestPreviewPaneRender_AllWidthsRespected(t *testing.T) {
 				}
 				return &tuiview.WorkItem{Implement: impl, Reviews: []*tuiclient.Task{}}, nil, []tuiclient.Event{}
 			},
-			widths: []int{1, 2, 5, 12, 20},
+			widths:            []int{12, 20},
+			contentChecksWide: []string{"in checks", "round 12"}, // always present
+			contentChecksNorm: []string{"18m"},                   // present at width 12+
 		},
 		{
 			name: "review scenario with verdicts",
@@ -537,7 +547,9 @@ func TestPreviewPaneRender_AllWidthsRespected(t *testing.T) {
 				}
 				return &tuiview.WorkItem{Implement: impl, Reviews: reviews}, nil, []tuiclient.Event{}
 			},
-			widths: []int{5, 12, 30},
+			widths:            []int{5, 12, 30},
+			contentChecksWide: []string{"opus", "haiku"},      // models always present
+			contentChecksNorm: []string{"approve", "pending"}, // verdicts at width 12+
 		},
 		{
 			name: "with PR link",
@@ -558,7 +570,9 @@ func TestPreviewPaneRender_AllWidthsRespected(t *testing.T) {
 				}
 				return &tuiview.WorkItem{Implement: impl, Reviews: []*tuiclient.Task{}}, detail, []tuiclient.Event{}
 			},
-			widths: []int{2, 5, 12},
+			widths:            []int{12, 30},
+			contentChecksWide: []string{"PR"}, // prefix always present
+			contentChecksNorm: []string{"pull"},
 		},
 		{
 			name: "with events loading and loaded",
@@ -576,7 +590,9 @@ func TestPreviewPaneRender_AllWidthsRespected(t *testing.T) {
 				}
 				return &tuiview.WorkItem{Implement: impl, Reviews: []*tuiclient.Task{}}, nil, events
 			},
-			widths: []int{5, 12, 30},
+			widths:            []int{30, 60},
+			contentChecksWide: []string{"History"}, // header always present
+			contentChecksNorm: []string{"submitted"},
 		},
 	}
 
@@ -602,10 +618,33 @@ func TestPreviewPaneRender_AllWidthsRespected(t *testing.T) {
 					output := pane.Render()
 					lines := strings.Split(output, "\n")
 
+					// Check all lines respect width
 					for i, line := range lines {
 						displayWidth := runewidth.StringWidth(line)
 						if displayWidth > width {
 							t.Errorf("line %d exceeds width %d: got %d cells: %q", i, width, displayWidth, line)
+						}
+						// Check that lines don't contain invalid runes (mojibake)
+						for _, r := range line {
+							if r == utf8.RuneError {
+								t.Errorf("line %d contains invalid rune at width %d: %q", i, width, line)
+							}
+						}
+					}
+
+					// Check always-present content
+					for _, required := range tt.contentChecksWide {
+						if !strings.Contains(output, required) {
+							t.Errorf("at width %d, expected required content %q not found in output:\n%s", width, required, output)
+						}
+					}
+
+					// Check content at normal widths (only if there are normal-width checks defined)
+					if len(tt.contentChecksNorm) > 0 && width >= 30 {
+						for _, required := range tt.contentChecksNorm {
+							if !strings.Contains(output, required) {
+								t.Errorf("at width %d (normal), expected content %q not found in output:\n%s", width, required, output)
+							}
 						}
 					}
 				})
