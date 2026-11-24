@@ -123,7 +123,7 @@ func (p *WorkItemsPane) SetItems(items []*tuiview.WorkItem, claimable map[string
 	}
 	p.ensureSelectionVisible()
 
-	if newID := p.SelectedTaskID(); newID != oldID && newID != "" {
+	if newID := p.SelectedTaskID(); newID != oldID {
 		return func() tea.Msg { return WorkItemSelected{TaskID: newID} }
 	}
 	return nil

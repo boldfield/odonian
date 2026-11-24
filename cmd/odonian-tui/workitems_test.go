@@ -212,3 +212,16 @@ func TestWorkItemsBoundsSweep(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkItemsEmptyRefreshEmitsClearedSelection(t *testing.T) {
+	p := newTestPane(80, 10)
+	p.SetItems([]*tuiview.WorkItem{wiOf("a", "ready")}, map[string]bool{"a": true})
+	cmd := p.SetItems(nil, nil)
+	if cmd == nil {
+		t.Fatal("expected a selection message when the last item disappears")
+	}
+	msg, ok := cmd().(WorkItemSelected)
+	if !ok || msg.TaskID != "" {
+		t.Errorf("got %#v, want WorkItemSelected with empty TaskID", msg)
+	}
+}
