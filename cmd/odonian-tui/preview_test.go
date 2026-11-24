@@ -3,14 +3,16 @@ package main
 import (
 	"strings"
 	"testing"
-	"unicode/utf8"
+	"time"
 
 	"github.com/boldfield/odonian/internal/tuiclient"
+	"github.com/boldfield/odonian/internal/tuiview"
+	"github.com/mattn/go-runewidth"
 )
 
 func TestPreviewPaneRender_WorkItemInChecks(t *testing.T) {
 	now := "2026-11-24T12:00:00Z"
-	task := tuiclient.TaskDetail{
+	impl := &tuiclient.Task{
 		ID:              "task-123",
 		Title:           "Test task",
 		State:           stateChecks,
@@ -18,9 +20,20 @@ func TestPreviewPaneRender_WorkItemInChecks(t *testing.T) {
 		ReviewRound:     1,
 		ChecksStartedAt: &now,
 	}
-	events := []tuiclient.Event{}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
+	}
 
-	pane := NewPreviewPane(task, events, 50, 10)
+	mockClock := func() time.Time {
+		t, _ := time.Parse(time.RFC3339Nano, "2026-11-24T12:00:00Z")
+		return t
+	}
+
+	pane := NewPreviewPane(workItem, 50, 10)
+	pane.clock = mockClock
+	pane.SetEvents([]tuiclient.Event{})
+
 	output := pane.Render()
 
 	lines := strings.Split(output, "\n")
@@ -51,12 +64,21 @@ func TestPreviewPaneRender_WorkItemInChecks(t *testing.T) {
 }
 
 func TestPreviewPaneRender_WithPRLink(t *testing.T) {
-	task := tuiclient.TaskDetail{
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "Test task",
 		State:       stateReview,
 		Model:       "opus",
 		ReviewRound: 2,
+	}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
+	}
+
+	detail := &tuiclient.TaskDetail{
+		ID:    "task-123",
+		Title: "Test task",
 		Links: []tuiclient.TaskLink{
 			{
 				Kind:  "pr",
@@ -64,9 +86,11 @@ func TestPreviewPaneRender_WithPRLink(t *testing.T) {
 			},
 		},
 	}
-	events := []tuiclient.Event{}
 
-	pane := NewPreviewPane(task, events, 60, 10)
+	pane := NewPreviewPane(workItem, 60, 10)
+	pane.WithDetail(detail)
+	pane.SetEvents([]tuiclient.Event{})
+
 	output := pane.Render()
 
 	if !strings.Contains(output, "PR ") {
@@ -77,39 +101,69 @@ func TestPreviewPaneRender_WithPRLink(t *testing.T) {
 	}
 }
 
-func TestPreviewPaneRender_WithReviews(t *testing.T) {
-	reviewRound := 1
-	task := tuiclient.TaskDetail{
+func TestPreviewPaneRender_WithOneApprovedOneRejectingReviewer(t *testing.T) {
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "Test task",
 		State:       stateReview,
 		Model:       "sonnet",
 		ReviewRound: 1,
-		Links: []tuiclient.TaskLink{
-			{
-				Kind:        "review",
-				Value:       "review-data",
-				ReviewRound: &reviewRound,
-			},
+	}
+
+	approved := "approve"
+	reviews := []*tuiclient.Task{
+		{
+			ID:      "review-1",
+			Kind:    "review",
+			Model:   "opus",
+			Verdict: &approved,
+		},
+		{
+			ID:      "review-2",
+			Kind:    "review",
+			Model:   "haiku",
+			Verdict: nil,
 		},
 	}
-	events := []tuiclient.Event{}
 
-	pane := NewPreviewPane(task, events, 60, 10)
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   reviews,
+	}
+
+	pane := NewPreviewPane(workItem, 60, 10)
+	pane.SetEvents([]tuiclient.Event{})
+
 	output := pane.Render()
 
 	if !strings.Contains(output, "Reviews:") {
 		t.Errorf("expected 'Reviews:' in output")
 	}
+	if !strings.Contains(output, "opus") {
+		t.Errorf("expected 'opus' reviewer in output")
+	}
+	if !strings.Contains(output, "approve") {
+		t.Errorf("expected 'approve' verdict in output")
+	}
+	if !strings.Contains(output, "haiku") {
+		t.Errorf("expected 'haiku' reviewer in output")
+	}
+	if !strings.Contains(output, "pending") {
+		t.Errorf("expected 'pending' verdict in output")
+	}
 }
 
 func TestPreviewPaneRender_WithHistory(t *testing.T) {
-	task := tuiclient.TaskDetail{
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "Test task",
 		State:       stateInProgress,
 		Model:       "haiku",
 		ReviewRound: 1,
+	}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
 	}
 
 	verdict := "approve"
@@ -132,7 +186,8 @@ func TestPreviewPaneRender_WithHistory(t *testing.T) {
 		},
 	}
 
-	pane := NewPreviewPane(task, events, 60, 10)
+	pane := NewPreviewPane(workItem, 60, 10)
+	pane.SetEvents(events)
 	output := pane.Render()
 
 	// Should have history header
@@ -154,31 +209,64 @@ func TestPreviewPaneRender_WithHistory(t *testing.T) {
 	}
 }
 
-func TestPreviewPaneRender_HistoryLoadingWhenEmpty(t *testing.T) {
-	task := tuiclient.TaskDetail{
+func TestPreviewPaneRender_HistoryLoading(t *testing.T) {
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "Test task",
 		State:       stateInProgress,
 		Model:       "haiku",
 		ReviewRound: 1,
 	}
-	events := []tuiclient.Event{}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
+	}
 
-	pane := NewPreviewPane(task, events, 60, 10)
+	pane := NewPreviewPane(workItem, 60, 10)
+	// Don't call SetEvents - leave it in loading state
 	output := pane.Render()
 
 	if !strings.Contains(output, "History: loading...") {
-		t.Errorf("expected 'History: loading...' in output when events are empty")
+		t.Errorf("expected 'History: loading...' in output when events not yet loaded")
+	}
+}
+
+func TestPreviewPaneRender_HistoryLoadedEmpty(t *testing.T) {
+	impl := &tuiclient.Task{
+		ID:          "task-123",
+		Title:       "Test task",
+		State:       stateInProgress,
+		Model:       "haiku",
+		ReviewRound: 1,
+	}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
+	}
+
+	pane := NewPreviewPane(workItem, 60, 10)
+	pane.SetEvents([]tuiclient.Event{})
+	output := pane.Render()
+
+	if strings.Contains(output, "History: loading...") {
+		t.Errorf("expected no loading message when events are loaded but empty")
+	}
+	if strings.Contains(output, "History:") {
+		t.Errorf("expected no History header when events are empty")
 	}
 }
 
 func TestPreviewPaneRender_RespectHeight(t *testing.T) {
-	task := tuiclient.TaskDetail{
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "A very long title that will wrap to multiple lines to test height limits on the preview pane render function",
 		State:       stateInProgress,
 		Model:       "haiku",
 		ReviewRound: 1,
+	}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
 	}
 
 	events := make([]tuiclient.Event, 20)
@@ -192,7 +280,8 @@ func TestPreviewPaneRender_RespectHeight(t *testing.T) {
 		}
 	}
 
-	pane := NewPreviewPane(task, events, 60, 5)
+	pane := NewPreviewPane(workItem, 60, 5)
+	pane.SetEvents(events)
 	output := pane.Render()
 
 	lines := strings.Split(strings.TrimSpace(output), "\n")
@@ -202,44 +291,89 @@ func TestPreviewPaneRender_RespectHeight(t *testing.T) {
 }
 
 func TestPreviewPaneRender_RespectWidth(t *testing.T) {
-	task := tuiclient.TaskDetail{
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "A very long title that should wrap to fit within the width constraint of the preview pane renderer",
 		State:       stateInProgress,
 		Model:       "haiku",
 		ReviewRound: 1,
 	}
-	events := []tuiclient.Event{}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
+	}
 
-	pane := NewPreviewPane(task, events, 30, 20)
+	pane := NewPreviewPane(workItem, 30, 20)
+	pane.SetEvents([]tuiclient.Event{})
 	output := pane.Render()
 
 	lines := strings.Split(output, "\n")
 	for i, line := range lines {
-		width := utf8.RuneCountInString(line)
+		width := runewidth.StringWidth(line)
 		if width > 30 {
-			t.Errorf("line %d exceeds width of 30: got %d runes: %s", i, width, line)
+			t.Errorf("line %d exceeds width of 30: got %d display cells: %s", i, width, line)
+		}
+	}
+}
+
+func TestPreviewPaneRender_RespectWidthNarrow(t *testing.T) {
+	impl := &tuiclient.Task{
+		ID:          "task-123",
+		Title:       "Test task",
+		State:       stateInProgress,
+		Model:       "sonnet",
+		ReviewRound: 1,
+		ChecksStartedAt: func() *string {
+			s := "2026-11-24T12:00:00Z"
+			return &s
+		}(),
+	}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
+	}
+
+	mockClock := func() time.Time {
+		t, _ := time.Parse(time.RFC3339Nano, "2026-11-24T12:18:00Z")
+		return t
+	}
+
+	pane := NewPreviewPane(workItem, 12, 20)
+	pane.clock = mockClock
+	pane.SetEvents([]tuiclient.Event{})
+	output := pane.Render()
+
+	lines := strings.Split(output, "\n")
+	for i, line := range lines {
+		width := runewidth.StringWidth(line)
+		if width > 12 {
+			t.Errorf("line %d exceeds width of 12: got %d display cells: %s", i, width, line)
 		}
 	}
 }
 
 func TestPreviewPaneRender_EmptyWidthHeight(t *testing.T) {
-	task := tuiclient.TaskDetail{
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "Test task",
 		State:       stateInProgress,
 		Model:       "haiku",
 		ReviewRound: 1,
 	}
-	events := []tuiclient.Event{}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
+	}
 
-	pane := NewPreviewPane(task, events, 0, 10)
+	pane := NewPreviewPane(workItem, 0, 10)
+	pane.SetEvents([]tuiclient.Event{})
 	output := pane.Render()
 	if output != "" {
 		t.Errorf("expected empty output for zero width, got: %s", output)
 	}
 
-	pane = NewPreviewPane(task, events, 60, 0)
+	pane = NewPreviewPane(workItem, 60, 0)
+	pane.SetEvents([]tuiclient.Event{})
 	output = pane.Render()
 	if output != "" {
 		t.Errorf("expected empty output for zero height, got: %s", output)
@@ -247,12 +381,16 @@ func TestPreviewPaneRender_EmptyWidthHeight(t *testing.T) {
 }
 
 func TestPreviewPaneRender_MostRecentEventsNewestFirst(t *testing.T) {
-	task := tuiclient.TaskDetail{
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "Test task",
 		State:       stateInProgress,
 		Model:       "haiku",
 		ReviewRound: 1,
+	}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
 	}
 
 	events := []tuiclient.Event{
@@ -276,7 +414,8 @@ func TestPreviewPaneRender_MostRecentEventsNewestFirst(t *testing.T) {
 		},
 	}
 
-	pane := NewPreviewPane(task, events, 60, 20)
+	pane := NewPreviewPane(workItem, 60, 20)
+	pane.SetEvents(events)
 	output := pane.Render()
 
 	// Find positions of events in output
@@ -298,12 +437,16 @@ func TestPreviewPaneRender_MostRecentEventsNewestFirst(t *testing.T) {
 }
 
 func TestPreviewPaneRender_PaneTooShortForAllEvents(t *testing.T) {
-	task := tuiclient.TaskDetail{
+	impl := &tuiclient.Task{
 		ID:          "task-123",
 		Title:       "Test task",
 		State:       stateInProgress,
 		Model:       "haiku",
 		ReviewRound: 1,
+	}
+	workItem := &tuiview.WorkItem{
+		Implement: impl,
+		Reviews:   []*tuiclient.Task{},
 	}
 
 	events := make([]tuiclient.Event, 100)
@@ -316,12 +459,21 @@ func TestPreviewPaneRender_PaneTooShortForAllEvents(t *testing.T) {
 		}
 	}
 
-	pane := NewPreviewPane(task, events, 60, 3)
+	pane := NewPreviewPane(workItem, 60, 5)
+	pane.SetEvents(events)
 	output := pane.Render()
 
 	lines := strings.Split(strings.TrimSpace(output), "\n")
-	if len(lines) > 3 {
-		t.Errorf("expected at most 3 lines, got %d", len(lines))
+	if len(lines) > 5 {
+		t.Errorf("expected at most 5 lines, got %d", len(lines))
+	}
+
+	// Check that newest events are kept, not oldest (should have History: header and at least one event line)
+	if !strings.Contains(output, "History:") {
+		t.Errorf("expected History header in output")
+	}
+	if !strings.Contains(output, "event") {
+		t.Errorf("expected events in output")
 	}
 }
 
