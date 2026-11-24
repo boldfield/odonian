@@ -1,6 +1,7 @@
 package tuiview
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -33,6 +34,24 @@ func newMockTheme() RowTheme {
 			"done":        lipgloss.NewStyle(),
 			"backlog":     lipgloss.NewStyle(),
 			"abandoned":   lipgloss.NewStyle(),
+		},
+	}
+}
+
+// newStyledMockTheme returns a theme with colors to test ANSI-aware width handling.
+func newStyledMockTheme() RowTheme {
+	return &mockTheme{
+		styles: map[string]lipgloss.Style{
+			"ready":       lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
+			"in_progress": lipgloss.NewStyle().Foreground(lipgloss.Color("3")),
+			"checks":      lipgloss.NewStyle().Foreground(lipgloss.Color("4")),
+			"review":      lipgloss.NewStyle().Foreground(lipgloss.Color("5")),
+			"approved":    lipgloss.NewStyle().Foreground(lipgloss.Color("6")),
+			"blocked":     lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
+			"failed":      lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
+			"done":        lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
+			"backlog":     lipgloss.NewStyle().Foreground(lipgloss.Color("8")),
+			"abandoned":   lipgloss.NewStyle().Foreground(lipgloss.Color("8")),
 		},
 	}
 }
@@ -205,7 +224,7 @@ func TestRenderRowWidth(t *testing.T) {
 
 	for _, tt := range tests {
 		for _, width := range testWidths {
-			t.Run(tt.name+"_width_"+string(rune(width)), func(t *testing.T) {
+			t.Run(tt.name+"_width_"+fmt.Sprint(width), func(t *testing.T) {
 				wi := tt.build()
 				row := RenderRow(wi, width, now, theme)
 
@@ -377,6 +396,101 @@ func TestRenderRowHeld(t *testing.T) {
 	}
 }
 
+func TestRenderRowPriority(t *testing.T) {
+	theme := newMockTheme()
+
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name       string
+		priority   *int64
+		shouldShow bool
+	}{
+		{
+			name:       "priority_900",
+			priority:   ptrInt64(900),
+			shouldShow: true,
+		},
+		{
+			name:       "priority_500",
+			priority:   ptrInt64(500),
+			shouldShow: false, // default, should be hidden
+		},
+		{
+			name:       "priority_nil",
+			priority:   nil,
+			shouldShow: false, // nil is treated as default
+		},
+		{
+			name:       "priority_100",
+			priority:   ptrInt64(100),
+			shouldShow: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wi := &WorkItem{
+				Implement: &tuiclient.Task{
+					ID:       "12345678-abcd-efgh-ijkl",
+					Title:    "Task with priority",
+					State:    "ready",
+					Model:    "haiku",
+					Kind:     "implement",
+					Held:     false,
+					Priority: tt.priority,
+				},
+				Reviews: []*tuiclient.Task{},
+				Merge:   nil,
+			}
+
+			row := RenderRow(wi, 100, now, theme)
+
+			hasPriority := hasSubstring(row, "P:")
+			if hasPriority != tt.shouldShow {
+				if tt.shouldShow {
+					t.Errorf("priority should be shown but was not: %q", row)
+				} else {
+					t.Errorf("priority should be hidden but was shown: %q", row)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderRowStyledTheme(t *testing.T) {
+	theme := newStyledMockTheme()
+
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	testWidths := []int{46, 60, 100}
+
+	wi := &WorkItem{
+		Implement: &tuiclient.Task{
+			ID:    "12345678-abcd-efgh-ijkl",
+			Title: "Task with styled theme",
+			State: "ready",
+			Model: "haiku",
+			Kind:  "implement",
+			Held:  false,
+		},
+		Reviews: []*tuiclient.Task{},
+		Merge:   nil,
+	}
+
+	for _, width := range testWidths {
+		t.Run(fmt.Sprintf("styled_width_%d", width), func(t *testing.T) {
+			row := RenderRow(wi, width, now, theme)
+			lines := splitLines(row)
+			for _, line := range lines {
+				lineWidth := lipgloss.Width(line)
+				if lineWidth > width {
+					t.Errorf("row width %d exceeds limit %d: %q", lineWidth, width, line)
+				}
+			}
+		})
+	}
+}
+
 // Helper functions
 func splitLines(s string) []string {
 	return splitRunes([]rune(s), '\n')
@@ -406,4 +520,12 @@ func hasSubstring(s string, substr string) bool {
 		}
 	}
 	return false
+}
+
+func ptrInt64(i int64) *int64 {
+	return &i
+}
+
+func ptrInt(i int) *int {
+	return &i
 }

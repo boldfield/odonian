@@ -7,11 +7,44 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // RowTheme defines the styling for row rendering.
 type RowTheme interface {
 	GetStatusStyle(state string) lipgloss.Style
+}
+
+// statusTypeToString converts a computed StatusType to a string for theme styling.
+func statusTypeToString(st StatusType) string {
+	switch st {
+	case StatusReadyClaimable:
+		return "ready"
+	case StatusReadyWaiting:
+		return "ready"
+	case StatusBacklogNotPromoted:
+		return "backlog"
+	case StatusBacklogWaiting:
+		return "backlog"
+	case StatusInProgress:
+		return "in_progress"
+	case StatusChecks:
+		return "checks"
+	case StatusReview:
+		return "review"
+	case StatusApproved:
+		return "approved"
+	case StatusBlocked:
+		return "blocked"
+	case StatusFailed:
+		return "failed"
+	case StatusDone:
+		return "done"
+	case StatusAbandoned:
+		return "abandoned"
+	default:
+		return "unknown"
+	}
 }
 
 // RenderRow renders a work item as a single row fitted to a given width.
@@ -35,10 +68,10 @@ func RenderRow(wi *WorkItem, width int, now time.Time, theme RowTheme) string {
 	status := Status(impl, nil)
 	glyph := Glyph(status, impl.Held)
 
-	// Apply colour to glyph from theme
+	// Apply colour to glyph from theme, using computed status for the color
 	var coloredGlyph string
 	if theme != nil {
-		stateStyle := theme.GetStatusStyle(impl.State)
+		stateStyle := theme.GetStatusStyle(statusTypeToString(status))
 		coloredGlyph = stateStyle.Render(glyph)
 	} else {
 		coloredGlyph = glyph
@@ -53,20 +86,27 @@ func RenderRow(wi *WorkItem, width int, now time.Time, theme RowTheme) string {
 		taskID = taskID[:8]
 	}
 
+	// Add priority if non-default (default is 500)
+	var priorityStr string
+	if impl.Priority != nil && *impl.Priority != 500 {
+		priorityStr = fmt.Sprintf(" P:%d", int(*impl.Priority))
+	}
+
 	// Measure the parts we know the size of
 	glyphWidth := lipgloss.Width(glyph)
 	detailWidth := lipgloss.Width(detail)
+	priorityWidth := lipgloss.Width(priorityStr)
 
-	// Space for: glyph + " " + taskID + " " + title + "  " + detail
+	// Space for: glyph + " " + taskID + " " + title + priorityStr + "  " + detail
 	// Minimum space: glyph (1) + space (1) + taskID (8) + space (1) + min-title (12) + space-sep (2) + detail
 	minTitleWidth := 12
-	fixedWidth := glyphWidth + 1 + len(taskID) + 1 + 2 + detailWidth
+	fixedWidth := glyphWidth + 1 + len(taskID) + 1 + 2 + detailWidth + priorityWidth
 
 	// Available width for title
 	availableForTitle := width - fixedWidth
 	if availableForTitle < minTitleWidth {
 		// If not enough space, drop the detail
-		availableForTitle = width - glyphWidth - 1 - len(taskID) - 1
+		availableForTitle = width - glyphWidth - 1 - len(taskID) - 1 - priorityWidth
 		detail = ""
 		detailWidth = 0
 	}
@@ -83,13 +123,13 @@ func RenderRow(wi *WorkItem, width int, now time.Time, theme RowTheme) string {
 	if detail != "" {
 		// Right-align the detail
 		titleWidth = lipgloss.Width(title)
-		spaceBetween := width - glyphWidth - 1 - len(taskID) - 1 - titleWidth - detailWidth
+		spaceBetween := width - glyphWidth - 1 - len(taskID) - 1 - titleWidth - priorityWidth - detailWidth
 		if spaceBetween < 2 {
 			spaceBetween = 2
 		}
-		row = fmt.Sprintf("%s %s %s%s%s", coloredGlyph, taskID, title, strings.Repeat(" ", spaceBetween), detail)
+		row = fmt.Sprintf("%s %s %s%s%s%s", coloredGlyph, taskID, title, priorityStr, strings.Repeat(" ", spaceBetween), detail)
 	} else {
-		row = fmt.Sprintf("%s %s %s", coloredGlyph, taskID, title)
+		row = fmt.Sprintf("%s %s %s%s", coloredGlyph, taskID, title, priorityStr)
 	}
 
 	// Ensure row doesn't exceed width
@@ -114,15 +154,20 @@ func buildDetailString(task *tuiclient.Task, now time.Time) string {
 	case "ready":
 		return "ready"
 	case "in_progress":
+		holder := ""
 		if task.Assignee != nil {
-			assignee := *task.Assignee
-			if len(assignee) > 20 {
-				assignee = assignee[:17] + "…"
+			holder = *task.Assignee
+			if len(holder) > 20 {
+				holder = holder[:17] + "…"
 			}
-			duration := formatLeaseCountdown(task.LeaseExpiresAt, now)
-			return fmt.Sprintf("%s %s", task.Model, duration)
+			holder = "@" + holder
 		}
-		return task.Model
+		// Show lease countdown as the time remaining
+		timeRemaining := formatLeaseCountdown(task.LeaseExpiresAt, now)
+		if holder == "" {
+			return fmt.Sprintf("%s %s", task.Model, timeRemaining)
+		}
+		return fmt.Sprintf("%s %s %s", task.Model, holder, timeRemaining)
 
 	case "checks":
 		return fmt.Sprintf("checks %s", formatChecksDuration(task.ChecksStartedAt, now))
@@ -252,7 +297,7 @@ func buildReviewerLine(reviews []*tuiclient.Task, now time.Time, width int) stri
 }
 
 // truncateWithEllipsis truncates a string to fit within the given display width, adding an ellipsis.
-// Uses lipgloss.Width to measure display cells correctly (handles ANSI codes, unicode, etc).
+// Uses ansi.Truncate to handle ANSI escape sequences properly without cutting through them.
 func truncateWithEllipsis(s string, maxWidth int) string {
 	if maxWidth < 1 {
 		return ""
@@ -264,24 +309,13 @@ func truncateWithEllipsis(s string, maxWidth int) string {
 		return s
 	}
 
-	// Need to fit ellipsis (3 chars wide)
-	targetWidth := maxWidth - 3
+	// Reserve 1 cell for ellipsis
+	targetWidth := maxWidth - 1
 	if targetWidth < 0 {
 		targetWidth = 0
 	}
 
-	// Iterate through the string, measuring display width as we go
-	var result strings.Builder
-	var currentWidth int
-	for _, r := range s {
-		charWidth := lipgloss.Width(string(r))
-		if currentWidth+charWidth > targetWidth {
-			break
-		}
-		result.WriteRune(r)
-		currentWidth += charWidth
-	}
-
-	result.WriteString("…")
-	return result.String()
+	// Use ansi.Truncate to handle ANSI codes properly
+	truncated := ansi.Truncate(s, targetWidth, "")
+	return truncated + "…"
 }
