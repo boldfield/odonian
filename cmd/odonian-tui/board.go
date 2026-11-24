@@ -292,6 +292,8 @@ type prResolvedMsg struct {
 	taskID string
 	prURL  string
 	err    string
+	// fromShell marks a resolution requested from the three-pane layout rather than the detail view.
+	fromShell bool
 }
 
 // reviewApprove creates a command that calls ReviewTask(approve) then TransitionTask(done),
@@ -1286,14 +1288,31 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case prResolvedMsg:
+		fromDetail := m.mode == modeDetail
 		if msg.err != "" {
-			m.detailMessage = msg.err
+			if fromDetail {
+				m.detailMessage = msg.err
+			} else {
+				m.error = msg.err
+			}
 			return m, nil
+		}
+		// A shell merge resolves asynchronously; drop the answer if the user has moved on.
+		if m.shell != nil {
+			if msg.fromShell && (m.mode != modeNormal || m.shell.items.SelectedTaskID() != msg.taskID) {
+				return m, nil
+			}
+			if fromDetail && m.detailTask.ID != msg.taskID {
+				return m, nil
+			}
+			if !fromDetail && m.mode != modeNormal {
+				return m, nil
+			}
 		}
 		// Enter merge confirm mode with the resolved PR.
 		m.pendingTaskID = msg.taskID
 		m.pendingPRURL = msg.prURL
-		m.reviewFromDetail = true
+		m.reviewFromDetail = fromDetail
 		m.reviewInput.Placeholder = fmt.Sprintf("merge %s and complete? [y/N]", msg.prURL)
 		m.reviewInput.SetValue("")
 		m.reviewInput.Focus()
@@ -2211,7 +2230,7 @@ func (m *BoardModel) viewContent() string {
 		return b.String()
 	}
 
-	if m.shell != nil && m.mode == modeNormal {
+	if m.shell != nil && m.mode != modeScorecards && m.mode != modeProjectSwitch {
 		return m.shellView()
 	}
 

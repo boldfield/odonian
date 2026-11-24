@@ -239,14 +239,74 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 		}
 		return m, nil, true
 
-	case "r":
-		return m, m.fetchShellTasks(), true
+	case "z":
+		if m.effectiveFocus() == paneProjects {
+			if id := s.projects.SelectedProjectID(); id != "" {
+				m.pendingProjectID = id
+				m.mode = modeArchiveProjectConfirm
+			}
+			return m, nil, true
+		}
+		if m.effectiveFocus() != paneItems {
+			return m, nil, true
+		}
+
+	case "m":
+		if m.effectiveFocus() != paneItems {
+			return m, nil, true
+		}
+		if wi := s.items.SelectedItem(); wi != nil && wi.Implement.State == stateApproved {
+			return m, m.mergeSelectedCmd(wi.Implement.ID), true
+		}
+		return m, nil, true
+
+	// The remaining task actions apply only with the work-items pane focused.
+	case "p", "a", "x", "b", "u", "f", "t", "i", "w", "e":
+		if m.effectiveFocus() != paneItems {
+			return m, nil, true
+		}
+		return m, nil, false
 
 	// The tab layout's column and project-switcher keys have no meaning here.
 	case "left", "right", "h", "l", "P":
 		return m, nil, true
 	}
 	return m, nil, false
+}
+
+// effectiveFocus is the pane that has focus at the current layout (a hidden pane cannot).
+func (m *BoardModel) effectiveFocus() shellPane {
+	layout := m.shellLayout()
+	focus := m.shell.focus
+	if layout.ProjectWidth == 0 && focus == paneProjects {
+		focus = paneItems
+	}
+	if layout.PreviewWidth == 0 && focus == panePreview {
+		focus = paneItems
+	}
+	return focus
+}
+
+// mergeSelectedCmd resolves the PR of an approved task (its pr link, else the task's
+// deterministic branch) and reports it as a prResolvedMsg, which opens the merge confirmation.
+func (m *BoardModel) mergeSelectedCmd(taskID string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if task, err := m.client.GetTask(ctx, taskID); err == nil {
+			for _, link := range task.Links {
+				if link.Kind == "pr" {
+					return prResolvedMsg{taskID: taskID, prURL: link.Value, fromShell: true}
+				}
+			}
+		}
+		msg := m.resolvePRAndMerge(taskID)()
+		if resolved, ok := msg.(prResolvedMsg); ok {
+			resolved.fromShell = true
+			return resolved
+		}
+		return msg
+	}
 }
 
 func (s *shellState) projectsVisible(m *BoardModel) bool {
@@ -298,6 +358,41 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 		cmd = m.setShellItems(msg.tasks, msg.claimable)
 		s.preview.SetItem(s.items.SelectedItem())
 		return cmd, true
+
+	case projectArchiveMsg:
+		if msg.err != "" {
+			m.error = msg.err
+			m.mode = modeNormal
+			return nil, true
+		}
+		m.error = ""
+		m.mode = modeNormal
+		m.projects = msg.projects
+		s.projects.SetProjects(m.projects)
+		for _, p := range m.projects {
+			if p.ID == m.project.ID {
+				s.projects.SelectProject(p.ID)
+				return nil, true
+			}
+		}
+		// The current project was archived: move to the first remaining one, or empty the view.
+		m.tasks = make(map[string][]tuiclient.Task)
+		s.preview.SetItem(nil)
+		if len(m.projects) == 0 {
+			m.project = tuiclient.Project{}
+			m.loading = false
+			s.items.SetProjectName("")
+			s.items.SetItems(nil, nil)
+			m.syncShellSelection()
+			return nil, true
+		}
+		m.project = m.projects[0]
+		m.loading = true
+		s.projects.SelectProject(m.project.ID)
+		s.items.SetProjectName(m.project.Name)
+		s.items.SetItems(nil, nil)
+		m.syncShellSelection()
+		return m.fetchShellTasks(), true
 
 	case ProjectSelected:
 		if msg.ProjectID == "" || msg.ProjectID == m.project.ID {
@@ -352,9 +447,37 @@ func (m *BoardModel) shellHelpBar() string {
 	case m.statusMessage != "":
 		text = m.statusMessage
 	default:
-		text = "tab pane · ↑↓ move · enter detail · v preview · V projects · r refresh · c scorecards · q quit"
+		text = m.shellKeyHints()
 	}
 	return ansi.Truncate(text, m.width, "…")
+}
+
+// shellKeyHints lists the keys valid now: the focused pane's, and for the work-items pane
+// those the selected item's state allows.
+func (m *BoardModel) shellKeyHints() string {
+	const tail = "r refresh · c scorecards · q quit"
+	switch m.effectiveFocus() {
+	case paneProjects:
+		return "tab pane · ↑↓ move · enter open · z archive project · " + tail
+	case panePreview:
+		return "tab pane · ↑↓ scroll · v preview · " + tail
+	}
+	parts := []string{"tab pane", "↑↓ move", "enter detail"}
+	if wi := m.shell.items.SelectedItem(); wi != nil {
+		switch wi.Implement.State {
+		case stateBacklog:
+			parts = append(parts, "p promote")
+		case stateReview:
+			parts = append(parts, "a approve", "x reject")
+		case stateApproved:
+			parts = append(parts, "b bounce", "m merge")
+		case stateBlocked:
+			parts = append(parts, "u unblock", "f fail")
+		}
+		parts = append(parts, "t hold/release", "i priority", "w front", "e reset", "z archive")
+	}
+	parts = append(parts, "v preview", "V projects", tail)
+	return strings.Join(parts, " · ")
 }
 
 // shellView renders the three panes, joined, with a help bar.
@@ -362,6 +485,12 @@ func (m *BoardModel) shellView() string {
 	s := m.shell
 	layout := m.shellLayout()
 	bodyHeight := m.height - 2
+	// An active prompt takes the help bar's place and as many rows above it as it needs.
+	prompt := ""
+	if m.mode != modeNormal {
+		prompt = strings.TrimRight(m.renderReviewOverlay(), "\n")
+		bodyHeight -= strings.Count(prompt, "\n")
+	}
 	if bodyHeight < 1 {
 		bodyHeight = 1
 	}
@@ -394,6 +523,10 @@ func (m *BoardModel) shellView() string {
 		cols = append(cols, sep, box(layout.PreviewWidth, s.preview.Render()))
 	}
 
+	footer := m.shellHelpBar()
+	if prompt != "" {
+		footer = prompt
+	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, cols...) + "\n" +
-		strings.Repeat("─", m.width) + "\n" + m.shellHelpBar()
+		strings.Repeat("─", m.width) + "\n" + footer
 }
