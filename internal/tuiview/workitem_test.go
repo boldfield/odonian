@@ -293,20 +293,20 @@ func TestStatus(t *testing.T) {
 		name         string
 		task         *tuiclient.Task
 		claimableIDs map[string]bool
-		want         string
+		want         StatusType
 	}{
 		// Backlog tests
 		{
-			name:         "backlog claimable",
+			name:         "backlog not promoted (in claimableIDs)",
 			task:         &tuiclient.Task{ID: "t1", State: "backlog", Held: false},
 			claimableIDs: map[string]bool{"t1": true},
-			want:         "○",
+			want:         StatusBacklogNotPromoted,
 		},
 		{
-			name:         "backlog not claimable (waiting)",
+			name:         "backlog waiting on dependency",
 			task:         &tuiclient.Task{ID: "t2", State: "backlog", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "·",
+			want:         StatusBacklogWaiting,
 		},
 
 		// Ready tests
@@ -314,13 +314,13 @@ func TestStatus(t *testing.T) {
 			name:         "ready claimable",
 			task:         &tuiclient.Task{ID: "t3", State: "ready", Held: false},
 			claimableIDs: map[string]bool{"t3": true},
-			want:         "○",
+			want:         StatusReadyClaimable,
 		},
 		{
-			name:         "ready not claimable (waiting on dependency)",
+			name:         "ready waiting on dependency",
 			task:         &tuiclient.Task{ID: "t4", State: "ready", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "⛓",
+			want:         StatusReadyWaiting,
 		},
 
 		// In progress
@@ -328,7 +328,7 @@ func TestStatus(t *testing.T) {
 			name:         "in_progress",
 			task:         &tuiclient.Task{ID: "t5", State: "in_progress", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "●",
+			want:         StatusInProgress,
 		},
 
 		// In checks
@@ -336,7 +336,7 @@ func TestStatus(t *testing.T) {
 			name:         "checks",
 			task:         &tuiclient.Task{ID: "t6", State: "checks", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "◷",
+			want:         StatusChecks,
 		},
 
 		// In review
@@ -344,7 +344,7 @@ func TestStatus(t *testing.T) {
 			name:         "review",
 			task:         &tuiclient.Task{ID: "t7", State: "review", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "◆",
+			want:         StatusReview,
 		},
 
 		// Approved
@@ -352,7 +352,7 @@ func TestStatus(t *testing.T) {
 			name:         "approved",
 			task:         &tuiclient.Task{ID: "t8", State: "approved", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "✔",
+			want:         StatusApproved,
 		},
 
 		// Blocked
@@ -360,7 +360,7 @@ func TestStatus(t *testing.T) {
 			name:         "blocked",
 			task:         &tuiclient.Task{ID: "t9", State: "blocked", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "✖",
+			want:         StatusBlocked,
 		},
 
 		// Failed
@@ -368,53 +368,21 @@ func TestStatus(t *testing.T) {
 			name:         "failed",
 			task:         &tuiclient.Task{ID: "t10", State: "failed", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "!",
+			want:         StatusFailed,
 		},
 
-		// Held tests (prefix on any state)
-		{
-			name:         "held backlog claimable",
-			task:         &tuiclient.Task{ID: "t11", State: "backlog", Held: true},
-			claimableIDs: map[string]bool{"t11": true},
-			want:         "⏸",
-		},
-		{
-			name:         "held in_progress",
-			task:         &tuiclient.Task{ID: "t12", State: "in_progress", Held: true},
-			claimableIDs: map[string]bool{},
-			want:         "⏸",
-		},
-		{
-			name:         "held approved",
-			task:         &tuiclient.Task{ID: "t13", State: "approved", Held: true},
-			claimableIDs: map[string]bool{},
-			want:         "⏸",
-		},
-		{
-			name:         "held blocked",
-			task:         &tuiclient.Task{ID: "t14", State: "blocked", Held: true},
-			claimableIDs: map[string]bool{},
-			want:         "⏸",
-		},
-		{
-			name:         "held failed",
-			task:         &tuiclient.Task{ID: "t15", State: "failed", Held: true},
-			claimableIDs: map[string]bool{},
-			want:         "⏸",
-		},
-
-		// Done and abandoned (should default to "·")
+		// Done and abandoned (should default to StatusBacklogNotPromoted)
 		{
 			name:         "done",
 			task:         &tuiclient.Task{ID: "t16", State: "done", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "·",
+			want:         StatusBacklogNotPromoted,
 		},
 		{
 			name:         "abandoned",
 			task:         &tuiclient.Task{ID: "t17", State: "abandoned", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         "·",
+			want:         StatusBacklogNotPromoted,
 		},
 	}
 
@@ -422,7 +390,49 @@ func TestStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := Status(tt.task, tt.claimableIDs)
 			if got != tt.want {
-				t.Errorf("Status() = %s, want %s", got, tt.want)
+				t.Errorf("Status() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGlyph(t *testing.T) {
+	tests := []struct {
+		name   string
+		status StatusType
+		held   bool
+		want   string
+	}{
+		// Glyph table: all rows without held
+		{name: "ready claimable", status: StatusReadyClaimable, held: false, want: "○"},
+		{name: "ready waiting", status: StatusReadyWaiting, held: false, want: "⛓"},
+		{name: "backlog not promoted", status: StatusBacklogNotPromoted, held: false, want: "·"},
+		{name: "backlog waiting", status: StatusBacklogWaiting, held: false, want: "⛓"},
+		{name: "in_progress", status: StatusInProgress, held: false, want: "●"},
+		{name: "checks", status: StatusChecks, held: false, want: "◷"},
+		{name: "review", status: StatusReview, held: false, want: "◆"},
+		{name: "approved", status: StatusApproved, held: false, want: "✔"},
+		{name: "blocked", status: StatusBlocked, held: false, want: "✖"},
+		{name: "failed", status: StatusFailed, held: false, want: "!"},
+
+		// Held prefix on each state
+		{name: "held ready claimable", status: StatusReadyClaimable, held: true, want: "⏸○"},
+		{name: "held ready waiting", status: StatusReadyWaiting, held: true, want: "⏸⛓"},
+		{name: "held backlog not promoted", status: StatusBacklogNotPromoted, held: true, want: "⏸·"},
+		{name: "held backlog waiting", status: StatusBacklogWaiting, held: true, want: "⏸⛓"},
+		{name: "held in_progress", status: StatusInProgress, held: true, want: "⏸●"},
+		{name: "held checks", status: StatusChecks, held: true, want: "⏸◷"},
+		{name: "held review", status: StatusReview, held: true, want: "⏸◆"},
+		{name: "held approved", status: StatusApproved, held: true, want: "⏸✔"},
+		{name: "held blocked", status: StatusBlocked, held: true, want: "⏸✖"},
+		{name: "held failed", status: StatusFailed, held: true, want: "⏸!"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Glyph(tt.status, tt.held)
+			if got != tt.want {
+				t.Errorf("Glyph() = %s, want %s", got, tt.want)
 			}
 		})
 	}
@@ -602,9 +612,39 @@ func TestBadge(t *testing.T) {
 
 		// Approved with agent_merge=true (in flight)
 		{
-			name: "single in flight",
+			name: "single approved in flight",
 			workItems: []*WorkItem{
 				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+			},
+			wantGlyph: "●",
+			wantCount: 1,
+		},
+
+		// In progress only (in flight)
+		{
+			name: "in_progress only",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "in_progress"}},
+			},
+			wantGlyph: "●",
+			wantCount: 1,
+		},
+
+		// Checks only (in flight)
+		{
+			name: "checks only",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "checks"}},
+			},
+			wantGlyph: "●",
+			wantCount: 1,
+		},
+
+		// Review only (in flight)
+		{
+			name: "review only",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "review"}},
 			},
 			wantGlyph: "●",
 			wantCount: 1,
@@ -678,6 +718,31 @@ func TestBadge(t *testing.T) {
 			},
 			wantGlyph: "●",
 			wantCount: 2,
+		},
+
+		// Mixed in-flight states
+		{
+			name: "mixed in-flight states",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "in_progress"}},
+				{Implement: &tuiclient.Task{State: "checks"}},
+				{Implement: &tuiclient.Task{State: "review"}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+			},
+			wantGlyph: "●",
+			wantCount: 4,
+		},
+
+		// In flight takes priority over queued
+		{
+			name: "in-flight and queued",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "in_progress"}},
+				{Implement: &tuiclient.Task{State: "backlog"}},
+				{Implement: &tuiclient.Task{State: "ready"}},
+			},
+			wantGlyph: "●",
+			wantCount: 1,
 		},
 	}
 

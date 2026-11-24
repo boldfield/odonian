@@ -11,40 +11,86 @@ type WorkItem struct {
 	Merge     *tuiclient.Task   // Merge task (may be nil)
 }
 
-// Status returns the glyph for a task's status.
+// StatusType represents a row in the glyph table.
+type StatusType int
+
+const (
+	StatusReadyClaimable StatusType = iota
+	StatusReadyWaiting
+	StatusBacklogNotPromoted
+	StatusBacklogWaiting
+	StatusInProgress
+	StatusChecks
+	StatusReview
+	StatusApproved
+	StatusBlocked
+	StatusFailed
+)
+
+// Status returns the status classification for a task.
 // claimableIDs is a set of task IDs that are claimable (ready and not waiting on a dependency).
 // A ready or backlog task not in the set is waiting on a dependency.
-func Status(task *tuiclient.Task, claimableIDs map[string]bool) string {
-	if task.Held {
-		return "⏸"
-	}
-
+func Status(task *tuiclient.Task, claimableIDs map[string]bool) StatusType {
 	switch task.State {
 	case "backlog":
 		if claimableIDs[task.ID] {
-			return "○"
+			return StatusBacklogNotPromoted
 		}
-		return "·"
+		return StatusBacklogWaiting
 	case "ready":
 		if claimableIDs[task.ID] {
-			return "○"
+			return StatusReadyClaimable
 		}
-		return "⛓"
+		return StatusReadyWaiting
 	case "in_progress":
-		return "●"
+		return StatusInProgress
 	case "checks":
-		return "◷"
+		return StatusChecks
 	case "review":
-		return "◆"
+		return StatusReview
 	case "approved":
-		return "✔"
+		return StatusApproved
 	case "blocked":
-		return "✖"
+		return StatusBlocked
 	case "failed":
-		return "!"
+		return StatusFailed
 	default:
-		return "·"
+		return StatusBacklogNotPromoted
 	}
+}
+
+// Glyph returns the glyph string for a status, with optional held prefix.
+func Glyph(status StatusType, held bool) string {
+	var glyph string
+	switch status {
+	case StatusReadyClaimable:
+		glyph = "○"
+	case StatusReadyWaiting:
+		glyph = "⛓"
+	case StatusBacklogNotPromoted:
+		glyph = "·"
+	case StatusBacklogWaiting:
+		glyph = "⛓"
+	case StatusInProgress:
+		glyph = "●"
+	case StatusChecks:
+		glyph = "◷"
+	case StatusReview:
+		glyph = "◆"
+	case StatusApproved:
+		glyph = "✔"
+	case StatusBlocked:
+		glyph = "✖"
+	case StatusFailed:
+		glyph = "!"
+	default:
+		glyph = "·"
+	}
+
+	if held {
+		return "⏸" + glyph
+	}
+	return glyph
 }
 
 // IsHeld returns whether a task is held.
@@ -70,21 +116,25 @@ func NeedsYou(task *tuiclient.Task) bool {
 // Badge priority (highest first):
 // 1. Needs you (blocked or failed): "⚠"
 // 2. Awaiting merge (approved with agent_merge=false): "✔"
-// 3. In flight (approved with agent_merge=true): "●"
+// 3. In flight (in_progress, checks, review, or approved with agent_merge=true): "●"
 func Badge(workItems []*WorkItem) (string, int) {
 	var needsYouCount, awaitingMergeCount, inFlightCount int
 
 	for _, wi := range workItems {
 		impl := wi.Implement
 
-		if impl.State == "blocked" || impl.State == "failed" {
-			needsYouCount++
-		} else if impl.State == "approved" {
-			if impl.AgentMerge {
-				inFlightCount++
-			} else {
+		if NeedsYou(impl) {
+			if impl.State == "approved" {
+				// approved with agent_merge=false counts as awaiting merge
 				awaitingMergeCount++
+			} else {
+				// blocked or failed
+				needsYouCount++
 			}
+		} else if impl.State == "in_progress" || impl.State == "checks" || impl.State == "review" {
+			inFlightCount++
+		} else if impl.State == "approved" && impl.AgentMerge {
+			inFlightCount++
 		}
 	}
 
