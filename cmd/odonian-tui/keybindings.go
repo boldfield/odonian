@@ -143,19 +143,19 @@ func DefaultKeyBindings() KeyBindings {
 		Board: boardKeyMap{
 			// Navigation
 			Left: keybind.NewBinding(
-				keybind.WithKeys("left"),
+				keybind.WithKeys("left", "h"),
 				keybind.WithHelp("←", "prev column"),
 			),
 			Right: keybind.NewBinding(
-				keybind.WithKeys("right"),
+				keybind.WithKeys("right", "l"),
 				keybind.WithHelp("→", "next column"),
 			),
 			Up: keybind.NewBinding(
-				keybind.WithKeys("up"),
+				keybind.WithKeys("up", "k"),
 				keybind.WithHelp("↑", "select up"),
 			),
 			Down: keybind.NewBinding(
-				keybind.WithKeys("down"),
+				keybind.WithKeys("down", "j"),
 				keybind.WithHelp("↓", "select down"),
 			),
 			EnterDetail: keybind.NewBinding(
@@ -246,11 +246,11 @@ func DefaultKeyBindings() KeyBindings {
 				keybind.WithHelp("esc", "back"),
 			),
 			ScrollUp: keybind.NewBinding(
-				keybind.WithKeys("up"),
+				keybind.WithKeys("up", "k"),
 				keybind.WithHelp("↑", "scroll up"),
 			),
 			ScrollDown: keybind.NewBinding(
-				keybind.WithKeys("down"),
+				keybind.WithKeys("down", "j"),
 				keybind.WithHelp("↓", "scroll down"),
 			),
 			PageUp: keybind.NewBinding(
@@ -325,19 +325,19 @@ func DefaultKeyBindings() KeyBindings {
 
 			// Navigation within panes
 			Up: keybind.NewBinding(
-				keybind.WithKeys("up"),
+				keybind.WithKeys("up", "k"),
 				keybind.WithHelp("↑", "move up"),
 			),
 			Down: keybind.NewBinding(
-				keybind.WithKeys("down"),
+				keybind.WithKeys("down", "j"),
 				keybind.WithHelp("↓", "move down"),
 			),
 			Left: keybind.NewBinding(
-				keybind.WithKeys("left"),
+				keybind.WithKeys("left", "h"),
 				keybind.WithHelp("←", "scroll left"),
 			),
 			Right: keybind.NewBinding(
-				keybind.WithKeys("right"),
+				keybind.WithKeys("right", "l"),
 				keybind.WithHelp("→", "scroll right"),
 			),
 
