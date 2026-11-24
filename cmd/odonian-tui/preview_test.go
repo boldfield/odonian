@@ -719,3 +719,30 @@ func TestPreviewPaneRender_NewestEventsKeptWhenTruncating(t *testing.T) {
 		t.Errorf("expected History header in output")
 	}
 }
+
+func TestPreviewPaneView_ContentVisibleBelowPrefixWidth(t *testing.T) {
+	impl := &tuiclient.Task{ID: "t", Title: "T", State: stateReview, Model: "opus", ReviewRound: 1}
+	workItem := &tuiview.WorkItem{Implement: impl}
+	detail := &tuiclient.TaskDetail{Links: []tuiclient.TaskLink{{Kind: "pr", Value: "https://x.io/pull/9"}}}
+
+	for _, width := range []int{1, 2, 3, 5, 7} {
+		pane := NewPreviewPane(workItem, width, 60).WithDetail(detail)
+		model, _ := pane.Update(EventsLoadedMsg{Events: []tuiclient.Event{
+			{Kind: "claimed", CreatedAt: "2026-11-24T12:00:00Z"},
+		}})
+		out := model.(*PreviewPane).View().Content
+
+		for _, line := range strings.Split(out, "\n") {
+			if w := runewidth.StringWidth(line); w > width {
+				t.Errorf("width %d: line %q is %d cells", width, line, w)
+			}
+		}
+		// Content must survive wrapping, ignoring line breaks and padding.
+		squashed := strings.ReplaceAll(strings.ReplaceAll(out, "\n", ""), " ", "")
+		for _, want := range []string{"https://x.io/pull/9", "claimed"} {
+			if !strings.Contains(squashed, want) {
+				t.Errorf("width %d: %q missing from %q", width, want, squashed)
+			}
+		}
+	}
+}

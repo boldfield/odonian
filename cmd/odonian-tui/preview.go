@@ -203,10 +203,17 @@ func addLineWithWrap(lines *[]string, text, prefix string, width, lineLimit int)
 	}
 
 	prefixWidth := runewidth.StringWidth(prefix)
-	contentWidth := width - prefixWidth
+	if prefixWidth >= width {
+		// The prefix would leave no room for content; drop it (and the
+		// continuation indent) so the content gets the full pane width.
+		prefix = ""
+		prefixWidth = 0
+	}
+	contentWidth := width
 	if contentWidth < 1 {
 		contentWidth = 1
 	}
+	contentWidth -= prefixWidth
 
 	// Wrap the content to the available width by display cells
 	wrappedLines := wrapByDisplayWidth(text, contentWidth)
