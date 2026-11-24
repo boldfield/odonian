@@ -4,19 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image/color"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/localcommit"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/google/uuid"
 )
 
@@ -150,7 +151,7 @@ const (
 )
 
 var stateOrder = []string{stateBacklog, stateReady, stateInProgress, stateChecks, stateReview, stateApproved, stateDone, stateBlocked, stateFailed, stateAbandoned}
-var stateColors = map[string]lipgloss.Color{
+var stateColors = map[string]color.Color{
 	stateBacklog:    lipgloss.Color("8"),
 	stateReady:      lipgloss.Color("4"),
 	stateInProgress: lipgloss.Color("3"),
@@ -173,10 +174,33 @@ func columnIndex(state string) int {
 	return -1
 }
 
+// v1InputStyles returns text input styles that match the Bubbles v1 defaults: an unstyled
+// prompt and text, a grey placeholder and a cursor with no colour of its own.
+func v1InputStyles() textinput.Styles {
+	s := textinput.DefaultDarkStyles()
+	s.Focused.Prompt = lipgloss.NewStyle()
+	s.Blurred.Prompt = lipgloss.NewStyle()
+	s.Blurred.Text = lipgloss.NewStyle()
+	s.Cursor.Color = nil
+	return s
+}
+
+// reviewInputView renders the shared text input. Bubbles v2 cuts the placeholder to its
+// first character when the input has no width, so while the placeholder shows, render a
+// copy sized to it; the placeholder then shows in full with no padding, as in v1.
+func (m *BoardModel) reviewInputView() string {
+	input := m.reviewInput
+	if input.Value() == "" && input.Placeholder != "" {
+		input.SetWidth(len([]rune(input.Placeholder)) - 1)
+	}
+	return input.View()
+}
+
 // NewBoardModel creates a new board model and starts the initial fetch.
 func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tuiclient.Project) *BoardModel {
 	inputWidget := textinput.New()
 	inputWidget.CharLimit = 512
+	inputWidget.SetStyles(v1InputStyles())
 
 	m := &BoardModel{
 		client:         client,
@@ -941,7 +965,20 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.PasteMsg:
+		// Bubble Tea v2 delivers a bracketed paste as its own message rather than as a key.
+		// Pasted text goes only to the modes that type into the text input.
+		m.statusMessage = ""
+		switch m.mode {
+		case modeApproveNote, modeRejectReason, modeApprovedRejectNote, modeUnblockNote, modeFailNote,
+			modeSetPriorityInput, modeSetPriorityReason, modeMoveToFrontReason, modeResetPriorityReason:
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+
+	case tea.KeyPressMsg:
 		m.statusMessage = ""
 
 		// Detail mode: all keys go to the detail handler — board nav must not fire.
@@ -1375,7 +1412,7 @@ func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // updateDetailMode handles key events while the full-screen detail view is active.
 // Board navigation is fully suppressed in this mode.
-func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		// Return to the board.
@@ -1385,16 +1422,16 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Spec viewport scrolling.
 	case "up", "k":
-		m.detailViewport.LineUp(1)
+		m.detailViewport.ScrollUp(1)
 		return m, nil
 	case "down", "j":
-		m.detailViewport.LineDown(1)
+		m.detailViewport.ScrollDown(1)
 		return m, nil
 	case "pgup":
-		m.detailViewport.HalfViewUp()
+		m.detailViewport.HalfPageUp()
 		return m, nil
 	case "pgdown":
-		m.detailViewport.HalfViewDown()
+		m.detailViewport.HalfPageDown()
 		return m, nil
 
 	// Open PR link.
@@ -1526,7 +1563,7 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // updateProjectSwitchMode handles key events while the project switcher overlay is active.
-func (m *BoardModel) updateProjectSwitchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *BoardModel) updateProjectSwitchMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		// Cancel and return to normal mode
@@ -1585,7 +1622,7 @@ func (m *BoardModel) updateProjectSwitchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd
 
 // updateReviewMode handles key events when the model is in one of the review input modes.
 // It returns the updated model and any command to run. Normal navigation is suppressed.
-func (m *BoardModel) updateReviewMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *BoardModel) updateReviewMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch m.mode {
 	case modeApproveNote:
 		switch msg.String() {
@@ -2145,8 +2182,15 @@ func (m *BoardModel) ensureSelectionInColumn() {
 	m.clampScrollToSelection()
 }
 
-// View renders the board (or the detail view if in modeDetail).
-func (m *BoardModel) View() string {
+// View renders the board in the alternate screen buffer.
+func (m *BoardModel) View() tea.View {
+	v := tea.NewView(m.viewContent())
+	v.AltScreen = true
+	return v
+}
+
+// viewContent renders the board (or the detail view if in modeDetail).
+func (m *BoardModel) viewContent() string {
 	if m.width < 40 {
 		return "Terminal too narrow. Please resize."
 	}
@@ -2228,7 +2272,7 @@ func (m *BoardModel) renderReviewOverlay() string {
 	switch m.mode {
 	case modeApproveNote:
 		b.WriteString("Approve — add an optional note:\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		b.WriteString("(enter to continue, esc to cancel)\n")
 	case modeApproveConfirm:
@@ -2241,19 +2285,19 @@ func (m *BoardModel) renderReviewOverlay() string {
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
 	case modeRejectReason:
 		b.WriteString("Reject — reason (required):\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		if m.inputHint != "" {
 			b.WriteString("hint: " + m.inputHint + "\n")
 		}
 		b.WriteString("(enter to submit, esc to cancel)\n")
 	case modeMergeConfirm:
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		b.WriteString("(y to confirm merge and complete, n/esc to cancel)\n")
 	case modeApprovedRejectNote:
 		b.WriteString("Bounce back to ready — optional note:\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		b.WriteString("(enter to continue, esc to cancel)\n")
 	case modeApprovedRejectConfirm:
@@ -2261,7 +2305,7 @@ func (m *BoardModel) renderReviewOverlay() string {
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
 	case modeUnblockNote:
 		b.WriteString("Unblock — add an optional note:\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		b.WriteString("(enter to continue, esc to cancel)\n")
 	case modeUnblockConfirm:
@@ -2273,7 +2317,7 @@ func (m *BoardModel) renderReviewOverlay() string {
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
 	case modeFailNote:
 		b.WriteString("Fail — add an optional note:\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		b.WriteString("(enter to continue, esc to cancel)\n")
 	case modeFailConfirm:
@@ -2306,7 +2350,7 @@ func (m *BoardModel) renderReviewOverlay() string {
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
 	case modeSetPriorityInput:
 		b.WriteString("Set priority — enter a value (1-1000):\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		if m.inputHint != "" {
 			b.WriteString("hint: " + m.inputHint + "\n")
@@ -2314,7 +2358,7 @@ func (m *BoardModel) renderReviewOverlay() string {
 		b.WriteString("(enter to continue, esc to cancel)\n")
 	case modeSetPriorityReason:
 		b.WriteString("Set priority — reason (required):\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		if m.inputHint != "" {
 			b.WriteString("hint: " + m.inputHint + "\n")
@@ -2329,7 +2373,7 @@ func (m *BoardModel) renderReviewOverlay() string {
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
 	case modeMoveToFrontReason:
 		b.WriteString("Move to front — reason (required):\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		if m.inputHint != "" {
 			b.WriteString("hint: " + m.inputHint + "\n")
@@ -2345,7 +2389,7 @@ func (m *BoardModel) renderReviewOverlay() string {
 		b.WriteString("(y to confirm, n/esc to cancel)\n")
 	case modeResetPriorityReason:
 		b.WriteString("Reset priority to 500 — reason (required):\n")
-		b.WriteString(m.reviewInput.View())
+		b.WriteString(m.reviewInputView())
 		b.WriteString("\n")
 		if m.inputHint != "" {
 			b.WriteString("hint: " + m.inputHint + "\n")
