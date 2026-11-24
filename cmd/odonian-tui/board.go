@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -138,6 +139,11 @@ type BoardModel struct {
 
 	// shell is the three-pane layout; nil renders the old tab layout, which a later task deletes.
 	shell *shellState
+
+	// Key bindings and help
+	keyBindings  KeyBindings
+	helpModel    help.Model
+	showFullHelp bool
 }
 
 const (
@@ -193,6 +199,10 @@ func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tu
 	inputWidget.CharLimit = 512
 	inputWidget.SetStyles(v1InputStyles())
 
+	helpModel := help.New()
+	helpModel.ShowAll = false
+	helpModel.Ellipsis = "…"
+
 	m := &BoardModel{
 		client:         client,
 		config:         config,
@@ -203,6 +213,9 @@ func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tu
 		reviewInput:    inputWidget,
 		urlOpener:      defaultURLOpener,
 		ghMerger:       defaultGHMerger,
+		keyBindings:    DefaultKeyBindings(),
+		helpModel:      helpModel,
+		showFullHelp:   false,
 	}
 	m.newTickCmd = m.defaultTickCmd
 	return m
@@ -959,6 +972,7 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.helpModel.SetWidth(m.width)
 		// Reinitialize the detail viewport if we're in detail mode.
 		if m.mode == modeDetail {
 			m.initDetailViewport(m.detailTask)
@@ -1250,9 +1264,9 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scorecardLoading = true
 			return m, m.fetchScorecardCmd()
 
-		// Help (stub for TUI-3+)
+		// Help: toggle full help view
 		case "?":
-			// TODO: show help overlay
+			m.showFullHelp = !m.showFullHelp
 		}
 
 	case detailFetchedMsg:
@@ -2219,6 +2233,17 @@ func (m *BoardModel) viewContent() string {
 		return "Terminal too narrow. Please resize."
 	}
 
+	// Full help view
+	if m.showFullHelp {
+		var b strings.Builder
+		b.WriteString(m.renderFullHelp())
+		b.WriteString("\n")
+		b.WriteString(strings.Repeat("─", m.width))
+		b.WriteString("\n")
+		b.WriteString("? to close")
+		return b.String()
+	}
+
 	// Full-screen detail view.
 	if m.mode == modeDetail {
 		var b strings.Builder
@@ -2573,24 +2598,40 @@ func (m *BoardModel) renderColumnTasks() string {
 	return b.String()
 }
 
-// renderHelpBar renders the bottom help bar.
-// Show column-specific actions: `p promote` on backlog, `a approve` / `x reject` on review, `b bounce` on approved.
+// renderHelpBar renders the bottom help bar with key bindings for the current state.
+// It truncates with ellipsis instead of overflowing if the terminal is too narrow.
 func (m *BoardModel) renderHelpBar() string {
-	// While in a review input mode, show mode-specific hints.
 	if m.mode != modeNormal {
 		return "esc cancel"
 	}
-	priorityKeys := "   i set priority   w move to front   e reset priority"
-	switch stateOrder[m.selectedColumn] {
-	case stateBacklog:
-		return "←/→ column   ↑/↓ select   enter detail   p promote   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	case stateReview:
-		return "←/→ column   ↑/↓ select   enter detail   a approve   x reject   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	case stateApproved:
-		return "←/→ column   ↑/↓ select   enter detail   b bounce   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	case stateBlocked:
-		return "←/→ column   ↑/↓ select   enter detail   u unblock   f fail   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	default:
-		return "←/→ column   ↑/↓ select   enter detail   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	}
+
+	currentState := stateOrder[m.selectedColumn]
+	bindings := m.keyBindings.getBoardBindingsForState(currentState)
+
+	// Set the help model width to allow truncation
+	m.helpModel.SetWidth(m.width)
+	m.helpModel.ShowAll = false
+
+	return m.helpModel.ShortHelpView(bindings)
+}
+
+// renderDetailHelpBar renders the help bar for the detail view.
+func (m *BoardModel) renderDetailHelpBar() string {
+	bindings := m.keyBindings.getDetailBindingsForState(m.detailTask.State)
+
+	m.helpModel.SetWidth(m.width)
+	m.helpModel.ShowAll = false
+
+	return m.helpModel.ShortHelpView(bindings)
+}
+
+// renderFullHelp renders the full help view with all available key bindings grouped by context.
+func (m *BoardModel) renderFullHelp() string {
+	currentState := stateOrder[m.selectedColumn]
+	bindings := m.keyBindings.getBoardBindingsForState(currentState)
+
+	m.helpModel.SetWidth(m.width)
+	m.helpModel.ShowAll = true
+
+	return m.helpModel.ShortHelpView(bindings)
 }

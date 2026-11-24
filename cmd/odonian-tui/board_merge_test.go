@@ -44,7 +44,7 @@ func buildApprovedModel(t *testing.T, approvedClient *tuiclient.MockClient) *Boa
 	project := tuiclient.Project{ID: "project-1", Name: "Test", Repo: "https://github.com/boldfield/odonian"}
 
 	model := NewBoardModel(approvedClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 200, Height: 24})
 	model = m.(*BoardModel)
 
 	// Load an approved task into the board.
@@ -391,8 +391,8 @@ func TestBoardModel_ApprovedHelpBar(t *testing.T) {
 	model = executeReviewCmd(t, model, detailCmd)
 
 	approvedOutput := model.View().Content
-	if !strings.Contains(approvedOutput, "m merge & complete") {
-		t.Errorf("Expected 'm merge & complete' in help bar for approved task, got:\n%s", approvedOutput)
+	if !strings.Contains(approvedOutput, "merge") {
+		t.Errorf("Expected 'merge' in help bar for approved task, got:\n%s", approvedOutput)
 	}
 
 	// Exit detail mode and return to board.

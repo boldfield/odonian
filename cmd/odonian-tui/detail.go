@@ -408,18 +408,6 @@ func (m *BoardModel) initDetailViewport(task tuiclient.TaskDetail) {
 	m.detailViewport = vp
 }
 
-// renderDetailHelpBar returns the help bar text appropriate for detail view.
-func (m *BoardModel) renderDetailHelpBar() string {
-	base := "esc back   ↑/↓/pgup/pgdn scroll spec   o open PR   s source doc   d design doc   P switch project   i set priority   w move to front   e reset priority"
-	if m.detailTask.State == stateReview {
-		base += "   a approve   x reject"
-	}
-	if m.detailTask.State == stateApproved {
-		base += "   m merge & complete"
-	}
-	return base
-}
-
 // defaultURLOpener is the production opener. It tries $BROWSER, then platform open commands.
 func defaultURLOpener(rawURL string) error {
 	// Try $BROWSER first.
