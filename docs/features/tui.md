@@ -73,14 +73,14 @@ Resolution order (highest wins): **flags > environment > config file > defaults*
 ## Layout & navigation
 
 **Three panes with responsive layout.** The board shows (1) projects, (2) work items for the selected
-project, and (3) a preview pane when selected. The layout adapts to terminal width:
+project, and (3) a preview pane when an item is selected. The layout adapts to terminal width:
 
-- **Wide (120+ columns):** All three panes visible side by side. Projects pane shows full names, 
-  work items pane shows task details with assignee and state, preview pane shows the selected task.
-- **Medium (80–119 columns):** Projects pane (abbreviated) and items pane visible; preview is hidden
-  and can be toggled with `v`.
-- **Narrow (40–79 columns):** Items pane only; projects and detail are accessed via full-screen views
-  when switching panes or pressing `enter` to open a project.
+- **Wide (120+ columns):** All three panes visible side by side. Projects pane shows full names,
+  work items pane shows task details with assignee and state, preview pane shows the selected task
+  (toggled on/off with `v`).
+- **Medium (80–119 columns):** Projects pane (abbreviated rail) and items pane visible; no preview pane.
+- **Narrow (40–79 columns):** Items pane only; projects access via `V` toggle (shows full-screen
+  project list); detail view via `enter` on selected item.
 - **Too narrow (<40 columns):** The layout is too narrow to display safely.
 
 ```
@@ -90,16 +90,19 @@ project, and (3) a preview pane when selected. The layout adapts to terminal wid
  ▸ syndic   ●3   │ ● D-35 Replace prompts   sonnet @2bllr 12m│ PR #212 · in checks 18m
    ohand    ⚠1   │ ● D-34 Repair fixture    haiku  @s9jtd  4m│
  ──────────────────┴───────────────────────────────────────────┴──────────────────────────────
- p projects · ↑↓ move · enter detail · a approve · u unblock · / filter · ? help
+ V projects · ↑↓ move · enter detail · a approve · u unblock · m merge · ? help
 ```
 
 Navigation:
 - `↑/↓` (and `j/k`) move within the focused pane.
-- `tab` / `shift+tab` switch panes.
-- `enter` opens the selected item in the items pane (or project in the projects pane) in a full-screen detail view.
-- `V` toggles the projects pane (at 80+ columns).
-- `v` toggles the preview pane (at 120+ columns).
-- The selected item's available actions show in the help bar (e.g. `p` promote only on `backlog` items, 
+- `tab` / `shift+tab` switch panes (only in wide/medium widths; at narrow width, `V` toggles
+  between items and projects pane).
+- `enter` opens the selected item in a full-screen detail view (or selects a project in the
+  projects pane and returns focus to items).
+- `V` toggles the projects pane (at 80+ columns; at narrow width, shows/hides the full-screen
+  projects view).
+- `v` toggles the preview pane (at 120+ columns only; shown by default when an item is selected).
+- The selected item's available actions show in the help bar (e.g. `p` promote only on `backlog` items,
   `a/x` only on `review` items).
 - Items scroll internally if they overflow the pane height.
 
@@ -131,10 +134,10 @@ All actions go through the API; the board you see can be stale, so **every actio
 
 ## Detail view
 
-`enter` opens a **full-screen** detail (not a cramped split); `esc` returns to the board.
-Shows: title, state, the full `spec` (scrollable viewport), `depends_on` resolved to task
-titles, `links` (with `o` to open the `pr` link in `$BROWSER`/`open`/`xdg-open`), `result`,
-`assignee`, lease countdown, and created/updated timestamps. On `review` tasks the same
+`enter` opens a **full-screen** detail (not a cramped split); `esc` or `q` returns to the board
+(on the board, `q` quits instead). Shows: title, state, the full `spec` (scrollable viewport),
+`depends_on` resolved to task titles, `links` (with `o` to open the `pr` link in `$BROWSER`/`open`/`xdg-open`),
+`result`, `assignee`, lease countdown, and created/updated timestamps. On `review` tasks the same
 `a`/`x` actions are available from the detail view.
 
 From detail you can also open the task's **source documents** in the browser:
@@ -176,9 +179,9 @@ the ref — the TUI builds the URL (GitHub-shaped; abstract for other forges lat
 | `a` | approve review → done (confirmed) |
 | `x` | reject review → ready (reason required) |
 | `m` | merge approved → done |
-| `b` | bounce approved → backlog |
+| `b` | bounce approved → ready |
 | `u` | unblock blocked → ready |
-| `f` | fail blocked → backlog |
+| `f` | fail blocked → failed |
 
 ### Detail view options
 
@@ -238,11 +241,13 @@ Tightly coupled UI (one Bubble Tea model), so a **linear chain** — one claimab
    **Acceptance:** builds; `make tui` produces `bin/odonian-tui`; with valid config it lists
    projects (or auto-selects); bad config errors cleanly; client httptest + a model test pass.
    *(no deps)*
-2. **TUI-2 — board view, nav, polling.** Focused-column/tabs layout; bucket `ListTasks` by
-   state; cards with title and (in_progress) assignee + lease countdown; arrow/hjkl nav;
-   poll + manual refresh with **ID-keyed selection stability**; loading/empty/error states.
-   **Acceptance:** renders all five columns with counts; nav works; a simulated refresh keeps
-   the selection; teatest goldens for layout + selection-stability + error. *(deps: TUI-1)*
+2. **TUI-2 — board view, nav, polling (historical: focused-column/tabs layout).** Three-pane
+   responsive layout (projects, work items, preview); single-project work-item grouping (reviews/merges
+   nest under their implement task); responsive layout (120+ shows all three panes; 80–119 shows projects
+   rail and items; under 80 shows items only); arrow/hjkl nav; poll + manual refresh with **ID-keyed
+   selection stability**; loading/empty/error states.
+   **Acceptance:** renders the panes correctly at different widths; nav works; a simulated refresh
+   keeps the selection; teatest goldens for layout + selection-stability + error. *(deps: TUI-1)*
 3. **TUI-3 — promote.** `p` on a `backlog` task → `PromoteTask` → refetch; 409 surfaced.
    **Acceptance:** promoting a backlog task moves it to ready and the board updates; a 409 is
    shown, not fatal; model test covers both. *(deps: TUI-2)*
