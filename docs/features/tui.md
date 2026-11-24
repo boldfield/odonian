@@ -24,10 +24,10 @@ the API-only design: humans and agents drive the same single source of truth.
 - **See the board** as states — `backlog`, `ready`, `in_progress`, `checks`, `review`, `done` —
   from a single `GET /projects/{id}/tasks` call, bucketed by state client-side.
 - **Watch agents work**: `in_progress` cards show `assignee` and a live lease countdown.
-- **Watch the checks gate**: a `checks` column sits between `in_progress` and `review`; its cards
+- **Watch the checks gate**: `checks` is its own work-item state, between `in_progress` and `review`; its rows
   and the task detail show how long the task has been in `checks` (from `checks_started_at`).
 - **Promote** a `backlog` task to `ready` (`p`).
-- **Work the human gate** from the `review` column: approve (`a`) and reject (`x`). The API
+- **Work the human gate** on `review` items: approve (`a`) and reject (`x`). The API
   already supports this end to end (`POST /tasks/{id}/review`, `POST /tasks/{id}/transition`,
   both shipped) — no backend work, which is why it's v1.
 - **Task detail** (`enter`): spec, deps, links, result, timestamps.
@@ -79,8 +79,8 @@ project, and (3) a preview pane when an item is selected. The layout adapts to t
   work items pane shows task details with assignee and state, preview pane shows the selected task
   (toggled on/off with `v`).
 - **Medium (80–119 columns):** Projects pane (abbreviated rail) and items pane visible; no preview pane.
-- **Narrow (40–79 columns):** Items pane only; projects access via `V` toggle (shows full-screen
-  project list); detail view via `enter` on selected item.
+- **Narrow (40–79 columns):** Items pane only. The projects pane cannot be reached at this width;
+  `enter` on an item opens the full-screen detail view.
 - **Too narrow (<40 columns):** The layout is too narrow to display safely.
 
 ```
@@ -95,12 +95,11 @@ project, and (3) a preview pane when an item is selected. The layout adapts to t
 
 Navigation:
 - `↑/↓` (and `j/k`) move within the focused pane.
-- `tab` / `shift+tab` switch panes (only in wide/medium widths; at narrow width, `V` toggles
-  between items and projects pane).
+- `tab` / `shift+tab` switch panes (wide and medium widths only; at narrow width only the items
+  pane exists).
 - `enter` opens the selected item in a full-screen detail view (or selects a project in the
   projects pane and returns focus to items).
-- `V` toggles the projects pane (at 80+ columns; at narrow width, shows/hides the full-screen
-  projects view).
+- `V` toggles the projects pane (80+ columns only; it has no effect at narrow width).
 - `v` toggles the preview pane (at 120+ columns only; shown by default when an item is selected).
 - The selected item's available actions show in the help bar (e.g. `p` promote only on `backlog` items,
   `a/x` only on `review` items).
@@ -212,7 +211,7 @@ the ref — the TUI builds the URL (GitHub-shaped; abstract for other forges lat
 
 ## Visual design
 
-- State-tinted glyphs for each task (e.g. backlog ○, ready ◆, in_progress ●, review ◇, done ✓, checks ◷), 
+- State-tinted glyphs for each task (e.g. backlog ○, ready ◆, in_progress ●, review ◇, done ✓, checks ◷),
   status badges (assigned models), a persistent status/help bar.
 - Project badges show counts of open tasks and warning icons for blocked/abandoned work.
 - Lease rendered as a live countdown (`2m11s`) and `EXPIRED` (red) when past — an expired
