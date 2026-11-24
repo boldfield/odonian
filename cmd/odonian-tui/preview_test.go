@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -494,5 +495,188 @@ func TestFormatEventTime(t *testing.T) {
 				t.Errorf("formatEventTime(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestPreviewPaneRender_AllWidthsRespected(t *testing.T) {
+	tests := []struct {
+		name     string
+		scenario func() (*tuiview.WorkItem, *tuiclient.TaskDetail, []tuiclient.Event)
+		widths   []int
+	}{
+		{
+			name: "checks scenario with narrow widths",
+			scenario: func() (*tuiview.WorkItem, *tuiclient.TaskDetail, []tuiclient.Event) {
+				now := "2026-11-24T12:00:00Z"
+				impl := &tuiclient.Task{
+					ID:              "task-1",
+					Title:           "修复中文标题的预览窗格宽度问题",
+					State:           stateChecks,
+					Model:           "gpt-5.6-sol",
+					ReviewRound:     12,
+					ChecksStartedAt: &now,
+				}
+				return &tuiview.WorkItem{Implement: impl, Reviews: []*tuiclient.Task{}}, nil, []tuiclient.Event{}
+			},
+			widths: []int{1, 2, 5, 12, 20},
+		},
+		{
+			name: "review scenario with verdicts",
+			scenario: func() (*tuiview.WorkItem, *tuiclient.TaskDetail, []tuiclient.Event) {
+				impl := &tuiclient.Task{
+					ID:          "task-2",
+					Title:       "Review task title",
+					State:       stateReview,
+					Model:       "sonnet",
+					ReviewRound: 1,
+				}
+				approved := "approve"
+				reviews := []*tuiclient.Task{
+					{ID: "r1", Model: "opus", Verdict: &approved},
+					{ID: "r2", Model: "haiku", Verdict: nil},
+				}
+				return &tuiview.WorkItem{Implement: impl, Reviews: reviews}, nil, []tuiclient.Event{}
+			},
+			widths: []int{5, 12, 30},
+		},
+		{
+			name: "with PR link",
+			scenario: func() (*tuiview.WorkItem, *tuiclient.TaskDetail, []tuiclient.Event) {
+				impl := &tuiclient.Task{
+					ID:          "task-3",
+					Title:       "PR link test",
+					State:       stateInProgress,
+					Model:       "haiku",
+					ReviewRound: 1,
+				}
+				detail := &tuiclient.TaskDetail{
+					ID:    "task-3",
+					Title: "PR link test",
+					Links: []tuiclient.TaskLink{
+						{Kind: "pr", Value: "https://github.com/owner/repo/pull/123456789"},
+					},
+				}
+				return &tuiview.WorkItem{Implement: impl, Reviews: []*tuiclient.Task{}}, detail, []tuiclient.Event{}
+			},
+			widths: []int{2, 5, 12},
+		},
+		{
+			name: "with events loading and loaded",
+			scenario: func() (*tuiview.WorkItem, *tuiclient.TaskDetail, []tuiclient.Event) {
+				impl := &tuiclient.Task{
+					ID:          "task-4",
+					Title:       "Events test",
+					State:       stateInProgress,
+					Model:       "sonnet",
+					ReviewRound: 1,
+				}
+				events := []tuiclient.Event{
+					{ID: "e1", Kind: "submitted, PR opened, entered checks", CreatedAt: "2026-11-24T12:00:00Z"},
+					{ID: "e2", Kind: "claimed by @c4wqd", CreatedAt: "2026-11-24T12:05:00Z"},
+				}
+				return &tuiview.WorkItem{Implement: impl, Reviews: []*tuiclient.Task{}}, nil, events
+			},
+			widths: []int{5, 12, 30},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workItem, detail, events := tt.scenario()
+			mockClock := func() time.Time {
+				t, _ := time.Parse(time.RFC3339Nano, "2026-11-24T12:18:00Z")
+				return t
+			}
+
+			for _, width := range tt.widths {
+				t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+					pane := NewPreviewPane(workItem, width, 20)
+					pane.clock = mockClock
+					if detail != nil {
+						pane.WithDetail(detail)
+					}
+					if events != nil {
+						pane.SetEvents(events)
+					}
+
+					output := pane.Render()
+					lines := strings.Split(output, "\n")
+
+					for i, line := range lines {
+						displayWidth := runewidth.StringWidth(line)
+						if displayWidth > width {
+							t.Errorf("line %d exceeds width %d: got %d cells: %q", i, width, displayWidth, line)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestPreviewPaneRender_ChecksDurationShown(t *testing.T) {
+	now := "2026-11-24T12:00:00Z"
+	impl := &tuiclient.Task{
+		ID:              "task-1",
+		Title:           "Test task",
+		State:           stateChecks,
+		Model:           "sonnet",
+		ReviewRound:     1,
+		ChecksStartedAt: &now,
+	}
+	workItem := &tuiview.WorkItem{Implement: impl, Reviews: []*tuiclient.Task{}}
+
+	mockClock := func() time.Time {
+		t, _ := time.Parse(time.RFC3339Nano, "2026-11-24T12:18:00Z")
+		return t
+	}
+
+	pane := NewPreviewPane(workItem, 50, 10)
+	pane.clock = mockClock
+	pane.SetEvents([]tuiclient.Event{})
+
+	output := pane.Render()
+
+	if !strings.Contains(output, "in checks") {
+		t.Errorf("expected 'in checks' in output")
+	}
+	if !strings.Contains(output, "18m") {
+		t.Errorf("expected '18m' (duration) in output, got: %s", output)
+	}
+}
+
+func TestPreviewPaneRender_NewestEventsKeptWhenTruncating(t *testing.T) {
+	impl := &tuiclient.Task{
+		ID:          "task-1",
+		Title:       "Test task",
+		State:       stateInProgress,
+		Model:       "haiku",
+		ReviewRound: 1,
+	}
+	workItem := &tuiview.WorkItem{Implement: impl, Reviews: []*tuiclient.Task{}}
+
+	events := make([]tuiclient.Event, 10)
+	for i := 0; i < 10; i++ {
+		events[i] = tuiclient.Event{
+			ID:        fmt.Sprintf("event-%d", i),
+			Kind:      fmt.Sprintf("kind_%d", i),
+			CreatedAt: "2026-11-24T12:00:00Z",
+		}
+	}
+
+	pane := NewPreviewPane(workItem, 50, 4)
+	pane.SetEvents(events)
+	output := pane.Render()
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) > 4 {
+		t.Errorf("expected at most 4 lines, got %d", len(lines))
+	}
+
+	if !strings.Contains(output, "kind_9") {
+		t.Errorf("expected newest event (kind_9) in truncated output")
+	}
+	if !strings.Contains(output, "History:") {
+		t.Errorf("expected History header in output")
 	}
 }

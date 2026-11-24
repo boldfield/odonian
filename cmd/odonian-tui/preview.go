@@ -24,6 +24,11 @@ type PreviewPane struct {
 	clock    func() time.Time
 }
 
+// EventsLoadedMsg signals that events have arrived and should be displayed.
+type EventsLoadedMsg struct {
+	Events []tuiclient.Event
+}
+
 // NewPreviewPane creates a new preview pane for the given work item and optional detail.
 // Detail is used for PR links; if nil, PR links won't be shown.
 // Events are initially nil; SetEvents must be called to load them.
@@ -58,7 +63,20 @@ func (p *PreviewPane) Init() tea.Cmd {
 
 // Update implements tea.Model.
 func (p *PreviewPane) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case EventsLoadedMsg:
+		p.SetEvents(msg.Events)
+	case tea.WindowSizeMsg:
+		p.width = msg.Width
+		p.height = msg.Height
+	}
 	return p, nil
+}
+
+// SetSize updates the pane's width and height.
+func (p *PreviewPane) SetSize(width, height int) {
+	p.width = width
+	p.height = height
 }
 
 // View implements tea.Model and renders the preview pane content.
@@ -81,7 +99,7 @@ func (p *PreviewPane) Render() string {
 		if len(lines) >= lineLimit {
 			break
 		}
-		lines = append(lines, line)
+		lines = append(lines, ensureWidthLimit(line, p.width))
 	}
 
 	if len(lines) >= lineLimit {
@@ -90,10 +108,7 @@ func (p *PreviewPane) Render() string {
 
 	// Status line: state, round, model
 	statusLine := fmt.Sprintf("%s · round %d · %s", p.workItem.Implement.State, p.workItem.Implement.ReviewRound, p.workItem.Implement.Model)
-	if runewidth.StringWidth(statusLine) > p.width {
-		statusLine = truncateToDisplayWidth(statusLine, p.width)
-	}
-	lines = append(lines, statusLine)
+	lines = append(lines, ensureWidthLimit(statusLine, p.width))
 
 	if len(lines) >= lineLimit {
 		return joinLines(lines, lineLimit)
@@ -104,13 +119,17 @@ func (p *PreviewPane) Render() string {
 		for _, link := range p.detail.Links {
 			if link.Kind == "pr" {
 				prefix := "PR "
-				wrappedLink := wrapTextByDisplayWidth(link.Value, p.width-len(prefix))
-				linkLine := prefix + wrappedLink
-				for _, line := range strings.Split(linkLine, "\n") {
+				prefixWidth := runewidth.StringWidth(prefix)
+				availWidth := p.width - prefixWidth
+				if availWidth < 1 {
+					availWidth = 1
+				}
+				wrappedLink := wrapTextByDisplayWidth(link.Value, availWidth)
+				for _, linkLine := range strings.Split(wrappedLink, "\n") {
 					if len(lines) >= lineLimit {
 						break
 					}
-					lines = append(lines, line)
+					lines = append(lines, ensureWidthLimit(prefix+linkLine, p.width))
 				}
 				break
 			}
@@ -125,7 +144,7 @@ func (p *PreviewPane) Render() string {
 	if p.workItem.Implement.State == stateChecks && p.workItem.Implement.ChecksStartedAt != nil {
 		duration := formatChecksDuration(p.workItem.Implement.ChecksStartedAt, p.clock())
 		checksLine := fmt.Sprintf("in checks · %s", duration)
-		lines = append(lines, checksLine)
+		lines = append(lines, ensureWidthLimit(checksLine, p.width))
 	}
 
 	if len(lines) >= lineLimit {
@@ -134,7 +153,7 @@ func (p *PreviewPane) Render() string {
 
 	// Reviews with verdicts for the current round
 	if len(p.workItem.Reviews) > 0 {
-		lines = append(lines, "Reviews:")
+		lines = append(lines, ensureWidthLimit("Reviews:", p.width))
 		if len(lines) >= lineLimit {
 			return joinLines(lines, lineLimit)
 		}
@@ -145,10 +164,7 @@ func (p *PreviewPane) Render() string {
 				verdict = *review.Verdict
 			}
 			reviewLine := fmt.Sprintf("  %s (%s)", review.Model, verdict)
-			if runewidth.StringWidth(reviewLine) > p.width {
-				reviewLine = truncateToDisplayWidth(reviewLine, p.width)
-			}
-			lines = append(lines, reviewLine)
+			lines = append(lines, ensureWidthLimit(reviewLine, p.width))
 			if len(lines) >= lineLimit {
 				return joinLines(lines, lineLimit)
 			}
@@ -162,29 +178,35 @@ func (p *PreviewPane) Render() string {
 	// Event history: most recent first, as many as fit
 	if !p.loaded {
 		// Loading line if events have not yet been loaded
-		lines = append(lines, "History: loading...")
+		lines = append(lines, ensureWidthLimit("History: loading...", p.width))
 	} else if len(p.events) == 0 {
 		// No history header if there are no events
 	} else {
 		if len(lines) < lineLimit {
-			lines = append(lines, "History:")
+			lines = append(lines, ensureWidthLimit("History:", p.width))
 		}
 
 		// Reverse events to show newest first
 		for i := len(p.events) - 1; i >= 0 && len(lines) < lineLimit; i-- {
 			event := p.events[i]
 			timeStr := formatEventTime(event.CreatedAt)
-			eventLine := fmt.Sprintf("  %s %s", timeStr, event.Kind)
+			prefix := fmt.Sprintf("  %s ", timeStr)
+			prefixWidth := runewidth.StringWidth(prefix)
+			availWidth := p.width - prefixWidth
+			if availWidth < 1 {
+				availWidth = 1
+			}
+			eventContent := event.Kind
 			if event.Verdict != nil {
-				eventLine += fmt.Sprintf(" (%s)", *event.Verdict)
+				eventContent += fmt.Sprintf(" (%s)", *event.Verdict)
 			}
 
-			wrappedEvent := wrapTextByDisplayWidth(eventLine, p.width-2)
-			for _, line := range strings.Split(wrappedEvent, "\n") {
+			wrappedEvent := wrapTextByDisplayWidth(eventContent, availWidth)
+			for _, eventLine := range strings.Split(wrappedEvent, "\n") {
 				if len(lines) >= lineLimit {
 					break
 				}
-				lines = append(lines, line)
+				lines = append(lines, ensureWidthLimit(prefix+eventLine, p.width))
 			}
 		}
 	}
@@ -230,10 +252,22 @@ func wrapTextByDisplayWidth(s string, width int) string {
 				for col < width && len(word) > 0 {
 					remaSpace := width - col
 					var chunk string
-					for len(word) > 0 && runewidth.StringWidth(chunk) < remaSpace {
+					for len(word) > 0 {
 						r, sz := utf8.DecodeRuneInString(word)
+						rw := runewidth.RuneWidth(r)
+						if runewidth.StringWidth(chunk)+rw > remaSpace {
+							break
+						}
 						chunk += string(r)
 						word = word[sz:]
+					}
+					if chunk == "" {
+						chunk = string(rune(word[0]))
+						if len(word) > 1 {
+							word = word[utf8.RuneLen(rune(word[0])):]
+						} else {
+							word = ""
+						}
 					}
 					out.WriteString(chunk)
 					col += runewidth.StringWidth(chunk)
@@ -267,6 +301,20 @@ func truncateToDisplayWidth(s string, width int) string {
 		w += rw
 	}
 	return out.String()
+}
+
+// ensureWidthLimit wraps or truncates s to fit within the given display width.
+// First tries to wrap at word boundaries, then truncates if needed.
+func ensureWidthLimit(s string, width int) string {
+	if runewidth.StringWidth(s) <= width {
+		return s
+	}
+	wrapped := wrapTextByDisplayWidth(s, width)
+	lines := strings.Split(wrapped, "\n")
+	if len(lines) > 0 {
+		return truncateToDisplayWidth(lines[0], width)
+	}
+	return truncateToDisplayWidth(s, width)
 }
 
 // joinLines joins lines and truncates to lineLimit.
