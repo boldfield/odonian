@@ -81,7 +81,7 @@ func TestPreviewPaneRender_WithPRLink(t *testing.T) {
 	detail := &tuiclient.TaskDetail{
 		ID:    "task-123",
 		Title: "Test task",
-		Links: []tuiclient.TaskLink{
+		CurrentRoundLinks: []tuiclient.TaskLink{
 			{
 				Kind:  "pr",
 				Value: "https://github.com/owner/repo/pull/123",
@@ -564,7 +564,7 @@ func TestPreviewPaneRender_AllWidthsRespected(t *testing.T) {
 				detail := &tuiclient.TaskDetail{
 					ID:    "task-3",
 					Title: "PR link test",
-					Links: []tuiclient.TaskLink{
+					CurrentRoundLinks: []tuiclient.TaskLink{
 						{Kind: "pr", Value: "https://github.com/owner/repo/pull/123456789"},
 					},
 				}
@@ -723,7 +723,7 @@ func TestPreviewPaneRender_NewestEventsKeptWhenTruncating(t *testing.T) {
 func TestPreviewPaneView_ContentVisibleBelowPrefixWidth(t *testing.T) {
 	impl := &tuiclient.Task{ID: "t", Title: "T", State: stateReview, Model: "opus", ReviewRound: 1}
 	workItem := &tuiview.WorkItem{Implement: impl}
-	detail := &tuiclient.TaskDetail{Links: []tuiclient.TaskLink{{Kind: "pr", Value: "https://x.io/pull/9"}}}
+	detail := &tuiclient.TaskDetail{CurrentRoundLinks: []tuiclient.TaskLink{{Kind: "pr", Value: "https://x.io/pull/9"}}}
 
 	for _, width := range []int{1, 2, 3, 5, 7} {
 		pane := NewPreviewPane(workItem, width, 60).WithDetail(detail)
@@ -744,5 +744,20 @@ func TestPreviewPaneView_ContentVisibleBelowPrefixWidth(t *testing.T) {
 				t.Errorf("width %d: %q missing from %q", width, want, squashed)
 			}
 		}
+	}
+}
+
+func TestPreviewPane_ShowsOnlyCurrentRoundPR(t *testing.T) {
+	impl := &tuiclient.Task{ID: "t", Title: "T", State: stateReview, Model: "opus", ReviewRound: 2}
+	workItem := &tuiview.WorkItem{Implement: impl}
+	old := tuiclient.TaskLink{Kind: "pr", Value: "https://github.com/o/r/pull/545"}
+	cur := tuiclient.TaskLink{Kind: "pr", Value: "https://github.com/o/r/pull/547"}
+	detail := &tuiclient.TaskDetail{
+		Links:             []tuiclient.TaskLink{old, cur},
+		CurrentRoundLinks: []tuiclient.TaskLink{cur},
+	}
+	out := NewPreviewPane(workItem, 80, 20).WithDetail(detail).Render()
+	if strings.Contains(out, "pull/545") || !strings.Contains(out, "pull/547") {
+		t.Fatalf("expected only current PR, got:\n%s", out)
 	}
 }

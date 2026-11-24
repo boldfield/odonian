@@ -109,8 +109,8 @@ func (p *PreviewPane) Render() string {
 
 	// PR link when known (from TaskDetail)
 	if p.detail != nil {
-		for _, link := range p.detail.Links {
-			if link.Kind == "pr" {
+		for _, link := range p.detail.CurrentRoundLinks {
+			if link.Kind == "pr" && link.TombstonedAt == nil {
 				prefix := "PR "
 				addLineWithWrap(&lines, link.Value, prefix, p.width, lineLimit)
 				break
