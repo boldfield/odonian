@@ -3,8 +3,10 @@ package main
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 )
 
@@ -127,13 +129,14 @@ func TestProjectsPaneRenderFullWidth(t *testing.T) {
 		{ID: "p2", Name: "ProjectTwo"},
 	}
 	pane := NewProjectsPane(theme, projects)
-	pane.SetSize(120, 10) // Wide mode: full names
+	pane.SetSize(50, 10) // Wide mode: pane width >= ProjectPaneWidth
 
 	view := pane.View()
-	if !strings.Contains(view.Content, "ProjectOne") {
+	content := view.Content
+	if !strings.Contains(content, "ProjectOne") {
 		t.Error("expected full project name 'ProjectOne' in wide mode")
 	}
-	if !strings.Contains(view.Content, "ProjectTwo") {
+	if !strings.Contains(content, "ProjectTwo") {
 		t.Error("expected full project name 'ProjectTwo' in wide mode")
 	}
 }
@@ -145,15 +148,16 @@ func TestProjectsPaneRenderRailWidth(t *testing.T) {
 		{ID: "p2", Name: "ProjectTwo"},
 	}
 	pane := NewProjectsPane(theme, projects)
-	pane.SetSize(80, 10) // Rail mode: abbreviated names (< 120)
+	pane.SetSize(16, 10) // Rail mode: pane width < ProjectPaneWidth (17)
 
 	view := pane.View()
-	// In rail mode, names should be abbreviated to 3 chars
-	if !strings.Contains(view.Content, "Pro") {
+	content := view.Content
+	// In rail mode, names should be abbreviated
+	if !strings.Contains(content, "Pro") {
 		t.Error("expected abbreviated project name 'Pro' in rail mode")
 	}
 	// Full names should not appear
-	if strings.Contains(view.Content, "ProjectOne") {
+	if strings.Contains(content, "ProjectOne") {
 		t.Error("expected no full project names in rail mode")
 	}
 }
@@ -246,18 +250,179 @@ func TestProjectsPaneLineWidth(t *testing.T) {
 	pane.SetSize(10, 10)
 
 	view := pane.View()
-	lines := strings.Split(view.Content, "\n")
-	for _, line := range lines {
-		// Remove ANSI escape codes to get visual width
-		// ANSI codes start with \x1b and end with [a-mA-Z]
-		cleanLine := strings.ReplaceAll(line, "\x1b[7m", "")
-		cleanLine = strings.ReplaceAll(cleanLine, "\x1b[m", "")
-		cleanLine = strings.ReplaceAll(cleanLine, "\x1b(B\x1b)0", "")
-
-		if len(cleanLine) > 10 {
-			t.Errorf("visual line exceeds pane width: %q (len=%d)", cleanLine, len(cleanLine))
+	lines := strings.Split(strings.TrimSpace(view.Content), "\n")
+	for i, line := range lines {
+		if i == 0 {
+			continue // Skip title
+		}
+		width := lipgloss.Width(line)
+		if width > 10 {
+			t.Errorf("line %d display width exceeds pane width: %q (width=%d)", i, line, width)
 		}
 	}
+}
+
+func TestProjectsPaneLineWidthWithBadges(t *testing.T) {
+	theme := NewTheme()
+	projects := []tuiclient.Project{
+		{ID: "p1", Name: "VeryLongProjectNameThatExceedsTheWidth"},
+	}
+	pane := NewProjectsPane(theme, projects)
+	pane.SetSize(10, 10)
+
+	badges := map[string]ProjectBadge{
+		"p1": {Symbol: "⚠"},
+	}
+	pane.SetBadges(badges)
+
+	view := pane.View()
+	lines := strings.Split(strings.TrimSpace(view.Content), "\n")
+	for i, line := range lines {
+		if i == 0 {
+			continue // Skip title
+		}
+		width := lipgloss.Width(line)
+		if width > 10 {
+			t.Errorf("line %d with badge exceeds pane width: %q (width=%d)", i, line, width)
+		}
+		if !strings.Contains(line, "⚠") {
+			t.Error("expected badge to be present in line")
+		}
+	}
+}
+
+func TestProjectsPaneUTF8Truncation(t *testing.T) {
+	theme := NewTheme()
+	projects := []tuiclient.Project{
+		{ID: "p1", Name: "日本語プロジェクト名"},
+	}
+	pane := NewProjectsPane(theme, projects)
+	pane.SetSize(10, 10)
+
+	badges := map[string]ProjectBadge{
+		"p1": {Symbol: "⚠"},
+	}
+	pane.SetBadges(badges)
+
+	view := pane.View()
+	lines := strings.Split(strings.TrimSpace(view.Content), "\n")
+	for i, line := range lines {
+		if i == 0 {
+			continue // Skip title
+		}
+		// Should not contain invalid UTF-8 sequences
+		if !utf8.ValidString(line) {
+			t.Errorf("line contains invalid UTF-8: %q", line)
+		}
+		width := lipgloss.Width(line)
+		if width > 10 {
+			t.Errorf("UTF-8 line exceeds width: %q (width=%d)", line, width)
+		}
+	}
+}
+
+func TestProjectsPaneNavigationSendsMessage(t *testing.T) {
+	theme := NewTheme()
+	projects := []tuiclient.Project{
+		{ID: "p1", Name: "Project1"},
+		{ID: "p2", Name: "Project2"},
+		{ID: "p3", Name: "Project3"},
+	}
+	pane := NewProjectsPane(theme, projects)
+	pane.SetSize(50, 10)
+	pane.selectedIndex = 0
+
+	_, cmd := pane.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if cmd == nil {
+		t.Error("expected command for down navigation")
+	}
+	if pane.selectedIndex != 1 {
+		t.Errorf("expected selectedIndex=1 after down, got %d", pane.selectedIndex)
+	}
+
+	msg := cmd()
+	selected, ok := msg.(ProjectSelected)
+	if !ok {
+		t.Errorf("expected ProjectSelected message, got %T", msg)
+	}
+	if selected.ProjectID != "p2" {
+		t.Errorf("expected ProjectID=p2, got %s", selected.ProjectID)
+	}
+
+	_, cmd = pane.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	if cmd == nil {
+		t.Error("expected command for up navigation")
+	}
+	if pane.selectedIndex != 0 {
+		t.Errorf("expected selectedIndex=0 after up, got %d", pane.selectedIndex)
+	}
+
+	msg = cmd()
+	selected, ok = msg.(ProjectSelected)
+	if !ok {
+		t.Errorf("expected ProjectSelected message, got %T", msg)
+	}
+	if selected.ProjectID != "p1" {
+		t.Errorf("expected ProjectID=p1, got %s", selected.ProjectID)
+	}
+}
+
+func TestProjectsPaneNavigationRenderedOutput(t *testing.T) {
+	theme := NewTheme()
+	projects := []tuiclient.Project{
+		{ID: "p1", Name: "Project1"},
+		{ID: "p2", Name: "Project2"},
+	}
+	pane := NewProjectsPane(theme, projects)
+	pane.SetSize(50, 10)
+
+	// Check initial render has cursor at first project
+	view1 := pane.View()
+	content1 := view1.Content
+	lines1 := strings.Split(content1, "\n")
+	if len(lines1) < 2 {
+		t.Fatal("expected at least 2 lines (title + project)")
+	}
+	if !strings.Contains(lines1[1], "▸") {
+		t.Error("expected cursor at first project in line 2")
+	}
+	if !strings.Contains(lines1[1], "Project1") {
+		t.Error("expected Project1 in first project line")
+	}
+
+	// Navigate down
+	pane.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	view2 := pane.View()
+	content2 := view2.Content
+	lines2 := strings.Split(content2, "\n")
+	if len(lines2) < 3 {
+		t.Fatal("expected at least 3 lines (title + 2 projects)")
+	}
+
+	// First project should not have cursor
+	if strings.Contains(lines2[1], "▸ Project1") {
+		t.Error("expected no cursor at Project1 after down navigation")
+	}
+
+	// Second project should have cursor
+	if !strings.Contains(lines2[2], "▸") {
+		t.Error("expected cursor at Project2 after down navigation")
+	}
+	if !strings.Contains(lines2[2], "Project2") {
+		t.Error("expected Project2 in second project line")
+	}
+}
+
+// Utility function for UTF-8 validation
+func utf8Valid(s string) bool {
+	for len(s) > 0 {
+		r, size := utf8.DecodeRuneInString(s)
+		if r == utf8.RuneError && size == 1 {
+			return false
+		}
+		s = s[size:]
+	}
+	return true
 }
 
 func TestProjectsPaneWithBadges(t *testing.T) {
@@ -290,7 +455,7 @@ func TestProjectsPaneEmptyList(t *testing.T) {
 	pane.SetSize(50, 10)
 
 	view := pane.View()
-	if view.Content != "(no projects)" {
+	if !strings.Contains(view.Content, "(no projects)") {
 		t.Errorf("expected '(no projects)', got %q", view.Content)
 	}
 }
@@ -322,14 +487,16 @@ func TestProjectsPaneSetSize(t *testing.T) {
 	}
 	pane := NewProjectsPane(theme, projects)
 
-	pane.SetSize(130, 10)
+	// Wide mode: width >= ProjectPaneWidth (17)
+	pane.SetSize(20, 10)
 	if pane.railMode {
-		t.Error("expected railMode=false for width=130")
+		t.Error("expected railMode=false for width >= ProjectPaneWidth")
 	}
 
-	pane.SetSize(100, 10)
+	// Rail mode: width < ProjectPaneWidth (17)
+	pane.SetSize(16, 10)
 	if !pane.railMode {
-		t.Error("expected railMode=true for width=100")
+		t.Error("expected railMode=true for width < ProjectPaneWidth")
 	}
 }
 

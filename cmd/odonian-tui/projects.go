@@ -5,7 +5,9 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
+	"github.com/boldfield/odonian/internal/tuiview"
 )
 
 // ProjectBadge represents the badge displayed next to a project name.
@@ -27,7 +29,8 @@ type ProjectsPane struct {
 	width         int                     // pane width in characters
 	height        int                     // pane height in lines
 	theme         *Theme
-	railMode      bool // true when width < 120 (abbreviated names)
+	railMode      bool // true when width < ProjectPaneWidth (abbreviated names)
+	focused       bool // true when the pane has keyboard focus
 }
 
 // NewProjectsPane creates a new ProjectsPane.
@@ -53,8 +56,13 @@ func NewProjectsPane(theme *Theme, projects []tuiclient.Project) *ProjectsPane {
 func (p *ProjectsPane) SetSize(width, height int) {
 	p.width = width
 	p.height = height
-	p.railMode = width < 120
+	p.railMode = width < tuiview.ProjectPaneWidth
 	p.ensureSelectionVisible()
+}
+
+// SetFocused updates the focus state of the pane.
+func (p *ProjectsPane) SetFocused(focused bool) {
+	p.focused = focused
 }
 
 // SetBadges updates the badges for all projects.
@@ -102,11 +110,17 @@ func (p *ProjectsPane) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if p.selectedIndex > 0 {
 				p.selectedIndex--
 				p.ensureSelectionVisible()
+				return p, func() tea.Msg {
+					return ProjectSelected{ProjectID: p.SelectedProjectID()}
+				}
 			}
 		case "down", "j":
 			if p.selectedIndex < len(p.projects)-1 {
 				p.selectedIndex++
 				p.ensureSelectionVisible()
+				return p, func() tea.Msg {
+					return ProjectSelected{ProjectID: p.SelectedProjectID()}
+				}
 			}
 		case "enter":
 			return p, func() tea.Msg {
@@ -119,6 +133,19 @@ func (p *ProjectsPane) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // View renders the projects pane.
 func (p *ProjectsPane) View() tea.View {
+	var title string
+	if p.railMode {
+		title = "PROJ"
+	} else {
+		title = "PROJECTS"
+	}
+
+	if p.focused {
+		title = p.theme.PaneTitleFocused.Render(title)
+	} else {
+		title = p.theme.PaneTitleUnfocused.Render(title)
+	}
+
 	var content string
 	if len(p.projects) == 0 {
 		content = "(no projects)"
@@ -144,7 +171,8 @@ func (p *ProjectsPane) View() tea.View {
 		content = strings.Join(result, "\n")
 	}
 
-	return tea.NewView(content)
+	fullContent := title + "\n" + content
+	return tea.NewView(fullContent)
 }
 
 // renderProjectLine renders a single project line.
@@ -156,8 +184,10 @@ func (p *ProjectsPane) renderProjectLine(index int, proj tuiclient.Project) stri
 
 	badge := p.badges[proj.ID]
 	badgeStr := ""
+	badgeWidth := 0
 	if badge.Symbol != "" {
 		badgeStr = " " + badge.Symbol
+		badgeWidth = lipgloss.Width(badgeStr)
 	}
 
 	var name string
@@ -167,10 +197,15 @@ func (p *ProjectsPane) renderProjectLine(index int, proj tuiclient.Project) stri
 		name = proj.Name
 	}
 
-	line := fmt.Sprintf("%s%s%s", cursor, name, badgeStr)
+	cursorWidth := lipgloss.Width(cursor)
+	availableWidth := p.width - cursorWidth - badgeWidth
+	if availableWidth < 1 {
+		availableWidth = 1
+	}
 
-	// Truncate to fit within pane width before styling
-	line = truncateToWidth(line, p.width)
+	name = truncateToDisplayWidth(name, availableWidth)
+
+	line := fmt.Sprintf("%s%s%s", cursor, name, badgeStr)
 
 	// Apply styling if selected (after truncation so it doesn't affect width)
 	if index == p.selectedIndex {
@@ -180,12 +215,27 @@ func (p *ProjectsPane) renderProjectLine(index int, proj tuiclient.Project) stri
 	return line
 }
 
-// abbreviateName shortens a project name to 3 characters for rail mode.
+// abbreviateName shortens a project name to 3 display-width characters for rail mode.
 func (p *ProjectsPane) abbreviateName(name string) string {
-	if len(name) <= 3 {
-		return name
+	const maxRailWidth = 3
+	var result strings.Builder
+	var runes []rune
+	for _, r := range name {
+		runes = append(runes, r)
 	}
-	return name[:3]
+
+	width := 0
+	for _, r := range runes {
+		rStr := string(r)
+		rWidth := lipgloss.Width(rStr)
+		if width+rWidth > maxRailWidth {
+			break
+		}
+		result.WriteRune(r)
+		width += rWidth
+	}
+
+	return result.String()
 }
 
 // ensureSelectionVisible adjusts scroll offset to keep the selection in view.
@@ -201,13 +251,41 @@ func (p *ProjectsPane) ensureSelectionVisible() {
 	}
 }
 
-// truncateToWidth truncates a string to fit within the given width, adding "…" if needed.
-func truncateToWidth(s string, width int) string {
-	if len(s) <= width {
+// truncateToDisplayWidth truncates a string to fit within the given display width, adding "…" if needed.
+// It properly handles multi-byte UTF-8 characters and preserves rune boundaries.
+func truncateToDisplayWidth(s string, maxWidth int) string {
+	if maxWidth < 0 {
+		return ""
+	}
+
+	currentWidth := lipgloss.Width(s)
+	if currentWidth <= maxWidth {
 		return s
 	}
-	if width <= 1 {
+
+	ellipsisWidth := lipgloss.Width("…")
+	targetWidth := maxWidth - ellipsisWidth
+
+	if targetWidth < 0 {
 		return "…"
 	}
-	return s[:width-1] + "…"
+
+	var result strings.Builder
+	var runes []rune
+	for _, r := range s {
+		runes = append(runes, r)
+	}
+
+	width := 0
+	for _, r := range runes {
+		rStr := string(r)
+		rWidth := lipgloss.Width(rStr)
+		if width+rWidth > targetWidth {
+			break
+		}
+		result.WriteRune(r)
+		width += rWidth
+	}
+
+	return result.String() + "…"
 }
