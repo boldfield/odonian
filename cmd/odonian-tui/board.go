@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"image/color"
 	"net/http"
 	"sort"
 	"strconv"
@@ -151,18 +150,6 @@ const (
 )
 
 var stateOrder = []string{stateBacklog, stateReady, stateInProgress, stateChecks, stateReview, stateApproved, stateDone, stateBlocked, stateFailed, stateAbandoned}
-var stateColors = map[string]color.Color{
-	stateBacklog:    lipgloss.Color("8"),
-	stateReady:      lipgloss.Color("4"),
-	stateInProgress: lipgloss.Color("3"),
-	stateChecks:     lipgloss.Color("11"),
-	stateReview:     lipgloss.Color("5"),
-	stateApproved:   lipgloss.Color("6"),
-	stateDone:       lipgloss.Color("2"),
-	stateBlocked:    lipgloss.Color("1"),
-	stateFailed:     lipgloss.Color("9"),
-	stateAbandoned:  lipgloss.Color("8"),
-}
 
 // columnIndex returns the position of state in stateOrder (the board's column order).
 func columnIndex(state string) int {
