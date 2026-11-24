@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -8,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
+	"github.com/boldfield/odonian/internal/tuiview"
 )
 
 func TestProjectsPaneNavigationUp(t *testing.T) {
@@ -129,7 +131,7 @@ func TestProjectsPaneRenderFullWidth(t *testing.T) {
 		{ID: "p2", Name: "ProjectTwo"},
 	}
 	pane := NewProjectsPane(theme, projects)
-	pane.SetSize(50, 10) // Wide mode: pane width >= ProjectPaneWidth
+	pane.SetSize(tuiview.ProjectPaneWidth, 10) // Wide mode: pane width >= ProjectPaneWidth (17)
 
 	view := pane.View()
 	content := view.Content
@@ -148,7 +150,7 @@ func TestProjectsPaneRenderRailWidth(t *testing.T) {
 		{ID: "p2", Name: "ProjectTwo"},
 	}
 	pane := NewProjectsPane(theme, projects)
-	pane.SetSize(16, 10) // Rail mode: pane width < ProjectPaneWidth (17)
+	pane.SetSize(tuiview.ProjectRailWidth, 10) // Rail mode: pane width < ProjectPaneWidth (10)
 
 	view := pane.View()
 	content := view.Content
@@ -172,15 +174,23 @@ func TestProjectsPaneScrolling(t *testing.T) {
 		{ID: "p5", Name: "Project5"},
 	}
 	pane := NewProjectsPane(theme, projects)
-	pane.SetSize(50, 2) // Height of 2, but 5 projects
+	pane.SetSize(50, 3) // Height of 3 (title + 2 project rows)
 
 	// Selection at index 0 - should start at scrollOffset 0
 	if pane.scrollOffset != 0 {
 		t.Errorf("expected scrollOffset=0, got %d", pane.scrollOffset)
 	}
 
-	// Move down to index 2 - should scroll
+	// Move down to index 1 - should not scroll yet (still visible)
 	pane.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if pane.selectedIndex != 1 {
+		t.Errorf("expected selectedIndex=1, got %d", pane.selectedIndex)
+	}
+	if pane.scrollOffset != 0 {
+		t.Errorf("expected scrollOffset=0 (still visible), got %d", pane.scrollOffset)
+	}
+
+	// Move down to index 2 - should scroll to keep selection visible
 	pane.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if pane.selectedIndex != 2 {
 		t.Errorf("expected selectedIndex=2, got %d", pane.selectedIndex)
@@ -205,9 +215,10 @@ func TestProjectsPaneScrolling(t *testing.T) {
 	if pane.selectedIndex != 3 {
 		t.Errorf("expected selectedIndex=3, got %d", pane.selectedIndex)
 	}
-	// Selection should still be visible in the pane
-	if pane.selectedIndex < pane.scrollOffset || pane.selectedIndex >= pane.scrollOffset+pane.height {
-		t.Errorf("selection not visible: selectedIndex=%d, scrollOffset=%d, height=%d", pane.selectedIndex, pane.scrollOffset, pane.height)
+	// Selection should still be visible in the pane (visible rows = height - 1)
+	visibleRows := pane.height - 1
+	if pane.selectedIndex < pane.scrollOffset || pane.selectedIndex >= pane.scrollOffset+visibleRows {
+		t.Errorf("selection not visible: selectedIndex=%d, scrollOffset=%d, visibleRows=%d", pane.selectedIndex, pane.scrollOffset, visibleRows)
 	}
 }
 
@@ -246,19 +257,21 @@ func TestProjectsPaneLineWidth(t *testing.T) {
 	projects := []tuiclient.Project{
 		{ID: "p1", Name: "VeryLongProjectNameThatExceedsTheWidth"},
 	}
-	pane := NewProjectsPane(theme, projects)
-	pane.SetSize(10, 10)
 
-	view := pane.View()
-	lines := strings.Split(strings.TrimSpace(view.Content), "\n")
-	for i, line := range lines {
-		if i == 0 {
-			continue // Skip title
-		}
-		width := lipgloss.Width(line)
-		if width > 10 {
-			t.Errorf("line %d display width exceeds pane width: %q (width=%d)", i, line, width)
-		}
+	for _, width := range []int{1, 2, 3, 10, tuiview.ProjectRailWidth, tuiview.ProjectPaneWidth} {
+		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+			pane := NewProjectsPane(theme, projects)
+			pane.SetSize(width, 10)
+
+			view := pane.View()
+			lines := strings.Split(strings.TrimSpace(view.Content), "\n")
+			for i, line := range lines {
+				lineWidth := lipgloss.Width(line)
+				if lineWidth > width {
+					t.Errorf("line %d display width %d exceeds pane width %d: %q", i, lineWidth, width, line)
+				}
+			}
+		})
 	}
 }
 
@@ -563,5 +576,71 @@ func TestProjectsPaneNavigationWithOneProject(t *testing.T) {
 	pane.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if pane.selectedIndex != 0 {
 		t.Errorf("expected selectedIndex=0, got %d", pane.selectedIndex)
+	}
+}
+
+func TestProjectsPaneHeightConstraint(t *testing.T) {
+	theme := NewTheme()
+	projects := make([]tuiclient.Project, 10)
+	for i := 0; i < 10; i++ {
+		projects[i] = tuiclient.Project{ID: fmt.Sprintf("p%d", i), Name: fmt.Sprintf("Project%d", i)}
+	}
+	pane := NewProjectsPane(theme, projects)
+
+	for _, height := range []int{1, 2, 3, 5} {
+		t.Run(fmt.Sprintf("height_%d", height), func(t *testing.T) {
+			pane.SetSize(50, height)
+			pane.selectedIndex = height - 1 // Select the last row to stress the constraint
+
+			view := pane.View()
+			lines := strings.Split(strings.TrimSuffix(view.Content, "\n"), "\n")
+			if len(lines) > height {
+				t.Errorf("view has %d lines but height is %d: %q", len(lines), height, view.Content)
+			}
+		})
+	}
+}
+
+func TestProjectsPaneNavigationCommandDataRace(t *testing.T) {
+	theme := NewTheme()
+	projects := []tuiclient.Project{
+		{ID: "p1", Name: "Project1"},
+		{ID: "p2", Name: "Project2"},
+		{ID: "p3", Name: "Project3"},
+	}
+	pane := NewProjectsPane(theme, projects)
+	pane.SetSize(50, 10)
+	pane.selectedIndex = 0
+
+	// Press down to move to p2 and get the command
+	_, cmd1 := pane.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if cmd1 == nil {
+		t.Fatal("expected command for first down press")
+	}
+
+	// Press down again to move to p3
+	_, cmd2 := pane.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if cmd2 == nil {
+		t.Fatal("expected command for second down press")
+	}
+
+	// Execute the first command - should return p2, not p3
+	msg1 := cmd1()
+	selected1, ok := msg1.(ProjectSelected)
+	if !ok {
+		t.Fatalf("expected ProjectSelected message, got %T", msg1)
+	}
+	if selected1.ProjectID != "p2" {
+		t.Errorf("first command should return p2, got %s", selected1.ProjectID)
+	}
+
+	// Execute the second command - should return p3
+	msg2 := cmd2()
+	selected2, ok := msg2.(ProjectSelected)
+	if !ok {
+		t.Fatalf("expected ProjectSelected message, got %T", msg2)
+	}
+	if selected2.ProjectID != "p3" {
+		t.Errorf("second command should return p3, got %s", selected2.ProjectID)
 	}
 }

@@ -110,21 +110,24 @@ func (p *ProjectsPane) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if p.selectedIndex > 0 {
 				p.selectedIndex--
 				p.ensureSelectionVisible()
+				selectedID := p.SelectedProjectID()
 				return p, func() tea.Msg {
-					return ProjectSelected{ProjectID: p.SelectedProjectID()}
+					return ProjectSelected{ProjectID: selectedID}
 				}
 			}
 		case "down", "j":
 			if p.selectedIndex < len(p.projects)-1 {
 				p.selectedIndex++
 				p.ensureSelectionVisible()
+				selectedID := p.SelectedProjectID()
 				return p, func() tea.Msg {
-					return ProjectSelected{ProjectID: p.SelectedProjectID()}
+					return ProjectSelected{ProjectID: selectedID}
 				}
 			}
 		case "enter":
+			selectedID := p.SelectedProjectID()
 			return p, func() tea.Msg {
-				return ProjectSelected{ProjectID: p.SelectedProjectID()}
+				return ProjectSelected{ProjectID: selectedID}
 			}
 		}
 	}
@@ -146,6 +149,8 @@ func (p *ProjectsPane) View() tea.View {
 		title = p.theme.PaneTitleUnfocused.Render(title)
 	}
 
+	title = ensureLineWidth(title, p.width)
+
 	var content string
 	if len(p.projects) == 0 {
 		content = "(no projects)"
@@ -156,9 +161,14 @@ func (p *ProjectsPane) View() tea.View {
 			lines = append(lines, line)
 		}
 
-		// Apply scroll offset and height
+		// Apply scroll offset and height (title takes 1 row, so projects get height-1 rows)
+		rowsForProjects := p.height - 1
+		if rowsForProjects < 0 {
+			rowsForProjects = 0
+		}
+
 		startIdx := p.scrollOffset
-		endIdx := startIdx + p.height
+		endIdx := startIdx + rowsForProjects
 		if endIdx > len(lines) {
 			endIdx = len(lines)
 		}
@@ -212,6 +222,8 @@ func (p *ProjectsPane) renderProjectLine(index int, proj tuiclient.Project) stri
 		line = p.theme.SelectedRow.Render(line)
 	}
 
+	line = ensureLineWidth(line, p.width)
+
 	return line
 }
 
@@ -219,13 +231,9 @@ func (p *ProjectsPane) renderProjectLine(index int, proj tuiclient.Project) stri
 func (p *ProjectsPane) abbreviateName(name string) string {
 	const maxRailWidth = 3
 	var result strings.Builder
-	var runes []rune
-	for _, r := range name {
-		runes = append(runes, r)
-	}
 
 	width := 0
-	for _, r := range runes {
+	for _, r := range name {
 		rStr := string(r)
 		rWidth := lipgloss.Width(rStr)
 		if width+rWidth > maxRailWidth {
@@ -240,11 +248,16 @@ func (p *ProjectsPane) abbreviateName(name string) string {
 
 // ensureSelectionVisible adjusts scroll offset to keep the selection in view.
 func (p *ProjectsPane) ensureSelectionVisible() {
+	rowsForProjects := p.height - 1
+	if rowsForProjects < 0 {
+		rowsForProjects = 0
+	}
+
 	if p.selectedIndex < p.scrollOffset {
 		p.scrollOffset = p.selectedIndex
 	}
-	if p.selectedIndex >= p.scrollOffset+p.height {
-		p.scrollOffset = p.selectedIndex - p.height + 1
+	if p.selectedIndex >= p.scrollOffset+rowsForProjects {
+		p.scrollOffset = p.selectedIndex - rowsForProjects + 1
 	}
 	if p.scrollOffset < 0 {
 		p.scrollOffset = 0
@@ -271,21 +284,39 @@ func truncateToDisplayWidth(s string, maxWidth int) string {
 	}
 
 	var result strings.Builder
-	var runes []rune
 	for _, r := range s {
-		runes = append(runes, r)
-	}
-
-	width := 0
-	for _, r := range runes {
 		rStr := string(r)
 		rWidth := lipgloss.Width(rStr)
-		if width+rWidth > targetWidth {
+		if lipgloss.Width(result.String())+rWidth > targetWidth {
 			break
 		}
 		result.WriteRune(r)
-		width += rWidth
 	}
 
 	return result.String() + "…"
+}
+
+// ensureLineWidth ensures a line does not exceed the given display width by truncating if necessary.
+// It preserves ANSI codes and rune boundaries.
+func ensureLineWidth(line string, maxWidth int) string {
+	if maxWidth < 1 {
+		maxWidth = 1
+	}
+
+	currentWidth := lipgloss.Width(line)
+	if currentWidth <= maxWidth {
+		return line
+	}
+
+	var result strings.Builder
+	for _, r := range line {
+		rStr := string(r)
+		rWidth := lipgloss.Width(rStr)
+		if lipgloss.Width(result.String())+rWidth > maxWidth {
+			break
+		}
+		result.WriteRune(r)
+	}
+
+	return result.String()
 }
