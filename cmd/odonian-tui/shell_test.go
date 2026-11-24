@@ -388,3 +388,64 @@ func TestShellToggles(t *testing.T) {
 	}
 	assertWidth(t, out, 120)
 }
+
+func TestShellHelpBarAtWidths(t *testing.T) {
+	for _, w := range []int{60, 100, 160} {
+		t.Run(fmt.Sprintf("width_%d", w), func(t *testing.T) {
+			f := newShellFixture(t, w, 24)
+			f.model.width = w
+			f.model.height = 24
+			f.model.selectedTaskID = "a1"
+			f.model.selectedColumn = 2 // in_progress
+			view := f.model.View().Content
+			lines := strings.Split(view, "\n")
+			if len(lines) == 0 {
+				t.Fatal("no view output")
+			}
+			helpBar := lines[len(lines)-1]
+			if len([]rune(helpBar)) > w {
+				t.Errorf("help bar width %d > %d: %q", len([]rune(helpBar)), w, helpBar)
+			}
+		})
+	}
+}
+
+func TestShellHelpBarReviewState(t *testing.T) {
+	f := newShellFixture(t, 100, 24)
+	f.mu.Lock()
+	f.listed["p1"] = []tuiclient.Task{
+		{ID: "a1", Title: "Review task", State: "review", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
+		{ID: "a3", Title: "Charlie", State: "blocked", Kind: "implement", CreatedAt: "2026-01-01T00:00:02Z"},
+	}
+	f.mu.Unlock()
+	f.send(tea.WindowSizeMsg{Width: 100, Height: 24})
+	f.send(tickMsg{}) // trigger fetch with new data
+	f.send(key("up")) // select first item in review state
+	helpBar := f.model.shellKeyHints()
+	if !strings.Contains(helpBar, "approve") {
+		t.Errorf("review help bar missing 'approve': %q", helpBar)
+	}
+	if !strings.Contains(helpBar, "reject") {
+		t.Errorf("review help bar missing 'reject': %q", helpBar)
+	}
+}
+
+func TestShellHelpBarBlockedState(t *testing.T) {
+	f := newShellFixture(t, 100, 24)
+	f.send(key("down")) // select a2 (ready)
+	f.send(key("down")) // select a3 (blocked)
+	selected := f.model.shell.items.SelectedTaskID()
+	if selected != "a3" {
+		t.Fatalf("selected %q, want a3", selected)
+	}
+	helpBar := f.model.shellKeyHints()
+	if !strings.Contains(helpBar, "unblock") {
+		t.Errorf("blocked help bar missing 'unblock': %q", helpBar)
+	}
+	if !strings.Contains(helpBar, "fail") {
+		t.Errorf("blocked help bar missing 'fail': %q", helpBar)
+	}
+	if strings.Contains(helpBar, "approve") {
+		t.Errorf("blocked help bar should not have 'approve': %q", helpBar)
+	}
+}

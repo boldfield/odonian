@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/help"
+	keybind "charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -19,6 +20,7 @@ import (
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
 	"github.com/boldfield/odonian/internal/tuiview"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 )
 
@@ -2612,7 +2614,8 @@ func (m *BoardModel) renderHelpBar() string {
 	m.helpModel.SetWidth(m.width)
 	m.helpModel.ShowAll = false
 
-	return m.helpModel.ShortHelpView(bindings)
+	styled := m.helpModel.ShortHelpView(bindings)
+	return ansi.Strip(styled)
 }
 
 // renderDetailHelpBar renders the help bar for the detail view.
@@ -2622,7 +2625,8 @@ func (m *BoardModel) renderDetailHelpBar() string {
 	m.helpModel.SetWidth(m.width)
 	m.helpModel.ShowAll = false
 
-	return m.helpModel.ShortHelpView(bindings)
+	styled := m.helpModel.ShortHelpView(bindings)
+	return ansi.Strip(styled)
 }
 
 // renderFullHelp renders the full help view with all available key bindings grouped by context.
@@ -2631,7 +2635,7 @@ func (m *BoardModel) renderFullHelp() string {
 	bindings := m.keyBindings.getBoardBindingsForState(currentState)
 
 	m.helpModel.SetWidth(m.width)
-	m.helpModel.ShowAll = true
 
-	return m.helpModel.ShortHelpView(bindings)
+	styled := m.helpModel.FullHelpView([][]keybind.Binding{bindings})
+	return ansi.Strip(styled)
 }

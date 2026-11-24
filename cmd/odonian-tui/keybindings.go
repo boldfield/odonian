@@ -256,19 +256,11 @@ func DefaultKeyBindings() KeyBindings {
 }
 
 // getBoardBindingsForState returns the bindings that are valid for a given state.
+// State-specific actions are listed first so they're visible at narrow widths.
 func (kb *KeyBindings) getBoardBindingsForState(state string) []keybind.Binding {
 	var bindings []keybind.Binding
 
-	// Navigation bindings are always available
-	bindings = append(bindings,
-		kb.Board.Left,
-		kb.Board.Right,
-		kb.Board.Up,
-		kb.Board.Down,
-		kb.Board.EnterDetail,
-	)
-
-	// State-specific bindings
+	// State-specific bindings first (listed first so they don't get truncated at narrow widths)
 	switch state {
 	case stateBacklog:
 		bindings = append(bindings, kb.Board.Promote)
@@ -285,6 +277,15 @@ func (kb *KeyBindings) getBoardBindingsForState(state string) []keybind.Binding 
 			kb.Board.Fail,
 		)
 	}
+
+	// Navigation bindings always available
+	bindings = append(bindings,
+		kb.Board.Left,
+		kb.Board.Right,
+		kb.Board.Up,
+		kb.Board.Down,
+		kb.Board.EnterDetail,
+	)
 
 	// State-independent bindings
 	bindings = append(bindings,
@@ -304,8 +305,20 @@ func (kb *KeyBindings) getBoardBindingsForState(state string) []keybind.Binding 
 }
 
 // getDetailBindingsForState returns the bindings that are valid for the detail view in a given state.
+// State-specific actions are listed first so they're visible at narrow widths.
 func (kb *KeyBindings) getDetailBindingsForState(state string) []keybind.Binding {
 	var bindings []keybind.Binding
+
+	// State-specific bindings first (listed first so they don't get truncated at narrow widths)
+	switch state {
+	case stateReview:
+		bindings = append(bindings,
+			kb.Detail.Approve,
+			kb.Detail.Reject,
+		)
+	case stateApproved:
+		bindings = append(bindings, kb.Detail.MergeComplete)
+	}
 
 	// Navigation and scrolling
 	bindings = append(bindings,
@@ -322,17 +335,6 @@ func (kb *KeyBindings) getDetailBindingsForState(state string) []keybind.Binding
 		kb.Detail.MoveToFront,
 		kb.Detail.ResetPriority,
 	)
-
-	// State-specific bindings
-	switch state {
-	case stateReview:
-		bindings = append(bindings,
-			kb.Detail.Approve,
-			kb.Detail.Reject,
-		)
-	case stateApproved:
-		bindings = append(bindings, kb.Detail.MergeComplete)
-	}
 
 	// Help is always available
 	bindings = append(bindings, kb.Detail.Help)

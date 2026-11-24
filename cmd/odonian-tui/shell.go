@@ -260,6 +260,10 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 		}
 		return m, nil, true
 
+	case "?":
+		m.showFullHelp = !m.showFullHelp
+		return m, nil, true
+
 	// The remaining task actions apply only with the work-items pane focused.
 	case "p", "a", "x", "b", "u", "f", "t", "i", "w", "e":
 		if m.effectiveFocus() != paneItems {
@@ -447,36 +451,36 @@ func (m *BoardModel) shellHelpBar() string {
 	case m.statusMessage != "":
 		text = m.statusMessage
 	default:
-		text = m.shellKeyHints()
+		text = ansi.Strip(m.shellKeyHints())
 	}
 	return ansi.Truncate(text, m.width, "…")
 }
 
 // shellKeyHints lists the keys valid now: the focused pane's, and for the work-items pane
-// those the selected item's state allows.
+// those the selected item's state allows, built from the bindings.
 func (m *BoardModel) shellKeyHints() string {
-	const tail = "r refresh · c scorecards · q quit"
 	switch m.effectiveFocus() {
 	case paneProjects:
-		return "tab pane · ↑↓ move · enter open · z archive project · " + tail
+		return "tab pane · ↑↓ move · enter open · z archive · r refresh · q quit"
 	case panePreview:
-		return "tab pane · ↑↓ scroll · v preview · " + tail
+		return "tab pane · ↑↓ scroll · v preview · r refresh · q quit"
 	}
-	parts := []string{"tab pane", "↑↓ move", "enter detail"}
+	var parts []string
 	if wi := m.shell.items.SelectedItem(); wi != nil {
-		switch wi.Implement.State {
-		case stateBacklog:
-			parts = append(parts, "p promote")
-		case stateReview:
-			parts = append(parts, "a approve", "x reject")
-		case stateApproved:
-			parts = append(parts, "b bounce", "m merge")
-		case stateBlocked:
-			parts = append(parts, "u unblock", "f fail")
+		bindings := m.keyBindings.getBoardBindingsForState(wi.Implement.State)
+		for _, b := range bindings {
+			help := b.Help()
+			if help.Key != "" && help.Desc != "" {
+				part := help.Key + " " + help.Desc
+				parts = append(parts, part)
+			}
 		}
-		parts = append(parts, "t hold/release", "i priority", "w front", "e reset", "z archive")
+		if wi.Implement.State == stateApproved {
+			parts = append(parts, "m merge")
+		}
+	} else {
+		parts = append(parts, "tab pane", "↑↓ move", "enter detail")
 	}
-	parts = append(parts, "v preview", "V projects", tail)
 	return strings.Join(parts, " · ")
 }
 
