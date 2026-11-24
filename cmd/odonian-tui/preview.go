@@ -127,7 +127,7 @@ func (p *PreviewPane) Render() string {
 		extra = append(extra, previewPRLabel(p.prURL))
 	}
 	if task.State == stateChecks {
-		extra = append(extra, "in checks "+formatChecksDuration(task.ChecksStartedAt, p.now()))
+		extra = append(extra, "in checks "+tuiview.FormatChecksDuration(task.ChecksStartedAt, p.now()))
 	}
 	if len(extra) > 0 {
 		add("", strings.Join(extra, " · "))

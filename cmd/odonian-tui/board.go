@@ -17,6 +17,7 @@ import (
 	"github.com/boldfield/odonian/internal/localcommit"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
+	"github.com/boldfield/odonian/internal/tuiview"
 	"github.com/google/uuid"
 )
 
@@ -2505,8 +2506,9 @@ func (m *BoardModel) renderColumnTasks() string {
 		// Show assignee for in_progress, review, approved, and done states
 		shouldShowAssignee := task.State == stateInProgress || task.State == stateChecks || task.State == stateReview ||
 			task.State == stateApproved || task.State == stateDone
+		now := time.Now()
 		if task.State == stateChecks && task.Assignee == nil {
-			b.WriteString(fmt.Sprintf("    in checks %s · updated %s ago\n", formatChecksDuration(task.ChecksStartedAt, time.Now()), m.formatTime(task.UpdatedAt)))
+			b.WriteString(fmt.Sprintf("    in checks %s · updated %s ago\n", tuiview.FormatChecksDuration(task.ChecksStartedAt, now), tuiview.FormatTime(task.UpdatedAt, now)))
 		}
 		if shouldShowAssignee && task.Assignee != nil {
 			assignee := *task.Assignee
@@ -2517,71 +2519,18 @@ func (m *BoardModel) renderColumnTasks() string {
 
 			// For in_progress, also show lease countdown and updated time
 			if task.State == stateInProgress {
-				leaseStatus := "no lease"
-				if task.LeaseExpiresAt != nil {
-					leaseStatus = m.formatLeaseCountdown(*task.LeaseExpiresAt)
-				}
-				b.WriteString(fmt.Sprintf("    @%s · lease %s · updated %s ago\n", assignee, leaseStatus, m.formatTime(task.UpdatedAt)))
+				leaseStatus := tuiview.FormatLeaseCountdown(task.LeaseExpiresAt, now)
+				b.WriteString(fmt.Sprintf("    @%s · lease %s · updated %s ago\n", assignee, leaseStatus, tuiview.FormatTime(task.UpdatedAt, now)))
 			} else if task.State == stateChecks {
-				b.WriteString(fmt.Sprintf("    @%s · in checks %s · updated %s ago\n", assignee, formatChecksDuration(task.ChecksStartedAt, time.Now()), m.formatTime(task.UpdatedAt)))
+				b.WriteString(fmt.Sprintf("    @%s · in checks %s · updated %s ago\n", assignee, tuiview.FormatChecksDuration(task.ChecksStartedAt, now), tuiview.FormatTime(task.UpdatedAt, now)))
 			} else {
 				// For other states, just show assignee and updated time
-				b.WriteString(fmt.Sprintf("    @%s · updated %s ago\n", assignee, m.formatTime(task.UpdatedAt)))
+				b.WriteString(fmt.Sprintf("    @%s · updated %s ago\n", assignee, tuiview.FormatTime(task.UpdatedAt, now)))
 			}
 		}
 	}
 
 	return b.String()
-}
-
-// formatLeaseCountdown formats the lease expiration time as a countdown.
-func (m *BoardModel) formatLeaseCountdown(expiresAt string) string {
-	// Parse the RFC3339 timestamp
-	t, err := time.Parse(time.RFC3339Nano, expiresAt)
-	if err != nil {
-		return "invalid"
-	}
-
-	now := time.Now()
-	if now.After(t) {
-		return "EXPIRED"
-	}
-
-	remaining := t.Sub(now)
-	hours := int(remaining.Hours())
-	minutes := int(remaining.Minutes()) % 60
-	seconds := int(remaining.Seconds()) % 60
-
-	if hours > 0 {
-		return fmt.Sprintf("%dh%dm%ds", hours, minutes, seconds)
-	}
-	if minutes > 0 {
-		return fmt.Sprintf("%dm%ds", minutes, seconds)
-	}
-	return fmt.Sprintf("%ds", seconds)
-}
-
-// formatTime formats a timestamp relative to now.
-func (m *BoardModel) formatTime(timestamp string) string {
-	t, err := time.Parse(time.RFC3339Nano, timestamp)
-	if err != nil {
-		return "unknown"
-	}
-
-	now := time.Now()
-	diff := now.Sub(t)
-
-	if diff < time.Minute {
-		return fmt.Sprintf("%ds", int(diff.Seconds()))
-	}
-	if diff < time.Hour {
-		return fmt.Sprintf("%dm", int(diff.Minutes()))
-	}
-	if diff < 24*time.Hour {
-		return fmt.Sprintf("%dh", int(diff.Hours()))
-	}
-
-	return fmt.Sprintf("%dd", int(diff.Hours()/24))
 }
 
 // renderHelpBar renders the bottom help bar.
@@ -2603,28 +2552,5 @@ func (m *BoardModel) renderHelpBar() string {
 		return "←/→ column   ↑/↓ select   enter detail   u unblock   f fail   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
 	default:
 		return "←/→ column   ↑/↓ select   enter detail   t hold/release" + priorityKeys + "   z archive   c scorecards   P switch project   r refresh   q quit"
-	}
-}
-
-// formatChecksDuration renders how long a task has been in checks, from checks_started_at.
-func formatChecksDuration(startedAt *string, now time.Time) string {
-	if startedAt == nil {
-		return "unknown"
-	}
-	t, err := time.Parse(time.RFC3339Nano, *startedAt)
-	if err != nil {
-		return "unknown"
-	}
-	d := now.Sub(t)
-	if d < 0 {
-		d = 0
-	}
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	default:
-		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
+	"github.com/boldfield/odonian/internal/tuiview"
 )
 
 // TestBoardModel_RenderLayout tests that the board renders with all five columns and counts.
@@ -6199,7 +6200,7 @@ func TestFormatChecksDuration(t *testing.T) {
 		{ts(-time.Minute), "0s"},
 	}
 	for _, c := range cases {
-		if got := formatChecksDuration(c.in, now); got != c.want {
+		if got := tuiview.FormatChecksDuration(c.in, now); got != c.want {
 			t.Errorf("got %q want %q", got, c.want)
 		}
 	}
