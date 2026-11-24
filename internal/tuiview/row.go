@@ -10,6 +10,14 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+// claimableSet constructs a set for Status() based on a single claimable flag.
+func claimableSet(taskID string, claimable bool) map[string]bool {
+	if claimable {
+		return map[string]bool{taskID: true}
+	}
+	return map[string]bool{}
+}
+
 // RowTheme defines the styling for row rendering.
 type RowTheme interface {
 	GetStatusStyle(state string) lipgloss.Style
@@ -59,13 +67,14 @@ func statusTypeToString(st StatusType) string {
 //   - width: target width in display cells
 //   - now: current time for duration calculations
 //   - theme: provides Lip Gloss styles for colouring glyphs by status
-func RenderRow(wi *WorkItem, width int, now time.Time, theme RowTheme) string {
+//   - claimable: whether the task is claimable (ready and not waiting on a dependency)
+func RenderRow(wi *WorkItem, width int, now time.Time, theme RowTheme, claimable bool) string {
 	if wi == nil || wi.Implement == nil {
 		return ""
 	}
 
 	impl := wi.Implement
-	status := Status(impl, nil)
+	status := Status(impl, claimableSet(impl.ID, claimable))
 	glyph := Glyph(status, impl.Held)
 
 	// Apply colour to glyph from theme, using computed status for the color
@@ -157,20 +166,21 @@ func buildDetailString(task *tuiclient.Task, now time.Time) string {
 		holder := ""
 		if task.Assignee != nil {
 			holder = *task.Assignee
-			if len(holder) > 20 {
-				holder = holder[:17] + "…"
+			if lipgloss.Width(holder) > 20 {
+				holder = ansi.Truncate(holder, 17, "")
+				holder = holder + "…"
 			}
 			holder = "@" + holder
 		}
-		// Show lease countdown as the time remaining
-		timeRemaining := formatLeaseCountdown(task.LeaseExpiresAt, now)
+		// Show time held (elapsed time since task was updated)
+		timeHeld := FormatTime(task.UpdatedAt, now)
 		if holder == "" {
-			return fmt.Sprintf("%s %s", task.Model, timeRemaining)
+			return fmt.Sprintf("%s %s", task.Model, timeHeld)
 		}
-		return fmt.Sprintf("%s %s %s", task.Model, holder, timeRemaining)
+		return fmt.Sprintf("%s %s %s", task.Model, holder, timeHeld)
 
 	case "checks":
-		return fmt.Sprintf("checks %s", formatChecksDuration(task.ChecksStartedAt, now))
+		return fmt.Sprintf("checks %s", FormatChecksDuration(task.ChecksStartedAt, now))
 
 	case "review":
 		return fmt.Sprintf("review r%d", task.ReviewRound)
@@ -192,61 +202,6 @@ func buildDetailString(task *tuiclient.Task, now time.Time) string {
 
 	default:
 		return task.State
-	}
-}
-
-// formatLeaseCountdown formats the lease expiration time as a countdown.
-func formatLeaseCountdown(expiresAt *string, now time.Time) string {
-	if expiresAt == nil {
-		return "no lease"
-	}
-
-	t, err := time.Parse(time.RFC3339Nano, *expiresAt)
-	if err != nil {
-		return "invalid"
-	}
-
-	if now.After(t) {
-		return "EXPIRED"
-	}
-
-	remaining := t.Sub(now)
-	minutes := int(remaining.Minutes())
-	hours := int(remaining.Hours())
-	secs := int(remaining.Seconds()) % 60
-
-	if hours > 0 {
-		return fmt.Sprintf("%dh%dm", hours, minutes%60)
-	}
-	if minutes > 0 {
-		return fmt.Sprintf("%dm", minutes)
-	}
-	return fmt.Sprintf("%ds", secs)
-}
-
-// formatChecksDuration renders how long a task has been in checks, from checks_started_at.
-func formatChecksDuration(startedAt *string, now time.Time) string {
-	if startedAt == nil {
-		return "unknown"
-	}
-
-	t, err := time.Parse(time.RFC3339Nano, *startedAt)
-	if err != nil {
-		return "unknown"
-	}
-
-	d := now.Sub(t)
-	if d < 0 {
-		d = 0
-	}
-
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	default:
-		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 }
 
@@ -275,7 +230,11 @@ func buildReviewerLine(reviews []*tuiclient.Task, now time.Time, width int) stri
 		case "reject":
 			verdictGlyph = "✖"
 		default:
-			verdictGlyph = "·"
+			// For pending reviewers, show elapsed time
+			verdictGlyph = "…"
+			if review.UpdatedAt != "" {
+				verdictGlyph = FormatTime(review.UpdatedAt, now)
+			}
 		}
 
 		reviewerParts = append(reviewerParts, fmt.Sprintf("%s %s", review.Model, verdictGlyph))

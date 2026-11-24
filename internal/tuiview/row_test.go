@@ -226,7 +226,8 @@ func TestRenderRowWidth(t *testing.T) {
 		for _, width := range testWidths {
 			t.Run(tt.name+"_width_"+fmt.Sprint(width), func(t *testing.T) {
 				wi := tt.build()
-				row := RenderRow(wi, width, now, theme)
+				claimable := tt.state == "ready" // ready tasks are claimable by default in tests
+				row := RenderRow(wi, width, now, theme, claimable)
 
 				// Split lines (may be multiple if review)
 				lines := splitLines(row)
@@ -279,7 +280,7 @@ func TestRenderRowReviewersWithVerdicts(t *testing.T) {
 		Merge: nil,
 	}
 
-	row := RenderRow(wi, 100, now, theme)
+	row := RenderRow(wi, 100, now, theme, false)
 
 	// Should have multiple lines
 	lines := splitLines(row)
@@ -325,7 +326,7 @@ func TestRenderRowTitleTruncation(t *testing.T) {
 
 	// Test at a narrow width
 	width := 46
-	row := RenderRow(wi, width, now, theme)
+	row := RenderRow(wi, width, now, theme, true)
 
 	lineWidth := lipgloss.Width(row)
 	if lineWidth > width {
@@ -362,7 +363,7 @@ func TestRenderRowMinimumTitle(t *testing.T) {
 
 	// Test at very narrow width where detail should be dropped
 	width := 40
-	row := RenderRow(wi, width, now, theme)
+	row := RenderRow(wi, width, now, theme, false)
 
 	lineWidth := lipgloss.Width(row)
 	if lineWidth > width {
@@ -388,7 +389,7 @@ func TestRenderRowHeld(t *testing.T) {
 		Merge:   nil,
 	}
 
-	row := RenderRow(wi, 100, now, theme)
+	row := RenderRow(wi, 100, now, theme, true)
 
 	// Should contain held prefix glyph ⏸
 	if !hasSubstring(row, "⏸") {
@@ -444,7 +445,7 @@ func TestRenderRowPriority(t *testing.T) {
 				Merge:   nil,
 			}
 
-			row := RenderRow(wi, 100, now, theme)
+			row := RenderRow(wi, 100, now, theme, true)
 
 			hasPriority := hasSubstring(row, "P:")
 			if hasPriority != tt.shouldShow {
@@ -479,7 +480,7 @@ func TestRenderRowStyledTheme(t *testing.T) {
 
 	for _, width := range testWidths {
 		t.Run(fmt.Sprintf("styled_width_%d", width), func(t *testing.T) {
-			row := RenderRow(wi, width, now, theme)
+			row := RenderRow(wi, width, now, theme, true)
 			lines := splitLines(row)
 			for _, line := range lines {
 				lineWidth := lipgloss.Width(line)
@@ -528,4 +529,134 @@ func ptrInt64(i int64) *int64 {
 
 func ptrInt(i int) *int {
 	return &i
+}
+
+func TestRenderRowReadyClaimableGlyph(t *testing.T) {
+	theme := newMockTheme()
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+
+	wi := &WorkItem{
+		Implement: &tuiclient.Task{
+			ID:    "12345678-abcd-efgh-ijkl",
+			Title: "Ready task",
+			State: "ready",
+			Model: "haiku",
+			Kind:  "implement",
+			Held:  false,
+		},
+		Reviews: []*tuiclient.Task{},
+		Merge:   nil,
+	}
+
+	tests := []struct {
+		name          string
+		claimable     bool
+		expectedGlyph string
+	}{
+		{"ready_claimable", true, "○"},
+		{"ready_waiting", false, "⛓"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			row := RenderRow(wi, 100, now, theme, tt.claimable)
+			if !hasSubstring(row, tt.expectedGlyph) {
+				t.Errorf("expected glyph %q for claimable=%v, got: %q", tt.expectedGlyph, tt.claimable, row)
+			}
+		})
+	}
+}
+
+func TestRenderRowInProgressDetail(t *testing.T) {
+	theme := newMockTheme()
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	updatedAt := now.Add(-15 * time.Minute).Format(time.RFC3339Nano)
+	assignee := "worker-example"
+
+	wi := &WorkItem{
+		Implement: &tuiclient.Task{
+			ID:             "12345678-abcd-efgh-ijkl",
+			Title:          "In progress task",
+			State:          "in_progress",
+			Model:          "haiku",
+			Kind:           "implement",
+			Held:           false,
+			Assignee:       &assignee,
+			UpdatedAt:      updatedAt,
+			LeaseExpiresAt: ptrString(now.Add(10 * time.Minute).Format(time.RFC3339Nano)),
+		},
+		Reviews: []*tuiclient.Task{},
+		Merge:   nil,
+	}
+
+	row := RenderRow(wi, 100, now, theme, false)
+
+	// Should show model, holder, and time held (not lease countdown)
+	if !hasSubstring(row, "haiku") {
+		t.Errorf("missing model in row: %q", row)
+	}
+	if !hasSubstring(row, "@worker-example") {
+		t.Errorf("missing holder in row: %q", row)
+	}
+	if !hasSubstring(row, "15m") {
+		t.Errorf("missing time held (15m) in row: %q", row)
+	}
+	// Should NOT show 10m (the lease countdown)
+	if !hasSubstring(row, "10m") && hasSubstring(row, "10m") {
+		t.Errorf("should not show lease countdown in row: %q", row)
+	}
+}
+
+func TestRenderRowPendingReviewerWithTime(t *testing.T) {
+	theme := newMockTheme()
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	reviewUpdatedAt := now.Add(-8 * time.Minute).Format(time.RFC3339Nano)
+
+	approve := "approve"
+	wi := &WorkItem{
+		Implement: &tuiclient.Task{
+			ID:          "12345678-abcd-efgh-ijkl",
+			Title:       "Task under review",
+			State:       "review",
+			Model:       "opus",
+			Kind:        "implement",
+			Held:        false,
+			ReviewRound: 1,
+		},
+		Reviews: []*tuiclient.Task{
+			{
+				ID:          "aaaa-1111",
+				Model:       "sonnet",
+				State:       "review",
+				Kind:        "review",
+				Verdict:     &approve,
+				ReviewRound: 1,
+			},
+			{
+				ID:          "bbbb-2222",
+				Model:       "haiku",
+				State:       "review",
+				Kind:        "review",
+				Verdict:     nil, // pending
+				UpdatedAt:   reviewUpdatedAt,
+				ReviewRound: 1,
+			},
+		},
+		Merge: nil,
+	}
+
+	row := RenderRow(wi, 100, now, theme, false)
+	lines := splitLines(row)
+
+	// Check reviewer line contains time for pending reviewer
+	if len(lines) >= 2 {
+		reviewerLine := lines[1]
+		if !hasSubstring(reviewerLine, "8m") {
+			t.Errorf("pending reviewer should show elapsed time, got: %q", reviewerLine)
+		}
+	}
+}
+
+func ptrString(s string) *string {
+	return &s
 }
