@@ -1532,3 +1532,175 @@ func TestMockClaimTaskPassesAdmissionIdentity(t *testing.T) {
 		t.Errorf("mock args = %v, want %v", got, want)
 	}
 }
+
+func TestListTasksSummaryDecodesReviewFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/projects/proj123/tasks" {
+			t.Errorf("expected /projects/proj123/tasks, got %s", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		tasks := []Task{
+			{
+				ID:              "impl-task-1",
+				ProjectID:       "proj123",
+				DocumentID:      "doc1",
+				Title:           "Implement feature X",
+				Spec:            "",
+				State:           "in_progress",
+				Kind:            "implement",
+				Model:           "haiku",
+				Track:           "general",
+				Branch:          "feature-x",
+				Assignee:        stringPtr("agent-1"),
+				LeaseExpiresAt:  stringPtr("2026-01-01T00:00:00Z"),
+				Result:          nil,
+				Held:            false,
+				Priority:        nil,
+				TopicAnchorID:   stringPtr("topic-1"),
+				AwaitChecks:     false,
+				ChecksStartedAt: nil,
+				CreatedAt:       "2026-01-01T00:00:00Z",
+				UpdatedAt:       "2026-01-01T00:00:00Z",
+				TargetTaskID:    nil,
+				ReviewRound:     0,
+				Verdict:         nil,
+				AgentMerge:      false,
+				ReviewModels:    []string{"opus", "sonnet"},
+			},
+			{
+				ID:              "review-task-1",
+				ProjectID:       "proj123",
+				DocumentID:      "doc1",
+				Title:           "Review feature X",
+				Spec:            "",
+				State:           "in_review",
+				Kind:            "review",
+				Model:           "opus",
+				Track:           "general",
+				Branch:          "feature-x",
+				Assignee:        nil,
+				LeaseExpiresAt:  nil,
+				Result:          nil,
+				Held:            false,
+				Priority:        nil,
+				TopicAnchorID:   stringPtr("topic-1"),
+				AwaitChecks:     false,
+				ChecksStartedAt: nil,
+				CreatedAt:       "2026-01-01T00:01:00Z",
+				UpdatedAt:       "2026-01-01T00:01:00Z",
+				TargetTaskID:    stringPtr("impl-task-1"),
+				ReviewRound:     1,
+				Verdict:         nil,
+				AgentMerge:      false,
+				ReviewModels:    nil,
+			},
+			{
+				ID:              "merge-task-1",
+				ProjectID:       "proj123",
+				DocumentID:      "doc1",
+				Title:           "Merge feature X",
+				Spec:            "",
+				State:           "in_review",
+				Kind:            "merge",
+				Model:           "sonnet",
+				Track:           "general",
+				Branch:          "feature-x",
+				Assignee:        nil,
+				LeaseExpiresAt:  nil,
+				Result:          nil,
+				Held:            false,
+				Priority:        nil,
+				TopicAnchorID:   stringPtr("topic-1"),
+				AwaitChecks:     false,
+				ChecksStartedAt: nil,
+				CreatedAt:       "2026-01-01T00:02:00Z",
+				UpdatedAt:       "2026-01-01T00:02:00Z",
+				TargetTaskID:    stringPtr("impl-task-1"),
+				ReviewRound:     1,
+				Verdict:         stringPtr("approve"),
+				AgentMerge:      true,
+				ReviewModels:    nil,
+			},
+		}
+		json.NewEncoder(w).Encode(tasks)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, "testtoken")
+	tasks, err := client.ListTasks(context.Background(), "proj123")
+	if err != nil {
+		t.Fatalf("ListTasks failed: %v", err)
+	}
+
+	if len(tasks) != 3 {
+		t.Errorf("expected 3 tasks, got %d", len(tasks))
+	}
+
+	implementTask := tasks[0]
+	if implementTask.ID != "impl-task-1" {
+		t.Errorf("expected implement task ID impl-task-1, got %s", implementTask.ID)
+	}
+	if implementTask.Kind != "implement" {
+		t.Errorf("expected implement task kind, got %s", implementTask.Kind)
+	}
+	if implementTask.TargetTaskID != nil {
+		t.Errorf("expected null target_task_id for implement task, got %v", implementTask.TargetTaskID)
+	}
+	if implementTask.ReviewRound != 0 {
+		t.Errorf("expected review_round 0 for implement task, got %d", implementTask.ReviewRound)
+	}
+	if implementTask.Verdict != nil {
+		t.Errorf("expected null verdict for implement task, got %v", implementTask.Verdict)
+	}
+	if implementTask.AgentMerge != false {
+		t.Errorf("expected agent_merge false for implement task, got %v", implementTask.AgentMerge)
+	}
+	if len(implementTask.ReviewModels) != 2 || implementTask.ReviewModels[0] != "opus" || implementTask.ReviewModels[1] != "sonnet" {
+		t.Errorf("expected review_models [opus, sonnet], got %v", implementTask.ReviewModels)
+	}
+
+	reviewTask := tasks[1]
+	if reviewTask.ID != "review-task-1" {
+		t.Errorf("expected review task ID review-task-1, got %s", reviewTask.ID)
+	}
+	if reviewTask.Kind != "review" {
+		t.Errorf("expected review task kind, got %s", reviewTask.Kind)
+	}
+	if reviewTask.TargetTaskID == nil || *reviewTask.TargetTaskID != "impl-task-1" {
+		t.Errorf("expected target_task_id impl-task-1 for review task, got %v", reviewTask.TargetTaskID)
+	}
+	if reviewTask.ReviewRound != 1 {
+		t.Errorf("expected review_round 1 for review task, got %d", reviewTask.ReviewRound)
+	}
+	if reviewTask.Verdict != nil {
+		t.Errorf("expected null verdict for review task (round in progress), got %v", reviewTask.Verdict)
+	}
+	if reviewTask.AgentMerge != false {
+		t.Errorf("expected agent_merge false for review task, got %v", reviewTask.AgentMerge)
+	}
+
+	mergeTask := tasks[2]
+	if mergeTask.ID != "merge-task-1" {
+		t.Errorf("expected merge task ID merge-task-1, got %s", mergeTask.ID)
+	}
+	if mergeTask.Kind != "merge" {
+		t.Errorf("expected merge task kind, got %s", mergeTask.Kind)
+	}
+	if mergeTask.TargetTaskID == nil || *mergeTask.TargetTaskID != "impl-task-1" {
+		t.Errorf("expected target_task_id impl-task-1 for merge task, got %v", mergeTask.TargetTaskID)
+	}
+	if mergeTask.ReviewRound != 1 {
+		t.Errorf("expected review_round 1 for merge task, got %d", mergeTask.ReviewRound)
+	}
+	if mergeTask.Verdict == nil || *mergeTask.Verdict != "approve" {
+		t.Errorf("expected verdict approve for merge task, got %v", mergeTask.Verdict)
+	}
+	if mergeTask.AgentMerge != true {
+		t.Errorf("expected agent_merge true for merge task, got %v", mergeTask.AgentMerge)
+	}
+}
