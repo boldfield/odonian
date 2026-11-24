@@ -165,7 +165,6 @@ func DefaultKeyBindings() KeyBindings {
 			bind(actResetPriority, "e", "e", "reset priority"),
 			bind(actArchive, "z", "z", "archive"),
 			bind(actScorecards, "c", "c", "scorecards"),
-			bind(actSwitchProject, "P", "P", "switch project"),
 			bind(actRefresh, "r", "r", "refresh"),
 			bind(actHelp, "?", "?", "help"),
 			bind(actQuit, "q", "q", "quit", "ctrl+c"),
@@ -187,7 +186,6 @@ func DefaultKeyBindings() KeyBindings {
 			bind(actOpenPR, "o", "o", "open PR"),
 			bind(actSourceDoc, "s", "s", "source doc"),
 			bind(actDesignDoc, "d", "d", "design doc"),
-			bind(actSwitchProject, "P", "P", "switch project"),
 		},
 
 		Shell: keyMap{

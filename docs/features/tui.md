@@ -72,27 +72,34 @@ Resolution order (highest wins): **flags > environment > config file > defaults*
 
 ## Layout & navigation
 
-**Focused column + tabs.** Column names with counts run across the top as tabs; the active
-column's tasks are listed full-width below, so titles are readable. The board never tries to
-cram five columns side by side.
+**Three panes with responsive layout.** The board shows (1) projects, (2) work items for the selected
+project, and (3) a preview pane when selected. The layout adapts to terminal width:
+
+- **Wide (120+ columns):** All three panes visible side by side. Projects pane shows full names, 
+  work items pane shows task details with assignee and state, preview pane shows the selected task.
+- **Medium (80–119 columns):** Projects pane (abbreviated) and items pane visible; preview opens over 
+  the list when you press `enter`.
+- **Narrow (<80 columns):** Items pane only; projects and detail are full-screen views.
 
 ```
- backlog(2)  ready(0)  ‹in_progress(1)›  review(0)  done(3)
- ──────────────────────────────────────────────────────────
- ▸ TUI-2  Board view + nav + polling
-     haiku-1 · lease 2m11s · updated 14s ago
-
-   TUI-5  Task detail pane
- ──────────────────────────────────────────────────────────
- ←/→ column   ↑/↓ select   enter detail   p/a/x act   ? help   q quit
+ PROJECTS        │ syndic · 59 open                          │ D-31 Repair loop
+─────────────────┼───────────────────────────────────────────┼──────────────────────────────
+   All      ⚠5   │ ◷ D-31 Repair loop            checks  18m │ checks · round 1 · sonnet
+ ▸ syndic   ●3   │ ● D-35 Replace prompts   sonnet @2bllr 12m│ PR #212 · in checks 18m
+   ohand    ⚠1   │ ● D-34 Repair fixture    haiku  @s9jtd  4m│
+ ──────────────────┴───────────────────────────────────────────┴──────────────────────────────
+ p projects · ↑↓ move · enter detail · a approve · u unblock · / filter · ? help
 ```
 
-- `←/→` (and `h/l`) switch the active column; `↑/↓` (and `j/k`) move the selection within it.
-- The selected column's available actions show in the help bar (e.g. `p` only on `backlog`,
-  `a/x` only on `review`).
-- A column with more tasks than fit scrolls internally (the `bubbles` list handles this).
-- Responsive to terminal resize; a minimum width below which it shows a "wider terminal"
-  hint rather than rendering garbage.
+Navigation:
+- `↑/↓` (and `j/k`) move within the focused pane.
+- `←/→` (and `h/l`) or `tab` / `shift+tab` switch panes.
+- `enter` opens the selected item in a full-screen detail view or toggles preview (depending on width).
+- `p` toggles the projects pane (at 80+ columns).
+- `v` toggles the preview pane (at 120+ columns).
+- The selected item's available actions show in the help bar (e.g. `p` only on `backlog` items, 
+  `a/x` only on `review` items).
+- Items scroll internally if they overflow the pane height.
 
 ## Data & refresh
 
@@ -162,8 +169,9 @@ the ref — the TUI builds the URL (GitHub-shaped; abstract for other forges lat
 
 ## Visual design
 
-- State-tinted columns/badges (e.g. backlog dim, ready blue, in_progress yellow, review
-  magenta, done green), counts in the tab headers, a persistent status/help bar.
+- State-tinted glyphs for each task (e.g. backlog ○, ready ◆, in_progress ●, review ◇, done ✓, checks ◷), 
+  status badges (assigned models), a persistent status/help bar.
+- Project badges show counts of open tasks and warning icons for blocked/abandoned work.
 - Lease rendered as a live countdown (`2m11s`) and `EXPIRED` (red) when past — an expired
   lease on an `in_progress` task means it's reclaimable.
 - Styling via `lipgloss`; degrade gracefully on narrow/low-color terminals.
