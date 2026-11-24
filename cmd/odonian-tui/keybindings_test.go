@@ -216,3 +216,65 @@ func TestDetailModeFullHelpToggle(t *testing.T) {
 		t.Errorf("showFullHelp should be false after second ?, got true")
 	}
 }
+
+// TestBoardHasVimStyleBindings tests that j/k/h/l appear in board help bindings.
+func TestBoardHasVimStyleBindings(t *testing.T) {
+	kb := DefaultKeyBindings()
+
+	// Check that up binding includes "k"
+	upBinding := kb.Board.Up
+	hasK := false
+	for _, key := range upBinding.Keys() {
+		if key == "k" {
+			hasK = true
+			break
+		}
+	}
+	if !hasK {
+		t.Errorf("board Up binding should include 'k', got %v", upBinding.Keys())
+	}
+
+	// Check that down binding includes "j"
+	downBinding := kb.Board.Down
+	hasJ := false
+	for _, key := range downBinding.Keys() {
+		if key == "j" {
+			hasJ = true
+			break
+		}
+	}
+	if !hasJ {
+		t.Errorf("board Down binding should include 'j', got %v", downBinding.Keys())
+	}
+}
+
+// TestShellHasVimStyleBindings tests that j/k/h/l appear in shell help bindings.
+func TestShellHasVimStyleBindings(t *testing.T) {
+	kb := DefaultKeyBindings()
+
+	// Check that up binding includes "k"
+	upBinding := kb.Shell.Up
+	hasK := false
+	for _, key := range upBinding.Keys() {
+		if key == "k" {
+			hasK = true
+			break
+		}
+	}
+	if !hasK {
+		t.Errorf("shell Up binding should include 'k', got %v", upBinding.Keys())
+	}
+
+	// Check that down binding includes "j"
+	downBinding := kb.Shell.Down
+	hasJ := false
+	for _, key := range downBinding.Keys() {
+		if key == "j" {
+			hasJ = true
+			break
+		}
+	}
+	if !hasJ {
+		t.Errorf("shell Down binding should include 'j', got %v", downBinding.Keys())
+	}
+}
