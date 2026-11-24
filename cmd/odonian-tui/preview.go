@@ -136,7 +136,7 @@ func (p *PreviewPane) Render() string {
 	// Reviews with verdicts for the current round
 	if len(p.workItem.Reviews) > 0 {
 		if len(lines) < lineLimit {
-			lines = append(lines, truncateToDisplayWidth(fmt.Sprintf("Reviews: (round %d)", p.workItem.Implement.ReviewRound), p.width))
+			lines = append(lines, previewTruncate(fmt.Sprintf("Reviews: (round %d)", p.workItem.Implement.ReviewRound), p.width))
 		}
 		if len(lines) >= lineLimit {
 			return joinLines(lines, lineLimit)
@@ -163,11 +163,11 @@ func (p *PreviewPane) Render() string {
 	if !p.loaded {
 		// Loading line if events have not yet been loaded
 		if len(lines) < lineLimit {
-			lines = append(lines, truncateToDisplayWidth("History: loading...", p.width))
+			lines = append(lines, previewTruncate("History: loading...", p.width))
 		}
 	} else if len(p.events) > 0 {
 		if len(lines) < lineLimit {
-			lines = append(lines, truncateToDisplayWidth("History:", p.width))
+			lines = append(lines, previewTruncate("History:", p.width))
 		}
 
 		// Reverse events to show newest first
@@ -234,7 +234,7 @@ func addLineWithWrap(lines *[]string, text, prefix string, width, lineLimit int)
 		}
 
 		// Ensure it fits in the pane width
-		fullLine = truncateToDisplayWidth(fullLine, width)
+		fullLine = previewTruncate(fullLine, width)
 		*lines = append(*lines, fullLine)
 	}
 }
@@ -336,8 +336,8 @@ func wrapByDisplayWidth(s string, width int) []string {
 	return result
 }
 
-// truncateToDisplayWidth truncates s to fit within the given display width.
-func truncateToDisplayWidth(s string, width int) string {
+// previewTruncate truncates s to fit within the given display width.
+func previewTruncate(s string, width int) string {
 	if width < 0 {
 		width = 0
 	}
