@@ -295,18 +295,18 @@ func TestStatus(t *testing.T) {
 		claimableIDs map[string]bool
 		want         StatusType
 	}{
-		// Backlog tests
+		// Backlog tests - backlog tasks always return StatusBacklogNotPromoted
 		{
-			name:         "backlog not promoted (in claimableIDs)",
+			name:         "backlog not promoted",
 			task:         &tuiclient.Task{ID: "t1", State: "backlog", Held: false},
-			claimableIDs: map[string]bool{"t1": true},
+			claimableIDs: map[string]bool{},
 			want:         StatusBacklogNotPromoted,
 		},
 		{
-			name:         "backlog waiting on dependency",
-			task:         &tuiclient.Task{ID: "t2", State: "backlog", Held: false},
+			name:         "backlog with held",
+			task:         &tuiclient.Task{ID: "t2", State: "backlog", Held: true},
 			claimableIDs: map[string]bool{},
-			want:         StatusBacklogWaiting,
+			want:         StatusBacklogNotPromoted,
 		},
 
 		// Ready tests
@@ -322,11 +322,23 @@ func TestStatus(t *testing.T) {
 			claimableIDs: map[string]bool{},
 			want:         StatusReadyWaiting,
 		},
+		{
+			name:         "ready held (claimable before held)",
+			task:         &tuiclient.Task{ID: "t5", State: "ready", Held: true},
+			claimableIDs: map[string]bool{},
+			want:         StatusReadyClaimable,
+		},
+		{
+			name:         "ready held and in claimableIDs",
+			task:         &tuiclient.Task{ID: "t6", State: "ready", Held: true},
+			claimableIDs: map[string]bool{"t6": true},
+			want:         StatusReadyClaimable,
+		},
 
 		// In progress
 		{
 			name:         "in_progress",
-			task:         &tuiclient.Task{ID: "t5", State: "in_progress", Held: false},
+			task:         &tuiclient.Task{ID: "t7", State: "in_progress", Held: false},
 			claimableIDs: map[string]bool{},
 			want:         StatusInProgress,
 		},
@@ -334,7 +346,7 @@ func TestStatus(t *testing.T) {
 		// In checks
 		{
 			name:         "checks",
-			task:         &tuiclient.Task{ID: "t6", State: "checks", Held: false},
+			task:         &tuiclient.Task{ID: "t8", State: "checks", Held: false},
 			claimableIDs: map[string]bool{},
 			want:         StatusChecks,
 		},
@@ -342,7 +354,7 @@ func TestStatus(t *testing.T) {
 		// In review
 		{
 			name:         "review",
-			task:         &tuiclient.Task{ID: "t7", State: "review", Held: false},
+			task:         &tuiclient.Task{ID: "t9", State: "review", Held: false},
 			claimableIDs: map[string]bool{},
 			want:         StatusReview,
 		},
@@ -350,7 +362,7 @@ func TestStatus(t *testing.T) {
 		// Approved
 		{
 			name:         "approved",
-			task:         &tuiclient.Task{ID: "t8", State: "approved", Held: false},
+			task:         &tuiclient.Task{ID: "t10", State: "approved", Held: false},
 			claimableIDs: map[string]bool{},
 			want:         StatusApproved,
 		},
@@ -358,7 +370,7 @@ func TestStatus(t *testing.T) {
 		// Blocked
 		{
 			name:         "blocked",
-			task:         &tuiclient.Task{ID: "t9", State: "blocked", Held: false},
+			task:         &tuiclient.Task{ID: "t11", State: "blocked", Held: false},
 			claimableIDs: map[string]bool{},
 			want:         StatusBlocked,
 		},
@@ -366,23 +378,25 @@ func TestStatus(t *testing.T) {
 		// Failed
 		{
 			name:         "failed",
-			task:         &tuiclient.Task{ID: "t10", State: "failed", Held: false},
+			task:         &tuiclient.Task{ID: "t12", State: "failed", Held: false},
 			claimableIDs: map[string]bool{},
 			want:         StatusFailed,
 		},
 
-		// Done and abandoned (should default to StatusBacklogNotPromoted)
+		// Done
 		{
 			name:         "done",
-			task:         &tuiclient.Task{ID: "t16", State: "done", Held: false},
+			task:         &tuiclient.Task{ID: "t13", State: "done", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         StatusBacklogNotPromoted,
+			want:         StatusDone,
 		},
+
+		// Abandoned
 		{
 			name:         "abandoned",
-			task:         &tuiclient.Task{ID: "t17", State: "abandoned", Held: false},
+			task:         &tuiclient.Task{ID: "t14", State: "abandoned", Held: false},
 			claimableIDs: map[string]bool{},
-			want:         StatusBacklogNotPromoted,
+			want:         StatusAbandoned,
 		},
 	}
 
@@ -414,6 +428,8 @@ func TestGlyph(t *testing.T) {
 		{name: "approved", status: StatusApproved, held: false, want: "✔"},
 		{name: "blocked", status: StatusBlocked, held: false, want: "✖"},
 		{name: "failed", status: StatusFailed, held: false, want: "!"},
+		{name: "done", status: StatusDone, held: false, want: "✓"},
+		{name: "abandoned", status: StatusAbandoned, held: false, want: "⊗"},
 
 		// Held prefix on each state
 		{name: "held ready claimable", status: StatusReadyClaimable, held: true, want: "⏸○"},
@@ -426,6 +442,8 @@ func TestGlyph(t *testing.T) {
 		{name: "held approved", status: StatusApproved, held: true, want: "⏸✔"},
 		{name: "held blocked", status: StatusBlocked, held: true, want: "⏸✖"},
 		{name: "held failed", status: StatusFailed, held: true, want: "⏸!"},
+		{name: "held done", status: StatusDone, held: true, want: "⏸✓"},
+		{name: "held abandoned", status: StatusAbandoned, held: true, want: "⏸⊗"},
 	}
 
 	for _, tt := range tests {

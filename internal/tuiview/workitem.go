@@ -25,19 +25,22 @@ const (
 	StatusApproved
 	StatusBlocked
 	StatusFailed
+	StatusDone
+	StatusAbandoned
 )
 
 // Status returns the status classification for a task.
 // claimableIDs is a set of task IDs that are claimable (ready and not waiting on a dependency).
-// A ready or backlog task not in the set is waiting on a dependency.
+// Ready tasks not in the set are waiting on a dependency; held tasks ignore the set.
+// Backlog tasks have no dependency information, so they always return StatusBacklogNotPromoted.
 func Status(task *tuiclient.Task, claimableIDs map[string]bool) StatusType {
 	switch task.State {
 	case "backlog":
-		if claimableIDs[task.ID] {
-			return StatusBacklogNotPromoted
-		}
-		return StatusBacklogWaiting
+		return StatusBacklogNotPromoted
 	case "ready":
+		if task.Held {
+			return StatusReadyClaimable
+		}
 		if claimableIDs[task.ID] {
 			return StatusReadyClaimable
 		}
@@ -54,8 +57,12 @@ func Status(task *tuiclient.Task, claimableIDs map[string]bool) StatusType {
 		return StatusBlocked
 	case "failed":
 		return StatusFailed
+	case "done":
+		return StatusDone
+	case "abandoned":
+		return StatusAbandoned
 	default:
-		return StatusBacklogNotPromoted
+		return StatusAbandoned
 	}
 }
 
@@ -83,8 +90,12 @@ func Glyph(status StatusType, held bool) string {
 		glyph = "✖"
 	case StatusFailed:
 		glyph = "!"
+	case StatusDone:
+		glyph = "✓"
+	case StatusAbandoned:
+		glyph = "⊗"
 	default:
-		glyph = "·"
+		glyph = "?"
 	}
 
 	if held {
