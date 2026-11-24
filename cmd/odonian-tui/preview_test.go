@@ -248,12 +248,18 @@ func TestPreviewPane_NeverExceedsBounds(t *testing.T) {
 			item.Implement.Title = "修复中文标题的预览窗格宽度问题"
 			return newTestPreview(item, 0, 0)
 		},
+		"emoji": func() *PreviewPane {
+			item := checksItem()
+			item.Implement.Title = previewEmoji
+			return newTestPreview(item, 0, 0)
+		},
 	}
 	required := map[string][]string{
 		"checks with PR":       {"checks·round1·sonnet", "PR#212", "inchecks18m", "noneyet:waitingforCI"},
 		"review with verdicts": {longModel + "✔approve", "gpt-5.6-sol…pending"},
 		"loaded events":        {"12:12claimedby@c4wqd", "12:41checksfailed:returnedtoready"},
 		"wide characters":      {"修复中文标题的预览窗格宽度问题"},
+		"emoji":                {previewEmoji},
 	}
 
 	for name, build := range scenarios {
@@ -265,7 +271,7 @@ func TestPreviewPane_NeverExceedsBounds(t *testing.T) {
 				assertWithinBounds(t, out, width, 200)
 
 				// A 2-cell rune cannot be shown in a 1-cell pane.
-				if name == "wide characters" && width < 2 {
+				if (name == "wide characters" || name == "emoji") && width < 2 {
 					return
 				}
 				flat := strings.Join(strings.Fields(out), "")
@@ -276,6 +282,21 @@ func TestPreviewPane_NeverExceedsBounds(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// previewEmoji holds 2-cell grapheme clusters made of several runes: emoji
+// with a variation selector, a keycap sequence and a ZWJ sequence.
+const previewEmoji = "❤️✈️1️⃣👩‍💻"
+
+func TestWrapCells_SplitsBetweenGraphemeClusters(t *testing.T) {
+	want := []string{"❤️", "✈️", "1️⃣", "👩‍💻"}
+	got := wrapCells(previewEmoji, 2)
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("wrapCells(%q, 2) = %q, want %q", previewEmoji, got, want)
+	}
+	if got := wrapCells(previewEmoji, 1); strings.Join(got, "") != "" {
+		t.Errorf("2-cell clusters cannot fit in 1 cell and should be dropped, got %q", got)
 	}
 }
 

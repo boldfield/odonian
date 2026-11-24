@@ -298,8 +298,8 @@ func previewWrap(prefix, text string, width int) []string {
 }
 
 // wrapCells word-wraps text to limit display cells (limit >= 1), breaking a
-// word that is wider than limit wherever it has to. A rune wider than limit
-// cannot be shown at all and is dropped.
+// word that is wider than limit between grapheme clusters. A cluster wider
+// than limit cannot be shown at all and is dropped.
 func wrapCells(text string, limit int) []string {
 	var out []string
 	for _, para := range strings.Split(text, "\n") {
@@ -326,16 +326,17 @@ func wrapCells(text string, limit int) []string {
 				lineWidth = w
 				continue
 			}
-			for _, r := range word {
-				rw := ansi.StringWidth(string(r))
-				if rw > limit {
+			for rest := word; rest != ""; {
+				g, gw := ansi.FirstGraphemeCluster(rest, ansi.GraphemeWidth)
+				rest = rest[len(g):]
+				if gw > limit {
 					continue
 				}
-				if lineWidth+rw > limit {
+				if lineWidth+gw > limit {
 					flush()
 				}
-				line.WriteRune(r)
-				lineWidth += rw
+				line.WriteString(g)
+				lineWidth += gw
 			}
 		}
 		flush()
