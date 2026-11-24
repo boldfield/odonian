@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestProjectPickerModel(t *testing.T) {
@@ -27,28 +27,28 @@ func TestProjectPickerModel(t *testing.T) {
 	}
 
 	// Test navigation down
-	model, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	model, _ := m.Update(tea.KeyPressMsg{Code: 'j', Text: "j"})
 	m = model.(ProjectPickerModel)
 	if m.Selected != 1 {
 		t.Errorf("expected Selected=1 after j, got %d", m.Selected)
 	}
 
 	// Test navigation up
-	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	model, _ = m.Update(tea.KeyPressMsg{Code: 'k', Text: "k"})
 	m = model.(ProjectPickerModel)
 	if m.Selected != 0 {
 		t.Errorf("expected Selected=0 after k, got %d", m.Selected)
 	}
 
 	// Test boundary: can't go above 0
-	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	model, _ = m.Update(tea.KeyPressMsg{Code: 'k', Text: "k"})
 	m = model.(ProjectPickerModel)
 	if m.Selected != 0 {
 		t.Errorf("expected Selected=0 at boundary, got %d", m.Selected)
 	}
 
 	// Test down key
-	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("down")})
+	model, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	m = model.(ProjectPickerModel)
 	if m.Selected != 1 {
 		t.Errorf("expected Selected=1 after down, got %d", m.Selected)
@@ -56,14 +56,14 @@ func TestProjectPickerModel(t *testing.T) {
 
 	// Test boundary: can't go beyond last
 	m.Selected = 2
-	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("down")})
+	model, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	m = model.(ProjectPickerModel)
 	if m.Selected != 2 {
 		t.Errorf("expected Selected=2 at boundary, got %d", m.Selected)
 	}
 
 	// Test quit
-	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	model, cmd := m.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
 	m = model.(ProjectPickerModel)
 	if !m.Quit {
 		t.Error("expected Quit=true after q")
@@ -74,7 +74,7 @@ func TestProjectPickerModel(t *testing.T) {
 
 	// Test enter
 	m = NewProjectPickerModel(projects)
-	model, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model, cmd = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if cmd == nil {
 		t.Error("expected cmd to be tea.Quit after enter")
 	}
@@ -87,7 +87,7 @@ func TestProjectPickerView(t *testing.T) {
 	}
 
 	m := NewProjectPickerModel(projects)
-	view := m.View()
+	view := m.View().Content
 
 	// Check that both projects are in the view
 	if !strings.Contains(view, "Project 1") {

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"os"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
@@ -78,7 +78,7 @@ func main() {
 
 	// Create and run the board model for the selected project
 	boardModel := NewBoardModel(client, cfg, selectedProject)
-	p := tea.NewProgram(boardModel, tea.WithAltScreen())
+	p := tea.NewProgram(boardModel)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running board: %v\n", err)
 		os.Exit(1)
@@ -106,7 +106,7 @@ func (m ProjectPickerModel) Init() tea.Cmd {
 
 func (m ProjectPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.Quit = true
@@ -128,7 +128,7 @@ func (m ProjectPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m ProjectPickerModel) View() string {
+func (m ProjectPickerModel) View() tea.View {
 	s := "Select a project (arrow keys or hjkl, enter to select, q to quit):\n\n"
 	for i, p := range m.Projects {
 		cursor := "  "
@@ -137,5 +137,5 @@ func (m ProjectPickerModel) View() string {
 		}
 		s += fmt.Sprintf("%s%s\n", cursor, p.Name)
 	}
-	return s
+	return tea.NewView(s)
 }
