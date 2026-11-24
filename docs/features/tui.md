@@ -77,9 +77,11 @@ project, and (3) a preview pane when selected. The layout adapts to terminal wid
 
 - **Wide (120+ columns):** All three panes visible side by side. Projects pane shows full names, 
   work items pane shows task details with assignee and state, preview pane shows the selected task.
-- **Medium (80–119 columns):** Projects pane (abbreviated) and items pane visible; preview opens over 
-  the list when you press `enter`.
-- **Narrow (<80 columns):** Items pane only; projects and detail are full-screen views.
+- **Medium (80–119 columns):** Projects pane (abbreviated) and items pane visible; preview is hidden
+  and can be toggled with `v`.
+- **Narrow (40–79 columns):** Items pane only; projects and detail are accessed via full-screen views
+  when switching panes or pressing `enter` to open a project.
+- **Too narrow (<40 columns):** The layout is too narrow to display safely.
 
 ```
  PROJECTS        │ syndic · 59 open                          │ D-31 Repair loop
@@ -93,11 +95,11 @@ project, and (3) a preview pane when selected. The layout adapts to terminal wid
 
 Navigation:
 - `↑/↓` (and `j/k`) move within the focused pane.
-- `←/→` (and `h/l`) or `tab` / `shift+tab` switch panes.
-- `enter` opens the selected item in a full-screen detail view or toggles preview (depending on width).
-- `p` toggles the projects pane (at 80+ columns).
+- `tab` / `shift+tab` switch panes.
+- `enter` opens the selected item in the items pane (or project in the projects pane) in a full-screen detail view.
+- `V` toggles the projects pane (at 80+ columns).
 - `v` toggles the preview pane (at 120+ columns).
-- The selected item's available actions show in the help bar (e.g. `p` only on `backlog` items, 
+- The selected item's available actions show in the help bar (e.g. `p` promote only on `backlog` items, 
   `a/x` only on `review` items).
 - Items scroll internally if they overflow the pane height.
 
@@ -107,11 +109,10 @@ Navigation:
 - Poll every `poll_interval` (default 2s); `r` forces an immediate refresh.
 - **Selection is keyed by task ID and preserved across refreshes** — a poll must never move
   your cursor or reset scroll. If the selected task disappears (state changed/closed), select
-  the nearest remaining task in the same column.
+  the nearest remaining task.
 - After an action, refetch (no optimistic mutation) so the board reflects server truth.
-- States: a brief loading indicator on first fetch; an "empty" message for an empty column /
-  no tasks; an error banner (with the status/message) on failure that retries on the next
-  tick.
+- States: a brief loading indicator on first fetch; an "empty" message when no tasks exist;
+  an error banner (with the status/message) on failure that retries on the next tick.
 
 ## Actions
 
@@ -151,18 +152,57 @@ the ref — the TUI builds the URL (GitHub-shaped; abstract for other forges lat
 
 ## Keybindings (full)
 
+### Navigation
+
 | Key | Action |
 |-----|--------|
-| `←/→`, `h/l` | switch column |
 | `↑/↓`, `j/k` | move selection |
-| `enter` | open detail |
-| `esc` | back / close |
-| `p` | promote (backlog → ready) |
-| `a` | approve (review → done, confirmed) |
-| `x` | reject (review → ready, reason required) |
+| `tab`, `shift+tab` | switch panes |
+| `enter` | open detail view (or project) |
+| `esc` | back to board |
+
+### Pane toggles
+
+| Key | Action |
+|-----|--------|
+| `V` | toggle projects pane (80+ columns) |
+| `v` | toggle preview pane (120+ columns) |
+
+### Work item actions
+
+| Key | Action |
+|-----|--------|
+| `p` | promote backlog → ready |
+| `a` | approve review → done (confirmed) |
+| `x` | reject review → ready (reason required) |
+| `m` | merge approved → done |
+| `b` | bounce approved → backlog |
+| `u` | unblock blocked → ready |
+| `f` | fail blocked → backlog |
+
+### Detail view options
+
+| Key | Action |
+|-----|--------|
 | `o` | open the task's PR link in the browser |
-| `s` | (detail) open the task's source doc in the browser |
-| `d` | (detail) open the project's base design doc in the browser |
+| `s` | open the task's source doc in the browser |
+| `d` | open the project's base design doc in the browser |
+
+### Priority & workflow
+
+| Key | Action |
+|-----|--------|
+| `t` | hold / release (toggle) |
+| `i` | set priority |
+| `w` | move to front |
+| `e` | reset priority |
+| `z` | archive item (or archive project from projects pane) |
+| `c` | show scorecards |
+
+### General
+
+| Key | Action |
+|-----|--------|
 | `r` | refresh now |
 | `?` | toggle help overlay |
 | `q`, `ctrl+c` | quit |
@@ -180,9 +220,9 @@ the ref — the TUI builds the URL (GitHub-shaped; abstract for other forges lat
 
 - The API client is an interface; model tests use a **mock client** with canned data.
 - Bubble Tea model tests via `teatest` (charmbracelet): drive key messages, assert on the
-  rendered output (golden files) — column switching, selection stability across a simulated
-  refresh, the promote/approve/reject flows (including the confirm and the reject-reason
-  input), and error rendering.
+  rendered output (golden files) — pane switching, selection stability across a simulated
+  refresh, responsive layout behavior at various widths, the promote/approve/reject flows
+  (including the confirm and the reject-reason input), and error rendering.
 - The HTTP client gets a thin test against an `httptest` server for request shape + parsing.
 
 ## Task breakdown

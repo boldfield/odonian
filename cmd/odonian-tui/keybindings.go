@@ -26,7 +26,6 @@ const (
 	actToggleProjects action = "toggle-projects"
 	actOpenProject    action = "open-project"
 	actArchiveProject action = "archive-project"
-	actSwitchProject  action = "switch-project"
 	actHold           action = "hold"
 	actSetPriority    action = "set-priority"
 	actMoveToFront    action = "move-to-front"

@@ -193,6 +193,8 @@ func (m *BoardModel) reviewInputView() string {
 }
 
 // NewBoardModel creates a new board model and starts the initial fetch.
+// Production uses NewShellBoardModel instead, which initializes the shell state for the three-pane layout.
+// NewBoardModel is used by tests (action, detail, scorecard tests) and can be used as a base for custom layouts.
 func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tuiclient.Project) *BoardModel {
 	inputWidget := textinput.New()
 	inputWidget.CharLimit = 512
@@ -959,6 +961,10 @@ type tickMsg struct{}
 
 // Update handles messages from Bubble Tea.
 func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// The shell-nil path (old tab layout) is kept for backward compatibility with existing tests
+	// that use NewBoardModel directly. Production always uses NewShellBoardModel, which initializes
+	// the shell. Tests (action, detail, scorecard tests) could be refactored to use NewShellBoardModel
+	// in a future task.
 	if m.shell == nil {
 		return m.updateTabs(msg)
 	}
@@ -2199,6 +2205,8 @@ func (m *BoardModel) viewContent() string {
 		return b.String()
 	}
 
+	// Old tab layout rendering (kept for backward compatibility with tests that use NewBoardModel directly).
+	// Production uses the shell's three-pane layout above. This path is reached only when m.shell is nil.
 	var b strings.Builder
 
 	// Render project name
@@ -2509,19 +2517,10 @@ func (m *BoardModel) helpLine(bindings []keybind.Binding, width int) string {
 	return line
 }
 
-// detailKeys is the detail view's bindings. The shell has no project switcher, so there the
-// switch-project binding is left out — of the keys and of the help alike.
+// detailKeys is the detail view's bindings. All detail bindings are consistent between
+// tab layout and shell layouts since the detail view is full-screen in both.
 func (m *BoardModel) detailKeys() keyMap {
-	if m.shell == nil {
-		return m.keyBindings.Detail
-	}
-	var km keyMap
-	for _, e := range m.keyBindings.Detail {
-		if e.act != actSwitchProject {
-			km = append(km, e)
-		}
-	}
-	return km
+	return m.keyBindings.Detail
 }
 
 func (m *BoardModel) detailKeyCtx() keyCtx { return keyCtx{state: m.detailTask.State} }
