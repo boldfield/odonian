@@ -35,25 +35,12 @@ func FormatLeaseCountdown(expiresAt *string, now time.Time) string {
 }
 
 // FormatTime formats a timestamp relative to now, showing elapsed time.
-// Accepts either a string or *string for the timestamp parameter.
-func FormatTime(timestamp interface{}, now time.Time) string {
-	var ts string
-	switch v := timestamp.(type) {
-	case *string:
-		if v == nil {
-			return "unknown"
-		}
-		ts = *v
-	case string:
-		if v == "" {
-			return "unknown"
-		}
-		ts = v
-	default:
+func FormatTime(timestamp string, now time.Time) string {
+	if timestamp == "" {
 		return "unknown"
 	}
 
-	t, err := time.Parse(time.RFC3339Nano, ts)
+	t, err := time.Parse(time.RFC3339Nano, timestamp)
 	if err != nil {
 		return "unknown"
 	}

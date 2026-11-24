@@ -14,6 +14,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/forge"
 	"github.com/boldfield/odonian/internal/tuiclient"
+	"github.com/boldfield/odonian/internal/tuiview"
 )
 
 // commandContextFunc is the function used to create exec commands (made mockable for testing).
@@ -207,12 +208,12 @@ func (m *BoardModel) buildDetailContent(task tuiclient.TaskDetail) string {
 	}
 
 	if task.State == stateChecks {
-		b.WriteString(fmt.Sprintf("In checks: %s\n", formatChecksDuration(task.ChecksStartedAt, time.Now())))
+		b.WriteString(fmt.Sprintf("In checks: %s\n", tuiview.FormatChecksDuration(task.ChecksStartedAt, time.Now())))
 	}
 
 	// Lease countdown
 	if task.LeaseExpiresAt != nil {
-		b.WriteString(fmt.Sprintf("Lease: %s\n", m.formatLeaseCountdown(*task.LeaseExpiresAt)))
+		b.WriteString(fmt.Sprintf("Lease: %s\n", tuiview.FormatLeaseCountdown(task.LeaseExpiresAt, time.Now())))
 	}
 
 	// Priority

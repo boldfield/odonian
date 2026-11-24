@@ -220,6 +220,42 @@ func TestRenderRowWidth(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:  "backlog",
+			state: "backlog",
+			build: func() *WorkItem {
+				return &WorkItem{
+					Implement: &tuiclient.Task{
+						ID:    "yyyyyyyy-zzzz-aaaa-bbbb",
+						Title: "Backlog task",
+						State: "backlog",
+						Model: "sonnet",
+						Kind:  "implement",
+						Held:  false,
+					},
+					Reviews: []*tuiclient.Task{},
+					Merge:   nil,
+				}
+			},
+		},
+		{
+			name:  "abandoned",
+			state: "abandoned",
+			build: func() *WorkItem {
+				return &WorkItem{
+					Implement: &tuiclient.Task{
+						ID:    "cccccccc-dddd-eeee-ffff",
+						Title: "Abandoned task",
+						State: "abandoned",
+						Model: "haiku",
+						Kind:  "implement",
+						Held:  false,
+					},
+					Reviews: []*tuiclient.Task{},
+					Merge:   nil,
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -602,7 +638,7 @@ func TestRenderRowInProgressDetail(t *testing.T) {
 		t.Errorf("missing time held (15m) in row: %q", row)
 	}
 	// Should NOT show 10m (the lease countdown)
-	if !hasSubstring(row, "10m") && hasSubstring(row, "10m") {
+	if hasSubstring(row, "10m") {
 		t.Errorf("should not show lease countdown in row: %q", row)
 	}
 }

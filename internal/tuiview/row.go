@@ -230,10 +230,10 @@ func buildReviewerLine(reviews []*tuiclient.Task, now time.Time, width int) stri
 		case "reject":
 			verdictGlyph = "✖"
 		default:
-			// For pending reviewers, show elapsed time
+			// For pending reviewers, show pending mark plus elapsed time if available
 			verdictGlyph = "…"
 			if review.UpdatedAt != "" {
-				verdictGlyph = FormatTime(review.UpdatedAt, now)
+				verdictGlyph = "… " + FormatTime(review.UpdatedAt, now)
 			}
 		}
 
