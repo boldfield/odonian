@@ -188,13 +188,12 @@ func TestShellTabCyclesFocus(t *testing.T) {
 	if s.focus != paneItems {
 		t.Fatalf("initial focus = %v", s.focus)
 	}
-	f.send(key("tab"))
-	if s.focus != paneProjects {
-		t.Errorf("after tab focus = %v, want projects", s.focus)
-	}
-	f.send(key("tab"))
-	if s.focus != paneItems {
-		t.Errorf("after 2nd tab focus = %v, want items", s.focus)
+	want := []shellPane{panePreview, paneProjects, paneItems}
+	for i, w := range want {
+		f.send(key("tab"))
+		if s.focus != w {
+			t.Errorf("tab %d focus = %v, want %v", i+1, s.focus, w)
+		}
 	}
 	f.send(key("shift+tab"))
 	if s.focus != paneProjects {
@@ -206,6 +205,38 @@ func TestShellTabCyclesFocus(t *testing.T) {
 	f.send(key("tab"))
 	if got := f.model.visiblePanes(f.model.shellLayout()); len(got) != 1 {
 		t.Errorf("visible panes at 70 = %v", got)
+	}
+	if s.focus != paneItems {
+		t.Errorf("focus at 70 = %v, want items", s.focus)
+	}
+}
+
+func TestShellPreviewFocusRendersAndTakesArrows(t *testing.T) {
+	f := newShellFixture(t, 120, 24)
+	s := f.model.shell
+	unfocused := f.model.View().Content
+	f.send(key("tab"))
+	if s.focus != panePreview {
+		t.Fatalf("focus = %v, want preview", s.focus)
+	}
+	focused := f.model.View().Content
+	if focused == unfocused {
+		t.Error("view did not change when the preview took focus")
+	}
+	if !strings.Contains(focused, "\x1b[1m") {
+		t.Error("focused preview title is not rendered bold")
+	}
+	sel := s.items.SelectedTaskID()
+	f.send(key("down"))
+	if s.items.SelectedTaskID() != sel {
+		t.Error("down moved the item selection while the preview was focused")
+	}
+	if s.preview.scroll < 0 {
+		t.Errorf("scroll = %d", s.preview.scroll)
+	}
+	f.send(key("v"))
+	if s.focus != paneItems {
+		t.Errorf("hiding the preview left focus on %v", s.focus)
 	}
 }
 
@@ -224,7 +255,7 @@ func TestShellArrowsGoToFocusedPane(t *testing.T) {
 		t.Fatal("project changed")
 	}
 
-	f.send(key("tab"))
+	f.send(key("shift+tab"))
 	f.send(key("down"))
 	if f.model.project.ID != "p2" {
 		t.Errorf("project = %q, want p2", f.model.project.ID)
@@ -233,7 +264,7 @@ func TestShellArrowsGoToFocusedPane(t *testing.T) {
 
 func TestShellProjectChangeLoadsItems(t *testing.T) {
 	f := newShellFixture(t, 120, 24)
-	f.send(key("tab"), key("down"))
+	f.send(key("shift+tab"), key("down"))
 	if got := f.model.shell.items.SelectedTaskID(); got != "b1" {
 		t.Errorf("selected = %q, want b1", got)
 	}
@@ -307,7 +338,7 @@ func TestShellToggles(t *testing.T) {
 	if strings.Contains(f.model.View().Content, "· round") {
 		t.Error("preview still shown after v")
 	}
-	f.send(key("tab"), key("V"))
+	f.send(key("shift+tab"), key("V"))
 	out := f.model.View().Content
 	if strings.Contains(out, "PROJECTS") {
 		t.Error("project pane still shown after V")

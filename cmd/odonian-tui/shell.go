@@ -24,6 +24,7 @@ type shellPane int
 const (
 	paneItems shellPane = iota
 	paneProjects
+	panePreview
 )
 
 // shellState is the three-pane shell: it owns the panes, the focus and the toggles.
@@ -70,6 +71,7 @@ func NewShellBoardModel(client tuiclient.Client, config *tuiconfig.Config, proje
 		focus:           paneItems,
 		previewDebounce: previewDebounce,
 	}
+	m.shell.preview.SetTheme(theme)
 	m.shell.items.SetProjectName(project.Name)
 	return m
 }
@@ -158,7 +160,11 @@ func (m *BoardModel) visiblePanes(layout tuiview.Layout) []shellPane {
 	if layout.ProjectWidth > 0 {
 		panes = append(panes, paneProjects)
 	}
-	return append(panes, paneItems)
+	panes = append(panes, paneItems)
+	if layout.PreviewWidth > 0 {
+		panes = append(panes, panePreview)
+	}
+	return panes
 }
 
 func (m *BoardModel) shellLayout() tuiview.Layout {
@@ -194,6 +200,9 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 
 	case "v":
 		s.previewHidden = !s.previewHidden
+		if s.previewHidden && s.focus == panePreview {
+			s.focus = paneItems
+		}
 		return m, nil, true
 	case "V":
 		s.projectHidden = !s.projectHidden
@@ -203,7 +212,13 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 		return m, nil, true
 
 	case "up", "k", "down", "j":
-		if s.focus == paneProjects && s.projectsVisible(m) {
+		if s.focus == panePreview && m.shellLayout().PreviewWidth > 0 {
+			if k := msg.String(); k == "up" || k == "k" {
+				s.preview.Scroll(-1)
+			} else {
+				s.preview.Scroll(1)
+			}
+		} else if s.focus == paneProjects && s.projectsVisible(m) {
 			_, cmd = s.projects.Update(msg)
 		} else {
 			_, cmd = s.items.Update(msg)
@@ -355,6 +370,10 @@ func (m *BoardModel) shellView() string {
 	if layout.ProjectWidth == 0 {
 		focus = paneItems
 	}
+	if layout.PreviewWidth == 0 && focus == panePreview {
+		focus = paneItems
+	}
+	s.preview.SetFocused(focus == panePreview)
 	s.projects.SetFocused(focus == paneProjects)
 	s.items.SetFocused(focus == paneItems)
 
