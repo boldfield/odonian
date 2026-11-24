@@ -61,7 +61,13 @@ func newActionFixture(t *testing.T) *actionFixture {
 			return out, nil
 		},
 		GetTaskFunc: func(ctx context.Context, id string) (tuiclient.TaskDetail, error) {
-			return tuiclient.TaskDetail{Links: []tuiclient.TaskLink{{Kind: "pr", Value: "https://github.com/o/r/pull/9"}}}, nil
+			d := tuiclient.TaskDetail{ID: id, Links: []tuiclient.TaskLink{{Kind: "pr", Value: "https://github.com/o/r/pull/9"}}}
+			for _, task := range tasks {
+				if task.ID == id {
+					d.Title, d.State = task.Title, task.State
+				}
+			}
+			return d, nil
 		},
 		PromoteTaskFunc: func(ctx context.Context, id string) error { rec("promote " + id); return nil },
 		ReviewTaskFunc: func(ctx context.Context, id, actor, verdict string, note *string) error {

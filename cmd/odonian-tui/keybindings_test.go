@@ -3,278 +3,303 @@ package main
 import (
 	"strings"
 	"testing"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	"github.com/boldfield/odonian/internal/tuiconfig"
+	"github.com/charmbracelet/x/ansi"
 )
 
-// TestHelpBarReviewState tests that the help bar for a review state includes approve and reject.
-func TestHelpBarReviewState(t *testing.T) {
-	config := &tuiconfig.Config{
-		PollInterval: 100 * time.Millisecond,
-	}
-	m := NewBoardModel(nil, config, tuiclient.Project{ID: "test", Name: "test"})
+// squeeze collapses runs of spaces, which the full list uses to align its columns.
+func squeeze(s string) string { return strings.Join(strings.Fields(s), " ") }
 
-	// Set up a task in review state
-	m.tasks[stateReview] = []tuiclient.Task{
-		{ID: "task1", State: stateReview, Title: "Test task"},
-	}
-	m.selectedColumn = columnIndex(stateReview)
-	m.selectedTaskID = "task1"
-	m.width = 200 // Use a wide width to ensure all bindings are shown
-	m.helpModel.SetWidth(m.width)
+// lastLine is the bottom row of a rendered view: the help bar.
+func lastLine(view string) string {
+	lines := strings.Split(view, "\n")
+	return lines[len(lines)-1]
+}
 
-	helpBar := m.renderHelpBar()
-
-	// Assert that approve and reject are in the help bar (they're the main actions for review state)
-	if !strings.Contains(helpBar, "approve") {
-		t.Errorf("approve action not in help bar: %s", helpBar)
-	}
-	if !strings.Contains(helpBar, "reject") {
-		t.Errorf("reject action not in help bar: %s", helpBar)
+func TestShellHelpBarReviewItemWidths(t *testing.T) {
+	for _, w := range []int{60, 100, 160} {
+		f := newActionFixture(t)
+		f.send(tea.WindowSizeMsg{Width: w, Height: 40})
+		f.selectItem(t, "t-review")
+		bar := lastLine(f.model.View().Content)
+		if got := ansi.StringWidth(bar); got > w {
+			t.Errorf("width %d: bar is %d columns wide: %q", w, got, bar)
+		}
+		if !strings.HasPrefix(bar, "a approve • x reject") {
+			t.Errorf("width %d: bar must start with approve then reject, got %q", w, bar)
+		}
 	}
 }
 
-// TestHelpBarBlockedState tests that the help bar for a blocked item shows unblock and fail, not approve.
-func TestHelpBarBlockedState(t *testing.T) {
-	config := &tuiconfig.Config{
-		PollInterval: 100 * time.Millisecond,
-	}
-	m := NewBoardModel(nil, config, tuiclient.Project{ID: "test", Name: "test"})
-
-	// Set up a task in blocked state
-	m.tasks[stateBlocked] = []tuiclient.Task{
-		{ID: "blocked-task", State: stateBlocked, Title: "Blocked task"},
-	}
-	m.selectedColumn = columnIndex(stateBlocked)
-	m.selectedTaskID = "blocked-task"
-	m.width = 200
-	m.helpModel.SetWidth(m.width)
-
-	helpBar := m.renderHelpBar()
-
-	// Assert unblock and fail are in the help bar
-	if !strings.Contains(helpBar, "u") || !strings.Contains(helpBar, "unblock") {
-		t.Errorf("unblock action not in help bar: %s", helpBar)
-	}
-	if !strings.Contains(helpBar, "f") || !strings.Contains(helpBar, "fail") {
-		t.Errorf("fail action not in help bar: %s", helpBar)
-	}
-
-	// Assert approve is NOT in the help bar
-	if strings.Contains(helpBar, "approve") {
-		t.Errorf("approve action should not be in help bar for blocked state: %s", helpBar)
+func TestShellHelpBarTruncatesWithEllipsis(t *testing.T) {
+	f := newActionFixture(t)
+	f.send(tea.WindowSizeMsg{Width: 40, Height: 40})
+	f.selectItem(t, "t-review")
+	bar := lastLine(f.model.View().Content)
+	if !strings.HasSuffix(bar, "…") || ansi.StringWidth(bar) > 40 {
+		t.Errorf("narrow bar should end in an ellipsis within 40 columns, got %q", bar)
 	}
 }
 
-// TestHelpToggleFullHelp tests that pressing ? toggles the full help view on and off.
-func TestHelpToggleFullHelp(t *testing.T) {
-	config := &tuiconfig.Config{
-		PollInterval: 100 * time.Millisecond,
+func TestShellHelpBarBlockedItem(t *testing.T) {
+	f := newActionFixture(t)
+	f.selectItem(t, "t-blocked")
+	bar := lastLine(f.model.View().Content)
+	for _, want := range []string{"u unblock", "f fail"} {
+		if !strings.Contains(bar, want) {
+			t.Errorf("blocked bar lacks %q: %q", want, bar)
+		}
 	}
-	m := NewBoardModel(nil, config, tuiclient.Project{ID: "test", Name: "test"})
-	m.width = 100
-	m.height = 30
-	m.helpModel.SetWidth(m.width)
+	if strings.Contains(bar, "approve") {
+		t.Errorf("blocked bar must not offer approve: %q", bar)
+	}
+}
 
-	// Set up a task in review state
-	m.tasks[stateReview] = []tuiclient.Task{
-		{ID: "task1", State: stateReview, Title: "Test task"},
+func TestShellHelpBarApprovedItemListsMergeFirst(t *testing.T) {
+	f := newActionFixture(t)
+	f.send(tea.WindowSizeMsg{Width: 60, Height: 40})
+	f.selectItem(t, "t-approved")
+	if bar := lastLine(f.model.View().Content); !strings.HasPrefix(bar, "m merge") {
+		t.Errorf("approved bar must start with merge, got %q", bar)
 	}
+}
+
+func TestShellHelpBarPerPane(t *testing.T) {
+	f := newActionFixture(t)
+	f.selectItem(t, "t-review")
+	items := f.model.shellKeyHints()
+	for _, want := range []string{"tab pane", "v preview", "V projects"} {
+		if !strings.Contains(items, want) {
+			t.Errorf("items bar lacks %q: %q", want, items)
+		}
+	}
+	f.send(key("shift+tab"))
+	projects := f.model.shellKeyHints()
+	if !strings.Contains(projects, "enter open") || !strings.Contains(projects, "z archive project") || strings.Contains(projects, "approve") {
+		t.Errorf("projects bar wrong: %q", projects)
+	}
+	f.press("tab", "tab")
+	preview := f.model.shellKeyHints()
+	if strings.Contains(preview, "approve") || strings.Contains(preview, "open") || !strings.Contains(preview, "↑/↓") {
+		t.Errorf("preview bar wrong: %q", preview)
+	}
+}
+
+func TestShellFullHelpToggle(t *testing.T) {
+	f := newActionFixture(t)
+	f.selectItem(t, "t-review")
+	before := f.model.View().Content
+
+	f.press("?")
+	raw := f.model.View().Content
+	open := squeeze(raw)
+	for _, want := range []string{"a approve", "x reject", "tab pane", "v preview", "V projects", "q quit", "? help"} {
+		if !strings.Contains(open, want) {
+			t.Errorf("full list lacks %q:\n%s", want, open)
+		}
+	}
+	if strings.Count(raw, "\n") < 5 {
+		t.Errorf("full list should span several rows:\n%s", open)
+	}
+	if strings.Contains(open, "u unblock") || strings.Contains(open, "left") {
+		t.Errorf("full list shows keys that do nothing here:\n%s", open)
+	}
+
+	// Other keys are swallowed while the list is open.
+	f.press("a", "x", "z", "down", "v", "tab")
+	if f.model.mode != modeNormal || f.model.shell.previewHidden || f.model.shell.focus != paneItems {
+		t.Errorf("keys leaked through the open list: mode %d previewHidden %v focus %d", f.model.mode, f.model.shell.previewHidden, f.model.shell.focus)
+	}
+	if f.model.shell.items.SelectedTaskID() != "t-review" {
+		t.Errorf("selection moved behind the list: %s", f.model.shell.items.SelectedTaskID())
+	}
+
+	f.press("?")
+	if after := f.model.View().Content; after != before {
+		t.Errorf("second ? should restore the shell view\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestShellFullHelpFollowsFocusedPane(t *testing.T) {
+	f := newActionFixture(t)
+	f.send(key("shift+tab"))
+	f.press("?")
+	out := squeeze(f.model.View().Content)
+	if !strings.Contains(out, "enter open") || !strings.Contains(out, "z archive project") {
+		t.Errorf("projects-pane list lacks project keys:\n%s", out)
+	}
+	if strings.Contains(out, "approve") {
+		t.Errorf("projects-pane list shows item keys:\n%s", out)
+	}
+}
+
+func TestShellQuitStillWorksUnderFullHelp(t *testing.T) {
+	f := newActionFixture(t)
+	f.press("?")
+	_, cmd := f.model.Update(key("q"))
+	if cmd == nil {
+		t.Fatal("q under the full list should quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Error("q under the full list did not produce a quit")
+	}
+}
+
+func TestShellKeysComeFromBindings(t *testing.T) {
+	f := newActionFixture(t)
+	// Rebind approve: the new key acts and the help shows it; the old key does nothing.
+	for i := range f.model.keyBindings.Shell {
+		e := &f.model.keyBindings.Shell[i]
+		if e.act == actApprove {
+			e.bind.SetKeys("y")
+			e.bind.SetHelp("y", "approve")
+		}
+	}
+	f.selectItem(t, "t-review")
+	if bar := lastLine(f.model.View().Content); !strings.HasPrefix(bar, "y approve") {
+		t.Errorf("help should show the rebound key: %q", bar)
+	}
+	f.press("a")
+	if f.model.mode != modeNormal {
+		t.Error("the old key still approves after rebinding")
+	}
+	f.press("y")
+	if f.model.mode != modeApproveNote {
+		t.Errorf("the rebound key did not start an approval, mode %d", f.model.mode)
+	}
+}
+
+func TestShellDoesNotOpenProjectSwitcherOrColumns(t *testing.T) {
+	f := newActionFixture(t)
+	for _, k := range []string{"P", "left", "right", "h", "l"} {
+		f.send(key(k))
+		if f.model.mode != modeNormal {
+			t.Errorf("%s changed mode to %d", k, f.model.mode)
+		}
+	}
+}
+
+func TestShellKeepsVimAliases(t *testing.T) {
+	f := newActionFixture(t)
+	first := f.model.shell.items.SelectedTaskID()
+	f.press("j")
+	if f.model.shell.items.SelectedTaskID() == first {
+		t.Error("j should move the selection down")
+	}
+	f.press("k")
+	if f.model.shell.items.SelectedTaskID() != first {
+		t.Error("k should move the selection back up")
+	}
+}
+
+func detailFixture(t *testing.T, id string) *actionFixture {
+	f := newActionFixture(t)
+	f.selectItem(t, id)
+	f.press("enter")
+	if f.model.mode != modeDetail {
+		t.Fatalf("enter did not open the detail view, mode %d", f.model.mode)
+	}
+	return f
+}
+
+func TestDetailFullHelpToggle(t *testing.T) {
+	f := detailFixture(t, "t-review")
+	before := f.model.View().Content
+	f.press("?")
+	open := squeeze(f.model.View().Content)
+	for _, want := range []string{"a approve", "x reject", "esc back", "i set priority", "o open PR"} {
+		if !strings.Contains(open, want) {
+			t.Errorf("detail full list lacks %q:\n%s", want, open)
+		}
+	}
+	if strings.Contains(open, "switch project") {
+		t.Errorf("the shell has no project switcher:\n%s", open)
+	}
+	f.press("a", "esc")
+	if f.model.mode != modeDetail {
+		t.Errorf("keys leaked through the open list, mode %d", f.model.mode)
+	}
+	f.press("?")
+	if after := f.model.View().Content; after != before {
+		t.Errorf("second ? should restore the detail view\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestDetailHelpBarFollowsState(t *testing.T) {
+	f := detailFixture(t, "t-review")
+	bar := lastLine(f.model.View().Content)
+	if !strings.HasPrefix(bar, "a approve • x reject") {
+		t.Errorf("review detail bar must start with approve, reject: %q", bar)
+	}
+	f = detailFixture(t, "t-blocked")
+	if bar := lastLine(f.model.View().Content); strings.Contains(bar, "approve") || strings.Contains(bar, "merge") {
+		t.Errorf("blocked detail bar offers other states' keys: %q", bar)
+	}
+}
+
+func TestLegacyBoardFullHelpToggle(t *testing.T) {
+	m := NewBoardModel(nil, nil, tuiclient.Project{ID: "p", Name: "p"})
+	m.width, m.height = 100, 30
+	m.tasks[stateReview] = []tuiclient.Task{{ID: "r1", State: stateReview, Title: "R"}}
 	m.selectedColumn = columnIndex(stateReview)
-	m.selectedTaskID = "task1"
-
-	// Initial state: full help should be false
+	m.selectedTaskID = "r1"
+	m.Update(key("?"))
+	if out := squeeze(m.viewContent()); !strings.Contains(out, "a approve") || !strings.Contains(out, "←/→ column") {
+		t.Errorf("legacy full list incomplete:\n%s", out)
+	}
+	m.Update(key("a"))
+	if m.mode != modeNormal {
+		t.Error("a leaked through the open list")
+	}
+	m.Update(key("?"))
 	if m.showFullHelp {
-		t.Errorf("showFullHelp should be false initially, got true")
-	}
-
-	// Press ?
-	msg := tea.KeyPressMsg{
-		Code: '?',
-		Text: "?",
-	}
-
-	_, _ = m.updateTabs(msg)
-
-	// After first ?, full help should be true
-	if !m.showFullHelp {
-		t.Errorf("showFullHelp should be true after first ?, got false")
-	}
-
-	// Press ? again
-	_, _ = m.updateTabs(msg)
-
-	// After second ?, full help should be false
-	if m.showFullHelp {
-		t.Errorf("showFullHelp should be false after second ?, got true")
+		t.Error("second ? should close the list")
 	}
 }
 
-// TestHelpViewContent tests that the help view is rendered when showFullHelp is true.
-func TestHelpViewContent(t *testing.T) {
-	config := &tuiconfig.Config{
-		PollInterval: 100 * time.Millisecond,
-	}
-	m := NewBoardModel(nil, config, tuiclient.Project{ID: "test", Name: "test"})
-	m.width = 100
-	m.height = 30
-	m.helpModel.SetWidth(m.width)
-
-	// Set up a task in review state
-	m.tasks[stateReview] = []tuiclient.Task{
-		{ID: "task1", State: stateReview, Title: "Test task"},
-	}
-	m.selectedColumn = columnIndex(stateReview)
-	m.selectedTaskID = "task1"
-
-	// Toggle to show full help
-	m.showFullHelp = true
-
-	content := m.viewContent()
-
-	// Assert that the content contains the help marker
-	if !strings.Contains(content, "?") || !strings.Contains(content, "close") {
-		t.Logf("Help view content: %s", content)
-		t.Errorf("Help view should contain '? to close' or similar")
-	}
-
-	// Should not show the normal board content
-	if strings.Contains(content, m.renderTabs()) {
-		t.Errorf("Help view should not show tabs")
-	}
-}
-
-// TestKeyBindingsAvailableForState tests that the right bindings are available for each state.
-func TestKeyBindingsAvailableForState(t *testing.T) {
+// Every binding a context lists must resolve, in that context, to its own action.
+func TestListedBindingsResolveToTheirActions(t *testing.T) {
 	kb := DefaultKeyBindings()
-
-	testCases := []struct {
-		state         string
-		expectedCount int // approximate expected number of bindings
-	}{
-		{state: stateBacklog, expectedCount: 15},  // promote + common bindings
-		{state: stateReview, expectedCount: 16},   // approve + reject + common bindings
-		{state: stateApproved, expectedCount: 15}, // bounce + common bindings
-		{state: stateBlocked, expectedCount: 16},  // unblock + fail + common bindings
+	cases := map[string][]keyCtx{"Board": {{state: stateReview}, {state: stateBlocked}, {state: stateBacklog}}, "Detail": {{state: stateReview}, {state: stateApproved}}, "Shell": {}}
+	for _, p := range []shellPane{paneItems, paneProjects, panePreview} {
+		for _, s := range []string{stateBacklog, stateReview, stateApproved, stateBlocked, "ready", ""} {
+			cases["Shell"] = append(cases["Shell"], keyCtx{pane: p, state: s})
+		}
 	}
-
-	for _, tc := range testCases {
-		t.Run(tc.state, func(t *testing.T) {
-			bindings := kb.getBoardBindingsForState(tc.state)
-			if len(bindings) == 0 {
-				t.Errorf("expected bindings for state %s, got none", tc.state)
+	maps := map[string]keyMap{"Board": kb.Board, "Detail": kb.Detail, "Shell": kb.Shell}
+	for name, ctxs := range cases {
+		for _, c := range ctxs {
+			for _, e := range maps[name] {
+				if !e.valid(c) || e.bind.Help().Key == "" {
+					continue
+				}
+				for _, k := range e.bind.Keys() {
+					got, ok := maps[name].lookup(key2msg(k), c)
+					if !ok || got != e.act {
+						t.Errorf("%s %+v: key %q lists %s but resolves to %q (ok=%v)", name, c, k, e.act, got, ok)
+					}
+				}
 			}
-			// Check approximate count (allowing some variance)
-			if len(bindings) < tc.expectedCount-2 || len(bindings) > tc.expectedCount+2 {
-				t.Logf("warning: state %s has %d bindings, expected around %d", tc.state, len(bindings), tc.expectedCount)
-			}
-		})
+		}
 	}
 }
 
-// TestDetailModeFullHelpToggle tests that ? in detail mode toggles full help.
-func TestDetailModeFullHelpToggle(t *testing.T) {
-	config := &tuiconfig.Config{
-		PollInterval: 100 * time.Millisecond,
+func key2msg(s string) tea.KeyPressMsg {
+	switch s {
+	case "esc":
+		return tea.KeyPressMsg{Code: tea.KeyEscape}
+	case "pgup":
+		return tea.KeyPressMsg{Code: tea.KeyPgUp}
+	case "pgdown":
+		return tea.KeyPressMsg{Code: tea.KeyPgDown}
+	case "ctrl+c":
+		return tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}
+	case "left":
+		return tea.KeyPressMsg{Code: tea.KeyLeft}
+	case "right":
+		return tea.KeyPressMsg{Code: tea.KeyRight}
 	}
-	m := NewBoardModel(nil, config, tuiclient.Project{ID: "test", Name: "test"})
-	m.width = 100
-	m.height = 30
-	m.helpModel.SetWidth(m.width)
-
-	// Set up a task in review state and enter detail mode
-	reviewTask := tuiclient.TaskDetail{
-		ID:    "task1",
-		Title: "Test task",
-		State: stateReview,
-	}
-	m.mode = modeDetail
-	m.detailTask = reviewTask
-
-	// Initial state: full help should be false
-	if m.showFullHelp {
-		t.Errorf("showFullHelp should be false initially, got true")
-	}
-
-	// Press ?
-	msg := tea.KeyPressMsg{Code: '?', Text: "?"}
-	_, _ = m.updateDetailMode(msg)
-
-	// After first ?, full help should be true
-	if !m.showFullHelp {
-		t.Errorf("showFullHelp should be true after first ?, got false")
-	}
-
-	// Press ? again
-	_, _ = m.updateDetailMode(msg)
-
-	// After second ?, full help should be false
-	if m.showFullHelp {
-		t.Errorf("showFullHelp should be false after second ?, got true")
-	}
-}
-
-// TestBoardHasVimStyleBindings tests that j/k/h/l appear in board help bindings.
-func TestBoardHasVimStyleBindings(t *testing.T) {
-	kb := DefaultKeyBindings()
-
-	// Check that up binding includes "k"
-	upBinding := kb.Board.Up
-	hasK := false
-	for _, key := range upBinding.Keys() {
-		if key == "k" {
-			hasK = true
-			break
-		}
-	}
-	if !hasK {
-		t.Errorf("board Up binding should include 'k', got %v", upBinding.Keys())
-	}
-
-	// Check that down binding includes "j"
-	downBinding := kb.Board.Down
-	hasJ := false
-	for _, key := range downBinding.Keys() {
-		if key == "j" {
-			hasJ = true
-			break
-		}
-	}
-	if !hasJ {
-		t.Errorf("board Down binding should include 'j', got %v", downBinding.Keys())
-	}
-}
-
-// TestShellHasVimStyleBindings tests that j/k/h/l appear in shell help bindings.
-func TestShellHasVimStyleBindings(t *testing.T) {
-	kb := DefaultKeyBindings()
-
-	// Check that up binding includes "k"
-	upBinding := kb.Shell.Up
-	hasK := false
-	for _, key := range upBinding.Keys() {
-		if key == "k" {
-			hasK = true
-			break
-		}
-	}
-	if !hasK {
-		t.Errorf("shell Up binding should include 'k', got %v", upBinding.Keys())
-	}
-
-	// Check that down binding includes "j"
-	downBinding := kb.Shell.Down
-	hasJ := false
-	for _, key := range downBinding.Keys() {
-		if key == "j" {
-			hasJ = true
-			break
-		}
-	}
-	if !hasJ {
-		t.Errorf("shell Down binding should include 'j', got %v", downBinding.Keys())
-	}
+	return key(s)
 }

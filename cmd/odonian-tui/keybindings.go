@@ -5,607 +5,219 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-// matchesBinding checks if a KeyPressMsg matches a key binding by comparing the
-// message string against the binding's configured keys.
-func matchesBinding(msg tea.KeyPressMsg, binding keybind.Binding) bool {
-	for _, key := range binding.Keys() {
-		if msg.String() == key {
+// action names what a key does. Handlers switch on the action a binding resolves to, and the
+// help bar is built from the same bindings, so the two cannot drift apart.
+type action string
+
+const (
+	actQuit           action = "quit"
+	actHelp           action = "help"
+	actLeft           action = "left"
+	actRight          action = "right"
+	actUp             action = "up"
+	actDown           action = "down"
+	actEnter          action = "enter"
+	actBack           action = "back"
+	actPageUp         action = "pgup"
+	actPageDown       action = "pgdown"
+	actNextPane       action = "next-pane"
+	actPrevPane       action = "prev-pane"
+	actTogglePreview  action = "toggle-preview"
+	actToggleProjects action = "toggle-projects"
+	actOpenProject    action = "open-project"
+	actArchiveProject action = "archive-project"
+	actSwitchProject  action = "switch-project"
+	actHold           action = "hold"
+	actSetPriority    action = "set-priority"
+	actMoveToFront    action = "move-to-front"
+	actResetPriority  action = "reset-priority"
+	actArchive        action = "archive"
+	actScorecards     action = "scorecards"
+	actRefresh        action = "refresh"
+	actPromote        action = "promote"
+	actApprove        action = "approve"
+	actReject         action = "reject"
+	actBounce         action = "bounce"
+	actUnblock        action = "unblock"
+	actFail           action = "fail"
+	actMerge          action = "merge"
+	actOpenPR         action = "open-pr"
+	actSourceDoc      action = "source-doc"
+	actDesignDoc      action = "design-doc"
+)
+
+// keyCtx is what decides which bindings are live: the focused shell pane and the state of
+// the item the keys would act on. The tab layout and the detail view ignore the pane.
+type keyCtx struct {
+	pane  shellPane
+	state string
+}
+
+// keyEntry binds an action to keys. A nil panes or states list means "any".
+type keyEntry struct {
+	act    action
+	bind   keybind.Binding
+	panes  []shellPane
+	states []string
+}
+
+func (e keyEntry) valid(c keyCtx) bool {
+	if len(e.panes) > 0 && !containsPane(e.panes, c.pane) {
+		return false
+	}
+	if len(e.states) > 0 && !containsString(e.states, c.state) {
+		return false
+	}
+	return true
+}
+
+func containsPane(ps []shellPane, p shellPane) bool {
+	for _, x := range ps {
+		if x == p {
 			return true
 		}
 	}
 	return false
 }
 
-// KeyBindings defines all key bindings for the TUI.
-// Bindings are grouped by context (board, detail, shell) and state.
+func containsString(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// keyMap is an ordered list of entries. The order is the help bar's order, so the primary
+// actions of a state come first and survive truncation at narrow widths.
+type keyMap []keyEntry
+
+// lookup resolves a key press to the first live entry's action.
+func (km keyMap) lookup(msg tea.KeyPressMsg, c keyCtx) (action, bool) {
+	for _, e := range km {
+		if e.valid(c) && keybind.Matches(msg, e.bind) {
+			return e.act, true
+		}
+	}
+	return "", false
+}
+
+// help lists the bindings live in the context, in order, skipping those with no help text.
+func (km keyMap) help(c keyCtx) []keybind.Binding {
+	var out []keybind.Binding
+	for _, e := range km {
+		if e.valid(c) && e.bind.Help().Key != "" {
+			out = append(out, e.bind)
+		}
+	}
+	return out
+}
+
+// binding returns the binding for an action (the zero Binding if there is none).
+func (km keyMap) binding(a action) keybind.Binding {
+	for _, e := range km {
+		if e.act == a {
+			return e.bind
+		}
+	}
+	return keybind.Binding{}
+}
+
+// KeyBindings holds the bindings of each context.
 type KeyBindings struct {
-	// Board navigation
-	Board boardKeyMap
-	// Detail view
-	Detail detailKeyMap
-	// Shell navigation
-	Shell shellKeyMap
+	Board  keyMap // the tab layout (legacy)
+	Detail keyMap // the full-screen detail view
+	Shell  keyMap // the three-pane shell
 }
 
-// boardKeyMap defines key bindings for the board view.
-type boardKeyMap struct {
-	// Navigation
-	Left        keybind.Binding
-	Right       keybind.Binding
-	Up          keybind.Binding
-	Down        keybind.Binding
-	EnterDetail keybind.Binding
-
-	// State-independent
-	Hold          keybind.Binding
-	SetPriority   keybind.Binding
-	MoveToFront   keybind.Binding
-	ResetPriority keybind.Binding
-	Archive       keybind.Binding
-	Scorecards    keybind.Binding
-	SwitchProject keybind.Binding
-	Refresh       keybind.Binding
-	Quit          keybind.Binding
-
-	// State-dependent (backlog only)
-	Promote keybind.Binding
-
-	// State-dependent (review only)
-	Approve keybind.Binding
-	Reject  keybind.Binding
-
-	// State-dependent (approved only)
-	Bounce keybind.Binding
-
-	// State-dependent (blocked only)
-	Unblock keybind.Binding
-	Fail    keybind.Binding
-
-	// Help
-	Help keybind.Binding
+func bind(a action, keys, helpKey, helpDesc string, extra ...string) keyEntry {
+	return keyEntry{act: a, bind: keybind.NewBinding(keybind.WithKeys(append([]string{keys}, extra...)...), keybind.WithHelp(helpKey, helpDesc))}
 }
 
-// detailKeyMap defines key bindings for the detail view.
-type detailKeyMap struct {
-	Back          keybind.Binding
-	ScrollUp      keybind.Binding
-	ScrollDown    keybind.Binding
-	PageUp        keybind.Binding
-	PageDown      keybind.Binding
-	OpenPR        keybind.Binding
-	SourceDoc     keybind.Binding
-	DesignDoc     keybind.Binding
-	SwitchProject keybind.Binding
-	SetPriority   keybind.Binding
-	MoveToFront   keybind.Binding
-	ResetPriority keybind.Binding
+func (e keyEntry) inPanes(ps ...shellPane) keyEntry { e.panes = ps; return e }
+func (e keyEntry) inStates(ss ...string) keyEntry   { e.states = ss; return e }
 
-	// State-dependent (review only)
-	Approve keybind.Binding
-	Reject  keybind.Binding
-
-	// State-dependent (approved only)
-	MergeComplete keybind.Binding
-
-	// Help
-	Help keybind.Binding
-}
-
-// shellKeyMap defines key bindings for the shell (three-pane) layout.
-type shellKeyMap struct {
-	// Pane navigation
-	NextPane keybind.Binding
-	PrevPane keybind.Binding
-
-	// Navigation within panes
-	Up    keybind.Binding
-	Down  keybind.Binding
-	Left  keybind.Binding
-	Right keybind.Binding
-
-	// Enter detail view
-	EnterDetail keybind.Binding
-
-	// Pane toggles
-	TogglePreview keybind.Binding
-	ToggleProject keybind.Binding
-
-	// Project pane actions
-	OpenProject    keybind.Binding
-	ArchiveProject keybind.Binding
-
-	// Item actions (state-independent)
-	Hold          keybind.Binding
-	SetPriority   keybind.Binding
-	MoveToFront   keybind.Binding
-	ResetPriority keybind.Binding
-	Archive       keybind.Binding
-	Scorecards    keybind.Binding
-	Refresh       keybind.Binding
-
-	// Item actions (state-dependent)
-	Promote keybind.Binding
-	Approve keybind.Binding
-	Reject  keybind.Binding
-	Bounce  keybind.Binding
-	Unblock keybind.Binding
-	Fail    keybind.Binding
-	Merge   keybind.Binding
-
-	// Help
-	Help keybind.Binding
-	Quit keybind.Binding
+// hidden marks an entry as live but absent from the help (an alias row).
+func (e keyEntry) hidden() keyEntry {
+	e.bind.SetHelp("", "")
+	return e
 }
 
 // DefaultKeyBindings returns the default key bindings.
 func DefaultKeyBindings() KeyBindings {
 	return KeyBindings{
-		Board: boardKeyMap{
-			// Navigation
-			Left: keybind.NewBinding(
-				keybind.WithKeys("left", "h"),
-				keybind.WithHelp("←", "prev column"),
-			),
-			Right: keybind.NewBinding(
-				keybind.WithKeys("right", "l"),
-				keybind.WithHelp("→", "next column"),
-			),
-			Up: keybind.NewBinding(
-				keybind.WithKeys("up", "k"),
-				keybind.WithHelp("↑", "select up"),
-			),
-			Down: keybind.NewBinding(
-				keybind.WithKeys("down", "j"),
-				keybind.WithHelp("↓", "select down"),
-			),
-			EnterDetail: keybind.NewBinding(
-				keybind.WithKeys("enter"),
-				keybind.WithHelp("enter", "detail"),
-			),
-
-			// State-independent
-			Hold: keybind.NewBinding(
-				keybind.WithKeys("t"),
-				keybind.WithHelp("t", "hold/release"),
-			),
-			SetPriority: keybind.NewBinding(
-				keybind.WithKeys("i"),
-				keybind.WithHelp("i", "set priority"),
-			),
-			MoveToFront: keybind.NewBinding(
-				keybind.WithKeys("w"),
-				keybind.WithHelp("w", "move to front"),
-			),
-			ResetPriority: keybind.NewBinding(
-				keybind.WithKeys("e"),
-				keybind.WithHelp("e", "reset priority"),
-			),
-			Archive: keybind.NewBinding(
-				keybind.WithKeys("z"),
-				keybind.WithHelp("z", "archive"),
-			),
-			Scorecards: keybind.NewBinding(
-				keybind.WithKeys("c"),
-				keybind.WithHelp("c", "scorecards"),
-			),
-			SwitchProject: keybind.NewBinding(
-				keybind.WithKeys("P"),
-				keybind.WithHelp("P", "switch project"),
-			),
-			Refresh: keybind.NewBinding(
-				keybind.WithKeys("r"),
-				keybind.WithHelp("r", "refresh"),
-			),
-			Quit: keybind.NewBinding(
-				keybind.WithKeys("q"),
-				keybind.WithHelp("q", "quit"),
-			),
-
-			// State-dependent (backlog only)
-			Promote: keybind.NewBinding(
-				keybind.WithKeys("p"),
-				keybind.WithHelp("p", "promote"),
-			),
-
-			// State-dependent (review only)
-			Approve: keybind.NewBinding(
-				keybind.WithKeys("a"),
-				keybind.WithHelp("a", "approve"),
-			),
-			Reject: keybind.NewBinding(
-				keybind.WithKeys("x"),
-				keybind.WithHelp("x", "reject"),
-			),
-
-			// State-dependent (approved only)
-			Bounce: keybind.NewBinding(
-				keybind.WithKeys("b"),
-				keybind.WithHelp("b", "bounce"),
-			),
-
-			// State-dependent (blocked only)
-			Unblock: keybind.NewBinding(
-				keybind.WithKeys("u"),
-				keybind.WithHelp("u", "unblock"),
-			),
-			Fail: keybind.NewBinding(
-				keybind.WithKeys("f"),
-				keybind.WithHelp("f", "fail"),
-			),
-
-			// Help
-			Help: keybind.NewBinding(
-				keybind.WithKeys("?"),
-				keybind.WithHelp("?", "help"),
-			),
+		Board: keyMap{
+			bind(actPromote, "p", "p", "promote").inStates(stateBacklog),
+			bind(actApprove, "a", "a", "approve").inStates(stateReview),
+			bind(actReject, "x", "x", "reject").inStates(stateReview),
+			bind(actBounce, "b", "b", "bounce").inStates(stateApproved),
+			bind(actUnblock, "u", "u", "unblock").inStates(stateBlocked),
+			bind(actFail, "f", "f", "fail").inStates(stateBlocked),
+			bind(actLeft, "left", "←/→", "column", "h"),
+			bind(actRight, "right", "", "", "l").hidden(),
+			bind(actUp, "up", "↑/↓", "select", "k"),
+			bind(actDown, "down", "", "", "j").hidden(),
+			bind(actEnter, "enter", "enter", "detail"),
+			bind(actHold, "t", "t", "hold/release"),
+			bind(actSetPriority, "i", "i", "set priority"),
+			bind(actMoveToFront, "w", "w", "move to front"),
+			bind(actResetPriority, "e", "e", "reset priority"),
+			bind(actArchive, "z", "z", "archive"),
+			bind(actScorecards, "c", "c", "scorecards"),
+			bind(actSwitchProject, "P", "P", "switch project"),
+			bind(actRefresh, "r", "r", "refresh"),
+			bind(actHelp, "?", "?", "help"),
+			bind(actQuit, "q", "q", "quit", "ctrl+c"),
 		},
 
-		Detail: detailKeyMap{
-			Back: keybind.NewBinding(
-				keybind.WithKeys("esc"),
-				keybind.WithHelp("esc", "back"),
-			),
-			ScrollUp: keybind.NewBinding(
-				keybind.WithKeys("up", "k"),
-				keybind.WithHelp("↑", "scroll up"),
-			),
-			ScrollDown: keybind.NewBinding(
-				keybind.WithKeys("down", "j"),
-				keybind.WithHelp("↓", "scroll down"),
-			),
-			PageUp: keybind.NewBinding(
-				keybind.WithKeys("pgup"),
-				keybind.WithHelp("pgup", "page up"),
-			),
-			PageDown: keybind.NewBinding(
-				keybind.WithKeys("pgdn"),
-				keybind.WithHelp("pgdn", "page down"),
-			),
-			OpenPR: keybind.NewBinding(
-				keybind.WithKeys("o"),
-				keybind.WithHelp("o", "open PR"),
-			),
-			SourceDoc: keybind.NewBinding(
-				keybind.WithKeys("s"),
-				keybind.WithHelp("s", "source doc"),
-			),
-			DesignDoc: keybind.NewBinding(
-				keybind.WithKeys("d"),
-				keybind.WithHelp("d", "design doc"),
-			),
-			SwitchProject: keybind.NewBinding(
-				keybind.WithKeys("P"),
-				keybind.WithHelp("P", "switch project"),
-			),
-			SetPriority: keybind.NewBinding(
-				keybind.WithKeys("i"),
-				keybind.WithHelp("i", "set priority"),
-			),
-			MoveToFront: keybind.NewBinding(
-				keybind.WithKeys("w"),
-				keybind.WithHelp("w", "move to front"),
-			),
-			ResetPriority: keybind.NewBinding(
-				keybind.WithKeys("e"),
-				keybind.WithHelp("e", "reset priority"),
-			),
-
-			// State-dependent (review only)
-			Approve: keybind.NewBinding(
-				keybind.WithKeys("a"),
-				keybind.WithHelp("a", "approve"),
-			),
-			Reject: keybind.NewBinding(
-				keybind.WithKeys("x"),
-				keybind.WithHelp("x", "reject"),
-			),
-
-			// State-dependent (approved only)
-			MergeComplete: keybind.NewBinding(
-				keybind.WithKeys("m"),
-				keybind.WithHelp("m", "merge & complete"),
-			),
-
-			// Help
-			Help: keybind.NewBinding(
-				keybind.WithKeys("?"),
-				keybind.WithHelp("?", "help"),
-			),
+		Detail: keyMap{
+			bind(actApprove, "a", "a", "approve").inStates(stateReview),
+			bind(actReject, "x", "x", "reject").inStates(stateReview),
+			bind(actMerge, "m", "m", "merge & complete").inStates(stateApproved),
+			bind(actBack, "esc", "esc", "back", "q"),
+			bind(actHelp, "?", "?", "help"),
+			bind(actSetPriority, "i", "i", "set priority"),
+			bind(actMoveToFront, "w", "w", "move to front"),
+			bind(actResetPriority, "e", "e", "reset priority"),
+			bind(actUp, "up", "↑/↓", "scroll spec", "k"),
+			bind(actDown, "down", "", "", "j").hidden(),
+			bind(actPageUp, "pgup", "pgup/pgdn", "page"),
+			bind(actPageDown, "pgdown", "", "").hidden(),
+			bind(actOpenPR, "o", "o", "open PR"),
+			bind(actSourceDoc, "s", "s", "source doc"),
+			bind(actDesignDoc, "d", "d", "design doc"),
+			bind(actSwitchProject, "P", "P", "switch project"),
 		},
-		Shell: shellKeyMap{
-			// Pane navigation
-			NextPane: keybind.NewBinding(
-				keybind.WithKeys("tab"),
-				keybind.WithHelp("tab", "next pane"),
-			),
-			PrevPane: keybind.NewBinding(
-				keybind.WithKeys("shift+tab"),
-				keybind.WithHelp("shift+tab", "prev pane"),
-			),
 
-			// Navigation within panes
-			Up: keybind.NewBinding(
-				keybind.WithKeys("up", "k"),
-				keybind.WithHelp("↑", "move up"),
-			),
-			Down: keybind.NewBinding(
-				keybind.WithKeys("down", "j"),
-				keybind.WithHelp("↓", "move down"),
-			),
-			Left: keybind.NewBinding(
-				keybind.WithKeys("left", "h"),
-				keybind.WithHelp("←", "scroll left"),
-			),
-			Right: keybind.NewBinding(
-				keybind.WithKeys("right", "l"),
-				keybind.WithHelp("→", "scroll right"),
-			),
+		Shell: keyMap{
+			// The selected item's state-specific actions come first.
+			bind(actPromote, "p", "p", "promote").inPanes(paneItems).inStates(stateBacklog),
+			bind(actApprove, "a", "a", "approve").inPanes(paneItems).inStates(stateReview),
+			bind(actReject, "x", "x", "reject").inPanes(paneItems).inStates(stateReview),
+			bind(actMerge, "m", "m", "merge").inPanes(paneItems).inStates(stateApproved),
+			bind(actBounce, "b", "b", "bounce").inPanes(paneItems).inStates(stateApproved),
+			bind(actUnblock, "u", "u", "unblock").inPanes(paneItems).inStates(stateBlocked),
+			bind(actFail, "f", "f", "fail").inPanes(paneItems).inStates(stateBlocked),
 
-			// Enter detail view
-			EnterDetail: keybind.NewBinding(
-				keybind.WithKeys("enter"),
-				keybind.WithHelp("enter", "detail"),
-			),
-
-			// Pane toggles
-			TogglePreview: keybind.NewBinding(
-				keybind.WithKeys("v"),
-				keybind.WithHelp("v", "preview"),
-			),
-			ToggleProject: keybind.NewBinding(
-				keybind.WithKeys("V"),
-				keybind.WithHelp("V", "projects"),
-			),
-
-			// Project pane actions
-			OpenProject: keybind.NewBinding(
-				keybind.WithKeys("enter"),
-				keybind.WithHelp("enter", "open"),
-			),
-			ArchiveProject: keybind.NewBinding(
-				keybind.WithKeys("z"),
-				keybind.WithHelp("z", "archive"),
-			),
-
-			// Item actions (state-independent)
-			Hold: keybind.NewBinding(
-				keybind.WithKeys("t"),
-				keybind.WithHelp("t", "hold/release"),
-			),
-			SetPriority: keybind.NewBinding(
-				keybind.WithKeys("i"),
-				keybind.WithHelp("i", "set priority"),
-			),
-			MoveToFront: keybind.NewBinding(
-				keybind.WithKeys("w"),
-				keybind.WithHelp("w", "move to front"),
-			),
-			ResetPriority: keybind.NewBinding(
-				keybind.WithKeys("e"),
-				keybind.WithHelp("e", "reset priority"),
-			),
-			Archive: keybind.NewBinding(
-				keybind.WithKeys("z"),
-				keybind.WithHelp("z", "archive"),
-			),
-			Scorecards: keybind.NewBinding(
-				keybind.WithKeys("c"),
-				keybind.WithHelp("c", "scorecards"),
-			),
-			Refresh: keybind.NewBinding(
-				keybind.WithKeys("r"),
-				keybind.WithHelp("r", "refresh"),
-			),
-
-			// Item actions (state-dependent)
-			Promote: keybind.NewBinding(
-				keybind.WithKeys("p"),
-				keybind.WithHelp("p", "promote"),
-			),
-			Approve: keybind.NewBinding(
-				keybind.WithKeys("a"),
-				keybind.WithHelp("a", "approve"),
-			),
-			Reject: keybind.NewBinding(
-				keybind.WithKeys("x"),
-				keybind.WithHelp("x", "reject"),
-			),
-			Bounce: keybind.NewBinding(
-				keybind.WithKeys("b"),
-				keybind.WithHelp("b", "bounce"),
-			),
-			Unblock: keybind.NewBinding(
-				keybind.WithKeys("u"),
-				keybind.WithHelp("u", "unblock"),
-			),
-			Fail: keybind.NewBinding(
-				keybind.WithKeys("f"),
-				keybind.WithHelp("f", "fail"),
-			),
-			Merge: keybind.NewBinding(
-				keybind.WithKeys("m"),
-				keybind.WithHelp("m", "merge"),
-			),
-
-			// Help
-			Help: keybind.NewBinding(
-				keybind.WithKeys("?"),
-				keybind.WithHelp("?", "help"),
-			),
-			Quit: keybind.NewBinding(
-				keybind.WithKeys("q"),
-				keybind.WithHelp("q", "quit"),
-			),
+			bind(actEnter, "enter", "enter", "detail").inPanes(paneItems),
+			bind(actOpenProject, "enter", "enter", "open").inPanes(paneProjects),
+			bind(actNextPane, "tab", "tab", "pane"),
+			bind(actPrevPane, "shift+tab", "", "").hidden(),
+			bind(actUp, "up", "↑/↓", "move", "k"),
+			bind(actDown, "down", "", "", "j").hidden(),
+			bind(actHold, "t", "t", "hold/release").inPanes(paneItems),
+			bind(actSetPriority, "i", "i", "priority").inPanes(paneItems),
+			bind(actMoveToFront, "w", "w", "front").inPanes(paneItems),
+			bind(actResetPriority, "e", "e", "reset").inPanes(paneItems),
+			bind(actArchive, "z", "z", "archive").inPanes(paneItems),
+			bind(actArchiveProject, "z", "z", "archive project").inPanes(paneProjects),
+			bind(actTogglePreview, "v", "v", "preview"),
+			bind(actToggleProjects, "V", "V", "projects"),
+			bind(actScorecards, "c", "c", "scorecards"),
+			bind(actRefresh, "r", "r", "refresh"),
+			bind(actHelp, "?", "?", "help"),
+			bind(actQuit, "q", "q", "quit", "ctrl+c"),
 		},
 	}
-}
-
-// getBoardBindingsForState returns the bindings that are valid for a given state.
-// State-specific actions are listed first so they're visible at narrow widths.
-func (kb *KeyBindings) getBoardBindingsForState(state string) []keybind.Binding {
-	var bindings []keybind.Binding
-
-	// State-specific bindings first (listed first so they don't get truncated at narrow widths)
-	switch state {
-	case stateBacklog:
-		bindings = append(bindings, kb.Board.Promote)
-	case stateReview:
-		bindings = append(bindings,
-			kb.Board.Approve,
-			kb.Board.Reject,
-		)
-	case stateApproved:
-		bindings = append(bindings, kb.Board.Bounce)
-	case stateBlocked:
-		bindings = append(bindings,
-			kb.Board.Unblock,
-			kb.Board.Fail,
-		)
-	}
-
-	// Navigation bindings always available
-	bindings = append(bindings,
-		kb.Board.Left,
-		kb.Board.Right,
-		kb.Board.Up,
-		kb.Board.Down,
-		kb.Board.EnterDetail,
-	)
-
-	// State-independent bindings
-	bindings = append(bindings,
-		kb.Board.Hold,
-		kb.Board.SetPriority,
-		kb.Board.MoveToFront,
-		kb.Board.ResetPriority,
-		kb.Board.Archive,
-		kb.Board.Scorecards,
-		kb.Board.SwitchProject,
-		kb.Board.Refresh,
-		kb.Board.Quit,
-		kb.Board.Help,
-	)
-
-	return bindings
-}
-
-// getDetailBindingsForState returns the bindings that are valid for the detail view in a given state.
-// State-specific actions are listed first so they're visible at narrow widths.
-func (kb *KeyBindings) getDetailBindingsForState(state string) []keybind.Binding {
-	var bindings []keybind.Binding
-
-	// State-specific bindings first (listed first so they don't get truncated at narrow widths)
-	switch state {
-	case stateReview:
-		bindings = append(bindings,
-			kb.Detail.Approve,
-			kb.Detail.Reject,
-		)
-	case stateApproved:
-		bindings = append(bindings, kb.Detail.MergeComplete)
-	}
-
-	// Navigation and scrolling
-	bindings = append(bindings,
-		kb.Detail.Back,
-		kb.Detail.ScrollUp,
-		kb.Detail.ScrollDown,
-		kb.Detail.PageUp,
-		kb.Detail.PageDown,
-		kb.Detail.OpenPR,
-		kb.Detail.SourceDoc,
-		kb.Detail.DesignDoc,
-		kb.Detail.SwitchProject,
-		kb.Detail.SetPriority,
-		kb.Detail.MoveToFront,
-		kb.Detail.ResetPriority,
-	)
-
-	// Help is always available
-	bindings = append(bindings, kb.Detail.Help)
-
-	return bindings
-}
-
-// getShellProjectsBindings returns the bindings valid in the projects pane.
-func (kb *KeyBindings) getShellProjectsBindings() []keybind.Binding {
-	return []keybind.Binding{
-		kb.Shell.NextPane,
-		kb.Shell.PrevPane,
-		kb.Shell.Up,
-		kb.Shell.Down,
-		kb.Shell.TogglePreview,
-		kb.Shell.ToggleProject,
-		kb.Shell.OpenProject,
-		kb.Shell.ArchiveProject,
-		kb.Shell.Refresh,
-		kb.Shell.Help,
-		kb.Shell.Quit,
-	}
-}
-
-// getShellPreviewBindings returns the bindings valid in the preview pane.
-func (kb *KeyBindings) getShellPreviewBindings() []keybind.Binding {
-	return []keybind.Binding{
-		kb.Shell.NextPane,
-		kb.Shell.PrevPane,
-		kb.Shell.Up,
-		kb.Shell.Down,
-		kb.Shell.Left,
-		kb.Shell.Right,
-		kb.Shell.TogglePreview,
-		kb.Shell.ToggleProject,
-		kb.Shell.Refresh,
-		kb.Shell.Help,
-		kb.Shell.Quit,
-	}
-}
-
-// getShellItemsBindingsForState returns the bindings valid in the items pane for a given state.
-// State-specific actions are listed first so they're visible at narrow widths.
-func (kb *KeyBindings) getShellItemsBindingsForState(state string) []keybind.Binding {
-	var bindings []keybind.Binding
-
-	// State-specific bindings first (listed first so they don't get truncated at narrow widths)
-	switch state {
-	case stateBacklog:
-		bindings = append(bindings, kb.Shell.Promote)
-	case stateReview:
-		bindings = append(bindings,
-			kb.Shell.Approve,
-			kb.Shell.Reject,
-		)
-	case stateApproved:
-		bindings = append(bindings,
-			kb.Shell.Merge,
-			kb.Shell.Bounce,
-		)
-	case stateBlocked:
-		bindings = append(bindings,
-			kb.Shell.Unblock,
-			kb.Shell.Fail,
-		)
-	}
-
-	// Navigation and state-independent actions
-	bindings = append(bindings,
-		kb.Shell.NextPane,
-		kb.Shell.PrevPane,
-		kb.Shell.Up,
-		kb.Shell.Down,
-		kb.Shell.EnterDetail,
-		kb.Shell.TogglePreview,
-		kb.Shell.ToggleProject,
-		kb.Shell.Hold,
-		kb.Shell.SetPriority,
-		kb.Shell.MoveToFront,
-		kb.Shell.ResetPriority,
-		kb.Shell.Archive,
-		kb.Shell.Scorecards,
-		kb.Shell.Refresh,
-		kb.Shell.Help,
-		kb.Shell.Quit,
-	)
-
-	return bindings
 }

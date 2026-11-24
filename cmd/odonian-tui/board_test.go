@@ -2673,7 +2673,7 @@ func TestBoardModel_ReviewHelpBar(t *testing.T) {
 	project := tuiclient.Project{ID: "project-1", Name: "Test"}
 
 	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 200, Height: 24})
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	model = m.(*BoardModel)
 
 	bucketed := make(map[string][]tuiclient.Task)
@@ -2695,8 +2695,11 @@ func TestBoardModel_ReviewHelpBar(t *testing.T) {
 	}
 
 	reviewOutput := model.View().Content
-	if !strings.Contains(reviewOutput, "approve") || !strings.Contains(reviewOutput, "reject") {
-		t.Errorf("Expected 'approve' and 'reject' in help bar when in review column, got:\n%s", reviewOutput)
+	if !strings.Contains(reviewOutput, "a approve") {
+		t.Errorf("Expected 'a approve' in help bar when in review column, got:\n%s", reviewOutput)
+	}
+	if !strings.Contains(reviewOutput, "x reject") {
+		t.Errorf("Expected 'x reject' in help bar when in review column, got:\n%s", reviewOutput)
 	}
 
 	// Navigate away to in_progress.
@@ -2704,17 +2707,11 @@ func TestBoardModel_ReviewHelpBar(t *testing.T) {
 	model = m.(*BoardModel)
 
 	nonReviewOutput := model.View().Content
-	// Extract just the help bar (last line) to avoid matching "approved" in column headers
-	lines := strings.Split(nonReviewOutput, "\n")
-	helpBar := ""
-	if len(lines) > 0 {
-		helpBar = lines[len(lines)-1]
+	if strings.Contains(nonReviewOutput, "a approve") {
+		t.Errorf("Did not expect 'a approve' in help bar when NOT in review column, got:\n%s", nonReviewOutput)
 	}
-	if strings.Contains(helpBar, "approve") {
-		t.Errorf("Did not expect 'approve' in help bar when NOT in review column, got help bar:\n%s", helpBar)
-	}
-	if strings.Contains(helpBar, "reject") {
-		t.Errorf("Did not expect 'reject' in help bar when NOT in review column, got help bar:\n%s", helpBar)
+	if strings.Contains(nonReviewOutput, "x reject") {
+		t.Errorf("Did not expect 'x reject' in help bar when NOT in review column, got:\n%s", nonReviewOutput)
 	}
 }
 
@@ -6063,7 +6060,7 @@ func buildBoardModelWithTasks(t *testing.T, client *tuiclient.MockClient, tasks 
 	project := tuiclient.Project{ID: "project-1", Name: "Test"}
 
 	model := NewBoardModel(client, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 200, Height: 24})
+	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	model = m.(*BoardModel)
 
 	// Bucket tasks by state

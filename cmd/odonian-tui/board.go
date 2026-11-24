@@ -1022,257 +1022,18 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateReviewMode(msg)
 		}
 
-		switch msg.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-
-		// Column navigation
-		case "left", "h":
-			if m.selectedColumn > 0 {
-				m.selectedColumn--
-				m.selectedIndex = 0 // Reset to top when changing columns
-				m.scrollOffset = 0  // Reset scroll to top
-				m.ensureSelectionInColumn()
+		act, _ := m.keyBindings.Board.lookup(msg, keyCtx{state: stateOrder[m.selectedColumn]})
+		// While the full key list is open it takes the keys: ? closes it, the rest are swallowed.
+		if m.showFullHelp {
+			switch act {
+			case actQuit:
+				return m, tea.Quit
+			case actHelp:
+				m.showFullHelp = false
 			}
-
-		case "right", "l":
-			if m.selectedColumn < len(stateOrder)-1 {
-				m.selectedColumn++
-				m.selectedIndex = 0 // Reset to top when changing columns
-				m.scrollOffset = 0  // Reset scroll to top
-				m.ensureSelectionInColumn()
-			}
-
-		// Selection within column
-		case "up", "k":
-			tasksInColumn := m.getTasksInSelectedColumn()
-			if len(tasksInColumn) == 0 {
-				return m, nil
-			}
-
-			if m.selectedTaskID == "" {
-				m.selectedTaskID = tasksInColumn[0].ID
-				m.selectedIndex = 0
-			} else {
-				// Find current position
-				for i, t := range tasksInColumn {
-					if t.ID == m.selectedTaskID && i > 0 {
-						m.selectedTaskID = tasksInColumn[i-1].ID
-						m.selectedIndex = i - 1
-						break
-					}
-				}
-			}
-			m.clampScrollToSelection()
-
-		case "down", "j":
-			tasksInColumn := m.getTasksInSelectedColumn()
-			if len(tasksInColumn) == 0 {
-				return m, nil
-			}
-
-			if m.selectedTaskID == "" {
-				m.selectedTaskID = tasksInColumn[0].ID
-				m.selectedIndex = 0
-			} else {
-				// Find current position
-				for i, t := range tasksInColumn {
-					if t.ID == m.selectedTaskID && i < len(tasksInColumn)-1 {
-						m.selectedTaskID = tasksInColumn[i+1].ID
-						m.selectedIndex = i + 1
-						break
-					}
-				}
-			}
-			m.clampScrollToSelection()
-
-		// Refresh: issue one-shot fetch of all columns (active and terminal); do NOT arm
-		// a new tick. The single perpetual tick chain started in Init re-arms itself from
-		// tickMsg.
-		case "r":
-			return m, m.fetchTasksFullRefresh()
-
-		// Open detail view for the selected task.
-		case "enter":
-			if m.selectedTaskID != "" {
-				m.mode = modeDetail
-				m.detailMessage = ""
-				return m, m.fetchDetailCmd(m.selectedTaskID)
-			}
-
-		// Promote: only on backlog tasks
-		case "p":
-			if m.selectedColumn == 0 && m.selectedTaskID != "" {
-				return m, m.promoteTask(m.selectedTaskID)
-			}
-
-		// Switch project (only in legacy board, not in shell)
-		case "P":
-			if m.shell != nil {
-				return m, nil
-			}
-			m.mode = modeProjectSwitch
-			m.projectSwitchIndex = 0
-			// Find the current project's index for re-selection purposes
-			for i, proj := range m.projects {
-				if proj.ID == m.project.ID {
-					m.projectSwitchIndex = i
-					break
-				}
-			}
-			return m, m.fetchProjects()
-
-		// Approve: only on review column tasks
-		case "a":
-			if m.selectedColumn == columnIndex(stateReview) && m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.reviewInput.Placeholder = "optional note (enter to skip)"
-				m.reviewInput.SetValue("")
-				m.reviewInput.Focus()
-				m.inputHint = ""
-				m.mode = modeApproveNote
-				var cmd tea.Cmd
-				m.reviewInput, cmd = m.reviewInput.Update(nil)
-				return m, cmd
-			}
-
-		// Reject: only on review column tasks
-		case "x":
-			if m.selectedColumn == columnIndex(stateReview) && m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.reviewInput.Placeholder = "rejection reason (required)"
-				m.reviewInput.SetValue("")
-				m.reviewInput.Focus()
-				m.inputHint = ""
-				m.mode = modeRejectReason
-				var cmd tea.Cmd
-				m.reviewInput, cmd = m.reviewInput.Update(nil)
-				return m, cmd
-			}
-
-		// Bounce back: only on approved column tasks
-		case "b":
-			if m.selectedColumn == columnIndex(stateApproved) && m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.reviewInput.Placeholder = "optional note (enter to skip)"
-				m.reviewInput.SetValue("")
-				m.reviewInput.Focus()
-				m.inputHint = ""
-				m.mode = modeApprovedRejectNote
-				var cmd tea.Cmd
-				m.reviewInput, cmd = m.reviewInput.Update(nil)
-				return m, cmd
-			}
-
-		// Unblock: only on blocked column tasks
-		case "u":
-			if m.selectedColumn == columnIndex(stateBlocked) && m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.reviewInput.Placeholder = "optional note (enter to skip)"
-				m.reviewInput.SetValue("")
-				m.reviewInput.Focus()
-				m.inputHint = ""
-				m.mode = modeUnblockNote
-				var cmd tea.Cmd
-				m.reviewInput, cmd = m.reviewInput.Update(nil)
-				return m, cmd
-			}
-
-		case "f":
-			if m.selectedColumn == columnIndex(stateBlocked) && m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.reviewInput.Placeholder = "optional note (enter to skip)"
-				m.reviewInput.SetValue("")
-				m.reviewInput.Focus()
-				m.inputHint = ""
-				m.mode = modeFailNote
-				var cmd tea.Cmd
-				m.reviewInput, cmd = m.reviewInput.Update(nil)
-				return m, cmd
-			}
-
-		// Archive: archive the selected task
-		case "z":
-			if m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.mode = modeArchiveTaskConfirm
-				return m, nil
-			}
-
-		// Hold/Release: hold or release the selected task
-		case "t":
-			if m.selectedTaskID != "" {
-				// Determine whether to hold or release based on current held status
-				for _, taskList := range m.tasks {
-					for _, t := range taskList {
-						if t.ID == m.selectedTaskID {
-							m.pendingTaskID = m.selectedTaskID
-							if t.Held {
-								m.mode = modeReleaseTaskConfirm
-							} else {
-								m.mode = modeHoldTaskConfirm
-							}
-							return m, nil
-						}
-					}
-				}
-			}
-
-		// Set Priority: set priority for the selected task
-		case "i":
-			if m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.reviewInput.Placeholder = "priority (1-1000)"
-				m.reviewInput.SetValue("")
-				m.reviewInput.Focus()
-				m.inputHint = ""
-				m.mode = modeSetPriorityInput
-				var cmd tea.Cmd
-				m.reviewInput, cmd = m.reviewInput.Update(nil)
-				return m, cmd
-			}
-
-		// Move to Front: move selected task to front (server-calculated priority)
-		case "w":
-			if m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.reviewInput.Placeholder = "reason for moving to front (required)"
-				m.reviewInput.SetValue("")
-				m.reviewInput.Focus()
-				m.inputHint = ""
-				m.mode = modeMoveToFrontReason
-				var cmd tea.Cmd
-				m.reviewInput, cmd = m.reviewInput.Update(nil)
-				return m, cmd
-			}
-
-		// Reset Priority: reset selected task priority to 500
-		case "e":
-			if m.selectedTaskID != "" {
-				m.pendingTaskID = m.selectedTaskID
-				m.reviewInput.Placeholder = "reason for resetting priority (required)"
-				m.reviewInput.SetValue("")
-				m.reviewInput.Focus()
-				m.inputHint = ""
-				m.mode = modeResetPriorityReason
-				var cmd tea.Cmd
-				m.reviewInput, cmd = m.reviewInput.Update(nil)
-				return m, cmd
-			}
-
-		// Scorecards: show research reviewer scorecards
-		case "c":
-			m.mode = modeScorecards
-			m.scorecardMessage = ""
-			m.scorecardViewport.SetContent("")
-			m.lastScorecards = nil
-			m.scorecardLoading = true
-			return m, m.fetchScorecardCmd()
-
-		// Help: toggle full help view
-		case "?":
-			m.showFullHelp = !m.showFullHelp
+			return m, nil
 		}
+		return m.boardAction(act)
 
 	case detailFetchedMsg:
 		if msg.err != nil {
@@ -1453,58 +1214,311 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// boardAction runs a normal-mode action on the selected task. Both layouts resolve their keys to
+// actions through their own bindings and share this code.
+func (m *BoardModel) boardAction(act action) (tea.Model, tea.Cmd) {
+	switch act {
+	case actQuit:
+		return m, tea.Quit
+
+	// Column navigation
+	case actLeft:
+		if m.selectedColumn > 0 {
+			m.selectedColumn--
+			m.selectedIndex = 0 // Reset to top when changing columns
+			m.scrollOffset = 0  // Reset scroll to top
+			m.ensureSelectionInColumn()
+		}
+
+	case actRight:
+		if m.selectedColumn < len(stateOrder)-1 {
+			m.selectedColumn++
+			m.selectedIndex = 0 // Reset to top when changing columns
+			m.scrollOffset = 0  // Reset scroll to top
+			m.ensureSelectionInColumn()
+		}
+
+	// Selection within column
+	case actUp:
+		tasksInColumn := m.getTasksInSelectedColumn()
+		if len(tasksInColumn) == 0 {
+			return m, nil
+		}
+
+		if m.selectedTaskID == "" {
+			m.selectedTaskID = tasksInColumn[0].ID
+			m.selectedIndex = 0
+		} else {
+			// Find current position
+			for i, t := range tasksInColumn {
+				if t.ID == m.selectedTaskID && i > 0 {
+					m.selectedTaskID = tasksInColumn[i-1].ID
+					m.selectedIndex = i - 1
+					break
+				}
+			}
+		}
+		m.clampScrollToSelection()
+
+	case actDown:
+		tasksInColumn := m.getTasksInSelectedColumn()
+		if len(tasksInColumn) == 0 {
+			return m, nil
+		}
+
+		if m.selectedTaskID == "" {
+			m.selectedTaskID = tasksInColumn[0].ID
+			m.selectedIndex = 0
+		} else {
+			// Find current position
+			for i, t := range tasksInColumn {
+				if t.ID == m.selectedTaskID && i < len(tasksInColumn)-1 {
+					m.selectedTaskID = tasksInColumn[i+1].ID
+					m.selectedIndex = i + 1
+					break
+				}
+			}
+		}
+		m.clampScrollToSelection()
+
+	// Refresh: issue one-shot fetch of all columns (active and terminal); do NOT arm
+	// a new tick. The single perpetual tick chain started in Init re-arms itself from
+	// tickMsg.
+	case actRefresh:
+		return m, m.fetchTasksFullRefresh()
+
+	// Open detail view for the selected task.
+	case actEnter:
+		if m.selectedTaskID != "" {
+			m.mode = modeDetail
+			m.detailMessage = ""
+			return m, m.fetchDetailCmd(m.selectedTaskID)
+		}
+
+	// Promote: only on backlog tasks
+	case actPromote:
+		if m.selectedColumn == 0 && m.selectedTaskID != "" {
+			return m, m.promoteTask(m.selectedTaskID)
+		}
+
+	// Switch project
+	case actSwitchProject:
+		m.mode = modeProjectSwitch
+		m.projectSwitchIndex = 0
+		// Find the current project's index for re-selection purposes
+		for i, proj := range m.projects {
+			if proj.ID == m.project.ID {
+				m.projectSwitchIndex = i
+				break
+			}
+		}
+		return m, m.fetchProjects()
+
+	// Approve: only on review column tasks
+	case actApprove:
+		if m.selectedColumn == columnIndex(stateReview) && m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.reviewInput.Placeholder = "optional note (enter to skip)"
+			m.reviewInput.SetValue("")
+			m.reviewInput.Focus()
+			m.inputHint = ""
+			m.mode = modeApproveNote
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(nil)
+			return m, cmd
+		}
+
+	// Reject: only on review column tasks
+	case actReject:
+		if m.selectedColumn == columnIndex(stateReview) && m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.reviewInput.Placeholder = "rejection reason (required)"
+			m.reviewInput.SetValue("")
+			m.reviewInput.Focus()
+			m.inputHint = ""
+			m.mode = modeRejectReason
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(nil)
+			return m, cmd
+		}
+
+	// Bounce back: only on approved column tasks
+	case actBounce:
+		if m.selectedColumn == columnIndex(stateApproved) && m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.reviewInput.Placeholder = "optional note (enter to skip)"
+			m.reviewInput.SetValue("")
+			m.reviewInput.Focus()
+			m.inputHint = ""
+			m.mode = modeApprovedRejectNote
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(nil)
+			return m, cmd
+		}
+
+	// Unblock: only on blocked column tasks
+	case actUnblock:
+		if m.selectedColumn == columnIndex(stateBlocked) && m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.reviewInput.Placeholder = "optional note (enter to skip)"
+			m.reviewInput.SetValue("")
+			m.reviewInput.Focus()
+			m.inputHint = ""
+			m.mode = modeUnblockNote
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(nil)
+			return m, cmd
+		}
+
+	case actFail:
+		if m.selectedColumn == columnIndex(stateBlocked) && m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.reviewInput.Placeholder = "optional note (enter to skip)"
+			m.reviewInput.SetValue("")
+			m.reviewInput.Focus()
+			m.inputHint = ""
+			m.mode = modeFailNote
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(nil)
+			return m, cmd
+		}
+
+	// Archive: archive the selected task
+	case actArchive:
+		if m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.mode = modeArchiveTaskConfirm
+			return m, nil
+		}
+
+	// Hold/Release: hold or release the selected task
+	case actHold:
+		if m.selectedTaskID != "" {
+			// Determine whether to hold or release based on current held status
+			for _, taskList := range m.tasks {
+				for _, t := range taskList {
+					if t.ID == m.selectedTaskID {
+						m.pendingTaskID = m.selectedTaskID
+						if t.Held {
+							m.mode = modeReleaseTaskConfirm
+						} else {
+							m.mode = modeHoldTaskConfirm
+						}
+						return m, nil
+					}
+				}
+			}
+		}
+
+	// Set Priority: set priority for the selected task
+	case actSetPriority:
+		if m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.reviewInput.Placeholder = "priority (1-1000)"
+			m.reviewInput.SetValue("")
+			m.reviewInput.Focus()
+			m.inputHint = ""
+			m.mode = modeSetPriorityInput
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(nil)
+			return m, cmd
+		}
+
+	// Move to Front: move selected task to front (server-calculated priority)
+	case actMoveToFront:
+		if m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.reviewInput.Placeholder = "reason for moving to front (required)"
+			m.reviewInput.SetValue("")
+			m.reviewInput.Focus()
+			m.inputHint = ""
+			m.mode = modeMoveToFrontReason
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(nil)
+			return m, cmd
+		}
+
+	// Reset Priority: reset selected task priority to 500
+	case actResetPriority:
+		if m.selectedTaskID != "" {
+			m.pendingTaskID = m.selectedTaskID
+			m.reviewInput.Placeholder = "reason for resetting priority (required)"
+			m.reviewInput.SetValue("")
+			m.reviewInput.Focus()
+			m.inputHint = ""
+			m.mode = modeResetPriorityReason
+			var cmd tea.Cmd
+			m.reviewInput, cmd = m.reviewInput.Update(nil)
+			return m, cmd
+		}
+
+	// Scorecards: show research reviewer scorecards
+	case actScorecards:
+		m.mode = modeScorecards
+		m.scorecardMessage = ""
+		m.scorecardViewport.SetContent("")
+		m.lastScorecards = nil
+		m.scorecardLoading = true
+		return m, m.fetchScorecardCmd()
+
+	case actHelp:
+		m.showFullHelp = true
+	}
+	return m, nil
+}
+
 // updateDetailMode handles key events while the full-screen detail view is active.
 // Board navigation is fully suppressed in this mode.
 func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	// If full help is open, only allow ? to toggle it off and swallow other keys
+	act, _ := m.detailKeys().lookup(msg, m.detailKeyCtx())
+	// While the full key list is open it takes the keys: ? closes it, the rest are swallowed.
 	if m.showFullHelp {
-		if msg.String() == "?" {
+		if act == actHelp {
 			m.showFullHelp = false
-			return m, nil
 		}
 		return m, nil
 	}
 
-	switch msg.String() {
-	case "esc", "q":
+	switch act {
+	case actBack:
 		// Return to the board.
 		m.mode = modeNormal
 		m.detailMessage = ""
 		return m, nil
 
 	// Spec viewport scrolling.
-	case "up", "k":
+	case actUp:
 		m.detailViewport.ScrollUp(1)
 		return m, nil
-	case "down", "j":
+	case actDown:
 		m.detailViewport.ScrollDown(1)
 		return m, nil
-	case "pgup":
+	case actPageUp:
 		m.detailViewport.HalfPageUp()
 		return m, nil
-	case "pgdown":
+	case actPageDown:
 		m.detailViewport.HalfPageDown()
 		return m, nil
 
 	// Open PR link.
-	case "o":
+	case actOpenPR:
 		return m, m.openPRCmd(m.detailTask)
 
 	// Open the task's source document.
-	case "s":
+	case actSourceDoc:
 		return m, m.openSourceDocCmd(m.detailTask, m.detailDocuments)
 
 	// Open the project's base design document.
-	case "d":
+	case actDesignDoc:
 		return m, m.openDesignDocCmd(m.detailDocuments)
 
 	// Help toggle
-	case "?":
-		m.showFullHelp = !m.showFullHelp
+	case actHelp:
+		m.showFullHelp = true
 		return m, nil
 
 	// Approve / reject: only available for review tasks; reuse existing review flow.
-	case "a":
+	case actApprove:
 		if m.detailTask.State == stateReview {
 			m.pendingTaskID = m.detailTask.ID
 			m.reviewFromDetail = true
@@ -1518,7 +1532,7 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 			return m, cmd
 		}
 
-	case "x":
+	case actReject:
 		if m.detailTask.State == stateReview {
 			m.pendingTaskID = m.detailTask.ID
 			m.reviewFromDetail = true
@@ -1533,7 +1547,7 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		}
 
 	// Merge PR and complete: only available for approved tasks.
-	case "m":
+	case actMerge:
 		if m.detailTask.State == stateApproved {
 			// Find the PR link.
 			var prURL string
@@ -1563,7 +1577,7 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		}
 
 	// Set Priority: set priority for the task (detail view)
-	case "i":
+	case actSetPriority:
 		m.pendingTaskID = m.detailTask.ID
 		m.reviewInput.Placeholder = "priority (1-1000)"
 		m.reviewInput.SetValue("")
@@ -1576,7 +1590,7 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		return m, cmd
 
 	// Move to Front: move task to front (server-calculated priority, detail view)
-	case "w":
+	case actMoveToFront:
 		m.pendingTaskID = m.detailTask.ID
 		m.reviewInput.Placeholder = "reason for moving to front (required)"
 		m.reviewInput.SetValue("")
@@ -1589,7 +1603,7 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		return m, cmd
 
 	// Reset Priority: reset task priority to 500 (detail view)
-	case "e":
+	case actResetPriority:
 		m.pendingTaskID = m.detailTask.ID
 		m.reviewInput.Placeholder = "reason for resetting priority (required)"
 		m.reviewInput.SetValue("")
@@ -1601,11 +1615,8 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		m.reviewInput, cmd = m.reviewInput.Update(nil)
 		return m, cmd
 
-	// Switch project from detail view (only in legacy mode, not in shell)
-	case "P":
-		if m.shell != nil {
-			return m, nil
-		}
+	// Switch project from detail view
+	case actSwitchProject:
 		// Exit detail view and enter project switcher mode
 		m.mode = modeProjectSwitch
 		m.projectSwitchIndex = 0
@@ -2620,68 +2631,69 @@ func (m *BoardModel) renderColumnTasks() string {
 	return b.String()
 }
 
-// renderHelpBar renders the bottom help bar with key bindings for the current state.
-// It truncates with ellipsis instead of overflowing if the terminal is too narrow.
+// helpLine renders bindings as one help line no wider than width (0 means no limit),
+// truncating with an ellipsis instead of overflowing.
+func (m *BoardModel) helpLine(bindings []keybind.Binding, width int) string {
+	m.helpModel.SetWidth(width)
+	m.helpModel.ShowAll = false
+	line := ansi.Strip(m.helpModel.ShortHelpView(bindings))
+	if width > 0 {
+		line = ansi.Truncate(line, width, "…")
+	}
+	return line
+}
+
+// detailKeys is the detail view's bindings. The shell has no project switcher, so there the
+// switch-project binding is left out — of the keys and of the help alike.
+func (m *BoardModel) detailKeys() keyMap {
+	if m.shell == nil {
+		return m.keyBindings.Detail
+	}
+	var km keyMap
+	for _, e := range m.keyBindings.Detail {
+		if e.act != actSwitchProject {
+			km = append(km, e)
+		}
+	}
+	return km
+}
+
+func (m *BoardModel) detailKeyCtx() keyCtx { return keyCtx{state: m.detailTask.State} }
+
+// helpBindings is the full list of bindings live in the current view.
+func (m *BoardModel) helpBindings() []keybind.Binding {
+	switch {
+	case m.mode == modeDetail:
+		return m.detailKeys().help(m.detailKeyCtx())
+	case m.shell != nil:
+		return m.keyBindings.Shell.help(m.shellKeyCtx())
+	}
+	return m.keyBindings.Board.help(keyCtx{state: stateOrder[m.selectedColumn]})
+}
+
+// renderHelpBar renders the bottom help bar of the tab layout.
 func (m *BoardModel) renderHelpBar() string {
 	if m.mode != modeNormal {
 		return "esc cancel"
 	}
-
-	currentState := stateOrder[m.selectedColumn]
-	bindings := m.keyBindings.getBoardBindingsForState(currentState)
-
-	// Set the help model width to allow truncation
-	m.helpModel.SetWidth(m.width)
-	m.helpModel.ShowAll = false
-
-	styled := m.helpModel.ShortHelpView(bindings)
-	return ansi.Strip(styled)
+	return m.helpLine(m.helpBindings(), m.width)
 }
 
 // renderDetailHelpBar renders the help bar for the detail view.
 func (m *BoardModel) renderDetailHelpBar() string {
-	bindings := m.keyBindings.getDetailBindingsForState(m.detailTask.State)
-
-	m.helpModel.SetWidth(m.width)
-	m.helpModel.ShowAll = false
-
-	styled := m.helpModel.ShortHelpView(bindings)
-	return ansi.Strip(styled)
+	return m.helpLine(m.helpBindings(), m.width)
 }
 
-// renderFullHelp renders the full help view with all available key bindings grouped by context.
+// renderFullHelp renders every binding live in the current view, one per row, in columns.
 func (m *BoardModel) renderFullHelp() string {
+	const perColumn = 8
+	bindings := m.helpBindings()
+	var groups [][]keybind.Binding
+	for len(bindings) > perColumn {
+		groups = append(groups, bindings[:perColumn])
+		bindings = bindings[perColumn:]
+	}
+	groups = append(groups, bindings)
 	m.helpModel.SetWidth(m.width)
-
-	// In detail mode, use detail bindings
-	if m.mode == modeDetail && m.detailTask.State != "" {
-		bindings := m.keyBindings.getDetailBindingsForState(m.detailTask.State)
-		styled := m.helpModel.FullHelpView([][]keybind.Binding{bindings})
-		return ansi.Strip(styled)
-	}
-
-	// In shell mode, use shell bindings based on focused pane and selected item state
-	if m.shell != nil {
-		var groups [][]keybind.Binding
-		switch m.effectiveFocus() {
-		case paneProjects:
-			groups = append(groups, m.keyBindings.getShellProjectsBindings())
-		case panePreview:
-			groups = append(groups, m.keyBindings.getShellPreviewBindings())
-		default: // paneItems
-			if wi := m.shell.items.SelectedItem(); wi != nil {
-				groups = append(groups, m.keyBindings.getShellItemsBindingsForState(wi.Implement.State))
-			} else {
-				groups = append(groups, m.keyBindings.getShellItemsBindingsForState(""))
-			}
-		}
-		styled := m.helpModel.FullHelpView(groups)
-		return ansi.Strip(styled)
-	}
-
-	// Legacy board mode: use board bindings for the selected column
-	currentState := stateOrder[m.selectedColumn]
-	bindings := m.keyBindings.getBoardBindingsForState(currentState)
-	styled := m.helpModel.FullHelpView([][]keybind.Binding{bindings})
-	return ansi.Strip(styled)
+	return ansi.Strip(m.helpModel.FullHelpView(groups))
 }

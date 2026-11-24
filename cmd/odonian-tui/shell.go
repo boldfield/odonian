@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	keybind "charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
@@ -184,157 +183,83 @@ func (m *BoardModel) cycleFocus(delta int) {
 	m.shell.focus = panes[(cur+delta+len(panes))%len(panes)]
 }
 
-// updateShellKey handles the keys the shell owns in normal mode. handled is false for
-// keys it leaves to the existing actions.
+// updateShellKey handles the keys of normal mode in the shell. Every key resolves through the
+// shell's bindings, the same ones the help bar lists; a key with no live binding is swallowed.
 func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd tea.Cmd, handled bool) {
 	s := m.shell
-	kb := m.keyBindings
-
-	// Quit
-	if matchesBinding(msg, kb.Shell.Quit) {
+	act, ok := m.keyBindings.Shell.lookup(msg, m.shellKeyCtx())
+	if !ok {
+		return m, nil, true
+	}
+	if act == actQuit {
 		return m, tea.Quit, true
 	}
-
-	// If full help is open, only allow ? to toggle it off and swallow other keys
+	// While the full key list is open it takes the keys: ? closes it, the rest are swallowed.
 	if m.showFullHelp {
-		if matchesBinding(msg, kb.Shell.Help) {
+		if act == actHelp {
 			m.showFullHelp = false
-			return m, nil, true
 		}
 		return m, nil, true
 	}
 
-	// Pane navigation
-	if matchesBinding(msg, kb.Shell.NextPane) {
+	switch act {
+	case actHelp:
+		m.showFullHelp = true
+	case actNextPane:
 		m.cycleFocus(1)
-		return m, nil, true
-	}
-	if matchesBinding(msg, kb.Shell.PrevPane) {
+	case actPrevPane:
 		m.cycleFocus(-1)
-		return m, nil, true
-	}
-
-	// Pane toggles
-	if matchesBinding(msg, kb.Shell.TogglePreview) {
+	case actTogglePreview:
 		s.previewHidden = !s.previewHidden
 		if s.previewHidden && s.focus == panePreview {
 			s.focus = paneItems
 		}
-		return m, nil, true
-	}
-	if matchesBinding(msg, kb.Shell.ToggleProject) {
+	case actToggleProjects:
 		s.projectHidden = !s.projectHidden
 		if s.projectHidden && s.focus == paneProjects {
 			s.focus = paneItems
 		}
-		return m, nil, true
-	}
-
-	// Navigation within panes
-	if matchesBinding(msg, kb.Shell.Up) || matchesBinding(msg, kb.Shell.Down) {
+	case actUp, actDown:
 		if s.focus == panePreview && m.shellLayout().PreviewWidth > 0 {
-			if matchesBinding(msg, kb.Shell.Up) {
+			if act == actUp {
 				s.preview.Scroll(-1)
 			} else {
 				s.preview.Scroll(1)
 			}
-		} else if s.focus == paneProjects && s.projectsVisible(m) {
+		} else if m.effectiveFocus() == paneProjects {
 			_, cmd = s.projects.Update(msg)
 		} else {
 			_, cmd = s.items.Update(msg)
 			m.syncShellSelection()
 		}
 		return m, cmd, true
-	}
-
-	// Scroll in preview pane
-	if matchesBinding(msg, kb.Shell.Left) || matchesBinding(msg, kb.Shell.Right) {
-		if s.focus == panePreview && m.shellLayout().PreviewWidth > 0 {
-			if matchesBinding(msg, kb.Shell.Left) {
-				s.preview.Scroll(-1)
-			} else {
-				s.preview.Scroll(1)
-			}
-		}
-		return m, nil, true
-	}
-
-	// Enter detail view or open project
-	if matchesBinding(msg, kb.Shell.EnterDetail) {
-		if s.focus == paneProjects && s.projectsVisible(m) {
+	case actOpenProject:
+		if s.projectsVisible(m) {
 			_, cmd = s.projects.Update(msg)
 			s.focus = paneItems
-			return m, cmd, true
 		}
+		return m, cmd, true
+	case actEnter:
 		if m.selectedTaskID != "" {
 			m.mode = modeDetail
 			m.detailMessage = ""
 			return m, m.fetchDetailCmd(m.selectedTaskID), true
 		}
-		return m, nil, true
-	}
-
-	// Archive project
-	if matchesBinding(msg, kb.Shell.ArchiveProject) {
-		if m.effectiveFocus() == paneProjects {
-			if id := s.projects.SelectedProjectID(); id != "" {
-				m.pendingProjectID = id
-				m.mode = modeArchiveProjectConfirm
-			}
-			return m, nil, true
+	case actArchiveProject:
+		if id := s.projects.SelectedProjectID(); id != "" {
+			m.pendingProjectID = id
+			m.mode = modeArchiveProjectConfirm
 		}
-		if m.effectiveFocus() != paneItems {
-			return m, nil, true
-		}
-		// Fall through to let updateTabs handle archive for items
-		return m, nil, false
-	}
-
-	// Merge (items only)
-	if matchesBinding(msg, kb.Shell.Merge) {
-		if m.effectiveFocus() != paneItems {
-			return m, nil, true
-		}
-		if wi := s.items.SelectedItem(); wi != nil && wi.Implement.State == stateApproved {
+	case actMerge:
+		if wi := s.items.SelectedItem(); wi != nil {
 			return m, m.mergeSelectedCmd(wi.Implement.ID), true
 		}
-		return m, nil, true
+	default:
+		// The task actions and the refresh and scorecards keys run the shared action code.
+		model, cmd = m.boardAction(act)
+		return model, cmd, true
 	}
-
-	// Help toggle
-	if matchesBinding(msg, kb.Shell.Help) {
-		m.showFullHelp = !m.showFullHelp
-		return m, nil, true
-	}
-
-	// Item-specific action keys - only let updateTabs handle them if in items pane
-	if matchesBinding(msg, kb.Shell.Promote) ||
-		matchesBinding(msg, kb.Shell.Approve) ||
-		matchesBinding(msg, kb.Shell.Reject) ||
-		matchesBinding(msg, kb.Shell.Bounce) ||
-		matchesBinding(msg, kb.Shell.Unblock) ||
-		matchesBinding(msg, kb.Shell.Fail) ||
-		matchesBinding(msg, kb.Shell.Hold) ||
-		matchesBinding(msg, kb.Shell.SetPriority) ||
-		matchesBinding(msg, kb.Shell.MoveToFront) ||
-		matchesBinding(msg, kb.Shell.ResetPriority) {
-		if m.effectiveFocus() != paneItems {
-			return m, nil, true // consume and ignore in other panes
-		}
-		return m, nil, false // let updateTabs handle in items pane
-	}
-
-	// Scorecards and Refresh can be handled in items pane OR projects pane
-	if matchesBinding(msg, kb.Shell.Scorecards) ||
-		matchesBinding(msg, kb.Shell.Refresh) {
-		if m.effectiveFocus() == paneItems {
-			return m, nil, false // let updateTabs handle in items pane
-		}
-		// In projects pane or preview, let updateTabs handle these
-		return m, nil, false
-	}
-
-	return m, nil, false
+	return m, nil, true
 }
 
 // effectiveFocus is the pane that has focus at the current layout (a hidden pane cannot).
@@ -510,39 +435,25 @@ func (m *BoardModel) shellHelpBar() string {
 	case m.statusMessage != "":
 		text = m.statusMessage
 	default:
-		text = ansi.Strip(m.shellKeyHints())
+		return m.helpLine(m.keyBindings.Shell.help(m.shellKeyCtx()), m.width)
 	}
 	return ansi.Truncate(text, m.width, "…")
 }
 
+// shellKeyCtx is the context the shell's keys resolve in: the focused pane and the state of
+// the selected work item.
+func (m *BoardModel) shellKeyCtx() keyCtx {
+	c := keyCtx{pane: m.effectiveFocus()}
+	if wi := m.shell.items.SelectedItem(); wi != nil {
+		c.state = wi.Implement.State
+	}
+	return c
+}
+
 // shellKeyHints lists the keys valid now: the focused pane's, and for the work-items pane
-// those the selected item's state allows, built from the bindings.
+// those the selected item's state allows. It is the bar's text before truncation.
 func (m *BoardModel) shellKeyHints() string {
-	var bindings []keybind.Binding
-	kb := m.keyBindings
-
-	switch m.effectiveFocus() {
-	case paneProjects:
-		bindings = kb.getShellProjectsBindings()
-	case panePreview:
-		bindings = kb.getShellPreviewBindings()
-	default: // paneItems
-		if wi := m.shell.items.SelectedItem(); wi != nil {
-			bindings = kb.getShellItemsBindingsForState(wi.Implement.State)
-		} else {
-			bindings = kb.getShellItemsBindingsForState("")
-		}
-	}
-
-	var parts []string
-	for _, b := range bindings {
-		help := b.Help()
-		if help.Key != "" && help.Desc != "" {
-			part := help.Key + " " + help.Desc
-			parts = append(parts, part)
-		}
-	}
-	return strings.Join(parts, " · ")
+	return m.helpLine(m.keyBindings.Shell.help(m.shellKeyCtx()), 0)
 }
 
 // shellView renders the three panes, joined, with a help bar.
