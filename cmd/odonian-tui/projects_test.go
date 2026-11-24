@@ -644,3 +644,77 @@ func TestProjectsPaneNavigationCommandDataRace(t *testing.T) {
 		t.Errorf("second command should return p3, got %s", selected2.ProjectID)
 	}
 }
+
+func TestProjectsPaneEmptyListRailWidth(t *testing.T) {
+	theme := NewTheme()
+	pane := NewProjectsPane(theme, []tuiclient.Project{})
+	pane.SetSize(tuiview.ProjectRailWidth, 10)
+
+	view := pane.View()
+	lines := strings.Split(strings.TrimSpace(view.Content), "\n")
+	for i, line := range lines {
+		lineWidth := lipgloss.Width(line)
+		if lineWidth > tuiview.ProjectRailWidth {
+			t.Errorf("empty list line %d exceeds rail width: width=%d (expected <= %d): %q", i, lineWidth, tuiview.ProjectRailWidth, line)
+		}
+	}
+}
+
+func TestProjectsPaneStyleBleeding(t *testing.T) {
+	theme := NewTheme()
+	projects := []tuiclient.Project{
+		{ID: "p1", Name: "VeryLongProjectNameThatExceedsTheWidth"},
+	}
+	pane := NewProjectsPane(theme, projects)
+
+	// Test at widths where truncation happens
+	for _, width := range []int{2, 3, 5} {
+		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+			pane.SetSize(width, 5)
+			view := pane.View()
+			lines := strings.Split(view.Content, "\n")
+			for _, line := range lines {
+				if line == "" {
+					continue
+				}
+
+				// Verify that all lines respect the width constraint
+				lineWidth := lipgloss.Width(line)
+				if lineWidth > width {
+					t.Errorf("line exceeds width at truncation: width=%d (expected <= %d): %q", lineWidth, width, line)
+				}
+			}
+		})
+	}
+}
+
+func TestProjectsPaneSelectedRowStyledLineWidth(t *testing.T) {
+	theme := NewTheme()
+	projects := []tuiclient.Project{
+		{ID: "p1", Name: "VeryLongProjectNameThatExceedsTheWidth"},
+	}
+	pane := NewProjectsPane(theme, projects)
+	pane.SetSize(10, 5)
+	pane.SetFocused(true)
+
+	view := pane.View()
+	lines := strings.Split(strings.TrimSpace(view.Content), "\n")
+
+	// Check the title line (should be styled as focused)
+	if len(lines) > 0 {
+		titleLine := lines[0]
+		titleWidth := lipgloss.Width(titleLine)
+		if titleWidth > 10 {
+			t.Errorf("focused title line exceeds width: width=%d (expected <= 10): %q", titleWidth, titleLine)
+		}
+	}
+
+	// Check project lines (selected one should be styled)
+	if len(lines) > 1 {
+		projectLine := lines[1]
+		projectWidth := lipgloss.Width(projectLine)
+		if projectWidth > 10 {
+			t.Errorf("project line exceeds width: width=%d (expected <= 10): %q", projectWidth, projectLine)
+		}
+	}
+}

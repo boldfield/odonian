@@ -8,6 +8,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiview"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // ProjectBadge represents the badge displayed next to a project name.
@@ -153,7 +154,7 @@ func (p *ProjectsPane) View() tea.View {
 
 	var content string
 	if len(p.projects) == 0 {
-		content = "(no projects)"
+		content = ensureLineWidth("(no projects)", p.width)
 	} else {
 		var lines []string
 		for i, proj := range p.projects {
@@ -297,7 +298,7 @@ func truncateToDisplayWidth(s string, maxWidth int) string {
 }
 
 // ensureLineWidth ensures a line does not exceed the given display width by truncating if necessary.
-// It preserves ANSI codes and rune boundaries.
+// It preserves ANSI codes and rune boundaries using ansi.Truncate.
 func ensureLineWidth(line string, maxWidth int) string {
 	if maxWidth < 1 {
 		maxWidth = 1
@@ -308,15 +309,5 @@ func ensureLineWidth(line string, maxWidth int) string {
 		return line
 	}
 
-	var result strings.Builder
-	for _, r := range line {
-		rStr := string(r)
-		rWidth := lipgloss.Width(rStr)
-		if lipgloss.Width(result.String())+rWidth > maxWidth {
-			break
-		}
-		result.WriteRune(r)
-	}
-
-	return result.String()
+	return ansi.Truncate(line, maxWidth, "")
 }
