@@ -11,6 +11,97 @@ type WorkItem struct {
 	Merge     *tuiclient.Task   // Merge task (may be nil)
 }
 
+// Status returns the glyph for a task's status.
+// claimableIDs is a set of task IDs that are claimable (ready and not waiting on a dependency).
+// A ready or backlog task not in the set is waiting on a dependency.
+func Status(task *tuiclient.Task, claimableIDs map[string]bool) string {
+	if task.Held {
+		return "⏸"
+	}
+
+	switch task.State {
+	case "backlog":
+		if claimableIDs[task.ID] {
+			return "○"
+		}
+		return "·"
+	case "ready":
+		if claimableIDs[task.ID] {
+			return "○"
+		}
+		return "⛓"
+	case "in_progress":
+		return "●"
+	case "checks":
+		return "◷"
+	case "review":
+		return "◆"
+	case "approved":
+		return "✔"
+	case "blocked":
+		return "✖"
+	case "failed":
+		return "!"
+	default:
+		return "·"
+	}
+}
+
+// IsHeld returns whether a task is held.
+func IsHeld(task *tuiclient.Task) bool {
+	return task.Held
+}
+
+// NeedsYou returns whether a task needs the operator.
+// A task needs you when: blocked, failed, or approved with agent_merge=false.
+func NeedsYou(task *tuiclient.Task) bool {
+	switch task.State {
+	case "blocked", "failed":
+		return true
+	case "approved":
+		return !task.AgentMerge
+	default:
+		return false
+	}
+}
+
+// Badge computes a project's badge from its work items and returns the badge glyph and count.
+// Returns ("", 0) for projects with only queued work (no needs-you, no awaiting-merge, no in-flight items).
+// Badge priority (highest first):
+// 1. Needs you (blocked or failed): "⚠"
+// 2. Awaiting merge (approved with agent_merge=false): "✔"
+// 3. In flight (approved with agent_merge=true): "●"
+func Badge(workItems []*WorkItem) (string, int) {
+	var needsYouCount, awaitingMergeCount, inFlightCount int
+
+	for _, wi := range workItems {
+		impl := wi.Implement
+
+		if impl.State == "blocked" || impl.State == "failed" {
+			needsYouCount++
+		} else if impl.State == "approved" {
+			if impl.AgentMerge {
+				inFlightCount++
+			} else {
+				awaitingMergeCount++
+			}
+		}
+	}
+
+	// Highest priority first
+	if needsYouCount > 0 {
+		return "⚠", needsYouCount
+	}
+	if awaitingMergeCount > 0 {
+		return "✔", awaitingMergeCount
+	}
+	if inFlightCount > 0 {
+		return "●", inFlightCount
+	}
+
+	return "", 0
+}
+
 // Result holds the grouped work items and any orphaned review/merge tasks.
 type Result struct {
 	WorkItems []*WorkItem

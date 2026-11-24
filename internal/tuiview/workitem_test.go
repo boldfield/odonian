@@ -287,3 +287,406 @@ func TestGroupWorkItems(t *testing.T) {
 func strPtr(s string) *string {
 	return &s
 }
+
+func TestStatus(t *testing.T) {
+	tests := []struct {
+		name         string
+		task         *tuiclient.Task
+		claimableIDs map[string]bool
+		want         string
+	}{
+		// Backlog tests
+		{
+			name:         "backlog claimable",
+			task:         &tuiclient.Task{ID: "t1", State: "backlog", Held: false},
+			claimableIDs: map[string]bool{"t1": true},
+			want:         "○",
+		},
+		{
+			name:         "backlog not claimable (waiting)",
+			task:         &tuiclient.Task{ID: "t2", State: "backlog", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "·",
+		},
+
+		// Ready tests
+		{
+			name:         "ready claimable",
+			task:         &tuiclient.Task{ID: "t3", State: "ready", Held: false},
+			claimableIDs: map[string]bool{"t3": true},
+			want:         "○",
+		},
+		{
+			name:         "ready not claimable (waiting on dependency)",
+			task:         &tuiclient.Task{ID: "t4", State: "ready", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "⛓",
+		},
+
+		// In progress
+		{
+			name:         "in_progress",
+			task:         &tuiclient.Task{ID: "t5", State: "in_progress", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "●",
+		},
+
+		// In checks
+		{
+			name:         "checks",
+			task:         &tuiclient.Task{ID: "t6", State: "checks", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "◷",
+		},
+
+		// In review
+		{
+			name:         "review",
+			task:         &tuiclient.Task{ID: "t7", State: "review", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "◆",
+		},
+
+		// Approved
+		{
+			name:         "approved",
+			task:         &tuiclient.Task{ID: "t8", State: "approved", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "✔",
+		},
+
+		// Blocked
+		{
+			name:         "blocked",
+			task:         &tuiclient.Task{ID: "t9", State: "blocked", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "✖",
+		},
+
+		// Failed
+		{
+			name:         "failed",
+			task:         &tuiclient.Task{ID: "t10", State: "failed", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "!",
+		},
+
+		// Held tests (prefix on any state)
+		{
+			name:         "held backlog claimable",
+			task:         &tuiclient.Task{ID: "t11", State: "backlog", Held: true},
+			claimableIDs: map[string]bool{"t11": true},
+			want:         "⏸",
+		},
+		{
+			name:         "held in_progress",
+			task:         &tuiclient.Task{ID: "t12", State: "in_progress", Held: true},
+			claimableIDs: map[string]bool{},
+			want:         "⏸",
+		},
+		{
+			name:         "held approved",
+			task:         &tuiclient.Task{ID: "t13", State: "approved", Held: true},
+			claimableIDs: map[string]bool{},
+			want:         "⏸",
+		},
+		{
+			name:         "held blocked",
+			task:         &tuiclient.Task{ID: "t14", State: "blocked", Held: true},
+			claimableIDs: map[string]bool{},
+			want:         "⏸",
+		},
+		{
+			name:         "held failed",
+			task:         &tuiclient.Task{ID: "t15", State: "failed", Held: true},
+			claimableIDs: map[string]bool{},
+			want:         "⏸",
+		},
+
+		// Done and abandoned (should default to "·")
+		{
+			name:         "done",
+			task:         &tuiclient.Task{ID: "t16", State: "done", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "·",
+		},
+		{
+			name:         "abandoned",
+			task:         &tuiclient.Task{ID: "t17", State: "abandoned", Held: false},
+			claimableIDs: map[string]bool{},
+			want:         "·",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Status(tt.task, tt.claimableIDs)
+			if got != tt.want {
+				t.Errorf("Status() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsHeld(t *testing.T) {
+	tests := []struct {
+		name string
+		task *tuiclient.Task
+		want bool
+	}{
+		{
+			name: "held task",
+			task: &tuiclient.Task{Held: true},
+			want: true,
+		},
+		{
+			name: "not held task",
+			task: &tuiclient.Task{Held: false},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsHeld(tt.task)
+			if got != tt.want {
+				t.Errorf("IsHeld() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNeedsYou(t *testing.T) {
+	tests := []struct {
+		name string
+		task *tuiclient.Task
+		want bool
+	}{
+		// Blocked always needs you
+		{
+			name: "blocked",
+			task: &tuiclient.Task{State: "blocked"},
+			want: true,
+		},
+
+		// Failed always needs you
+		{
+			name: "failed",
+			task: &tuiclient.Task{State: "failed"},
+			want: true,
+		},
+
+		// Approved with agent_merge=false needs you
+		{
+			name: "approved with agent_merge=false",
+			task: &tuiclient.Task{State: "approved", AgentMerge: false},
+			want: true,
+		},
+
+		// Approved with agent_merge=true does not need you (in flight)
+		{
+			name: "approved with agent_merge=true",
+			task: &tuiclient.Task{State: "approved", AgentMerge: true},
+			want: false,
+		},
+
+		// Other states don't need you
+		{
+			name: "backlog",
+			task: &tuiclient.Task{State: "backlog"},
+			want: false,
+		},
+		{
+			name: "ready",
+			task: &tuiclient.Task{State: "ready"},
+			want: false,
+		},
+		{
+			name: "in_progress",
+			task: &tuiclient.Task{State: "in_progress"},
+			want: false,
+		},
+		{
+			name: "checks",
+			task: &tuiclient.Task{State: "checks"},
+			want: false,
+		},
+		{
+			name: "review",
+			task: &tuiclient.Task{State: "review"},
+			want: false,
+		},
+		{
+			name: "done",
+			task: &tuiclient.Task{State: "done"},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NeedsYou(tt.task)
+			if got != tt.want {
+				t.Errorf("NeedsYou() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBadge(t *testing.T) {
+	tests := []struct {
+		name      string
+		workItems []*WorkItem
+		wantGlyph string
+		wantCount int
+	}{
+		// No work items
+		{
+			name:      "empty",
+			workItems: []*WorkItem{},
+			wantGlyph: "",
+			wantCount: 0,
+		},
+
+		// Only queued work (backlog, ready)
+		{
+			name: "only queued work",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "backlog"}},
+				{Implement: &tuiclient.Task{State: "ready"}},
+			},
+			wantGlyph: "",
+			wantCount: 0,
+		},
+
+		// Blocked (needs you)
+		{
+			name: "single blocked",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "blocked"}},
+			},
+			wantGlyph: "⚠",
+			wantCount: 1,
+		},
+
+		// Failed (needs you)
+		{
+			name: "single failed",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "failed"}},
+			},
+			wantGlyph: "⚠",
+			wantCount: 1,
+		},
+
+		// Mixed blocked and failed (needs you)
+		{
+			name: "blocked and failed",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "blocked"}},
+				{Implement: &tuiclient.Task{State: "failed"}},
+			},
+			wantGlyph: "⚠",
+			wantCount: 2,
+		},
+
+		// Approved with agent_merge=false (awaiting merge)
+		{
+			name: "single awaiting merge",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: false}},
+			},
+			wantGlyph: "✔",
+			wantCount: 1,
+		},
+
+		// Approved with agent_merge=true (in flight)
+		{
+			name: "single in flight",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+			},
+			wantGlyph: "●",
+			wantCount: 1,
+		},
+
+		// Needs you takes priority over awaiting merge
+		{
+			name: "blocked and awaiting merge",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "blocked"}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: false}},
+			},
+			wantGlyph: "⚠",
+			wantCount: 1,
+		},
+
+		// Needs you takes priority over in flight
+		{
+			name: "failed and in flight",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "failed"}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+			},
+			wantGlyph: "⚠",
+			wantCount: 1,
+		},
+
+		// Awaiting merge takes priority over in flight
+		{
+			name: "awaiting merge and in flight",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: false}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+			},
+			wantGlyph: "✔",
+			wantCount: 1,
+		},
+
+		// All priorities mixed
+		{
+			name: "all priorities",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "blocked"}},
+				{Implement: &tuiclient.Task{State: "blocked"}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: false}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+				{Implement: &tuiclient.Task{State: "in_progress"}},
+			},
+			wantGlyph: "⚠",
+			wantCount: 2,
+		},
+
+		// Multiple awaiting merge (no needs you)
+		{
+			name: "multiple awaiting merge",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: false}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: false}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+			},
+			wantGlyph: "✔",
+			wantCount: 2,
+		},
+
+		// Multiple in flight (no higher priority)
+		{
+			name: "multiple in flight",
+			workItems: []*WorkItem{
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
+			},
+			wantGlyph: "●",
+			wantCount: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotGlyph, gotCount := Badge(tt.workItems)
+			if gotGlyph != tt.wantGlyph || gotCount != tt.wantCount {
+				t.Errorf("Badge() = (%s, %d), want (%s, %d)", gotGlyph, gotCount, tt.wantGlyph, tt.wantCount)
+			}
+		})
+	}
+}
