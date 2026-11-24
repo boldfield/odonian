@@ -82,26 +82,31 @@ type PriorityChange struct {
 }
 
 type Task struct {
-	ID              string  `json:"id"`
-	ProjectID       string  `json:"project_id"`
-	DocumentID      string  `json:"document_id"`
-	Title           string  `json:"title"`
-	Spec            string  `json:"spec"`
-	State           string  `json:"state"`
-	Kind            string  `json:"kind"`
-	Model           string  `json:"model"`
-	Track           string  `json:"track"`
-	Branch          string  `json:"branch"`
-	Assignee        *string `json:"assignee"`
-	LeaseExpiresAt  *string `json:"lease_expires_at"`
-	Result          *string `json:"result"`
-	Held            bool    `json:"held"`
-	Priority        *int64  `json:"priority"`
-	TopicAnchorID   *string `json:"topic_anchor_id"`
-	AwaitChecks     bool    `json:"await_checks"`
-	ChecksStartedAt *string `json:"checks_started_at"`
-	CreatedAt       string  `json:"created_at"`
-	UpdatedAt       string  `json:"updated_at"`
+	ID              string   `json:"id"`
+	ProjectID       string   `json:"project_id"`
+	DocumentID      string   `json:"document_id"`
+	Title           string   `json:"title"`
+	Spec            string   `json:"spec"`
+	State           string   `json:"state"`
+	Kind            string   `json:"kind"`
+	Model           string   `json:"model"`
+	Track           string   `json:"track"`
+	Branch          string   `json:"branch"`
+	Assignee        *string  `json:"assignee"`
+	LeaseExpiresAt  *string  `json:"lease_expires_at"`
+	Result          *string  `json:"result"`
+	Held            bool     `json:"held"`
+	Priority        *int64   `json:"priority"`
+	TopicAnchorID   *string  `json:"topic_anchor_id"`
+	AwaitChecks     bool     `json:"await_checks"`
+	ChecksStartedAt *string  `json:"checks_started_at"`
+	CreatedAt       string   `json:"created_at"`
+	UpdatedAt       string   `json:"updated_at"`
+	TargetTaskID    *string  `json:"target_task_id"`
+	ReviewRound     int      `json:"review_round"`
+	Verdict         *string  `json:"verdict"`
+	AgentMerge      bool     `json:"agent_merge"`
+	ReviewModels    []string `json:"review_models"`
 }
 
 type TaskDetail struct {
