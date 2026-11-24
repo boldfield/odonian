@@ -6177,7 +6177,8 @@ func TestStateOrder_ChecksBetweenInProgressAndReview(t *testing.T) {
 	if !found {
 		t.Fatal("checks missing from activeStates")
 	}
-	if _, ok := stateColors[stateChecks]; !ok {
+	theme := NewTheme()
+	if _, ok := theme.StatusStyles[stateChecks]; !ok {
 		t.Fatal("checks has no colour")
 	}
 }
