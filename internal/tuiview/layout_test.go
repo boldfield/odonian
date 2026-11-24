@@ -50,12 +50,14 @@ func TestChooseLayout(t *testing.T) {
 		{name: "wide 120 selected", width: 120, height: 10, itemSelected: true, previewHidden: false, projectHidden: false, wantTooNarrow: false, checkWidthsSum: true},
 		{name: "wide 120 preview hidden", width: 120, height: 10, itemSelected: true, previewHidden: true, projectHidden: false, wantTooNarrow: false, checkWidthsSum: true},
 		{name: "wide 120 project hidden", width: 120, height: 10, itemSelected: false, previewHidden: false, projectHidden: true, wantTooNarrow: false, checkWidthsSum: true},
+		{name: "wide 120 project hidden + selected", width: 120, height: 10, itemSelected: true, previewHidden: false, projectHidden: true, wantTooNarrow: false, checkWidthsSum: true},
 		{name: "wide 120 both hidden", width: 120, height: 10, itemSelected: false, previewHidden: true, projectHidden: true, wantTooNarrow: false, checkWidthsSum: true},
 
 		{name: "wide 200 no selection", width: 200, height: 10, itemSelected: false, previewHidden: false, projectHidden: false, wantTooNarrow: false, checkWidthsSum: true},
 		{name: "wide 200 selected", width: 200, height: 10, itemSelected: true, previewHidden: false, projectHidden: false, wantTooNarrow: false, checkWidthsSum: true},
 		{name: "wide 200 preview hidden", width: 200, height: 10, itemSelected: true, previewHidden: true, projectHidden: false, wantTooNarrow: false, checkWidthsSum: true},
 		{name: "wide 200 project hidden", width: 200, height: 10, itemSelected: false, previewHidden: false, projectHidden: true, wantTooNarrow: false, checkWidthsSum: true},
+		{name: "wide 200 project hidden + selected", width: 200, height: 10, itemSelected: true, previewHidden: false, projectHidden: true, wantTooNarrow: false, checkWidthsSum: true},
 		{name: "wide 200 both hidden", width: 200, height: 10, itemSelected: false, previewHidden: true, projectHidden: true, wantTooNarrow: false, checkWidthsSum: true},
 	}
 
