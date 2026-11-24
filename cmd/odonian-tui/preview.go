@@ -31,6 +31,10 @@ type PreviewPane struct {
 	width  int
 	height int
 	now    func() time.Time
+	// focused styles the title; scroll is how many lines the view is scrolled down.
+	focused bool
+	scroll  int
+	theme   *Theme
 }
 
 // NewPreviewPane creates a preview pane for item. History shows as loading
@@ -46,6 +50,7 @@ func (p *PreviewPane) SetItem(item *tuiview.WorkItem) {
 		p.prURL = ""
 		p.events = nil
 		p.loaded = false
+		p.scroll = 0
 	}
 	p.item = item
 }
@@ -71,6 +76,24 @@ func (p *PreviewPane) SetDetail(detail tuiclient.TaskDetail) {
 func (p *PreviewPane) SetEvents(events []tuiclient.Event) {
 	p.events = events
 	p.loaded = true
+}
+
+// SetFocused updates the focus state of the pane; the title is bold while focused.
+func (p *PreviewPane) SetFocused(focused bool) {
+	p.focused = focused
+}
+
+// SetTheme sets the theme used to style the focused title.
+func (p *PreviewPane) SetTheme(theme *Theme) {
+	p.theme = theme
+}
+
+// Scroll moves the view by delta lines; Render clamps it to the content.
+func (p *PreviewPane) Scroll(delta int) {
+	p.scroll += delta
+	if p.scroll < 0 {
+		p.scroll = 0
+	}
 }
 
 // SetSize updates the pane dimensions.
@@ -141,7 +164,7 @@ func (p *PreviewPane) Render() string {
 		}
 	}
 
-	if len(lines) < p.height {
+	if len(lines) < p.height+p.scroll {
 		lines = append(lines, "")
 		add("", "History")
 		switch {
@@ -151,16 +174,26 @@ func (p *PreviewPane) Render() string {
 			add("  ", "no events yet")
 		default:
 			// Newest first; stop once the pane is full.
-			for i := len(p.events) - 1; i >= 0 && len(lines) < p.height; i-- {
+			for i := len(p.events) - 1; i >= 0 && len(lines) < p.height+p.scroll; i-- {
 				e := p.events[i]
 				add("  "+formatEventClock(e.CreatedAt)+" ", describeEvent(e))
 			}
 		}
 	}
 
-	if len(lines) > p.height {
-		lines = lines[:p.height]
+	if maxScroll := len(lines) - p.height; p.scroll > maxScroll {
+		p.scroll = max(maxScroll, 0)
 	}
+	// The first line stays pinned as a header so the focus marker survives
+	// scrolling; only the body below it moves.
+	header, body := lines[0], lines[1+p.scroll:]
+	if len(body) > p.height-1 {
+		body = body[:p.height-1]
+	}
+	if p.focused && p.theme != nil {
+		header = p.theme.PaneTitleFocused.Render(header)
+	}
+	lines = append([]string{header}, body...)
 	return strings.Join(lines, "\n")
 }
 

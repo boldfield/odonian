@@ -311,3 +311,15 @@ func ensureLineWidth(line string, maxWidth int) string {
 
 	return ansi.Truncate(line, maxWidth, "")
 }
+
+// SelectProject moves the selection to the project with the given id, without emitting
+// ProjectSelected. It does nothing when the id is not in the list.
+func (p *ProjectsPane) SelectProject(id string) {
+	for i, proj := range p.projects {
+		if proj.ID == id {
+			p.selectedIndex = i
+			p.ensureSelectionVisible()
+			return
+		}
+	}
+}

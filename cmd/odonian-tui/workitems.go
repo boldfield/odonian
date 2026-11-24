@@ -344,3 +344,11 @@ func (p *WorkItemsPane) clampLines(lines []string) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// SelectedItem returns the work item of the selected row, or nil when the list is empty.
+func (p *WorkItemsPane) SelectedItem() *tuiview.WorkItem {
+	if i := p.indexOf(p.selectedID); i >= 0 {
+		return p.items[i]
+	}
+	return nil
+}

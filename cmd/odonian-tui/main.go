@@ -77,7 +77,7 @@ func main() {
 	}
 
 	// Create and run the board model for the selected project
-	boardModel := NewBoardModel(client, cfg, selectedProject)
+	boardModel := NewShellBoardModel(client, cfg, selectedProject)
 	p := tea.NewProgram(boardModel)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running board: %v\n", err)

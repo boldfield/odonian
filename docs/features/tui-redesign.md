@@ -183,7 +183,7 @@ quit. Changes:
 
 - `tab` / `shift+tab` move focus between panes; arrows move within the focused pane.
 - `/` filters the work-item pane by text.
-- `v` toggles the preview; a second key hides the project pane.
+- `v` toggles the preview; `V` (shift+v) hides the project pane.
 - `?` opens the full key list. The bottom bar shows only the keys valid for the selected
   item's status, and truncates with `…` instead of overflowing.
 - The project-switcher overlay goes away; the project pane replaces it.
