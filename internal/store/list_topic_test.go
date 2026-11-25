@@ -17,18 +17,20 @@ func (f *priorityFixture) lineageList() []string {
 	loner := f.task("ready", 700)
 	cycA := f.task("ready", 650)
 	cycB := f.task("ready", 800)
+	merge := f.task("ready", 500)
 	f.exec(`UPDATE task SET target_task_id = ?, kind = 'review' WHERE id = ?`, root, review)
+	f.exec(`UPDATE task SET target_task_id = ?, kind = 'merge' WHERE id = ?`, root, merge)
 	f.exec(`UPDATE task SET superseded_by = ? WHERE id = ?`, replacement, old)
 	f.exec(`INSERT INTO task_link (id, task_id, kind, value) VALUES (?, ?, 'continuation_parent', ?)`, GenerateID(), child, root)
 	f.exec(`UPDATE task SET target_task_id = ? WHERE id = ?`, cycB, cycA)
 	f.exec(`UPDATE task SET target_task_id = ? WHERE id = ?`, cycA, cycB)
-	return []string{root, review, old, replacement, child, loner, cycA, cycB}
+	return []string{root, review, merge, old, replacement, child, loner, cycA, cycB}
 }
 
 func TestListTasksTopicMatchesGetTask(t *testing.T) {
 	f := newPriorityFixture(t)
 	ids := f.lineageList()
-	f.exec(`UPDATE task SET model = 'haiku' WHERE id IN (?, ?)`, ids[0], ids[5])
+	f.exec(`UPDATE task SET model = 'haiku' WHERE id IN (?, ?)`, ids[0], ids[6])
 
 	state := "ready"
 	model := "haiku"
