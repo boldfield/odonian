@@ -20040,7 +20040,8 @@ func TestListTasksOmitBodies(t *testing.T) {
 
 	// Test 1: ListTasks without OmitBodies should return spec and result
 	// Filter by kind=implement to get only the original tasks (review tasks are created after submit)
-	tasksWithBodies, err := store.ListTasks(ctx, proj.ID, TaskListFilter{OmitBodies: false, Kind: &[]string{"implement"}[0]})
+	kind := "implement"
+	tasksWithBodies, err := store.ListTasks(ctx, proj.ID, TaskListFilter{OmitBodies: false, Kind: &kind})
 	if err != nil {
 		t.Fatalf("failed to list tasks without OmitBodies: %v", err)
 	}
@@ -20067,7 +20068,7 @@ func TestListTasksOmitBodies(t *testing.T) {
 	}
 
 	// Test 2: ListTasks with OmitBodies should return empty spec and nil result
-	tasksWithoutBodies, err := store.ListTasks(ctx, proj.ID, TaskListFilter{OmitBodies: true, Kind: &[]string{"implement"}[0]})
+	tasksWithoutBodies, err := store.ListTasks(ctx, proj.ID, TaskListFilter{OmitBodies: true, Kind: &kind})
 	if err != nil {
 		t.Fatalf("failed to list tasks with OmitBodies: %v", err)
 	}
