@@ -1,153 +1,12 @@
 package main
 
 import (
-	"context"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	"github.com/boldfield/odonian/internal/tuiconfig"
 )
-
-// actionFixture is the three-pane shell over a recording client, one implement task per state.
-type actionFixture struct {
-	model  *BoardModel
-	mu     sync.Mutex
-	calls  []string
-	states []string // states requested by ListTasks
-}
-
-func newActionFixture(t *testing.T) *actionFixture {
-	t.Helper()
-	f := &actionFixture{}
-	tasks := []tuiclient.Task{
-		{ID: "t-backlog", Title: "Backlog", State: "backlog", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
-		{ID: "t-ready", Title: "Ready", State: "ready", Kind: "implement", CreatedAt: "2026-01-01T00:00:01Z"},
-		{ID: "t-review", Title: "Review", State: "review", Kind: "implement", CreatedAt: "2026-01-01T00:00:02Z"},
-		{ID: "t-approved", Title: "Approved", State: "approved", Kind: "implement", CreatedAt: "2026-01-01T00:00:03Z"},
-		{ID: "t-blocked", Title: "Blocked", State: "blocked", Kind: "implement", CreatedAt: "2026-01-01T00:00:04Z"},
-		{ID: "t-held", Title: "Held", State: "ready", Held: true, Kind: "implement", CreatedAt: "2026-01-01T00:00:05Z"},
-	}
-	rec := func(s string) {
-		f.mu.Lock()
-		f.calls = append(f.calls, s)
-		f.mu.Unlock()
-	}
-	client := &tuiclient.MockClient{
-		ListProjectsFunc: func(ctx context.Context, o ...tuiclient.ProjectListOption) ([]tuiclient.Project, error) {
-			return []tuiclient.Project{{ID: "p1", Name: "One"}}, nil
-		},
-		ListTasksFunc: func(ctx context.Context, projectID string, opts ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
-			var o tuiclient.TaskListOptions
-			for _, opt := range opts {
-				opt(&o)
-			}
-			f.mu.Lock()
-			f.states = append(f.states, o.State)
-			f.mu.Unlock()
-			var out []tuiclient.Task
-			for _, task := range tasks {
-				if o.State != "" && task.State != o.State {
-					continue
-				}
-				if o.Claimable && task.State != "ready" {
-					continue
-				}
-				out = append(out, task)
-			}
-			return out, nil
-		},
-		GetTaskFunc: func(ctx context.Context, id string) (tuiclient.TaskDetail, error) {
-			d := tuiclient.TaskDetail{ID: id, Links: []tuiclient.TaskLink{{Kind: "pr", Value: "https://github.com/o/r/pull/9"}}}
-			for _, task := range tasks {
-				if task.ID == id {
-					d.Title, d.State = task.Title, task.State
-				}
-			}
-			return d, nil
-		},
-		PromoteTaskFunc: func(ctx context.Context, id string) error { rec("promote " + id); return nil },
-		ReviewTaskFunc: func(ctx context.Context, id, actor, verdict string, note *string) error {
-			rec("review " + verdict + " " + id)
-			return nil
-		},
-		TransitionTaskFunc: func(ctx context.Context, id, to string, note *string) error {
-			rec("transition " + id + " " + to)
-			return nil
-		},
-		ArchiveTaskFunc:    func(ctx context.Context, id string) error { rec("archive " + id); return nil },
-		ArchiveProjectFunc: func(ctx context.Context, id string) error { rec("archive-project " + id); return nil },
-		ReleaseTaskFunc:    func(ctx context.Context, id string) error { rec("release " + id); return nil },
-		HoldTaskFunc:       func(ctx context.Context, id string) error { rec("hold " + id); return nil },
-		SetTaskPriorityFunc: func(ctx context.Context, id string, req tuiclient.SetTaskPriorityRequest) (tuiclient.PriorityChange, error) {
-			rec("priority " + id)
-			return tuiclient.PriorityChange{Priority: req.Priority}, nil
-		},
-		MoveTaskToFrontFunc: func(ctx context.Context, id string, req tuiclient.MoveTaskToFrontRequest) (tuiclient.PriorityChange, error) {
-			rec("front " + id)
-			return tuiclient.PriorityChange{}, nil
-		},
-	}
-	cfg := &tuiconfig.Config{URL: "http://test", Token: "t", Actor: "u", PollInterval: time.Hour}
-	f.model = NewShellBoardModel(client, cfg, tuiclient.Project{ID: "p1", Name: "One"})
-	f.model.shell.previewDebounce = 0
-	f.model.newTickCmd = func() tea.Cmd { return nil }
-	f.model.ghMerger = func(ctx context.Context, prURL string) error { rec("merge " + prURL); return nil }
-	f.send(tea.WindowSizeMsg{Width: 140, Height: 40})
-	f.send(projectsMsg())
-	f.send(f.run(f.model.fetchShellTasks())...)
-	return f
-}
-
-func (f *actionFixture) run(cmd tea.Cmd) []tea.Msg {
-	return (&shellFixture{}).run(cmd)
-}
-
-func (f *actionFixture) send(msgs ...tea.Msg) {
-	queue := append([]tea.Msg{}, msgs...)
-	for len(queue) > 0 {
-		msg := queue[0]
-		queue = queue[1:]
-		_, cmd := f.model.Update(msg)
-		queue = append(queue, f.run(cmd)...)
-	}
-}
-
-// press sends keys; each element is one key, except text, which is typed per character.
-func (f *actionFixture) press(keys ...string) {
-	for _, k := range keys {
-		if len(k) > 1 && k != "enter" && k != "tab" && k != "down" && k != "up" {
-			for _, ch := range k {
-				f.send(key(string(ch)))
-			}
-			continue
-		}
-		f.send(key(k))
-	}
-}
-
-// selectItem moves the items-pane selection to the task.
-func (f *actionFixture) selectItem(t *testing.T, id string) {
-	t.Helper()
-	for i := 0; i < 10 && f.model.shell.items.SelectedTaskID() != id; i++ {
-		f.press("down")
-	}
-	for i := 0; i < 10 && f.model.shell.items.SelectedTaskID() != id; i++ {
-		f.press("up")
-	}
-	if got := f.model.shell.items.SelectedTaskID(); got != id {
-		t.Fatalf("could not select %s, selected %q", id, got)
-	}
-}
-
-func (f *actionFixture) got() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return strings.Join(f.calls, "; ")
-}
 
 func TestShellActions(t *testing.T) {
 	tests := []struct {
@@ -289,17 +148,17 @@ func TestShellPromptsRenderInsideShell(t *testing.T) {
 func TestShellProjectsPaneRefreshAndQuit(t *testing.T) {
 	f := newActionFixture(t)
 	f.press("tab", "tab")
-	f.mu.Lock()
-	f.states = nil
-	f.mu.Unlock()
+	f.resetCalls()
 	_, cmd := f.model.Update(key("r"))
 	if cmd == nil {
 		t.Fatal("r in projects pane returned no refetch command")
 	}
 	f.send(f.run(cmd)...)
-	f.mu.Lock()
-	states := strings.Join(f.states, ",")
-	f.mu.Unlock()
+	var listed []string
+	for _, c := range f.listCalls() {
+		listed = append(listed, c.state)
+	}
+	states := strings.Join(listed, ",")
 	for _, want := range []string{"backlog", "ready", "review", "approved", "blocked", "done", "failed"} {
 		if !strings.Contains(states, want) {
 			t.Errorf("refresh did not list state %q: %s", want, states)
