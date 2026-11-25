@@ -248,6 +248,9 @@ func Open(dbPath string, allowedModels []string, opts ...StoreOption) (Store, er
 		return nil, fmt.Errorf("failed to apply migrations: %w", err)
 	}
 
+	// Collect planner statistics for query optimization
+	store.analyzeDatabase(conn)
+
 	// Open a second connection for reads with SetMaxOpenConns(4)
 	readConn, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -385,6 +388,27 @@ func (s *sqliteStore) migrate(fsys fs.FS) error {
 	}
 
 	return tx.Commit()
+}
+
+// analyzeDatabase runs the SQLite ANALYZE pragma to collect planner statistics.
+// It runs with a limit to avoid delaying startup on large databases.
+// If analysis fails, the error is logged but does not stop startup.
+func (s *sqliteStore) analyzeDatabase(conn *sql.DB) {
+	start := time.Now()
+	logger := slog.Default()
+
+	if _, err := conn.Exec("PRAGMA analysis_limit = 1000"); err != nil {
+		logger.Error("failed to set analysis_limit pragma", "error", err)
+		return
+	}
+
+	if _, err := conn.Exec("ANALYZE"); err != nil {
+		logger.Error("failed to run ANALYZE", "error", err)
+		return
+	}
+
+	elapsed := time.Since(start)
+	logger.Info("database statistics analysis completed", "duration_ms", elapsed.Milliseconds())
 }
 
 type migration struct {
