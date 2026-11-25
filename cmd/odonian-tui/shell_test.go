@@ -12,7 +12,6 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
-	"github.com/charmbracelet/x/ansi"
 )
 
 type shellFixture struct {
@@ -393,7 +392,7 @@ func TestShellToggles(t *testing.T) {
 func TestShellErrorAtNarrowWidthPreservesHint(t *testing.T) {
 	f := newShellFixture(t, 60, 24)
 
-	// Deliver a failed fetch with a long error message at narrow width
+	// First test: deliver a failed fetch with a long error message at narrow width
 	longError := "This is a very long error message that would normally exceed the terminal width and needs to be truncated carefully to fit"
 	f.send(shellTasksMsg{projectID: "p1", err: fmt.Errorf("%s", longError)})
 
@@ -407,19 +406,40 @@ func TestShellErrorAtNarrowWidthPreservesHint(t *testing.T) {
 	}
 	assertWidth(t, out, 60)
 
-	// Now send another long error (simulating projectArchiveMsg or similar error path)
-	// to verify the new error is shown and the stale fetch hint is not shown
+	// Second test: short fetch error followed by long promote error (verifies guard prevents stale hint)
+	f.send(shellTasksMsg{projectID: "p1", err: fmt.Errorf("boom")})
+	out1 := f.model.View().Content
+	if !strings.Contains(out1, expectedHint) {
+		t.Errorf("retry hint missing after short fetch error: %s", out1)
+	}
+	assertWidth(t, out1, 60)
+
 	anotherLongError := "Another completely different error message that is also quite long and would overflow if measured against stale state from the first error but should be measured against itself"
 	f.send(projectArchiveMsg{err: anotherLongError})
 	out2 := f.model.View().Content
-	if ansi.StringWidth(strings.Split(out2, "\n")[len(strings.Split(out2, "\n"))-1]) > 60 {
-		lastLine := strings.Split(out2, "\n")[len(strings.Split(out2, "\n"))-1]
-		t.Errorf("error bar exceeds width after second error: %d > 60: %q", ansi.StringWidth(lastLine), lastLine)
-	}
+	assertWidth(t, out2, 60)
 	if strings.Contains(out2, expectedHint) {
 		t.Errorf("stale retry hint shown after different error: %s", out2)
 	}
 	if !strings.Contains(out2, "Another completely") {
 		t.Errorf("new error not shown: %s", out2)
+	}
+
+	// Third test: long fetch error followed by short promote error
+	f.send(shellTasksMsg{projectID: "p1", err: fmt.Errorf("%s", longError)})
+	out3 := f.model.View().Content
+	if !strings.Contains(out3, expectedHint) {
+		t.Errorf("retry hint missing after long fetch error: %s", out3)
+	}
+	assertWidth(t, out3, 60)
+
+	f.send(projectArchiveMsg{err: "promote failed"})
+	out4 := f.model.View().Content
+	assertWidth(t, out4, 60)
+	if strings.Contains(out4, expectedHint) {
+		t.Errorf("stale retry hint shown after short promote error: %s", out4)
+	}
+	if !strings.Contains(out4, "promote failed") {
+		t.Errorf("new error not shown: %s", out4)
 	}
 }

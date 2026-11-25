@@ -316,8 +316,17 @@ func (m *BoardModel) updateShell(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	model, cmd := m.updateTabs(msg)
-	switch msg.(type) {
-	case reviewActionMsg, tasksFetchedMsg:
+	switch msg := msg.(type) {
+	case tasksFetchedMsg:
+		if msg.err != nil {
+			m.shell.fetchErrorMsg = m.error
+		} else {
+			m.shell.fetchErrorMsg = ""
+		}
+		rebuild := m.rebuildShellItems()
+		m.shell.preview.SetItem(m.shell.items.SelectedItem())
+		cmd = tea.Batch(cmd, rebuild)
+	case reviewActionMsg:
 		rebuild := m.rebuildShellItems()
 		m.shell.preview.SetItem(m.shell.items.SelectedItem())
 		cmd = tea.Batch(cmd, rebuild)
@@ -453,7 +462,7 @@ func (m *BoardModel) shellHelpBar() string {
 			return m.error + separator + retryHint
 		}
 		availableForError := m.width - sepWidth - hintWidth
-		if availableForError < 0 {
+		if availableForError <= 0 {
 			// Not enough room for error + separator + hint; try just the hint
 			if hintWidth <= m.width {
 				return retryHint
@@ -465,11 +474,7 @@ func (m *BoardModel) shellHelpBar() string {
 		truncatedError := ansi.Truncate(m.error, availableForError, "…")
 		return truncatedError + separator + retryHint
 	case m.statusMessage != "":
-		text := m.statusMessage
-		if ansi.StringWidth(text) <= m.width {
-			return text
-		}
-		return ansi.Truncate(text, m.width, "…")
+		return ansi.Truncate(m.statusMessage, m.width, "…")
 	default:
 		return m.helpLine(m.keyBindings.Shell.help(m.shellKeyCtx()), m.width)
 	}

@@ -431,3 +431,57 @@ func TestShellErrorShowsRetryHint(t *testing.T) {
 		t.Errorf("error or hint still visible in view after retry:\n%s", view)
 	}
 }
+
+func TestShellRefreshKeyFailureShowsHint(t *testing.T) {
+	f := &actionFixture{}
+	tasks := []tuiclient.Task{
+		{ID: "t-ready", Title: "Ready", State: "ready", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
+	}
+	refreshFailCount := 0
+	client := &tuiclient.MockClient{
+		ListProjectsFunc: func(ctx context.Context, o ...tuiclient.ProjectListOption) ([]tuiclient.Project, error) {
+			return []tuiclient.Project{{ID: "p1", Name: "One"}}, nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, opts ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			if refreshFailCount > 0 {
+				refreshFailCount--
+				return nil, fmt.Errorf("different network error")
+			}
+			return tasks, nil
+		},
+	}
+	cfg := &tuiconfig.Config{URL: "http://test", Token: "t", Actor: "u", PollInterval: time.Hour}
+	f.model = NewShellBoardModel(client, cfg, tuiclient.Project{ID: "p1", Name: "One"})
+	f.model.shell.previewDebounce = 0
+	f.model.newTickCmd = func() tea.Cmd { return nil }
+	f.send(tea.WindowSizeMsg{Width: 140, Height: 40})
+	f.send(projectsMsg())
+	f.send(f.run(f.model.fetchShellTasks())...)
+
+	// Make refresh fail
+	refreshFailCount = 1
+	refreshBinding := f.model.keyBindings.Shell.binding(actRefresh)
+	refreshKeyStr := refreshBinding.Keys()[0]
+	f.press(refreshKeyStr)
+
+	// Verify error and hint are shown after refresh key failure
+	view := f.model.View().Content
+	refreshKey := refreshBinding.Help().Key
+	expectedHint := fmt.Sprintf("Press '%s' to retry", refreshKey)
+	if !strings.Contains(view, "Error") {
+		t.Errorf("error not shown after refresh key failure: %s", view)
+	}
+	if !strings.Contains(view, expectedHint) {
+		t.Errorf("retry hint missing after refresh key failure: want to contain %q\n%s", expectedHint, view)
+	}
+
+	// Press refresh key again successfully
+	refreshFailCount = 0
+	f.press(refreshKeyStr)
+
+	// Verify error and hint are cleared
+	view = f.model.View().Content
+	if strings.Contains(view, "Error") || strings.Contains(view, expectedHint) {
+		t.Errorf("error or hint still visible after successful refresh: %s", view)
+	}
+}
