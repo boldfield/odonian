@@ -5194,6 +5194,21 @@ func (s *sqliteStore) buildResearchSupersessionSpec(ctx context.Context, tx *sql
 	return b.String(), nil
 }
 
+// priorAttemptFeedbackPreamble is the fixed text written directly under the
+// "## Prior attempt feedback" heading of a replacement task's spec. It tells the
+// worker whose pull request the feedback names. prURL is the superseded task's live
+// pr link, or empty when it has none.
+func priorAttemptFeedbackPreamble(oldTaskID, prURL string) string {
+	closed := "That attempt's pull request was closed by the server when the task was superseded, on purpose, and its branch was deleted."
+	if prURL != "" {
+		closed = fmt.Sprintf("That attempt's pull request (%s) was closed by the server when the task was superseded, on purpose, and its branch was deleted.", prURL)
+	}
+	return fmt.Sprintf("This task replaces task %s, which was superseded. The feedback below was written about that earlier attempt. %s "+
+		"That pull request is not this task's: do not reopen it, do not rework it, and do not block because it is closed. "+
+		"This task starts from `origin/main` on its own branch and opens its own new pull request. "+
+		"The feedback is a list of what the earlier attempt got wrong, to be avoided in the new work.\n\n", oldTaskID, closed)
+}
+
 // supersedeTaskTx is the core implementation of task supersession.
 // It creates a replacement task with copied fields and dependencies,
 // re-points all dependents, and marks the old task as superseded.
@@ -5241,6 +5256,13 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 		}
 		oldTask.Spec = newSpec
 	} else {
+		var prURL string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT value FROM task_link WHERE task_id = ? AND kind = 'pr' AND tombstoned_at IS NULL ORDER BY id DESC LIMIT 1
+		`, taskID).Scan(&prURL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("failed to load superseded task pr link: %w", err)
+		}
+
 		rows, err := tx.QueryContext(ctx, `
 			SELECT actor, verdict, note FROM event
 			WHERE task_id = ? AND ((kind IN ('review', 'submit') AND verdict = 'reject') OR kind = 'checks_failed')
@@ -5263,6 +5285,7 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 
 			if !hasFeedback {
 				feedbackBlock.WriteString("## Prior attempt feedback\n\n")
+				feedbackBlock.WriteString(priorAttemptFeedbackPreamble(taskID, prURL))
 				hasFeedback = true
 			}
 
