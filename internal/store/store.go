@@ -390,6 +390,9 @@ func (s *sqliteStore) migrate(fsys fs.FS) error {
 	return tx.Commit()
 }
 
+// analyzeSQLCmd is the SQL command to run for analysis. It can be overridden in tests.
+var analyzeSQLCmd = "ANALYZE"
+
 // analyzeDatabase runs the SQLite ANALYZE pragma to collect planner statistics.
 // It runs with a limit to avoid delaying startup on large databases.
 // If analysis fails, the error is logged but does not stop startup.
@@ -402,7 +405,7 @@ func (s *sqliteStore) analyzeDatabase(conn *sql.DB) {
 		return
 	}
 
-	if _, err := conn.Exec("ANALYZE"); err != nil {
+	if _, err := conn.Exec(analyzeSQLCmd); err != nil {
 		logger.Error("failed to run ANALYZE", "error", err)
 		return
 	}

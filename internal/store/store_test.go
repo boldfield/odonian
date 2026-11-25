@@ -19839,7 +19839,8 @@ func TestSubmitReviewTaskContents(t *testing.T) {
 }
 
 // TestAnalyzeDatabaseStatistics verifies that ANALYZE is run after migrations
-// and that sqlite_stat1 contains statistics for major tables.
+// and that sqlite_stat1 contains statistics for major tables. It uses a file
+// database with a few hundred tasks and events to exercise realistic scale.
 func TestAnalyzeDatabaseStatistics(t *testing.T) {
 	// Create a temporary file database instead of in-memory
 	tmpDir := t.TempDir()
@@ -19865,12 +19866,15 @@ func TestAnalyzeDatabaseStatistics(t *testing.T) {
 		t.Fatalf("failed to create document: %v", err)
 	}
 
-	// Create tasks with events
-	for i := 0; i < 10; i++ {
+	// Create a few hundred tasks with events to generate meaningful statistics
+	const taskCount = 300
+	const eventsPerTask = 2
+
+	for i := 0; i < taskCount; i++ {
 		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
 			{
 				Title:      fmt.Sprintf("Task %d", i),
-				Spec:       "test spec",
+				Spec:       "test spec content",
 				DocumentID: doc.ID,
 			},
 		})
@@ -19878,30 +19882,35 @@ func TestAnalyzeDatabaseStatistics(t *testing.T) {
 			t.Fatalf("failed to create task: %v", err)
 		}
 
-		// Create an event for each task
+		// Create multiple events for each task
 		taskID := tasks[0].ID
-		tx, err := store.Conn().BeginTx(ctx, nil)
-		if err != nil {
-			t.Fatalf("failed to begin transaction: %v", err)
-		}
-		_, err = store.AppendEvent(ctx, tx, taskID, "test-actor", "test_event", nil, nil)
-		if err != nil {
-			tx.Rollback()
-			t.Fatalf("failed to append event: %v", err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatalf("failed to commit transaction: %v", err)
+		for j := 0; j < eventsPerTask; j++ {
+			tx, err := store.Conn().BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatalf("failed to begin transaction: %v", err)
+			}
+			_, err = store.AppendEvent(ctx, tx, taskID, "test-actor", "test_event", nil, nil)
+			if err != nil {
+				tx.Rollback()
+				t.Fatalf("failed to append event: %v", err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("failed to commit transaction: %v", err)
+			}
 		}
 	}
 
 	store.Close()
 
 	// Reopen the store to trigger ANALYZE again
+	start := time.Now()
 	store2, err := Open(dbPath, defaultTestAllowedModels())
 	if err != nil {
 		t.Fatalf("failed to reopen store: %v", err)
 	}
 	defer store2.Close()
+	elapsed := time.Since(start)
+	t.Logf("reopened store with %d tasks and %d events per task; analysis took %v", taskCount, eventsPerTask, elapsed)
 
 	// Check that sqlite_stat1 has statistics for task and event tables
 	conn := store2.Conn()
@@ -19932,94 +19941,29 @@ func TestAnalyzeDatabaseStatistics(t *testing.T) {
 }
 
 // TestOpenSucceedsWhenAnalysisFails verifies that Open succeeds even when
-// the ANALYZE step fails, by injecting a mock failure.
+// the ANALYZE step fails, by injecting invalid SQL via the analyzeSQLCmd seam.
 func TestOpenSucceedsWhenAnalysisFails(t *testing.T) {
-	// This test verifies the behavior by using a database connection where ANALYZE would fail.
-	// We can't directly inject a failure into the real ANALYZE, but we can verify the code
-	// path exists and succeeds. The actual failure handling is implicitly tested since
-	// ANALYZE failures are caught and logged (not returned as errors).
+	// Save the original SQL command and restore it after the test
+	originalCmd := analyzeSQLCmd
+	defer func() { analyzeSQLCmd = originalCmd }()
 
-	// Open a normal store to verify it works
+	// Inject an invalid SQL command to simulate an ANALYZE failure
+	analyzeSQLCmd = "INVALID SQL COMMAND XYZ"
+
+	// Open a store with the injected failure; it should still succeed
 	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
 	if err != nil {
-		t.Fatalf("failed to open store: %v", err)
+		t.Fatalf("failed to open store despite injected ANALYZE failure: %v", err)
 	}
 	defer store.Close()
 
-	// If we reach here, the store opened successfully, which means even if ANALYZE
-	// had failed (which it shouldn't on a fresh empty database), it wouldn't have
-	// prevented the store from being created.
-	//
-	// To truly test failure handling, we would need to modify the store code to
-	// allow seaming in a failing connection, but the current implementation catches
-	// and logs ANALYZE errors without returning them, so the test demonstrates
-	// that the caller path succeeds.
-}
-
-// TestAnalyzeDatabaseMeasureTime measures and logs the time taken for ANALYZE.
-// This is implicitly tested above, but we document the measurement requirement here.
-// The test opens a store and observes that the measurement is logged (by checking
-// that the store opens without error). The actual time measurement is performed
-// in analyzeDatabase and logged via slog.
-func TestAnalyzeDatabaseMeasureTime(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-
-	// First open to create schema
-	store1, err := Open(dbPath, defaultTestAllowedModels())
-	if err != nil {
-		t.Fatalf("failed to open store: %v", err)
-	}
-
+	// Verify the store is usable despite the analysis failure
 	ctx := context.Background()
-
-	// Create some data to analyze
-	proj, err := store1.CreateProject(ctx, "Project", "https://github.com/test/repo")
+	proj, err := store.CreateProject(ctx, "Test Project", "https://github.com/test/repo")
 	if err != nil {
-		t.Fatalf("failed to create project: %v", err)
+		t.Fatalf("store should be usable after ANALYZE failure: %v", err)
 	}
-
-	// Create many items to generate stats
-	doc, err := store1.CreateDocument(ctx, proj.ID, "feature_spec", "Spec", "ref", nil)
-	if err != nil {
-		t.Fatalf("failed to create document: %v", err)
+	if proj.ID == "" {
+		t.Fatal("project creation should succeed despite ANALYZE failure")
 	}
-
-	for i := 0; i < 100; i++ {
-		tasks, err := store1.CreateTasks(ctx, proj.ID, []TaskInput{
-			{Title: fmt.Sprintf("Task %d", i), Spec: "spec", DocumentID: doc.ID},
-		})
-		if err != nil {
-			t.Fatalf("failed to create task: %v", err)
-		}
-
-		// Create an event for each task
-		taskID := tasks[0].ID
-		tx, err := store1.Conn().BeginTx(ctx, nil)
-		if err != nil {
-			t.Fatalf("failed to begin transaction: %v", err)
-		}
-		_, err = store1.AppendEvent(ctx, tx, taskID, "test-actor", "test_event", nil, nil)
-		if err != nil {
-			tx.Rollback()
-			t.Fatalf("failed to append event: %v", err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatalf("failed to commit transaction: %v", err)
-		}
-	}
-
-	store1.Close()
-
-	// Reopen - this will run ANALYZE and measure the time
-	store2, err := Open(dbPath, defaultTestAllowedModels())
-	if err != nil {
-		t.Fatalf("failed to reopen store: %v", err)
-	}
-	defer store2.Close()
-
-	// If we successfully opened the store, the ANALYZE measurement was performed.
-	// The actual measurement is logged via slog; this test documents that requirement.
 }
-
-// TestAnalyzeDatabaseMeasureTime measures and logs the time taken for ANALYZE.
