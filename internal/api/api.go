@@ -676,6 +676,9 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		filter.IncludeSuperseded = true
 	}
 
+	fieldsSummary := r.URL.Query().Get("fields") == "summary"
+	filter.OmitBodies = fieldsSummary
+
 	tasks, err := s.store.ListTasks(r.Context(), projectID, filter)
 	if err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, "LIST_ERROR", "Failed to list tasks")
@@ -687,7 +690,6 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		tasks = make([]store.Task, 0)
 	}
 
-	fieldsSummary := r.URL.Query().Get("fields") == "summary"
 	if fieldsSummary {
 		summaries := make([]map[string]interface{}, len(tasks))
 		for i, task := range tasks {

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -19969,5 +19970,71 @@ func TestOpenSucceedsWhenAnalysisFails(t *testing.T) {
 	}
 	if proj.ID == "" {
 		t.Fatal("project creation should succeed despite ANALYZE failure")
+	}
+}
+
+// TestListTasksOmitBodies verifies OmitBodies returns tasks without spec/result
+// and that the query ListTasks builds never references those columns.
+func TestListTasksOmitBodies(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "omit-bodies", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Doc", "DOC.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{{Title: "T", Spec: "the spec", DocumentID: doc.ID, Model: "haiku"}})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	if _, err := store.Conn().ExecContext(ctx, "UPDATE task SET result = ? WHERE id = ?", "the result", tasks[0].ID); err != nil {
+		t.Fatalf("failed to set result: %v", err)
+	}
+
+	full, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("ListTasks failed: %v", err)
+	}
+	if len(full) != 1 || full[0].Spec != "the spec" || full[0].Result == nil || *full[0].Result != "the result" {
+		t.Errorf("full list should return spec and result, got %+v", full)
+	}
+
+	slim, err := store.ListTasks(ctx, proj.ID, TaskListFilter{OmitBodies: true})
+	if err != nil {
+		t.Fatalf("ListTasks with OmitBodies failed: %v", err)
+	}
+	if len(slim) != 1 || slim[0].ID != tasks[0].ID || slim[0].Title != "T" {
+		t.Fatalf("unexpected slim list: %+v", slim)
+	}
+	if slim[0].Spec != "" || slim[0].Result != nil {
+		t.Errorf("OmitBodies should give empty spec and nil result, got %q / %v", slim[0].Spec, slim[0].Result)
+	}
+
+	// The built SQL must not read the spec or result columns, bare or qualified.
+	// The constant aliases are the only permitted mentions.
+	bodyRef := regexp.MustCompile("(?i)\\b(spec|result)\\b")
+	selectList := func(q string) string {
+		i := strings.Index(q, "FROM task")
+		if i < 0 {
+			t.Fatalf("no FROM task in query: %s", q)
+		}
+		return q[:i]
+	}
+	omitSQL, _ := buildListTasksQuery(proj.ID, TaskListFilter{OmitBodies: true})
+	stripped := strings.NewReplacer("'' AS spec", "", "NULL AS result", "").Replace(selectList(omitSQL))
+	if m := bodyRef.FindString(stripped); m != "" {
+		t.Errorf("OmitBodies query references %q column: %s", m, omitSQL)
+	}
+	// Sanity: the same check catches the full query, and the filter tails never mention the columns.
+	fullSQL, _ := buildListTasksQuery(proj.ID, TaskListFilter{})
+	if !bodyRef.MatchString(selectList(fullSQL)) {
+		t.Errorf("check is vacuous: full query should reference spec/result: %s", fullSQL)
+	}
+	if bodyRef.MatchString(omitSQL[strings.Index(omitSQL, "FROM task"):]) {
+		t.Errorf("OmitBodies query references spec/result outside the select list: %s", omitSQL)
 	}
 }
