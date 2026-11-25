@@ -19870,34 +19870,38 @@ func TestAnalyzeDatabaseStatistics(t *testing.T) {
 	const taskCount = 300
 	const eventsPerTask = 2
 
+	// Batch create all tasks in one call
+	taskInputs := make([]TaskInput, taskCount)
 	for i := 0; i < taskCount; i++ {
-		tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{
-			{
-				Title:      fmt.Sprintf("Task %d", i),
-				Spec:       "test spec content",
-				DocumentID: doc.ID,
-			},
-		})
-		if err != nil {
-			t.Fatalf("failed to create task: %v", err)
+		taskInputs[i] = TaskInput{
+			Title:      fmt.Sprintf("Task %d", i),
+			Spec:       "test spec content",
+			DocumentID: doc.ID,
 		}
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, taskInputs)
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
 
-		// Create multiple events for each task
-		taskID := tasks[0].ID
+	// Create all events in a single transaction
+	tx, err := store.Conn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	for _, task := range tasks {
 		for j := 0; j < eventsPerTask; j++ {
-			tx, err := store.Conn().BeginTx(ctx, nil)
+			_, err = store.AppendEvent(ctx, tx, task.ID, "test-actor", "test_event", nil, nil)
 			if err != nil {
-				t.Fatalf("failed to begin transaction: %v", err)
-			}
-			_, err = store.AppendEvent(ctx, tx, taskID, "test-actor", "test_event", nil, nil)
-			if err != nil {
-				tx.Rollback()
 				t.Fatalf("failed to append event: %v", err)
 			}
-			if err := tx.Commit(); err != nil {
-				t.Fatalf("failed to commit transaction: %v", err)
-			}
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit events transaction: %v", err)
 	}
 
 	store.Close()
@@ -19910,7 +19914,7 @@ func TestAnalyzeDatabaseStatistics(t *testing.T) {
 	}
 	defer store2.Close()
 	elapsed := time.Since(start)
-	t.Logf("reopened store with %d tasks and %d events per task; analysis took %v", taskCount, eventsPerTask, elapsed)
+	t.Logf("reopened store with %d tasks and %d events per task; reopen took %v", taskCount, eventsPerTask, elapsed)
 
 	// Check that sqlite_stat1 has statistics for task and event tables
 	conn := store2.Conn()
