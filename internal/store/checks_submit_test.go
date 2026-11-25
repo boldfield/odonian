@@ -606,6 +606,10 @@ func TestFailChecksPastThresholdEscalates(t *testing.T) {
 	if !strings.Contains(feedbackBlock, "checks failed") {
 		t.Errorf("feedback block lacks 'checks failed' marker")
 	}
+	wantPreamble := "## Prior attempt feedback\n\n" + priorAttemptFeedbackPreamble(h.taskID, "https://github.com/o/r/pull/1")
+	if !strings.HasPrefix(feedbackBlock, wantPreamble) {
+		t.Errorf("feedback block does not begin with preamble: %q", feedbackBlock)
+	}
 }
 
 func TestFailChecksOutsideChecksConflicts(t *testing.T) {
