@@ -10,29 +10,29 @@ The TUI shows three panes: **projects**, **work items**, and **preview**. The la
 ```
  PROJECTS        │ syndic · 59 open                          │ D-31 Repair loop
 ─────────────────┼───────────────────────────────────────────┼──────────────────────────────
- ▸ syndic   ●3   │ ◷ D-31 Repair loop            checks  18m │ checks · round 1 · sonnet
-   ohand    ⚠1   │ ● D-35 Replace prompts   sonnet @2bllr 12m│ PR #212 · in checks 18m
-   llm-gw   ●2   │ ● D-34 Repair fixture    haiku  @s9jtd  4m│
-   reala    ⚠1   │ ◆ D-30 Rubric loader          review r2   │ Reviews (round 1)
-   dumpdem  ✔1   │     opus ✔ approve · gpt-5.6-sol … 6m     │   none yet: waiting for CI
-   foia     ✔1   │ ○ D-36 Author prompt          ready       │
-   notblue  ●1   │ ⛓ D-37 Rubric export          waits D-35  │ History
-   manifests !1  │ ⛓ D-39 Index page             waits D-36  │   12:41 submitted, PR opened
-   +19 quiet     │ ○ D-38 Export                 ready       │   12:41 entered checks
+ ▸ syndic        │ ◷ D-31 Repair loop            checks  18m │ checks · round 1 · sonnet
+   ohand         │ ● D-35 Replace prompts   sonnet @2bllr 12m│ PR #212 · in checks 18m
+   llm-gw        │ ● D-34 Repair fixture    haiku  @s9jtd  4m│
+   reala         │ ◆ D-30 Rubric loader          review r2   │ Reviews (round 1)
+   dumpdem       │     opus ✔ approve · gpt-5.6-sol … 6m     │   none yet: waiting for CI
+   foia          │ ○ D-36 Author prompt          ready       │
+   notblue       │ ⛓ D-37 Rubric export          waits D-35  │ History
+   manifests     │ ⛓ D-39 Index page             waits D-36  │   12:41 submitted, PR opened
+                 │ ○ D-38 Export                 ready       │   12:41 entered checks
                  │ ↓ 50 more                                 │   12:12 claimed by @c4wqd
 ─────────────────┴───────────────────────────────────────────┴──────────────────────────────
- tab pane · ↑↓ move · enter detail · a approve · u unblock · t hold · v preview · ? help
+ p promote · tab pane · ↑↓ move · enter detail · t hold/release · i priority · v preview · ? help
 ```
 
-- **Projects pane** (left): projects in the board with badges showing the highest-priority status (⚠ needs you, ! failed, ✔ awaiting merge, ● in flight). One project is selected; focus shifts to the projects pane when needed.
-- **Work items pane** (center): one implement task per row; review and merge tasks nest as indented lines under their target. Focus here with `tab`/`shift+tab`.
+- **Projects pane** (left): projects in the board, one per row. One project is selected; focus shifts to the projects pane with `tab`. Selecting a project loads its tasks in the work items pane.
+- **Work items pane** (center): one implement task per row; review and merge tasks nest as indented lines under their target. The selected item's state determines which actions are available (see Actions below).
 - **Preview pane** (right): events and details for the selected item. Only shown when an item is selected; `v` toggles it.
 
 ### Medium (80–119 columns): project rail + items
 The project pane collapses to a 10-column rail on the left; detail opens full-screen over the items on `enter`.
 
 ### Narrow (under 80 columns): items only
-Only the work items pane is shown; projects and detail open full-screen.
+Only the work items pane is shown. Projects and detail open full-screen on `enter` when the projects or detail panes are focused.
 
 ## Work items
 
@@ -49,21 +49,21 @@ Each row is one implement task. Status is shown with a glyph (◷ in checks, ●
 
 ## Actions on work items
 
-| State | Key | Action |
-|---|---|---|
-| backlog | `p` | promote → ready |
-| ready, in progress, review, approved, blocked | `t` | hold/release (prefix on status) |
-| any item | `i` | set priority |
-| any item | `w` | move to front (highest priority) |
-| any item | `e` | reset priority |
-| any item | `z` | archive |
-| review | `a` | approve (with optional note; confirm required) |
-| review | `x` | reject (reason required) |
-| approved | `m` | merge & complete |
-| approved | `b` | bounce (back to ready) |
-| blocked | `u` | unblock |
-| blocked | `f` | fail |
-| any item | `c` | open research scorecards |
+| Key | Action |
+|---|---|
+| `p` | promote (backlog → ready) |
+| `a` | approve (review state only) |
+| `x` | reject (review state only) |
+| `m` | merge & complete (approved state only) |
+| `b` | bounce (approved state only) |
+| `u` | unblock (blocked state only) |
+| `f` | fail (blocked state only) |
+| `t` | hold/release (any item) |
+| `i` | set priority (any item) |
+| `w` | move to front (any item) |
+| `e` | reset priority (any item) |
+| `z` | archive (any item) |
+| `c` | open research scorecards (any item) |
 
 **On projects:** `z` to archive a project.
 
@@ -108,5 +108,7 @@ All actions go through the API; the board may be stale. Every action handles a 4
 ## Terminal size requirements
 
 - **Minimum 40 columns** to render anything usable
-- Below 80 columns the layout degrades to items-only (projects and detail open full-screen)
+- **80–119 columns**: project rail (10 columns) + items pane; detail opens full-screen over the items
+- **Below 80 columns**: items pane only; use `enter` on a project (after `tab` to focus projects) to view it full-screen
+- **120 columns and up**: full three-pane layout
 - Resizes are live; panes adapt to new width on the fly
