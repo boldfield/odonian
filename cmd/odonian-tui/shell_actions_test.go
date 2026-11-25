@@ -397,7 +397,7 @@ func TestShellErrorShowsRetryHint(t *testing.T) {
 	failCount = 1
 	f.send(f.run(f.model.fetchShellTasks())...)
 
-	// Verify error contains the retry hint with the actual refresh key from bindings
+	// Verify error and hint are in both bar and full view
 	bar := f.model.shellHelpBar()
 	if !strings.Contains(bar, "Error") {
 		t.Errorf("error bar missing error text: %q", bar)
@@ -408,18 +408,26 @@ func TestShellErrorShowsRetryHint(t *testing.T) {
 	if !strings.Contains(bar, expectedHint) {
 		t.Errorf("error bar missing retry hint: got %q, want to contain %q", bar, expectedHint)
 	}
+	view := f.model.View().Content
+	if !strings.Contains(view, expectedHint) {
+		t.Errorf("view missing retry hint: %s", view)
+	}
 
 	// Press the refresh key to retry with successful fetch
 	failCount = 0
 	refreshKeyStr := refreshBinding.Keys()[0]
 	f.press(refreshKeyStr)
 
-	// Verify error is cleared and normal help bar is back
+	// Verify error is cleared in both bar and full view, and normal help is back
 	bar = f.model.shellHelpBar()
 	if strings.Contains(bar, "Error") {
 		t.Errorf("error not cleared after retry: %q", bar)
 	}
 	if !strings.Contains(bar, "enter") || !strings.Contains(bar, "tab") {
 		t.Errorf("normal help bar not restored: %q", bar)
+	}
+	view = f.model.View().Content
+	if strings.Contains(view, "Error") || strings.Contains(view, expectedHint) {
+		t.Errorf("error or hint still visible in view after retry:\n%s", view)
 	}
 }

@@ -42,8 +42,7 @@ type shellState struct {
 	// selection has since left is dropped.
 	previewSeq      int
 	previewDebounce time.Duration
-	errorBase       string
-	retryHint       string
+	fetchErrorMsg   string
 }
 
 // shellTasksMsg carries one project's work for the shell: the tasks and the ids of the
@@ -338,17 +337,13 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 			return nil, true // a response for a project the user has since left
 		}
 		if msg.err != nil {
-			refreshBinding := m.keyBindings.Shell.binding(actRefresh)
-			refreshKey := refreshBinding.Help().Key
-			s.errorBase = fmt.Sprintf("Error: %v", msg.err)
-			s.retryHint = fmt.Sprintf("Press '%s' to retry", refreshKey)
-			m.error = s.errorBase + ". " + s.retryHint
+			s.fetchErrorMsg = fmt.Sprintf("Error: %v", msg.err)
+			m.error = s.fetchErrorMsg
 			return nil, true
 		}
 		m.loading = false
 		m.error = ""
-		s.errorBase = ""
-		s.retryHint = ""
+		s.fetchErrorMsg = ""
 		m.tasks = bucketTasksByState(msg.tasks)
 		m.lastRefresh = time.Now()
 		cmd = m.setShellItems(msg.tasks, msg.claimable)
@@ -358,14 +353,12 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 	case projectArchiveMsg:
 		if msg.err != "" {
 			m.error = msg.err
-			s.errorBase = ""
-			s.retryHint = ""
+			s.fetchErrorMsg = ""
 			m.mode = modeNormal
 			return nil, true
 		}
 		m.error = ""
-		s.errorBase = ""
-		s.retryHint = ""
+		s.fetchErrorMsg = ""
 		m.mode = modeNormal
 		m.projects = msg.projects
 		s.projects.SetProjects(m.projects)
@@ -409,8 +402,7 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 		m.tasks = make(map[string][]tuiclient.Task)
 		m.loading = true
 		m.error = ""
-		s.errorBase = ""
-		s.retryHint = ""
+		s.fetchErrorMsg = ""
 		s.items.SetProjectName(m.project.Name)
 		s.items.SetItems(nil, nil)
 		m.syncShellSelection()
@@ -445,29 +437,33 @@ func (m *BoardModel) shellHelpBar() string {
 	switch {
 	case m.error != "":
 		s := m.shell
-		if s.retryHint == "" {
+		// Only show the retry hint if the current error is still the fetch error
+		if s.fetchErrorMsg == "" || m.error != s.fetchErrorMsg {
 			return ansi.Truncate(m.error, m.width, "…")
 		}
+		refreshBinding := m.keyBindings.Shell.binding(actRefresh)
+		refreshKey := refreshBinding.Help().Key
+		retryHint := fmt.Sprintf("Press '%s' to retry", refreshKey)
 		separator := ". "
-		errorWidth := ansi.StringWidth(s.errorBase)
-		hintWidth := ansi.StringWidth(s.retryHint)
+		errorWidth := ansi.StringWidth(m.error)
+		hintWidth := ansi.StringWidth(retryHint)
 		sepWidth := ansi.StringWidth(separator)
 		totalWidth := errorWidth + sepWidth + hintWidth
 		if totalWidth <= m.width {
-			return m.error
+			return m.error + separator + retryHint
 		}
 		availableForError := m.width - sepWidth - hintWidth
 		if availableForError < 0 {
 			// Not enough room for error + separator + hint; try just the hint
 			if hintWidth <= m.width {
-				return s.retryHint
+				return retryHint
 			}
 			// Hint doesn't fit either; truncate the hint
-			return ansi.Truncate(s.retryHint, m.width, "…")
+			return ansi.Truncate(retryHint, m.width, "…")
 		}
 		// Truncate error and keep hint
-		truncatedError := ansi.Truncate(s.errorBase, availableForError, "…")
-		return truncatedError + separator + s.retryHint
+		truncatedError := ansi.Truncate(m.error, availableForError, "…")
+		return truncatedError + separator + retryHint
 	case m.statusMessage != "":
 		text := m.statusMessage
 		if ansi.StringWidth(text) <= m.width {
