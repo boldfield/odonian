@@ -19837,3 +19837,138 @@ func TestSubmitReviewTaskContents(t *testing.T) {
 		t.Error("spawn_review event not found")
 	}
 }
+
+func TestListTasksOmitBodies(t *testing.T) {
+	store := newTestStore(t)
+	defer store.Close()
+
+	ctx := context.Background()
+
+	// Create a project
+	proj, err := store.CreateProject(ctx, "test-project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Create a document first
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Test Design", "test-ref", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create tasks with non-empty spec and result
+	spec := `{"key": "value", "data": "this is a long spec that takes up space"}`
+	result := `{"status": "completed", "output": "this is a detailed result with lots of information"}`
+
+	tasks := []TaskInput{
+		{
+			Title:      "Task 1",
+			Spec:       spec,
+			DocumentID: doc.ID,
+			Model:      "haiku",
+		},
+		{
+			Title:      "Task 2",
+			Spec:       spec,
+			DocumentID: doc.ID,
+			Model:      "sonnet",
+		},
+	}
+
+	created, err := store.CreateTasks(ctx, proj.ID, tasks)
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	if len(created) != 2 {
+		t.Fatalf("expected 2 tasks to be created, got %d", len(created))
+	}
+
+	taskID1 := created[0].ID
+
+	// Promote task 1 to ready so we can claim it
+	_, err = store.Conn().ExecContext(ctx, "UPDATE task SET state = ? WHERE id = ?", "ready", taskID1)
+	if err != nil {
+		t.Fatalf("failed to set task to ready: %v", err)
+	}
+
+	// Claim task 1 so we can submit it
+	_, err = store.ClaimTask(ctx, taskID1, "worker-1", "haiku", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to claim task: %v", err)
+	}
+
+	// Add a result to task 1
+	_, err = store.SubmitTask(ctx, taskID1, "worker-1", result, nil, nil, 1, map[string]int{}, map[string]int{}, 999999)
+	if err != nil {
+		t.Fatalf("failed to submit task: %v", err)
+	}
+
+	// Test 1: ListTasks without OmitBodies should return spec and result
+	// Filter by kind=implement to get only the original tasks (review tasks are created after submit)
+	tasksWithBodies, err := store.ListTasks(ctx, proj.ID, TaskListFilter{OmitBodies: false, Kind: &[]string{"implement"}[0]})
+	if err != nil {
+		t.Fatalf("failed to list tasks without OmitBodies: %v", err)
+	}
+
+	if len(tasksWithBodies) != 2 {
+		t.Fatalf("expected 2 implement tasks, got %d", len(tasksWithBodies))
+	}
+
+	// Find the task with result
+	var taskWithResult Task
+	for _, t := range tasksWithBodies {
+		if t.ID == taskID1 {
+			taskWithResult = t
+			break
+		}
+	}
+
+	if taskWithResult.Spec != spec {
+		t.Errorf("expected spec to be preserved, got %q", taskWithResult.Spec)
+	}
+
+	if taskWithResult.Result == nil {
+		t.Error("expected result to not be nil, but it was")
+	}
+
+	// Test 2: ListTasks with OmitBodies should return empty spec and nil result
+	tasksWithoutBodies, err := store.ListTasks(ctx, proj.ID, TaskListFilter{OmitBodies: true, Kind: &[]string{"implement"}[0]})
+	if err != nil {
+		t.Fatalf("failed to list tasks with OmitBodies: %v", err)
+	}
+
+	if len(tasksWithoutBodies) != 2 {
+		t.Fatalf("expected 2 implement tasks, got %d", len(tasksWithoutBodies))
+	}
+
+	// All tasks should have empty spec and nil result
+	for _, task := range tasksWithoutBodies {
+		if task.Spec != "" {
+			t.Errorf("expected empty spec when OmitBodies=true, got %q", task.Spec)
+		}
+		if task.Result != nil {
+			t.Errorf("expected nil result when OmitBodies=true, got %v", task.Result)
+		}
+	}
+
+	// Test 3: Verify that full list (without OmitBodies) includes spec and result
+	// while summary list (with OmitBodies) doesn't include them (they're empty/nil)
+	fullListWithoutOmit, err := store.ListTasks(ctx, proj.ID, TaskListFilter{Kind: &[]string{"implement"}[0]})
+	if err != nil {
+		t.Fatalf("failed to list tasks: %v", err)
+	}
+
+	for _, task := range fullListWithoutOmit {
+		if task.Spec == "" {
+			t.Errorf("expected spec to be non-empty in full list, got empty string")
+		}
+	}
+
+	// Summary list should have empty specs
+	for _, task := range tasksWithoutBodies {
+		if task.Spec != "" {
+			t.Errorf("expected empty spec in summary list, got %q", task.Spec)
+		}
+	}
+}

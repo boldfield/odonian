@@ -11744,3 +11744,91 @@ func mustListTasks(t *testing.T, server *Server, authHeader, taskID string) []st
 	json.NewDecoder(w.Body).Decode(&tasks)
 	return tasks
 }
+
+// TestListTasksSummaryFieldsOmitBodies verifies that fields=summary response is identical
+// and that the full list still includes spec and result.
+func TestListTasksSummaryFieldsOmitBodies(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	// Create a task with spec and result
+	spec := `{"key": "value", "data": "this is test spec"}`
+	taskPayload := []store.TaskInput{
+		{
+			Key:        "test-task",
+			Title:      "Test Task",
+			Spec:       spec,
+			DocumentID: docID,
+			Model:      "haiku",
+		},
+	}
+	taskBody, _ := json.Marshal(taskPayload)
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+
+	// Get full list (without fields=summary)
+	fullListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	fullListReq.Header.Set("Authorization", authHeader)
+	fullListW := httptest.NewRecorder()
+	server.mux.ServeHTTP(fullListW, fullListReq)
+
+	if fullListW.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for full list, got %d", fullListW.Code)
+	}
+
+	var fullTasks []store.Task
+	if err := json.NewDecoder(fullListW.Body).Decode(&fullTasks); err != nil {
+		t.Fatalf("failed to decode full list tasks: %v", err)
+	}
+
+	if len(fullTasks) != 1 {
+		t.Fatalf("expected 1 task in full list, got %d", len(fullTasks))
+	}
+
+	// Verify full list includes spec
+	if fullTasks[0].Spec != spec {
+		t.Errorf("expected full list to include spec, got %q", fullTasks[0].Spec)
+	}
+
+	// Get summary list (with fields=summary)
+	summaryListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary", nil)
+	summaryListReq.Header.Set("Authorization", authHeader)
+	summaryListW := httptest.NewRecorder()
+	server.mux.ServeHTTP(summaryListW, summaryListReq)
+
+	if summaryListW.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for summary list, got %d", summaryListW.Code)
+	}
+
+	var summaryTasks []map[string]interface{}
+	if err := json.NewDecoder(summaryListW.Body).Decode(&summaryTasks); err != nil {
+		t.Fatalf("failed to decode summary list tasks: %v", err)
+	}
+
+	if len(summaryTasks) != 1 {
+		t.Fatalf("expected 1 task in summary list, got %d", len(summaryTasks))
+	}
+
+	// Verify summary response matches what taskToSummary produces
+	fullSummary := taskToSummary(fullTasks[0])
+
+	// Marshal both to JSON and compare - this is what the API returns
+	fullSummaryJSON, err := json.Marshal(fullSummary)
+	if err != nil {
+		t.Fatalf("failed to marshal fullSummary: %v", err)
+	}
+
+	summaryResponseJSON, err := json.Marshal(summaryTasks[0])
+	if err != nil {
+		t.Fatalf("failed to marshal summaryTasks[0]: %v", err)
+	}
+
+	if string(fullSummaryJSON) != string(summaryResponseJSON) {
+		t.Errorf("summary response does not match fullSummary\nExpected: %s\nGot: %s", string(fullSummaryJSON), string(summaryResponseJSON))
+	}
+}
