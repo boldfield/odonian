@@ -194,7 +194,7 @@ func TestShellKeepsVimAliases(t *testing.T) {
 	}
 }
 
-func detailFixture(t *testing.T, id string) *actionFixture {
+func detailFixture(t *testing.T, id string) *boardFixture {
 	f := newActionFixture(t)
 	f.selectItem(t, id)
 	f.press("enter")

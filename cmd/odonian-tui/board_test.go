@@ -129,101 +129,75 @@ func TestBoardModel_Navigation(t *testing.T) {
 
 // TestBoardModel_SelectionStability tests that selection is preserved across refreshes.
 func TestBoardModel_SelectionStability(t *testing.T) {
-	mockClient := &tuiclient.MockClient{}
-
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test"}
-
-	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
-
-	// Simulate first fetch
-	bucketed1 := make(map[string][]tuiclient.Task)
-	bucketed1["backlog"] = []tuiclient.Task{}
-	bucketed1["ready"] = []tuiclient.Task{}
-	bucketed1["in_progress"] = []tuiclient.Task{
-		{ID: "task-1", Title: "Task 1", State: "in_progress"},
-		{ID: "task-2", Title: "Task 2", State: "in_progress"},
-	}
-	bucketed1["review"] = []tuiclient.Task{}
-	bucketed1["done"] = []tuiclient.Task{}
-
-	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed1})
-	model = m.(*BoardModel)
+	f := newBoardFixture(t, 80, 24,
+		tuiclient.Task{ID: "task-1", Title: "Task 1", State: "in_progress", Kind: "implement"},
+		tuiclient.Task{ID: "task-2", Title: "Task 2", State: "in_progress", Kind: "implement"},
+	)
 
 	// Verify task-1 is selected
-	if model.selectedTaskID != "task-1" {
-		t.Errorf("Expected initial selection to be task-1, got %s", model.selectedTaskID)
+	if f.model.selectedTaskID != "task-1" {
+		t.Errorf("Expected initial selection to be task-1, got %s", f.model.selectedTaskID)
 	}
 
 	// Move down to select task-2
-	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
-	model = m.(*BoardModel)
-	if model.selectedTaskID != "task-2" {
-		t.Errorf("Expected selection to be task-2 after down, got %s", model.selectedTaskID)
+	f.press("down")
+	if f.model.selectedTaskID != "task-2" {
+		t.Errorf("Expected selection to be task-2 after down, got %s", f.model.selectedTaskID)
 	}
 
-	// Simulate a refresh with reordered tasks
-	bucketed2 := make(map[string][]tuiclient.Task)
-	bucketed2["backlog"] = []tuiclient.Task{}
-	bucketed2["ready"] = []tuiclient.Task{}
-	bucketed2["in_progress"] = []tuiclient.Task{
-		{ID: "task-2", Title: "Task 2", State: "in_progress"},
-		{ID: "task-1", Title: "Task 1", State: "in_progress"},
+	// Simulate a refresh with reordered tasks: task-2 now outranks task-1.
+	f.setTasks(
+		tuiclient.Task{ID: "task-2", Title: "Task 2", State: "in_progress", Kind: "implement", Priority: intPtr(900)},
+		tuiclient.Task{ID: "task-1", Title: "Task 1", State: "in_progress", Kind: "implement"},
+	)
+	f.send(tickMsg{})
+	view := f.model.viewContent()
+	if i2, i1 := strings.Index(view, "Task 2"), strings.Index(view, "Task 1"); i2 < 0 || i1 < 0 || i2 > i1 {
+		t.Fatalf("refresh did not reorder the items:\n%s", view)
 	}
-	bucketed2["review"] = []tuiclient.Task{}
-	bucketed2["done"] = []tuiclient.Task{}
-
-	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed2})
-	model = m.(*BoardModel)
 
 	// Verify task-2 is still selected
-	if model.selectedTaskID != "task-2" {
-		t.Errorf("Selection not preserved: was task-2, became %s", model.selectedTaskID)
+	if f.model.selectedTaskID != "task-2" {
+		t.Errorf("Selection not preserved: was task-2, became %s", f.model.selectedTaskID)
+	}
+	if got := f.model.shell.items.SelectedTaskID(); got != "task-2" {
+		t.Errorf("Items pane selection not preserved: was task-2, became %s", got)
 	}
 }
 
 // TestBoardModel_ErrorState tests that errors are rendered correctly.
 func TestBoardModel_ErrorState(t *testing.T) {
-	mockClient := &tuiclient.MockClient{}
-
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test"}
-
-	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
-
 	// First set a successful state
-	bucketed := make(map[string][]tuiclient.Task)
-	for _, state := range []string{"backlog", "ready", "in_progress", "review", "done"} {
-		bucketed[state] = []tuiclient.Task{}
-	}
-	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed})
-	model = m.(*BoardModel)
+	f := newBoardFixture(t, 80, 24,
+		tuiclient.Task{ID: "task-1", Title: "Task 1", State: "in_progress", Kind: "implement"},
+	)
 
-	// Now simulate an error
-	m, _ = model.Update(tasksFetchedMsg{err: errors.New("test error message")})
-	model = m.(*BoardModel)
+	// Now simulate an error on the next poll
+	f.mu.Lock()
+	f.listErr = errors.New("test error message")
+	f.mu.Unlock()
+	f.send(tickMsg{})
 
-	output := model.View().Content
+	output := f.model.viewContent()
 	if !strings.Contains(output, "Error:") || !strings.Contains(output, "test error message") {
 		t.Errorf("Expected error message in output, got:\n%s", output)
 	}
+	if !strings.Contains(output, "Press 'r' to retry.") {
+		t.Errorf("Expected retry prompt in output, got:\n%s", output)
+	}
 
-	if !strings.Contains(output, "Press 'r' to retry") {
-		t.Errorf("Expected retry hint in output, got:\n%s", output)
+	// 'r' retries: once the server answers again the error is gone.
+	f.mu.Lock()
+	f.listErr = nil
+	f.mu.Unlock()
+	f.resetCalls()
+	f.press("r")
+	if len(f.listCalls()) == 0 {
+		t.Errorf("Expected 'r' to refetch the tasks, got no ListTasks call")
+	}
+	output = f.model.viewContent()
+	if strings.Contains(output, "test error message") || strings.Contains(output, "to retry.") || f.model.error != "" {
+		t.Errorf("Expected the error cleared after retry, got %q:\n%s", f.model.error, output)
 	}
 }
 
@@ -445,79 +419,34 @@ func TestBoardModel_NoAssigneeShown(t *testing.T) {
 // TestBoardModel_DisappearedTaskSelection tests that when the selected task disappears,
 // the cursor lands on the positionally-nearest remaining task, not the first.
 func TestBoardModel_DisappearedTaskSelection(t *testing.T) {
-	mockClient := &tuiclient.MockClient{}
-
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test"}
-
-	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
-
-	// Simulate first fetch with three tasks
-	bucketed1 := make(map[string][]tuiclient.Task)
-	bucketed1["backlog"] = []tuiclient.Task{}
-	bucketed1["ready"] = []tuiclient.Task{}
-	bucketed1["in_progress"] = []tuiclient.Task{
-		{ID: "task-1", Title: "Task 1", State: "in_progress"},
-		{ID: "task-2", Title: "Task 2", State: "in_progress"},
-		{ID: "task-3", Title: "Task 3", State: "in_progress"},
-	}
-	bucketed1["review"] = []tuiclient.Task{}
-	bucketed1["done"] = []tuiclient.Task{}
-
-	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed1})
-	model = m.(*BoardModel)
+	// First fetch with three tasks
+	f := newBoardFixture(t, 80, 24,
+		tuiclient.Task{ID: "task-1", Title: "Task 1", State: "in_progress", Kind: "implement"},
+		tuiclient.Task{ID: "task-2", Title: "Task 2", State: "in_progress", Kind: "implement"},
+		tuiclient.Task{ID: "task-3", Title: "Task 3", State: "in_progress", Kind: "implement"},
+	)
 
 	// Select task-2 (index 1)
-	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
-	model = m.(*BoardModel)
-	if model.selectedTaskID != "task-2" {
-		t.Errorf("Expected selection to be task-2, got %s", model.selectedTaskID)
+	f.press("down")
+	if f.model.selectedTaskID != "task-2" {
+		t.Errorf("Expected selection to be task-2, got %s", f.model.selectedTaskID)
 	}
 
 	// Simulate refresh where task-2 is REMOVED (only task-1 and task-3 remain)
-	bucketed2 := make(map[string][]tuiclient.Task)
-	bucketed2["backlog"] = []tuiclient.Task{}
-	bucketed2["ready"] = []tuiclient.Task{}
-	bucketed2["in_progress"] = []tuiclient.Task{
-		{ID: "task-1", Title: "Task 1", State: "in_progress"},
-		{ID: "task-3", Title: "Task 3", State: "in_progress"},
-	}
-	bucketed2["review"] = []tuiclient.Task{}
-	bucketed2["done"] = []tuiclient.Task{}
-
-	m, _ = model.Update(tasksFetchedMsg{tasks: bucketed2})
-	model = m.(*BoardModel)
+	f.setTasks(
+		tuiclient.Task{ID: "task-1", Title: "Task 1", State: "in_progress", Kind: "implement"},
+		tuiclient.Task{ID: "task-3", Title: "Task 3", State: "in_progress", Kind: "implement"},
+	)
+	f.send(tickMsg{})
 
 	// Should have selected task-3 (at clamped index 1, which is now the second task)
 	// not task-1 (the first task).
-	if model.selectedTaskID != "task-3" {
-		t.Errorf("Expected selection to move to task-3 (nearest), got %s", model.selectedTaskID)
+	if f.model.selectedTaskID != "task-3" {
+		t.Errorf("Expected selection to move to task-3 (nearest), got %s", f.model.selectedTaskID)
 	}
-	if model.selectedIndex != 1 {
-		t.Errorf("Expected selectedIndex to be 1, got %d", model.selectedIndex)
+	if got := f.model.shell.items.indexOf(f.model.shell.items.SelectedTaskID()); got != 1 {
+		t.Errorf("Expected selected index to be 1, got %d", got)
 	}
-}
-
-// tickSentinel is returned by the test tick command to identify that a tick was armed.
-type tickSentinel struct{}
-
-// countTickCmds installs a counting tick function on the model and returns a pointer to the counter.
-// Each time the model arms a new tick (via newTickCmd), the counter increments by 1
-// and returns a tea.Cmd that immediately sends tickSentinel{} when executed.
-func countTickCmds(model *BoardModel) *int {
-	count := 0
-	model.newTickCmd = func() tea.Cmd {
-		count++
-		return func() tea.Msg { return tickSentinel{} }
-	}
-	return &count
 }
 
 // runCmd executes a tea.Cmd synchronously and collects all leaf messages it produces.
@@ -866,130 +795,96 @@ func TestBoardModel_PromoteOnNonBacklogIsNoOp(t *testing.T) {
 //   - Init arms exactly ONE tick.
 //   - A tickMsg arms exactly ONE tick (the re-arm) and issues a fetch.
 //   - 'r' (manual refresh) arms ZERO ticks (issues a fetch only).
-//   - tasksFetchedMsg arms ZERO ticks.
+//   - A fetch result, successful or failed, arms ZERO ticks.
 //
-// The test uses an injectable newTickCmd that counts arming calls instead of using real timers.
-// This test WILL FAIL if a tick is re-armed from the 'r' handler or from tasksFetchedMsg.
+// The fixture's newTickCmd counts arming calls instead of using real timers.
+// This test WILL FAIL if a tick is re-armed from the 'r' handler or from a fetch result.
 func TestBoardModel_TickGeneration(t *testing.T) {
-	mockClient := &tuiclient.MockClient{}
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test"}
+	f := newBoardFixture(t, 80, 24)
 
 	// --- Init arms exactly one tick ---
-	model := NewBoardModel(mockClient, config, project)
-	tickCount := countTickCmds(model)
-
-	_ = model.Init()
-	if *tickCount != 1 {
-		t.Errorf("Init: expected exactly 1 tick armed, got %d", *tickCount)
+	f.resetCalls()
+	initMsgs := f.run(f.model.Init())
+	if f.ticks != 1 {
+		t.Errorf("Init: expected exactly 1 tick armed, got %d", f.ticks)
 	}
 
-	// --- tasksFetchedMsg arms ZERO ticks ---
-	*tickCount = 0
-	bucketed := make(map[string][]tuiclient.Task)
-	for _, state := range []string{"backlog", "ready", "in_progress", "review", "done"} {
-		bucketed[state] = []tuiclient.Task{}
-	}
-	m, fetchedCmd := model.Update(tasksFetchedMsg{tasks: bucketed})
-	model = m.(*BoardModel)
-
-	if *tickCount != 0 {
-		t.Errorf("tasksFetchedMsg: expected 0 ticks armed, got %d (tick fork regression)", *tickCount)
-	}
-
-	// fetchedCmd should be nil (tasksFetchedMsg returns no command)
-	if fetchedCmd != nil {
-		// Run it and check that no tickSentinel is produced
-		msgs := runCmd(fetchedCmd)
-		for _, msg := range msgs {
-			if _, isTickSentinel := msg.(tickSentinel); isTickSentinel {
-				t.Errorf("tasksFetchedMsg returned a cmd that produced a tick (tick fork regression)")
-			}
+	// --- A fetch result arms ZERO ticks ---
+	var fetched []tea.Msg
+	for _, msg := range initMsgs {
+		if _, ok := msg.(shellTasksMsg); ok {
+			fetched = append(fetched, msg)
 		}
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("Init: expected one task fetch, got %v", initMsgs)
+	}
+	f.resetCalls()
+	for _, msg := range f.step(fetched[0]) {
+		if _, isTick := msg.(tickArmedMsg); isTick {
+			t.Errorf("fetch result returned a cmd that produced a tick (tick fork regression)")
+		}
+	}
+	if f.ticks != 0 {
+		t.Errorf("fetch result: expected 0 ticks armed, got %d (tick fork regression)", f.ticks)
 	}
 
 	// --- 'r' (manual refresh) arms ZERO ticks ---
-	*tickCount = 0
-	m, refreshCmd := model.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
-	model = m.(*BoardModel)
-
-	if *tickCount != 0 {
-		t.Errorf("'r' key: expected 0 ticks armed, got %d (tick fork regression)", *tickCount)
+	f.resetCalls()
+	refreshMsgs := f.step(key("r"))
+	if f.ticks != 0 {
+		t.Errorf("'r' key: expected 0 ticks armed, got %d (tick fork regression)", f.ticks)
 	}
-	if refreshCmd == nil {
-		t.Errorf("'r' key: expected a fetch cmd (non-nil), got nil")
-	}
-
-	// Execute the refreshCmd and confirm it produces tasksFetchedMsg, NOT a tickSentinel.
-	refreshMsgs := runCmd(refreshCmd)
 	hasTasksFetched := false
-	hasTick := false
 	for _, msg := range refreshMsgs {
 		switch msg.(type) {
 		case tasksFetchedMsg:
 			hasTasksFetched = true
-		case tickSentinel:
-			hasTick = true
+		case tickArmedMsg:
+			t.Errorf("'r' key cmd: produced a tick (tick fork regression)")
 		}
 	}
 	if !hasTasksFetched {
 		t.Errorf("'r' key cmd: expected a tasksFetchedMsg, got none (msgs: %v)", refreshMsgs)
 	}
-	if hasTick {
-		t.Errorf("'r' key cmd: produced a tick (tick fork regression)")
-	}
+	f.send(refreshMsgs...)
 
 	// --- tickMsg arms exactly ONE tick and issues a fetch ---
-	*tickCount = 0
-	m, tickCmdResult := model.Update(tickMsg{})
-	model = m.(*BoardModel)
-
-	if *tickCount != 1 {
-		t.Errorf("tickMsg: expected exactly 1 tick armed, got %d", *tickCount)
+	f.resetCalls()
+	tickMsgs := f.step(tickMsg{})
+	if f.ticks != 1 {
+		t.Errorf("tickMsg: expected exactly 1 tick armed, got %d", f.ticks)
 	}
-	if tickCmdResult == nil {
-		t.Errorf("tickMsg: expected a non-nil batch cmd (fetch + tick), got nil")
-	}
-
-	// Execute the batch from tickMsg and confirm it produces BOTH a tasksFetchedMsg AND a tickSentinel.
-	tickMsgs := runCmd(tickCmdResult)
-	hasTasksFetchedFromTick := false
-	hasTickFromTick := false
+	hasFetchFromTick, hasTickFromTick := false, false
 	for _, msg := range tickMsgs {
 		switch msg.(type) {
-		case tasksFetchedMsg:
-			hasTasksFetchedFromTick = true
-		case tickSentinel:
+		case shellTasksMsg:
+			hasFetchFromTick = true
+		case tickArmedMsg:
 			hasTickFromTick = true
 		}
 	}
-	if !hasTasksFetchedFromTick {
-		t.Errorf("tickMsg batch: expected a tasksFetchedMsg, got none (msgs: %v)", tickMsgs)
+	if !hasFetchFromTick {
+		t.Errorf("tickMsg batch: expected a shellTasksMsg, got none (msgs: %v)", tickMsgs)
 	}
 	if !hasTickFromTick {
-		t.Errorf("tickMsg batch: expected a tickSentinel (re-armed tick), got none (msgs: %v)", tickMsgs)
+		t.Errorf("tickMsg batch: expected a re-armed tick, got none (msgs: %v)", tickMsgs)
 	}
 
-	// --- tasksFetchedMsg with error arms ZERO ticks ---
-	*tickCount = 0
-	m, errFetchedCmd := model.Update(tasksFetchedMsg{err: errors.New("network error")})
-	_ = m
-
-	if *tickCount != 0 {
-		t.Errorf("tasksFetchedMsg(error): expected 0 ticks armed, got %d (tick fork regression)", *tickCount)
-	}
-	if errFetchedCmd != nil {
-		msgs := runCmd(errFetchedCmd)
-		for _, msg := range msgs {
-			if _, isTickSentinel := msg.(tickSentinel); isTickSentinel {
-				t.Errorf("tasksFetchedMsg(error) returned a cmd that produced a tick (tick fork regression)")
+	// --- A failed fetch arms ZERO ticks ---
+	f.resetCalls()
+	for _, msg := range []tea.Msg{
+		shellTasksMsg{projectID: "p1", err: errors.New("network error")},
+		tasksFetchedMsg{err: errors.New("network error")},
+	} {
+		for _, out := range f.step(msg) {
+			if _, isTick := out.(tickArmedMsg); isTick {
+				t.Errorf("%T(error) returned a cmd that produced a tick (tick fork regression)", msg)
 			}
 		}
+	}
+	if f.ticks != 0 {
+		t.Errorf("failed fetch: expected 0 ticks armed, got %d (tick fork regression)", f.ticks)
 	}
 }
 
@@ -1004,55 +899,31 @@ func extractFieldsFromOptions(options ...tuiclient.TaskListOption) string {
 
 // TestBoardModel_PerStatePollingWithSummaryFields verifies the per-state poll contract:
 // a tick issues exactly one WithState(...)+fields=summary ListTasks call per active state
-// (backlog, ready, in_progress, review, approved, blocked) and leaves the terminal columns
-// (done, failed, abandoned) untouched, while startup/manual refresh issues one such call per
-// state across all nine states.
+// (backlog, ready, in_progress, checks, review, approved, blocked) plus failed, and one
+// claimable+fields=summary call, leaving done and abandoned unpolled; manual refresh
+// issues one such call per state across all states.
 func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
-	type listTasksCall struct {
-		state  string
-		fields string
-	}
-	var calls []listTasksCall
+	f := newBoardFixture(t, 80, 24,
+		tuiclient.Task{ID: "task-active", Title: "Active", State: "in_progress", Kind: "implement"},
+		tuiclient.Task{ID: "task-done", Title: "Done", State: "done", Kind: "implement"},
+		tuiclient.Task{ID: "task-failed", Title: "Failed", State: "failed", Kind: "implement"},
+		tuiclient.Task{ID: "task-abandoned", Title: "Abandoned", State: "abandoned", Kind: "implement"},
+	)
 
-	mockClient := &tuiclient.MockClient{
-		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
-			calls = append(calls, listTasksCall{
-				state:  extractStateFromOptions(options...),
-				fields: extractFieldsFromOptions(options...),
-			})
-			return []tuiclient.Task{}, nil
-		},
-	}
-
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test"}
-	model := NewBoardModel(mockClient, config, project)
-
-	// Seed the board with terminal-column data so the merge path has something to preserve.
-	seeded := make(map[string][]tuiclient.Task)
-	for _, state := range stateOrder {
-		seeded[state] = []tuiclient.Task{}
-	}
-	seeded["done"] = []tuiclient.Task{{ID: "task-done", Title: "Done", State: "done"}}
-	seeded["failed"] = []tuiclient.Task{{ID: "task-failed", Title: "Failed", State: "failed"}}
-	seeded["abandoned"] = []tuiclient.Task{{ID: "task-abandoned", Title: "Abandoned", State: "abandoned"}}
-	m, _ := model.Update(tasksFetchedMsg{tasks: seeded})
-	model = m.(*BoardModel)
-
-	assertCalls := func(t *testing.T, calls []listTasksCall, wantStates []string) {
+	assertCalls := func(t *testing.T, calls []listCall, wantStates []string, wantClaimable int) {
 		t.Helper()
-		if len(calls) != len(wantStates) {
-			t.Fatalf("expected %d ListTasks calls, got %d: %v", len(wantStates), len(calls), calls)
+		if len(calls) != len(wantStates)+wantClaimable {
+			t.Fatalf("expected %d ListTasks calls, got %d: %v", len(wantStates)+wantClaimable, len(calls), calls)
 		}
 		seen := make(map[string]int)
+		claimable := 0
 		for _, call := range calls {
 			if call.fields != "summary" {
 				t.Errorf("expected fields=summary, got %q (state=%q)", call.fields, call.state)
+			}
+			if call.claimable {
+				claimable++
+				continue
 			}
 			seen[call.state]++
 		}
@@ -1061,42 +932,27 @@ func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
 				t.Errorf("expected exactly 1 call for state %q, got %d", state, seen[state])
 			}
 		}
+		if claimable != wantClaimable {
+			t.Errorf("expected %d claimable calls, got %d", wantClaimable, claimable)
+		}
 	}
 
-	// --- Tick polls only the active states and preserves the terminal columns ---
-	calls = nil
-	m, tickCmd := model.Update(tickMsg{})
-	model = m.(*BoardModel)
-	for _, msg := range runCmd(tickCmd) {
-		m, _ = model.Update(msg)
-		model = m.(*BoardModel)
+	// --- Tick polls only the active states and failed ---
+	f.resetCalls()
+	f.send(tickMsg{})
+	assertCalls(t, f.listCalls(), append(append([]string{}, activeStates...), stateFailed), 1)
+
+	if len(f.model.tasks["failed"]) != 1 || f.model.tasks["failed"][0].ID != "task-failed" {
+		t.Errorf("expected failed tasks polled with task-failed, got %v", f.model.tasks["failed"])
+	}
+	if view := f.model.viewContent(); !strings.Contains(view, "Active") || !strings.Contains(view, "Failed") {
+		t.Errorf("expected the polled tasks in the work items:\n%s", view)
 	}
 
-	assertCalls(t, calls, activeStates)
-
-	if len(model.tasks["done"]) != 1 || model.tasks["done"][0].ID != "task-done" {
-		t.Errorf("expected done column preserved with task-done, got %v", model.tasks["done"])
-	}
-	if len(model.tasks["failed"]) != 1 || model.tasks["failed"][0].ID != "task-failed" {
-		t.Errorf("expected failed column preserved with task-failed, got %v", model.tasks["failed"])
-	}
-	if len(model.tasks["abandoned"]) != 1 || model.tasks["abandoned"][0].ID != "task-abandoned" {
-		t.Errorf("expected abandoned column preserved with task-abandoned, got %v", model.tasks["abandoned"])
-	}
-
-	// --- Manual refresh ('r') fetches all 9 states ---
-	calls = nil
-	m, refreshCmd := model.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
-	model = m.(*BoardModel)
-	if refreshCmd == nil {
-		t.Fatalf("expected a refresh command from 'r', got nil")
-	}
-	for _, msg := range runCmd(refreshCmd) {
-		m, _ = model.Update(msg)
-		model = m.(*BoardModel)
-	}
-
-	assertCalls(t, calls, stateOrder)
+	// --- Manual refresh ('r') fetches every state ---
+	f.resetCalls()
+	f.press("r")
+	assertCalls(t, f.listCalls(), stateOrder, 0)
 }
 
 // --- TUI-4: Review action tests ---

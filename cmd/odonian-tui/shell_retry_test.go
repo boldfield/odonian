@@ -15,12 +15,12 @@ func retryHintFor(m *BoardModel) string {
 }
 
 // pressRefresh sends the bound refresh key, written from the binding rather than a letter.
-func pressRefresh(f *shellFixture) {
+func pressRefresh(f *boardFixture) {
 	f.send(key(f.model.keyBindings.Shell.binding(actRefresh).Help().Key))
 }
 
 // setListTasks replaces what the fixture's client returns for a task fetch.
-func setListTasks(f *shellFixture, fn func() ([]tuiclient.Task, error)) {
+func setListTasks(f *boardFixture, fn func() ([]tuiclient.Task, error)) {
 	f.model.client.(*tuiclient.MockClient).ListTasksFunc = func(ctx context.Context, projectID string, opts ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
 		return fn()
 	}
