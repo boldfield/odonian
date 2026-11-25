@@ -77,7 +77,8 @@ item on the right. The board shows one project at a time (the one selected in th
 pane). Each work item is one row: an implement task, with its review and merge tasks nested
 under it. A glyph shows its status: `○` ready to claim, `⛓` waiting on a dependency, `·` in
 backlog, `●` in progress, `◷` checks, `◆` review, `✔` approved, `✖` blocked, `!` failed, `✓`
-done, `⊗` abandoned; a held item carries a hold prefix.
+done, `⊗` abandoned (the last two are drawn by the renderer but never appear, because the
+board does not fetch done or abandoned tasks); a held item carries a hold prefix.
 
 Wide terminal (120 columns or more), a backlog item selected:
 
@@ -87,16 +88,16 @@ Wide terminal (120 columns or more), a backlog item selected:
    ohand         │ ◷ D-31 Repair loop            checks  18m │ backlog
  ▸ syndic        │ ● D-35 Replace prompts   sonnet @2bllr 12m│
    llm-gw        │ ◆ D-30 Rubric loader          review r2   │ History
-   reala         │ · D-36 Author prompt          backlog     │   events of the selected task
+   reala         │ • D-36 Author prompt          backlog     │   events of the selected task
  ──────────────────────────────────────────────────────────────────────────────────────────
- p promote · enter detail · tab pane · ↑/↓ move · t hold/release · i priority · w front · ...
+ p promote • enter detail • tab pane • ↑/↓ move • t hold/release • i priority • w front • ...
 ```
 
-The row and preview contents are illustrative; the help line is the real text for a backlog
+The row and preview contents are illustrative; the help line is the real text (bullet-separated, as rendered) for a backlog
 item with the items pane focused (before truncation to the terminal width):
 
 ```
-p promote · enter detail · tab pane · ↑/↓ move · t hold/release · i priority · w front · e reset · z archive · v preview · V projects · c scorecards · r refresh · ? help · q quit
+p promote • enter detail • tab pane • ↑/↓ move • t hold/release • i priority • w front • e reset • z archive • v preview • V projects • c scorecards • r refresh • ? help • q quit
 ```
 
 The help bar is generated from the key bindings for the focused pane and the selected item's
@@ -137,14 +138,18 @@ empty. The bands and badges are not in the key tables below because they have no
 
 ## Data & refresh
 
-- One `ListTasks(projectID)` call per refresh; bucket by `state` client-side.
+- Each refresh issues one state-filtered `ListTasks` call for every active state and for `failed`,
+  plus one `claimable=true` call that tells ready tasks from tasks waiting on a dependency. Done
+  and abandoned tasks are never requested, so they are not shown.
+- The tasks are grouped into work items (an implement task with its review and merge tasks nested
+  under it) and shown as one list; there are no state columns.
 - Poll every `poll_interval` (default 2s); `r` forces an immediate refresh.
 - **Selection is keyed by task ID and preserved across refreshes** — a poll must never move
-  your cursor or reset scroll. If the selected task disappears (state changed/closed), select
-  the nearest remaining task in the same column.
+  your cursor or reset scroll. If the selected work item disappears (state changed/closed), the
+  selection stays at the same position in the list, clamped to its new length.
 - After an action, refetch (no optimistic mutation) so the board reflects server truth.
-- States: a brief loading indicator on first fetch; an "empty" message for an empty column /
-  no tasks; an error banner (with the status/message) on failure that retries on the next
+- States: a brief loading indicator on first fetch; an "empty" message when the project has no
+  work items; an error banner (with the status/message) on failure that retries on the next
   tick.
 
 ## Actions

@@ -68,13 +68,13 @@ or `--url` / `--token` flags, in that order of precedence from lowest to highest
 ./bin/odonian-tui
 ```
 
-Active-state tasks are polled automatically. Finished tasks are loaded at startup and on
-refresh; press `r` to refresh them when looking for newly completed work.
+The board polls the active states and failed tasks automatically; `r` refreshes immediately. Done
+and abandoned tasks are not shown.
 
 The layout is three panes: projects, work items and a preview of the selected item. It adapts to
-the terminal width: all three at 120 columns or more, a narrow project rail and the items below
-that, and only the items under 80 columns. `tab` moves focus between panes, `v` hides the
-preview and `V` hides the projects pane, and `enter` opens a work item's full-screen detail view.
+the terminal width: all three at 120 columns or more, a narrow project rail beside the items,
+and only the items under 80 columns. `tab` moves focus between panes, `v` hides the preview
+and `V` hides the projects pane, and `enter` opens a work item's full-screen detail view.
 Press `?` for the full key list. The cross-project "All" view in the design is not built yet; see
 [the TUI guide](./features/tui.md) for the keys and layouts.
 
