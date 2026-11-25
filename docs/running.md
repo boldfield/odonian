@@ -59,7 +59,11 @@ full UUIDs. Local worktree operations also need full task UUIDs; see
 
 ## TUI
 
-`odonian-tui` shows the board with three responsive panes: projects (board projects, one per row), work items (grouped by state; review and merge tasks nest under their implement task), and a preview (task details and history). It talks to the server over the same API; the URL and token come from `~/.config/odonian/config.toml`, the `ODONIAN_URL` / `ODONIAN_TOKEN` environment, or `--url` / `--token` flags, in that order of precedence from lowest to highest.
+`odonian-tui` shows the board with three responsive panes: projects (board projects, one per row),
+work items (grouped by state; review and merge tasks nest under their implement task), and a preview
+(task details and history). It talks to the server over the same API; the URL and token come from
+`~/.config/odonian/config.toml`, the `ODONIAN_URL` / `ODONIAN_TOKEN` environment, or `--url` /
+`--token` flags, in that order of precedence from lowest to highest.
 
 ```bash
 ./bin/odonian-tui
@@ -68,7 +72,7 @@ full UUIDs. Local worktree operations also need full task UUIDs; see
 **Layout adapts to terminal width:**
 - **Wide (120+ columns):** projects pane | work items pane | preview pane
 - **Medium (80–119 columns):** project rail | work items pane (detail opens full-screen on `enter`)
-- **Narrow (under 80 columns):** work items pane only (use `enter` on a project to view it full-screen)
+- **Narrow (under 80 columns):** work items pane only (detail opens full-screen on `enter`)
 
 **Navigation:** `tab`/`shift+tab` switch panes, `↑/↓` move within panes, `enter` opens detail, `q` closes it. `v` toggles preview (wide layout only), `V` toggles projects pane.
 

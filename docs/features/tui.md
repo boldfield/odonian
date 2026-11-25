@@ -21,18 +21,20 @@ The TUI shows three panes: **projects**, **work items**, and **preview**. The la
                  │ ○ D-38 Export                 ready       │   12:41 entered checks
                  │ ↓ 50 more                                 │   12:12 claimed by @c4wqd
 ─────────────────┴───────────────────────────────────────────┴──────────────────────────────
- p promote · tab pane · ↑↓ move · enter detail · t hold/release · i priority · v preview · ? help
+ p promote · enter detail · tab pane · ↑↓ move · t hold/release · i priority · w front · e reset · z archive · v preview · ? help · q quit
 ```
 
 - **Projects pane** (left): projects in the board, one per row. One project is selected; focus shifts to the projects pane with `tab`. Selecting a project loads its tasks in the work items pane.
 - **Work items pane** (center): one implement task per row; review and merge tasks nest as indented lines under their target. The selected item's state determines which actions are available (see Actions below).
 - **Preview pane** (right): events and details for the selected item. Only shown when an item is selected; `v` toggles it.
 
+**Note:** An "All" entry for cross-project view and status badges are not yet implemented. The TUI is currently project-scoped.
+
 ### Medium (80–119 columns): project rail + items
 The project pane collapses to a 10-column rail on the left; detail opens full-screen over the items on `enter`.
 
 ### Narrow (under 80 columns): items only
-Only the work items pane is shown. Projects and detail open full-screen on `enter` when the projects or detail panes are focused.
+Only the work items pane is shown. The detail view opens full-screen on `enter`. Projects pane is not available in narrow layout.
 
 ## Work items
 
@@ -58,12 +60,12 @@ Each row is one implement task. Status is shown with a glyph (◷ in checks, ●
 | `b` | bounce (approved state only) |
 | `u` | unblock (blocked state only) |
 | `f` | fail (blocked state only) |
-| `t` | hold/release (any item) |
-| `i` | set priority (any item) |
-| `w` | move to front (any item) |
-| `e` | reset priority (any item) |
-| `z` | archive (any item) |
-| `c` | open research scorecards (any item) |
+| `t` | hold/release |
+| `i` | set priority |
+| `w` | move to front |
+| `e` | reset priority |
+| `z` | archive |
+| `c` | open research scorecards |
 
 **On projects:** `z` to archive a project.
 
@@ -109,6 +111,6 @@ All actions go through the API; the board may be stale. Every action handles a 4
 
 - **Minimum 40 columns** to render anything usable
 - **80–119 columns**: project rail (10 columns) + items pane; detail opens full-screen over the items
-- **Below 80 columns**: items pane only; use `enter` on a project (after `tab` to focus projects) to view it full-screen
+- **Below 80 columns**: items pane only; detail opens full-screen over the items. Projects pane is not available below 80 columns.
 - **120 columns and up**: full three-pane layout
 - Resizes are live; panes adapt to new width on the fly

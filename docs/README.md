@@ -84,9 +84,11 @@ current guide disagree, the current guide and the code win.
 - [`design-orchestration-restructure.md`](./design-orchestration-restructure.md): the June 2026
   design for splitting substrate and orchestration across repositories.
 - [`features/`](./features/): feature designs, one file per capability. At this baseline:
-  `model-and-review`, `tui` (three panes, project-scoped, grouped by work item), `tui-redesign` (design for cross-project "All" bands; partial implementation),
-  `sbx-agent-bootstrap`, `claude-fleet-auth-targets`, `harness-lease-renewal`, `urgent-work-queue`,
-  `dispatch-failure-handling`, `research-track`, `research-track-verification`, `research-continuations`,
+  `model-and-review`, `tui` (three panes, project-scoped, grouped by work item),
+  `tui-redesign` (design for cross-project "All" bands; not yet built),
+  `sbx-agent-bootstrap`, `claude-fleet-auth-targets`, `harness-lease-renewal`,
+  `urgent-work-queue`, `dispatch-failure-handling`, `research-track`,
+  `research-track-verification`, `research-continuations`,
   `research-pacing-and-reviewer-evaluation`, `checks-gate` (wait for CI in a board state, not in
   a worker session).
 - [`specs/`](./specs/): dated specs and postmortems, indexed with their status in
