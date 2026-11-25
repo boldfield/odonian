@@ -833,6 +833,9 @@ type TaskListFilter struct {
 	Claimable         bool
 	IncludeArchived   bool
 	IncludeSuperseded bool
+	// OmitBodies makes ListTasks skip reading the spec and result columns:
+	// the returned tasks have an empty Spec and a nil Result.
+	OmitBodies bool
 }
 
 // ProjectListFilter contains filters for listing projects.
@@ -1856,11 +1859,15 @@ const claimableSQL = `(state = 'ready' OR (state = 'in_progress' AND lease_expir
 		WHERE d.task_id = task.id AND t2.state != 'done'
 	)`
 
-// ListTasks retrieves tasks for a project with optional filters.
+// buildListTasksQuery builds the ListTasks SQL and its arguments.
 // Filters compose with AND logic.
 // By default, archived tasks are excluded unless filter.IncludeArchived is true.
-func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error) {
-	query := `SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, ` + taskTopicColumns + `, created_at, updated_at, archived_at, superseded_by
+func buildListTasksQuery(projectID string, filter TaskListFilter) (string, []interface{}) {
+	specColumn, resultColumn := "spec", "result"
+	if filter.OmitBodies {
+		specColumn, resultColumn = "'' AS spec", "NULL AS result"
+	}
+	query := `SELECT id, project_id, document_id, title, ` + specColumn + `, state, assignee, lease_expires_at, ` + resultColumn + `, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, ` + taskTopicColumns + `, created_at, updated_at, archived_at, superseded_by
 		FROM task
 		WHERE project_id = ?`
 	args := []interface{}{projectID}
@@ -1900,6 +1907,12 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 
 	query += ` ORDER BY topic_priority DESC, created_at, id`
 
+	return query, args
+}
+
+// ListTasks retrieves tasks for a project with optional filters (see buildListTasksQuery).
+func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error) {
+	query, args := buildListTasksQuery(projectID, filter)
 	rows, err := s.readConn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tasks: %w", err)
