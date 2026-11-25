@@ -281,8 +281,8 @@ func TestWorkItemsHeaderTruncatesLongProjectName(t *testing.T) {
 	p.SetProjectName(long)
 	p.SetItems([]*tuiview.WorkItem{wiOf("a", "backlog")}, nil)
 	out := p.render()
-	if strings.Contains(out, long) || !strings.Contains(out, "This Is A Very") {
-		t.Errorf("header should show a truncated name:\n%s", out)
+	if strings.Contains(out, long) || !strings.Contains(out, "This Is A Very") || !strings.Contains(out, "…") {
+		t.Errorf("header should show a truncated name ending in an ellipsis:\n%s", out)
 	}
 	assertBounds(t, out, 30, 5)
 }
