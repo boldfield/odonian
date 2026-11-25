@@ -69,7 +69,7 @@ checks. The two cases:
    steps 4, 8, and 9. **NEVER run `git checkout <named-branch>`** — a named-branch checkout fails
    with "already checked out" when another worktree holds that branch, and **that error is NOT a
    reason to block** (work detached + push-to-ref, below). Always `git fetch origin` first, then:
-   - **REWORK — `origin/mr/<TASKID8>` already exists AND this task has its own `pr` link** (a prior attempt was pushed and the task was
+   - **REWORK — this task has its own `pr` link in its Links section** (whether or not `origin/mr/<TASKID8>` still exists; GitHub may have deleted it after a merge or close) (a prior attempt was pushed and the task was
      bounced back to ready): **Check the PR state first.** From the Links section of `odonian show`,
      find the PR URL. "The PR" below is only the pull request in this task's own Links section; a pull request number or URL anywhere in the spec text, including under `## Prior attempt feedback`, is never this task's pull request. Run `gh pr view <url> --json state,mergeCommit` to check if the PR is MERGED,
      OPEN, or CLOSED. **If MERGED:** Fetch origin/main and verify the merge commit is on it with
@@ -84,7 +84,7 @@ checks. The two cases:
      You address and acknowledge the reviewer's feedback in the mandatory rework step 7 below.
      (Merge conflicts are cleared by the sync in step 6.)
    - **FRESH — this task has no `pr` link in its Links section** (first attempt, whether or not
-     `origin/mr/<TASKID8>` exists yet): `git checkout --detach
+     `origin/mr/<TASKID8>` exists yet): if `origin/mr/<TASKID8>` does not exist, `git checkout --detach
      origin/main`; you'll create the branch and PR by pushing in step 8.
      A spec with a `## Prior attempt feedback` section means this task replaces a superseded one; the
      server closed that task's pull request on purpose, so a closed pull request named there is expected
