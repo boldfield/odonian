@@ -182,6 +182,9 @@ func TestBoardModel_ErrorState(t *testing.T) {
 	if !strings.Contains(output, "Error:") || !strings.Contains(output, "test error message") {
 		t.Errorf("Expected error message in output, got:\n%s", output)
 	}
+	if !strings.Contains(output, "Press 'r' to retry.") {
+		t.Errorf("Expected retry prompt in output, got:\n%s", output)
+	}
 
 	// 'r' retries: once the server answers again the error is gone.
 	f.mu.Lock()
@@ -193,7 +196,7 @@ func TestBoardModel_ErrorState(t *testing.T) {
 		t.Errorf("Expected 'r' to refetch the tasks, got no ListTasks call")
 	}
 	output = f.model.viewContent()
-	if strings.Contains(output, "test error message") || f.model.error != "" {
+	if strings.Contains(output, "test error message") || strings.Contains(output, "to retry.") || f.model.error != "" {
 		t.Errorf("Expected the error cleared after retry, got %q:\n%s", f.model.error, output)
 	}
 }
