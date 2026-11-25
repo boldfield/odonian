@@ -11771,8 +11771,62 @@ func TestListTasksSummaryFieldsOmitBodies(t *testing.T) {
 	createW := httptest.NewRecorder()
 	server.mux.ServeHTTP(createW, createReq)
 
-	// Get full list (without fields=summary)
-	fullListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks", nil)
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("expected status 201 for task creation, got %d", createW.Code)
+	}
+
+	// Extract task ID from creation response
+	var createdTasks []store.Task
+	if err := json.NewDecoder(createW.Body).Decode(&createdTasks); err != nil {
+		t.Fatalf("failed to decode created tasks: %v", err)
+	}
+	if len(createdTasks) == 0 {
+		t.Fatalf("no task was created")
+	}
+	taskID := createdTasks[0].ID
+
+	// Promote the task to ready
+	promoteReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/promote", nil)
+	promoteReq.Header.Set("Authorization", authHeader)
+	promoteW := httptest.NewRecorder()
+	server.mux.ServeHTTP(promoteW, promoteReq)
+	if promoteW.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for task promote, got %d", promoteW.Code)
+	}
+
+	// Claim the task
+	claimPayload := map[string]interface{}{
+		"agent_id": "agent-1",
+		"model":    "haiku",
+	}
+	claimBody, _ := json.Marshal(claimPayload)
+	claimReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/claim", bytes.NewReader(claimBody))
+	claimReq.Header.Set("Authorization", authHeader)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimW := httptest.NewRecorder()
+	server.mux.ServeHTTP(claimW, claimReq)
+	if claimW.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for task claim, got %d", claimW.Code)
+	}
+
+	// Submit the task with a result
+	result := `{"status": "completed", "output": "task completed"}`
+	submitPayload := map[string]interface{}{
+		"agent_id": "agent-1",
+		"result":   result,
+	}
+	submitBody, _ := json.Marshal(submitPayload)
+	submitReq := httptest.NewRequest("POST", "/tasks/"+taskID+"/submit", bytes.NewReader(submitBody))
+	submitReq.Header.Set("Authorization", authHeader)
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	server.mux.ServeHTTP(submitW, submitReq)
+	if submitW.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for task submit, got %d", submitW.Code)
+	}
+
+	// Get full list (without fields=summary), filtered to implement tasks only
+	fullListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?kind=implement", nil)
 	fullListReq.Header.Set("Authorization", authHeader)
 	fullListW := httptest.NewRecorder()
 	server.mux.ServeHTTP(fullListW, fullListReq)
@@ -11787,7 +11841,7 @@ func TestListTasksSummaryFieldsOmitBodies(t *testing.T) {
 	}
 
 	if len(fullTasks) != 1 {
-		t.Fatalf("expected 1 task in full list, got %d", len(fullTasks))
+		t.Fatalf("expected 1 implement task in full list, got %d", len(fullTasks))
 	}
 
 	// Verify full list includes spec
@@ -11795,8 +11849,8 @@ func TestListTasksSummaryFieldsOmitBodies(t *testing.T) {
 		t.Errorf("expected full list to include spec, got %q", fullTasks[0].Spec)
 	}
 
-	// Get summary list (with fields=summary)
-	summaryListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary", nil)
+	// Get summary list (with fields=summary), filtered to implement tasks only
+	summaryListReq := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks?fields=summary&kind=implement", nil)
 	summaryListReq.Header.Set("Authorization", authHeader)
 	summaryListW := httptest.NewRecorder()
 	server.mux.ServeHTTP(summaryListW, summaryListReq)
@@ -11811,7 +11865,7 @@ func TestListTasksSummaryFieldsOmitBodies(t *testing.T) {
 	}
 
 	if len(summaryTasks) != 1 {
-		t.Fatalf("expected 1 task in summary list, got %d", len(summaryTasks))
+		t.Fatalf("expected 1 implement task in summary list, got %d", len(summaryTasks))
 	}
 
 	// Verify summary response matches what taskToSummary produces
