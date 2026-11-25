@@ -88,9 +88,9 @@ Wide terminal (120 columns or more), a backlog item selected:
    ohand         │ ◷ D-31 Repair loop            checks  18m │ backlog
  ▸ syndic        │ ● D-35 Replace prompts   sonnet @2bllr 12m│
    llm-gw        │ ◆ D-30 Rubric loader          review r2   │ History
-   reala         │ • D-36 Author prompt          backlog     │   events of the selected task
+   reala         │ · D-36 Author prompt          backlog     │   events of the selected task
  ──────────────────────────────────────────────────────────────────────────────────────────
- p promote • enter detail • tab pane • ↑/↓ move • t hold/release • i priority • w front • ...
+ p promote • enter detail • tab pane • ↑/↓ move • t hold/release • i priority • w front • …
 ```
 
 The row and preview contents are illustrative; the help line is the real text (bullet-separated, as rendered) for a backlog
@@ -148,9 +148,9 @@ empty. The bands and badges are not in the key tables below because they have no
   your cursor or reset scroll. If the selected work item disappears (state changed/closed), the
   selection stays at the same position in the list, clamped to its new length.
 - After an action, refetch (no optimistic mutation) so the board reflects server truth.
-- States: a brief loading indicator on first fetch; an "empty" message when the project has no
-  work items; an error banner (with the status/message) on failure that retries on the next
-  tick.
+- States: the items pane shows "Nothing open in this project" until the first fetch returns, and
+  when the project has no open work items. A fetch error replaces the help line with the error text
+  until a later refresh succeeds.
 
 ## Actions
 
