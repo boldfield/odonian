@@ -26,6 +26,27 @@ func (f *boardFixture) mock() *tuiclient.MockClient {
 	return f.model.client.(*tuiclient.MockClient)
 }
 
+// moveTask sets a listed task's state, as the server would after a transition.
+func (f *boardFixture) moveTask(id, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.listed["p1"] {
+		if f.listed["p1"][i].ID == id {
+			f.listed["p1"][i].State = state
+		}
+	}
+}
+
+// itemState is the state the shell shows for a task, or "" when it is not listed.
+func (f *boardFixture) itemState(id string) string {
+	for _, item := range f.model.shell.items.items {
+		if item.Implement.ID == id {
+			return item.Implement.State
+		}
+	}
+	return ""
+}
+
 // reviewCapture records the arguments of the review and transition calls.
 type reviewCapture struct {
 	reviewID, reviewActor, reviewVerdict string
@@ -44,16 +65,26 @@ func (f *boardFixture) capture() *reviewCapture {
 	}
 	f.mock().TransitionTaskFunc = func(ctx context.Context, id, to string, note *string) error {
 		c.transitionID, c.transitionTo, c.transitionNote = id, to, note
-		return transition(ctx, id, to, note)
+		err := transition(ctx, id, to, note)
+		if err == nil {
+			f.moveTask(id, to)
+		}
+		return err
 	}
 	return c
 }
 
-func TestShellPromoteTask(t *testing.T) {
+func TestBoardModel_PromoteTask(t *testing.T) {
 	f := newBoardFixture(t, 140, 40,
 		tuiclient.Task{ID: "task-1", Title: "Task 1", State: "backlog", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
 		tuiclient.Task{ID: "task-2", Title: "Task 2", State: "backlog", Kind: "implement", CreatedAt: "2026-01-01T00:00:01Z"},
 	)
+	promote := f.mock().PromoteTaskFunc
+	f.mock().PromoteTaskFunc = func(ctx context.Context, id string) error {
+		err := promote(ctx, id)
+		f.moveTask(id, "ready")
+		return err
+	}
 	f.selectItem(t, "task-1")
 	f.resetCalls()
 	f.press("p")
@@ -62,6 +93,12 @@ func TestShellPromoteTask(t *testing.T) {
 	}
 	if len(f.listCalls()) == 0 {
 		t.Errorf("expected a refetch after promoting")
+	}
+	if got := f.itemState("task-1"); got != "ready" {
+		t.Errorf("task-1 state = %q after the refetch, want ready", got)
+	}
+	if got := f.itemState("task-2"); got != "backlog" {
+		t.Errorf("task-2 state = %q, want backlog", got)
 	}
 }
 
@@ -78,7 +115,7 @@ func promoteWithError(t *testing.T, returnedErr error) *boardFixture {
 
 // A real *tuiclient.APIError with StatusCode 409 produces the friendly message, not the generic
 // branch, so this fails if the typed-error detection is replaced by string matching.
-func TestShellPromoteTask409(t *testing.T) {
+func TestBoardModel_PromoteTask409(t *testing.T) {
 	f := promoteWithError(t, &tuiclient.APIError{StatusCode: 409, Code: "CONFLICT", Message: "Task is not in backlog"})
 	const friendlyMsg = "not in backlog (already moved?)"
 	if f.model.error != friendlyMsg {
@@ -89,7 +126,7 @@ func TestShellPromoteTask409(t *testing.T) {
 	}
 }
 
-func TestShellPromoteTask500(t *testing.T) {
+func TestBoardModel_PromoteTask500(t *testing.T) {
 	f := promoteWithError(t, &tuiclient.APIError{StatusCode: 500, Code: "INTERNAL_ERROR", Message: "something went wrong"})
 	if f.model.error == "not in backlog (already moved?)" {
 		t.Errorf("500 produced the friendly 409 message")
@@ -102,7 +139,7 @@ func TestShellPromoteTask500(t *testing.T) {
 	}
 }
 
-func TestShellPromoteOnNonBacklogIsNoOp(t *testing.T) {
+func TestBoardModel_PromoteOnNonBacklogIsNoOp(t *testing.T) {
 	f := newBoardFixture(t, 140, 40,
 		tuiclient.Task{ID: "task-2", Title: "Task 2", State: "ready", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
 	)
@@ -116,7 +153,7 @@ func TestShellPromoteOnNonBacklogIsNoOp(t *testing.T) {
 	}
 }
 
-func TestShellApproveFlow_ConfirmY(t *testing.T) {
+func TestBoardModel_ApproveFlow_ConfirmY(t *testing.T) {
 	f := newReviewFixture(t)
 	c := f.capture()
 	f.resetCalls()
@@ -143,6 +180,10 @@ func TestShellApproveFlow_ConfirmY(t *testing.T) {
 	if len(f.listCalls()) == 0 {
 		t.Errorf("expected a refetch after approving")
 	}
+	// A done task leaves the shell's item list.
+	if got := f.itemState("review-task-1"); got != "" {
+		t.Errorf("review-task-1 still listed as %q after the refetch, want gone (done)", got)
+	}
 	if c.reviewID != "review-task-1" || c.reviewActor != "u" || c.reviewVerdict != "approve" {
 		t.Errorf("ReviewTask got id %q actor %q verdict %q", c.reviewID, c.reviewActor, c.reviewVerdict)
 	}
@@ -157,7 +198,7 @@ func TestShellApproveFlow_ConfirmY(t *testing.T) {
 	}
 }
 
-func TestShellApproveFlow_EmptyNote(t *testing.T) {
+func TestBoardModel_ApproveFlow_EmptyNote(t *testing.T) {
 	f := newReviewFixture(t)
 	c := f.capture()
 	f.press("a", "enter", "y")
@@ -172,7 +213,7 @@ func TestShellApproveFlow_EmptyNote(t *testing.T) {
 	}
 }
 
-func TestShellApproveFlow_CancelWithEscAtNote(t *testing.T) {
+func TestBoardModel_ApproveFlow_CancelWithEscAtNote(t *testing.T) {
 	f := newReviewFixture(t)
 	f.press("a")
 	if f.model.mode != modeApproveNote {
@@ -190,7 +231,7 @@ func TestShellApproveFlow_CancelWithEscAtNote(t *testing.T) {
 	}
 }
 
-func TestShellApproveFlow_CancelWithN(t *testing.T) {
+func TestBoardModel_ApproveFlow_CancelWithN(t *testing.T) {
 	f := newReviewFixture(t)
 	f.press("a", "enter")
 	if f.model.mode != modeApproveConfirm {
@@ -209,7 +250,7 @@ func TestShellApproveFlow_CancelWithN(t *testing.T) {
 }
 
 // A bracketed paste is typed into the text input in a reason mode and ignored on the board.
-func TestShellPasteGoesToTextInput(t *testing.T) {
+func TestBoardModel_PasteGoesToTextInput(t *testing.T) {
 	f := newReviewFixture(t)
 	f.send(tea.PasteMsg{Content: "x"})
 	if f.model.mode != modeNormal {
@@ -225,7 +266,7 @@ func TestShellPasteGoesToTextInput(t *testing.T) {
 	}
 }
 
-func TestShellRejectFlow_EmptyReasonBlocked(t *testing.T) {
+func TestBoardModel_RejectFlow_EmptyReasonBlocked(t *testing.T) {
 	f := newReviewFixture(t)
 	f.press("x")
 	if f.model.mode != modeRejectReason {
@@ -246,7 +287,7 @@ func TestShellRejectFlow_EmptyReasonBlocked(t *testing.T) {
 	}
 }
 
-func TestShellRejectFlow_NonEmptyReason(t *testing.T) {
+func TestBoardModel_RejectFlow_NonEmptyReason(t *testing.T) {
 	f := newReviewFixture(t)
 	c := f.capture()
 	f.resetCalls()
@@ -260,6 +301,9 @@ func TestShellRejectFlow_NonEmptyReason(t *testing.T) {
 	}
 	if len(f.listCalls()) == 0 {
 		t.Errorf("expected a refetch after rejecting")
+	}
+	if got := f.itemState("review-task-1"); got != "ready" {
+		t.Errorf("review-task-1 state = %q after the refetch, want ready", got)
 	}
 	if c.reviewID != "review-task-1" || c.reviewActor != "u" || c.reviewVerdict != "reject" {
 		t.Errorf("ReviewTask got id %q actor %q verdict %q", c.reviewID, c.reviewActor, c.reviewVerdict)
@@ -276,17 +320,19 @@ func TestShellRejectFlow_NonEmptyReason(t *testing.T) {
 }
 
 // A 409 from TransitionTask after a successful ReviewTask surfaces an error and still refetches.
-func TestShellApproveTransition409(t *testing.T) {
+func TestBoardModel_ApproveTransition409(t *testing.T) {
 	f := newReviewFixture(t)
+	transition := f.mock().TransitionTaskFunc
 	f.mock().TransitionTaskFunc = func(ctx context.Context, id, to string, note *string) error {
-		f.setTasks(tuiclient.Task{ID: "review-task-1", Title: "Review Task", State: "done", Kind: "implement"})
+		_ = transition(ctx, id, to, note)
+		f.moveTask(id, "done")
 		return &tuiclient.APIError{StatusCode: http.StatusConflict, Code: "CONFLICT", Message: "task already transitioned"}
 	}
 	f.resetCalls()
 	f.press("a", "enter", "y")
 
-	if got := f.got(); got != "review approve review-task-1" {
-		t.Errorf("calls = %q, want only the review call", got)
+	if got := f.got(); got != "review approve review-task-1; transition review-task-1 done" {
+		t.Errorf("calls = %q, want the review and transition calls", got)
 	}
 	if f.model.error == "" {
 		t.Fatalf("expected an error after the 409 transition")
@@ -308,7 +354,7 @@ func TestShellApproveTransition409(t *testing.T) {
 }
 
 // Pressing 'a' or 'x' on a selected item that is not in review does nothing.
-func TestShellReviewActionsNoopOutsideReview(t *testing.T) {
+func TestBoardModel_ReviewActionsNoopOutsideReviewColumn(t *testing.T) {
 	f := newBoardFixture(t, 140, 40,
 		tuiclient.Task{ID: "task-b", Title: "Backlog Task", State: "backlog", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
 		tuiclient.Task{ID: "task-ip", Title: "IP Task", State: "in_progress", Kind: "implement", CreatedAt: "2026-01-01T00:00:01Z"},
@@ -331,7 +377,7 @@ func TestShellReviewActionsNoopOutsideReview(t *testing.T) {
 }
 
 // The help bar offers approve/reject only for a selected item in review.
-func TestShellReviewHelpBar(t *testing.T) {
+func TestBoardModel_ReviewHelpBar(t *testing.T) {
 	f := newReviewFixture(t, tuiclient.Task{ID: "t-ip", Title: "IP", State: "in_progress", Kind: "implement", CreatedAt: "2026-01-01T00:00:01Z"})
 	bar := f.model.shellKeyHints()
 	if !strings.Contains(bar, "a approve") || !strings.Contains(bar, "x reject") {
@@ -352,7 +398,7 @@ func TestShellReviewHelpBar(t *testing.T) {
 
 // In local_commit mode approving must land the work on the MR branch, which only `odonian
 // approve` does, so the TUI must neither record the verdict nor transition the task to done.
-func TestShellApproveRefusedInLocalCommitMode(t *testing.T) {
+func TestBoardModel_ApproveRefusedInLocalCommitMode(t *testing.T) {
 	t.Setenv("ODONIAN_DELIVERY_MODE", "local_commit")
 	f := newReviewFixture(t)
 	f.resetCalls()
