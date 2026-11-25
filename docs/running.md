@@ -59,16 +59,24 @@ full UUIDs. Local worktree operations also need full task UUIDs; see
 
 ## TUI
 
-`odonian-tui` shows projects, documents, and tasks by state with filtering and search, and offers
-confirm-gated archive and unarchive actions. It talks to the server over the same API; the URL and token come from
-`~/.config/odonian/config.toml`, the `ODONIAN_URL` / `ODONIAN_TOKEN` environment, or `--url` / `--token` flags, in that order of precedence from lowest to highest.
+`odonian-tui` shows one project's work as a list of work items: each implement task with its
+review and merge tasks nested under it. It talks to the server over the same API; the URL and
+token come from `~/.config/odonian/config.toml`, the `ODONIAN_URL` / `ODONIAN_TOKEN` environment,
+or `--url` / `--token` flags, in that order of precedence from lowest to highest.
 
 ```bash
 ./bin/odonian-tui
 ```
 
-Active-state columns are polled automatically. Terminal columns are loaded at startup and on
-refresh; press `r` to refresh them when looking for newly completed work.
+The board polls the active states and failed tasks automatically; `r` refreshes immediately. Done
+and abandoned tasks are not shown.
+
+The layout is three panes: projects, work items and a preview of the selected item. It adapts to
+the terminal width: all three at 120 columns or more, a narrow project rail beside the items
+from 80 to 119 columns, and only the items under 80 columns. `tab` moves focus between panes, `v` hides the preview
+and `V` hides the projects pane, and `enter` opens a work item's full-screen detail view.
+Press `?` for the full key list. The cross-project "All" view in the design is not built yet; see
+[the TUI guide](./features/tui.md) for the keys and layouts.
 
 ## The fleet in your development environment
 
