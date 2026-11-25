@@ -1,5 +1,4 @@
 -- Add indexes to improve query performance on hot lookups
--- (docs/features/latency.md)
 
 CREATE INDEX idx_event_task ON event(task_id, created_at);
 CREATE INDEX idx_task_link_task ON task_link(task_id, kind);

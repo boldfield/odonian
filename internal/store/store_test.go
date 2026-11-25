@@ -282,8 +282,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 35 {
-		t.Errorf("expected 35 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 36 {
+		t.Errorf("expected 36 migrations after second open, but got %d", migrationCount)
 	}
 }
 

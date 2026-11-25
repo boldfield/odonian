@@ -20,7 +20,7 @@ func TestMigration0035ChecksState(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if entry.Name() > "0035" {
+		if entry.Name() >= "0035" {
 			continue
 		}
 		data, err := fs.ReadFile(migrationsFS, "migrations/"+entry.Name())
@@ -126,11 +126,17 @@ func TestMigration0035ChecksState(t *testing.T) {
 	}
 	sort.Strings(beforeIdx)
 	sort.Strings(afterIdx)
-	// Filter out indexes added by migrations after 0035 (like idx_task_target from 0036)
+	// Filter out indexes added by migrations after 0035 (from 0036)
+	newIn0036 := map[string]bool{
+		"idx_event_task":          true,
+		"idx_task_link_task":      true,
+		"idx_task_target":         true,
+		"idx_task_dep_depends_on": true,
+	}
 	var afterIdxFiltered []string
 	for _, idx := range afterIdx {
-		if !strings.HasPrefix(idx, "idx_task_target") && !strings.HasPrefix(idx, "idx_event_task") &&
-			!strings.HasPrefix(idx, "idx_task_link_task") && !strings.HasPrefix(idx, "idx_task_dep_depends_on") {
+		idxName := strings.Split(idx, "|")[0]
+		if !newIn0036[idxName] {
 			afterIdxFiltered = append(afterIdxFiltered, idx)
 		}
 	}
@@ -193,13 +199,13 @@ func TestMigration0036LatencyIndexes(t *testing.T) {
 		}
 	}
 
-	// Create seed data for testing
+	// Create seed data for testing - use large dataset similar to production
 	// Create a task that will have events, links, and dependents
 	taskID := "task-1"
 	targetTaskID := "target-task-1"
 
-	// Create all seed tasks
-	for i := 0; i < 100; i++ {
+	// Create all seed tasks (2,000 tasks to test at scale)
+	for i := 0; i < 2000; i++ {
 		taskNum := fmt.Sprintf("task-%d", i+1)
 		if _, err := conn.Exec(`
 			INSERT INTO task (id, project_id, document_id, title, spec, state, created_at, updated_at, review_round)
@@ -209,8 +215,8 @@ func TestMigration0036LatencyIndexes(t *testing.T) {
 		}
 	}
 
-	// Create dependent tasks
-	for i := 0; i < 10; i++ {
+	// Create dependent tasks (200 to test dependencies)
+	for i := 0; i < 200; i++ {
 		depTaskID := fmt.Sprintf("dep-task-%d", i+1)
 		if _, err := conn.Exec(`
 			INSERT INTO task (id, project_id, document_id, title, spec, state, created_at, updated_at, review_round)
@@ -236,8 +242,8 @@ func TestMigration0036LatencyIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create events for task-1
-	for i := 0; i < 50; i++ {
+	// Create events for task-1 (5,000 events at scale)
+	for i := 0; i < 5000; i++ {
 		eventID := fmt.Sprintf("event-%d", i+1)
 		if _, err := conn.Exec(`
 			INSERT INTO event (id, task_id, actor, kind, verdict, note, created_at)
@@ -247,8 +253,8 @@ func TestMigration0036LatencyIndexes(t *testing.T) {
 		}
 	}
 
-	// Create task links for task-1
-	for i := 0; i < 20; i++ {
+	// Create task links for task-1 (1,000 links at scale)
+	for i := 0; i < 1000; i++ {
 		linkID := fmt.Sprintf("link-%d", i+1)
 		if _, err := conn.Exec(`
 			INSERT INTO task_link (id, task_id, kind, value)
@@ -258,8 +264,8 @@ func TestMigration0036LatencyIndexes(t *testing.T) {
 		}
 	}
 
-	// Create task dependencies for testing idx_task_dep_depends_on
-	for i := 0; i < 10; i++ {
+	// Create task dependencies for testing idx_task_dep_depends_on (100)
+	for i := 0; i < 100; i++ {
 		depTaskID := fmt.Sprintf("dep-task-%d", i+1)
 		if _, err := conn.Exec(`
 			INSERT INTO task_dep (depends_on_id, task_id)
@@ -318,29 +324,34 @@ func TestMigration0036LatencyIndexes(t *testing.T) {
 
 	// Test EXPLAIN QUERY PLAN for each index
 	tests := []struct {
-		name         string
-		explainStmt  string
-		shouldUseIdx bool
+		name        string
+		explainStmt string
+		expectedIdx string
+		noScanTable string
 	}{
 		{
-			name:         "events by task",
-			explainStmt:  fmt.Sprintf(`EXPLAIN QUERY PLAN SELECT id FROM event WHERE task_id = '%s' ORDER BY created_at, id`, taskID),
-			shouldUseIdx: true,
+			name:        "events by task",
+			explainStmt: fmt.Sprintf(`EXPLAIN QUERY PLAN SELECT id FROM event WHERE task_id = '%s' ORDER BY created_at, id`, taskID),
+			expectedIdx: "idx_event_task",
+			noScanTable: "event",
 		},
 		{
-			name:         "task links by task",
-			explainStmt:  fmt.Sprintf(`EXPLAIN QUERY PLAN SELECT id FROM task_link WHERE task_id = '%s' ORDER BY id`, taskID),
-			shouldUseIdx: true,
+			name:        "task links by task",
+			explainStmt: fmt.Sprintf(`EXPLAIN QUERY PLAN SELECT id FROM task_link WHERE task_id = '%s' ORDER BY id`, taskID),
+			expectedIdx: "idx_task_link_task",
+			noScanTable: "task_link",
 		},
 		{
-			name:         "review tasks by target",
-			explainStmt:  fmt.Sprintf(`EXPLAIN QUERY PLAN SELECT id FROM task WHERE target_task_id = '%s' AND kind = 'review' AND review_round = 1`, targetTaskID),
-			shouldUseIdx: true,
+			name:        "review tasks by target",
+			explainStmt: fmt.Sprintf(`EXPLAIN QUERY PLAN SELECT id FROM task WHERE target_task_id = '%s' AND kind = 'review' AND review_round = 1`, targetTaskID),
+			expectedIdx: "idx_task_target",
+			noScanTable: "task",
 		},
 		{
-			name:         "dependents of task",
-			explainStmt:  fmt.Sprintf(`EXPLAIN QUERY PLAN SELECT task_id FROM task_dep WHERE depends_on_id = '%s' ORDER BY task_id`, taskID),
-			shouldUseIdx: true,
+			name:        "dependents of task",
+			explainStmt: fmt.Sprintf(`EXPLAIN QUERY PLAN SELECT task_id FROM task_dep WHERE depends_on_id = '%s' ORDER BY task_id`, taskID),
+			expectedIdx: "idx_task_dep_depends_on",
+			noScanTable: "task_dep",
 		},
 	}
 
@@ -365,13 +376,55 @@ func TestMigration0036LatencyIndexes(t *testing.T) {
 			plan := strings.Join(plans, " | ")
 			t.Logf("Query plan: %s", plan)
 
-			// Check that the plan uses an index (not SCAN of table)
-			if test.shouldUseIdx {
-				// Should not have full table SCAN
-				if strings.Contains(plan, "SCAN ") {
-					t.Fatalf("query plan should use index, but got: %v", plan)
-				}
+			// Check that the plan uses the expected index
+			if !strings.Contains(plan, test.expectedIdx) {
+				t.Fatalf("query plan should use %s, but got: %s", test.expectedIdx, plan)
+			}
+			// Check that the plan does not scan the table
+			if strings.Contains(plan, "SCAN "+test.noScanTable) {
+				t.Fatalf("query plan should not scan %s, but got: %s", test.noScanTable, plan)
 			}
 		})
+	}
+
+	// Verify fresh database also has the four indexes
+	freshDB := filepath.Join(t.TempDir(), "fresh.db")
+	freshConn, err := sql.Open("sqlite", buildDSN(freshDB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer freshConn.Close()
+	freshConn.SetMaxOpenConns(1)
+	freshStore := &sqliteStore{conn: freshConn}
+	if err := freshStore.migrate(migrationsFS); err != nil {
+		t.Fatalf("fresh migrate: %v", err)
+	}
+
+	// Check that fresh database has all four indexes
+	var freshIdx []string
+	rows, err := freshConn.Query(`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name IN ('event', 'task_link', 'task', 'task_dep') AND sql IS NOT NULL ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		freshIdx = append(freshIdx, name)
+	}
+
+	for _, expected := range expectedIndexes {
+		found := false
+		for _, idx := range freshIdx {
+			if idx == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("fresh database missing index %s, has %v", expected, freshIdx)
+		}
 	}
 }
