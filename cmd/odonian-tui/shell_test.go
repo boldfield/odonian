@@ -1,125 +1,14 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	"github.com/boldfield/odonian/internal/tuiconfig"
 )
-
-type shellFixture struct {
-	model *BoardModel
-	mu    sync.Mutex
-	// listed holds the tasks per project; eventCalls records ListEvents task ids.
-	listed     map[string][]tuiclient.Task
-	eventCalls []string
-}
-
-func newShellFixture(t *testing.T, width, height int) *shellFixture {
-	t.Helper()
-	f := &shellFixture{listed: map[string][]tuiclient.Task{
-		"p1": {
-			{ID: "a1", Title: "Alpha", State: "in_progress", Kind: "implement", Model: "sonnet", CreatedAt: "2026-01-01T00:00:00Z"},
-			{ID: "a2", Title: "Bravo", State: "ready", Kind: "implement", CreatedAt: "2026-01-01T00:00:01Z"},
-			{ID: "a3", Title: "Charlie", State: "blocked", Kind: "implement", CreatedAt: "2026-01-01T00:00:02Z"},
-		},
-		"p2": {
-			{ID: "b1", Title: "Delta", State: "ready", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
-		},
-	}}
-	client := &tuiclient.MockClient{
-		ListTasksFunc: func(ctx context.Context, projectID string, opts ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
-			var o tuiclient.TaskListOptions
-			for _, opt := range opts {
-				opt(&o)
-			}
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			var out []tuiclient.Task
-			for _, task := range f.listed[projectID] {
-				if o.State != "" && task.State != o.State {
-					continue
-				}
-				if o.Claimable && task.State != "ready" {
-					continue
-				}
-				out = append(out, task)
-			}
-			return out, nil
-		},
-		ListEventsFunc: func(ctx context.Context, taskID string) ([]tuiclient.Event, error) {
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			f.eventCalls = append(f.eventCalls, taskID)
-			return nil, nil
-		},
-	}
-	cfg := &tuiconfig.Config{URL: "http://test", Token: "t", Actor: "u", PollInterval: time.Hour}
-	f.model = NewShellBoardModel(client, cfg, tuiclient.Project{ID: "p1", Name: "One"})
-	f.model.shell.previewDebounce = 0
-	f.model.newTickCmd = func() tea.Cmd { return nil }
-	f.send(tea.WindowSizeMsg{Width: width, Height: height})
-	f.send(projectsMsg())
-	f.send(f.run(f.model.fetchShellTasks())...)
-	return f
-}
-
-func projectsMsg() tea.Msg {
-	return projectsFetchedMsg{projects: []tuiclient.Project{{ID: "p1", Name: "One"}, {ID: "p2", Name: "Two"}}}
-}
-
-// run executes a command and returns its message(s), flattening batches.
-func (f *shellFixture) run(cmd tea.Cmd) []tea.Msg {
-	if cmd == nil {
-		return nil
-	}
-	msg := cmd()
-	if batch, ok := msg.(tea.BatchMsg); ok {
-		var out []tea.Msg
-		for _, c := range batch {
-			out = append(out, f.run(c)...)
-		}
-		return out
-	}
-	if msg == nil {
-		return nil
-	}
-	return []tea.Msg{msg}
-}
-
-// send delivers messages and every message their commands produce, until quiet.
-func (f *shellFixture) send(msgs ...tea.Msg) {
-	queue := append([]tea.Msg{}, msgs...)
-	for len(queue) > 0 {
-		msg := queue[0]
-		queue = queue[1:]
-		_, cmd := f.model.Update(msg)
-		queue = append(queue, f.run(cmd)...)
-	}
-}
-
-func key(s string) tea.KeyPressMsg {
-	switch s {
-	case "tab":
-		return tea.KeyPressMsg{Code: tea.KeyTab}
-	case "shift+tab":
-		return tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
-	case "down":
-		return tea.KeyPressMsg{Code: tea.KeyDown}
-	case "up":
-		return tea.KeyPressMsg{Code: tea.KeyUp}
-	case "enter":
-		return tea.KeyPressMsg{Code: tea.KeyEnter}
-	}
-	return tea.KeyPressMsg{Code: rune(s[0]), Text: s}
-}
 
 func assertWidth(t *testing.T, out string, w int) {
 	t.Helper()
