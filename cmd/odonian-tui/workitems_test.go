@@ -225,3 +225,64 @@ func TestWorkItemsEmptyRefreshEmitsClearedSelection(t *testing.T) {
 		t.Errorf("got %#v, want WorkItemSelected with empty TaskID", msg)
 	}
 }
+
+func TestWorkItemsAbandonedAndDoneAreHidden(t *testing.T) {
+	p := newTestPane(80, 20)
+	p.SetItems([]*tuiview.WorkItem{wiOf("open", "backlog"), wiOf("gone", "abandoned"), wiOf("fin", "done")}, nil)
+	out := p.render()
+	if got := fmt.Sprint(ids(p)); got != "[open]" {
+		t.Errorf("items %s, want [open]", got)
+	}
+	if !strings.Contains(out, "proj · 1 open") || strings.Contains(out, "Title gone") || strings.Contains(out, "Title fin") {
+		t.Errorf("finished items must not be listed:\n%s", out)
+	}
+}
+
+func TestWorkItemsScrollWindowFollowsSelection(t *testing.T) {
+	p := newTestPane(60, 6) // header + 5 body lines: 4 rows plus the more line
+	var items []*tuiview.WorkItem
+	for i := 0; i < 10; i++ {
+		items = append(items, wiOf(fmt.Sprintf("t%02d", i), "backlog"))
+	}
+	p.SetItems(items, nil)
+	out := p.render()
+	if !strings.Contains(out, "Title t00") || !strings.Contains(out, "Title t03") || strings.Contains(out, "Title t04") {
+		t.Errorf("initial window should be t00..t03:\n%s", out)
+	}
+	if !strings.Contains(out, "↓ 6 more") {
+		t.Errorf("missing more line:\n%s", out)
+	}
+	for i := 0; i < 4; i++ {
+		p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	out = p.render()
+	if p.SelectedTaskID() != "t04" || !strings.Contains(out, "Title t04") {
+		t.Fatalf("selected %q, row not visible:\n%s", p.SelectedTaskID(), out)
+	}
+	if strings.Contains(out, "Title t00") {
+		t.Errorf("t00 should have scrolled out:\n%s", out)
+	}
+	for i := 0; i < 5; i++ {
+		p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	out = p.render()
+	if p.SelectedTaskID() != "t09" || !strings.Contains(out, "Title t09") || strings.Contains(out, "Title t04") {
+		t.Errorf("tail window should be t05..t09:\n%s", out)
+	}
+	if strings.Contains(out, "more") {
+		t.Errorf("no more line expected at the end:\n%s", out)
+	}
+	assertBounds(t, out, 60, 6)
+}
+
+func TestWorkItemsHeaderTruncatesLongProjectName(t *testing.T) {
+	p := newTestPane(30, 5)
+	long := "This Is A Very Long Project Name That Should Be Truncated"
+	p.SetProjectName(long)
+	p.SetItems([]*tuiview.WorkItem{wiOf("a", "backlog")}, nil)
+	out := p.render()
+	if strings.Contains(out, long) || !strings.Contains(out, "This Is A Very") || !strings.Contains(out, "…") {
+		t.Errorf("header should show a truncated name ending in an ellipsis:\n%s", out)
+	}
+	assertBounds(t, out, 30, 5)
+}
