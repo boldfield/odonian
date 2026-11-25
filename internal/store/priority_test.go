@@ -17,7 +17,7 @@ import (
 )
 
 type priorityFixture struct {
-	t         *testing.T
+	t         testing.TB
 	ctx       context.Context
 	dbPath    string
 	store     Store
@@ -26,7 +26,7 @@ type priorityFixture struct {
 	sequence  int
 }
 
-func newPriorityFixture(t *testing.T) *priorityFixture {
+func newPriorityFixture(t testing.TB) *priorityFixture {
 	t.Helper()
 	f := &priorityFixture{t: t, ctx: context.Background(), dbPath: filepath.Join(t.TempDir(), "priority.db")}
 	f.open()
