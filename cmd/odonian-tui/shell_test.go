@@ -12,6 +12,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type shellFixture struct {
@@ -387,4 +388,27 @@ func TestShellToggles(t *testing.T) {
 		t.Error("focus left on hidden project pane")
 	}
 	assertWidth(t, out, 120)
+}
+
+func TestShellErrorAtNarrowWidthPreservesHint(t *testing.T) {
+	f := newShellFixture(t, 60, 24)
+
+	// Simulate a long error message with retry hint
+	errorMsg := "Error: This is a very long error message that would normally exceed the terminal width and needs to be truncated carefully"
+	hintMsg := "Press 'r' to retry"
+	f.model.shell.errorBase = errorMsg
+	f.model.shell.retryHint = hintMsg
+	f.model.error = errorMsg + ". " + hintMsg
+
+	out := f.model.View().Content
+	assertWidth(t, out, 60)
+
+	// The hint should still be present even if error text is truncated
+	bar := f.model.shellHelpBar()
+	if !strings.Contains(bar, "Press 'r' to retry") {
+		t.Errorf("retry hint missing from error bar at narrow width: %q", bar)
+	}
+	if ansi.StringWidth(bar) > 60 {
+		t.Errorf("error bar exceeds width: %d > 60", ansi.StringWidth(bar))
+	}
 }

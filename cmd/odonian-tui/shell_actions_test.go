@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -358,5 +359,64 @@ func TestShellStaleMergeResolutionIgnored(t *testing.T) {
 	f.send(prResolvedMsg{taskID: "t-ready", prURL: "https://github.com/o/r/pull/9", fromShell: true})
 	if f.model.mode != prompt {
 		t.Errorf("resolution during another prompt changed mode to %d", f.model.mode)
+	}
+}
+
+func TestShellErrorShowsRetryHint(t *testing.T) {
+	t.Helper()
+	f := &actionFixture{}
+	tasks := []tuiclient.Task{
+		{ID: "t-ready", Title: "Ready", State: "ready", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
+	}
+	failCount := 0
+	client := &tuiclient.MockClient{
+		ListProjectsFunc: func(ctx context.Context, o ...tuiclient.ProjectListOption) ([]tuiclient.Project, error) {
+			return []tuiclient.Project{{ID: "p1", Name: "One"}}, nil
+		},
+		ListTasksFunc: func(ctx context.Context, projectID string, opts ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
+			if failCount > 0 {
+				failCount--
+				return nil, fmt.Errorf("network error")
+			}
+			return tasks, nil
+		},
+	}
+	cfg := &tuiconfig.Config{URL: "http://test", Token: "t", Actor: "u", PollInterval: time.Hour}
+	f.model = NewShellBoardModel(client, cfg, tuiclient.Project{ID: "p1", Name: "One"})
+	f.model.shell.previewDebounce = 0
+	f.model.newTickCmd = func() tea.Cmd { return nil }
+	f.send(tea.WindowSizeMsg{Width: 140, Height: 40})
+	f.send(projectsMsg())
+	f.send(f.run(f.model.fetchShellTasks())...)
+
+	// Verify initial state has no error
+	if bar := f.model.shellHelpBar(); strings.Contains(bar, "Error") {
+		t.Errorf("initial bar has error: %q", bar)
+	}
+
+	// Trigger a fetch error
+	failCount = 1
+	f.send(f.run(f.model.fetchShellTasks())...)
+
+	// Verify error contains the retry hint with the refresh key
+	bar := f.model.shellHelpBar()
+	if !strings.Contains(bar, "Error") {
+		t.Errorf("error bar missing error text: %q", bar)
+	}
+	if !strings.Contains(bar, "Press 'r' to retry") {
+		t.Errorf("error bar missing retry hint: %q", bar)
+	}
+
+	// Press 'r' to retry with successful fetch
+	failCount = 0
+	f.send(f.run(f.model.fetchShellTasks())...)
+
+	// Verify error is cleared and normal help bar is back
+	bar = f.model.shellHelpBar()
+	if strings.Contains(bar, "Error") {
+		t.Errorf("error not cleared after retry: %q", bar)
+	}
+	if !strings.Contains(bar, "enter") || !strings.Contains(bar, "tab") {
+		t.Errorf("normal help bar not restored: %q", bar)
 	}
 }

@@ -42,6 +42,8 @@ type shellState struct {
 	// selection has since left is dropped.
 	previewSeq      int
 	previewDebounce time.Duration
+	errorBase       string
+	retryHint       string
 }
 
 // shellTasksMsg carries one project's work for the shell: the tasks and the ids of the
@@ -336,11 +338,17 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 			return nil, true // a response for a project the user has since left
 		}
 		if msg.err != nil {
-			m.error = fmt.Sprintf("Error: %v", msg.err)
+			refreshBinding := m.keyBindings.Shell.binding(actRefresh)
+			refreshKey := refreshBinding.Help().Key
+			s.errorBase = fmt.Sprintf("Error: %v", msg.err)
+			s.retryHint = fmt.Sprintf("Press '%s' to retry", refreshKey)
+			m.error = s.errorBase + ". " + s.retryHint
 			return nil, true
 		}
 		m.loading = false
 		m.error = ""
+		s.errorBase = ""
+		s.retryHint = ""
 		m.tasks = bucketTasksByState(msg.tasks)
 		m.lastRefresh = time.Now()
 		cmd = m.setShellItems(msg.tasks, msg.claimable)
@@ -428,16 +436,35 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 
 // shellHelpBar is the bottom bar; it truncates with an ellipsis instead of overflowing.
 func (m *BoardModel) shellHelpBar() string {
-	var text string
 	switch {
 	case m.error != "":
-		text = m.error
+		s := m.shell
+		if s.retryHint == "" {
+			return ansi.Truncate(m.error, m.width, "…")
+		}
+		separator := ". "
+		errorWidth := ansi.StringWidth(s.errorBase)
+		hintWidth := ansi.StringWidth(s.retryHint)
+		sepWidth := ansi.StringWidth(separator)
+		totalWidth := errorWidth + sepWidth + hintWidth
+		if totalWidth <= m.width {
+			return m.error
+		}
+		availableForError := m.width - sepWidth - hintWidth
+		if availableForError < 10 {
+			return ansi.Truncate(m.error, m.width, "…")
+		}
+		truncatedError := ansi.Truncate(s.errorBase, availableForError, "…")
+		return truncatedError + separator + s.retryHint
 	case m.statusMessage != "":
-		text = m.statusMessage
+		text := m.statusMessage
+		if ansi.StringWidth(text) <= m.width {
+			return text
+		}
+		return ansi.Truncate(text, m.width, "…")
 	default:
 		return m.helpLine(m.keyBindings.Shell.help(m.shellKeyCtx()), m.width)
 	}
-	return ansi.Truncate(text, m.width, "…")
 }
 
 // shellKeyCtx is the context the shell's keys resolve in: the focused pane and the state of
