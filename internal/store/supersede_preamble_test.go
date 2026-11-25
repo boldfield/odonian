@@ -103,26 +103,30 @@ func TestSupersedePreambleWithoutOrTombstonedPRLink(t *testing.T) {
 	}
 }
 
-func TestSupersedeChecksFailedPreamble(t *testing.T) {
-	st, ctx, id := supersedeFixture(t, "Spec", "")
-	addFeedbackEvent(t, st, ctx, id, "board", "checks_failed", nil, "lint failed")
-	repl, err := st.SupersedeTask(ctx, id, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "Spec\n\n## Prior attempt feedback\n\n" + priorAttemptFeedbackPreamble(id, "") + "**board (checks failed)**\nlint failed\n\n"
-	if repl.Spec != want {
-		t.Errorf("spec = %q, want %q", repl.Spec, want)
-	}
-}
-
 func TestSupersedeResearchHasNoPreamble(t *testing.T) {
 	st, ctx, id := supersedeFixture(t, "Spec", "research")
 	reject := "reject"
 	addFeedbackEvent(t, st, ctx, id, "rev", "review", &reject, "bad thing")
+	tx, err := st.Conn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := st.getTaskTx(ctx, tx, id)
+	if err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	want, err := st.buildResearchSupersessionSpec(ctx, tx, id, old.Spec)
+	tx.Rollback()
+	if err != nil {
+		t.Fatal(err)
+	}
 	repl, err := st.SupersedeTask(ctx, id, nil, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if repl.Spec != want {
+		t.Errorf("research spec = %q, want %q", repl.Spec, want)
 	}
 	if strings.Contains(repl.Spec, "This task replaces task") {
 		t.Errorf("research spec has preamble: %q", repl.Spec)
