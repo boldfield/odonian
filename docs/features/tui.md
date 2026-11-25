@@ -10,26 +10,26 @@ The TUI shows three panes: **projects**, **work items**, and **preview**. The la
 ```
  PROJECTS        │ syndic · 59 open                          │ D-31 Repair loop
 ─────────────────┼───────────────────────────────────────────┼──────────────────────────────
-   All      ⚠5   │ ◷ D-31 Repair loop            checks  18m │ checks · round 1 · sonnet
- ▸ syndic   ●3   │ ● D-35 Replace prompts   sonnet @2bllr 12m│ PR #212 · in checks 18m
-   ohand    ⚠1   │ ● D-34 Repair fixture    haiku  @s9jtd  4m│
-   llm-gw   ●2   │ ◆ D-30 Rubric loader          review r2   │ Reviews (round 1)
-   reala    ⚠1   │     opus ✔ approve · gpt-5.6-sol … 6m     │   none yet: waiting for CI
-   dumpdem  ✔1   │ ○ D-36 Author prompt          ready       │
-   foia     ✔1   │ ⛓ D-37 Rubric export          waits D-35  │ History
-   notblue  ●1   │ ⛓ D-39 Index page             waits D-36  │   12:41 submitted, PR opened
-   manifests !1  │ ○ D-38 Export                 ready       │   12:41 entered checks
-   +19 quiet     │ ↓ 50 more                                 │   12:12 claimed by @c4wqd
+ ▸ syndic   ●3   │ ◷ D-31 Repair loop            checks  18m │ checks · round 1 · sonnet
+   ohand    ⚠1   │ ● D-35 Replace prompts   sonnet @2bllr 12m│ PR #212 · in checks 18m
+   llm-gw   ●2   │ ● D-34 Repair fixture    haiku  @s9jtd  4m│
+   reala    ⚠1   │ ◆ D-30 Rubric loader          review r2   │ Reviews (round 1)
+   dumpdem  ✔1   │     opus ✔ approve · gpt-5.6-sol … 6m     │   none yet: waiting for CI
+   foia     ✔1   │ ○ D-36 Author prompt          ready       │
+   notblue  ●1   │ ⛓ D-37 Rubric export          waits D-35  │ History
+   manifests !1  │ ⛓ D-39 Index page             waits D-36  │   12:41 submitted, PR opened
+   +19 quiet     │ ○ D-38 Export                 ready       │   12:41 entered checks
+                 │ ↓ 50 more                                 │   12:12 claimed by @c4wqd
 ─────────────────┴───────────────────────────────────────────┴──────────────────────────────
- tab pane · ↑↓ move · enter detail · a approve · u unblock · / filter · v preview · ? help
+ tab pane · ↑↓ move · enter detail · a approve · u unblock · t hold · v preview · ? help
 ```
 
-- **Projects pane** (left): all projects with badges showing the highest-priority status (⚠ needs you, ! failed, ✔ awaiting merge, ● in flight). An "All" entry at top shows cross-project view.
+- **Projects pane** (left): projects in the board with badges showing the highest-priority status (⚠ needs you, ! failed, ✔ awaiting merge, ● in flight). One project is selected; focus shifts to the projects pane when needed.
 - **Work items pane** (center): one implement task per row; review and merge tasks nest as indented lines under their target. Focus here with `tab`/`shift+tab`.
 - **Preview pane** (right): events and details for the selected item. Only shown when an item is selected; `v` toggles it.
 
 ### Medium (80–119 columns): project rail + items
-The project pane collapses to a 10-column rail on the left; preview opens full-screen over the items on `enter`.
+The project pane collapses to a 10-column rail on the left; detail opens full-screen over the items on `enter`.
 
 ### Narrow (under 80 columns): items only
 Only the work items pane is shown; projects and detail open full-screen.
@@ -43,7 +43,7 @@ Each row is one implement task. Status is shown with a glyph (◷ in checks, ●
 - `tab` / `shift+tab` cycle focus between panes.
 - `↑/↓` (and `j/k`) move within the focused pane.
 - `enter` opens the full-screen detail view (or selects a project if focus is in the projects pane).
-- `esc` closes detail or returns to items.
+- `q` or `esc` in the detail view closes it and returns to the board.
 - `v` toggles the preview pane (wide layout only, only when an item is selected).
 - `V` (shift+v) toggles the projects pane.
 
@@ -52,23 +52,18 @@ Each row is one implement task. Status is shown with a glyph (◷ in checks, ●
 | State | Key | Action |
 |---|---|---|
 | backlog | `p` | promote → ready |
-| ready | `h` (hold) | hold/release (prefix on status) |
-| ready | `i` | set priority |
-| ready | `w` | move to front (highest priority) |
-| ready | `e` | reset priority |
-| ready | `z` | archive |
-| in progress | `t` | hold/release |
-| in progress | `i` | set priority |
-| in progress | `w` | move to front |
-| in progress | `e` | reset priority |
-| in progress | `z` | archive |
+| ready, in progress, review, approved, blocked | `t` | hold/release (prefix on status) |
+| any item | `i` | set priority |
+| any item | `w` | move to front (highest priority) |
+| any item | `e` | reset priority |
+| any item | `z` | archive |
 | review | `a` | approve (with optional note; confirm required) |
 | review | `x` | reject (reason required) |
 | approved | `m` | merge & complete |
 | approved | `b` | bounce (back to ready) |
 | blocked | `u` | unblock |
 | blocked | `f` | fail |
-| any (items) | `c` | open research scorecards |
+| any item | `c` | open research scorecards |
 
 **On projects:** `z` to archive a project.
 
@@ -115,41 +110,3 @@ All actions go through the API; the board may be stale. Every action handles a 4
 - **Minimum 40 columns** to render anything usable
 - Below 80 columns the layout degrades to items-only (projects and detail open full-screen)
 - Resizes are live; panes adapt to new width on the fly
-
-## Key bindings verified against code
-
-**Keybindings source:** `cmd/odonian-tui/keybindings.go` (Shell key map)
-
-| Key | Help text | Valid in | Valid states | Code reference |
-|---|---|---|---|---|
-| `p` | promote | items pane | backlog | keybindings.go:195 |
-| `a` | approve | items pane | review | keybindings.go:196 |
-| `x` | reject | items pane | review | keybindings.go:197 |
-| `m` | merge | items pane | approved | keybindings.go:198 |
-| `b` | bounce | items pane | approved | keybindings.go:199 |
-| `u` | unblock | items pane | blocked | keybindings.go:200 |
-| `f` | fail | items pane | blocked | keybindings.go:201 |
-| `enter` | detail | items/preview panes | any | keybindings.go:203 |
-| `enter` | open | projects pane | any | keybindings.go:204 |
-| `tab` | pane | any | any | keybindings.go:205 |
-| `shift+tab` | (hidden) | any | any | keybindings.go:206 |
-| `↑/↓`, `j/k` | move | any | any | keybindings.go:207-208 |
-| `t` | hold/release | items pane | any | keybindings.go:209 |
-| `i` | priority | items pane | any | keybindings.go:210 |
-| `w` | front | items pane | any | keybindings.go:211 |
-| `e` | reset | items pane | any | keybindings.go:212 |
-| `z` | archive | items pane | any | keybindings.go:213 |
-| `z` | archive project | projects pane | any | keybindings.go:214 |
-| `v` | preview | any | any | keybindings.go:215 |
-| `V` | projects | any | any | keybindings.go:216 |
-| `c` | scorecards | any | any | keybindings.go:217 |
-| `r` | refresh | any | any | keybindings.go:218 |
-| `?` | help | any | any | keybindings.go:219 |
-| `q`, `ctrl+c` | quit | any | any | keybindings.go:220 |
-
-**Width thresholds verified against code:** `internal/tuiview/layout.go`
-
-- Minimum width: 40 columns (MinWidth)
-- Narrow layout: < 80 columns (items only)
-- Medium layout: 80–119 columns (ProjectRailWidth = 10, items, no preview)
-- Wide layout: 120+ columns (ProjectPaneWidth = 17, items, preview)
