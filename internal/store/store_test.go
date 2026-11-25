@@ -20018,9 +20018,9 @@ func TestListTasksOmitBodies(t *testing.T) {
 	// The constant aliases are the only permitted mentions.
 	bodyRef := regexp.MustCompile("(?i)\\b(spec|result)\\b")
 	selectList := func(q string) string {
-		i := strings.Index(q, "FROM task")
+		i := strings.Index(q, "WHERE project_id")
 		if i < 0 {
-			t.Fatalf("no FROM task in query: %s", q)
+			t.Fatalf("no WHERE project_id marker in query: %s", q)
 		}
 		return q[:i]
 	}
@@ -20034,7 +20034,7 @@ func TestListTasksOmitBodies(t *testing.T) {
 	if !bodyRef.MatchString(selectList(fullSQL)) {
 		t.Errorf("check is vacuous: full query should reference spec/result: %s", fullSQL)
 	}
-	if bodyRef.MatchString(omitSQL[strings.Index(omitSQL, "FROM task"):]) {
+	if bodyRef.MatchString(omitSQL[strings.Index(omitSQL, "WHERE project_id"):]) {
 		t.Errorf("OmitBodies query references spec/result outside the select list: %s", omitSQL)
 	}
 }

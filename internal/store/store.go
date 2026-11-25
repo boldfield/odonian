@@ -1867,7 +1867,11 @@ func buildListTasksQuery(projectID string, filter TaskListFilter) (string, []int
 	if filter.OmitBodies {
 		specColumn, resultColumn = "'' AS spec", "NULL AS result"
 	}
-	query := `SELECT id, project_id, document_id, title, ` + specColumn + `, state, assignee, lease_expires_at, ` + resultColumn + `, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, ` + taskTopicColumns + `, created_at, updated_at, archived_at, superseded_by
+	// The inner query resolves the topic anchor once per row; the outer one reads the
+	// anchor's priority. LIMIT -1 OFFSET 0 is a barrier: without it SQLite flattens the
+	// subquery and re-expands the anchor walk in the outer column and ORDER BY.
+	query := `SELECT COALESCE((SELECT a.priority FROM task a WHERE a.id = t.topic_anchor_id), t.own_priority) AS topic_priority, t.*
+		FROM (SELECT id, project_id, document_id, title, ` + specColumn + `, state, assignee, lease_expires_at, ` + resultColumn + `, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, created_at, updated_at, archived_at, superseded_by, priority AS own_priority, ` + topicAnchorSQL + ` AS topic_anchor_id
 		FROM task
 		WHERE project_id = ?`
 	args := []interface{}{projectID}
@@ -1905,7 +1909,7 @@ func buildListTasksQuery(projectID string, filter TaskListFilter) (string, []int
 		args = append(args, nowTimestamp())
 	}
 
-	query += ` ORDER BY topic_priority DESC, created_at, id`
+	query += ` LIMIT -1 OFFSET 0) t ORDER BY topic_priority DESC, t.created_at, t.id`
 
 	return query, args
 }
@@ -1923,7 +1927,8 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 	for rows.Next() {
 		var t Task
 		var reviewModelsJSON *string
-		if err := rows.Scan(&t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.Priority, &t.TopicAnchorID, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy); err != nil {
+		var ownPriority int64
+		if err := rows.Scan(&t.Priority, &t.ID, &t.ProjectID, &t.DocumentID, &t.Title, &t.Spec, &t.State, &t.Assignee, &t.LeaseExpiresAt, &t.Result, &t.Model, &t.Kind, &reviewModelsJSON, &t.ReviewRound, &t.TargetTaskID, &t.Verdict, &t.AgentMerge, &t.Held, &t.Escalate, &t.Track, &t.Branch, &t.AwaitChecks, &t.ChecksStartedAt, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.SupersededBy, &ownPriority, &t.TopicAnchorID); err != nil {
 			return nil, fmt.Errorf("failed to scan task: %w", err)
 		}
 		// Unmarshal review_models from JSON
