@@ -20020,7 +20020,7 @@ func TestListTasksOmitBodies(t *testing.T) {
 	selectList := func(q string) string {
 		i := strings.Index(q, "WHERE project_id")
 		if i < 0 {
-			t.Fatalf("no FROM task in query: %s", q)
+			t.Fatalf("no "WHERE project_id" marker in query: %s", q)
 		}
 		return q[:i]
 	}
