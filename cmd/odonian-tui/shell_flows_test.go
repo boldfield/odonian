@@ -51,6 +51,18 @@ func taskHeld(f *boardFixture, id string) bool {
 	return false
 }
 
+// taskState is the state the board's model holds for the task, or "" if it is absent.
+func taskState(f *boardFixture, id string) string {
+	for _, list := range f.model.tasks {
+		for _, task := range list {
+			if task.ID == id {
+				return task.State
+			}
+		}
+	}
+	return ""
+}
+
 func TestBoardModel_UnblockFlow(t *testing.T) {
 	f := newBlockedFlowFixture(t)
 	notes := captureTransitions(f)
@@ -59,13 +71,16 @@ func TestBoardModel_UnblockFlow(t *testing.T) {
 	if f.model.mode != modeUnblockNote {
 		t.Fatalf("mode after 'u' = %d, want modeUnblockNote", f.model.mode)
 	}
-	f.press("Dependency resolved", "enter")
+	f.press("dep ok", "enter")
 	if f.model.mode != modeUnblockConfirm {
 		t.Fatalf("mode after enter = %d, want modeUnblockConfirm", f.model.mode)
 	}
 	if view := f.model.viewContent(); !strings.Contains(view, "→ ready?") {
 		t.Errorf("confirm prompt not in view:\n%s", view)
 	}
+	// The refetch that follows the transition serves the task in its new state.
+	f.setTasks(tuiclient.Task{ID: "blocked-task-1", Title: "Blocked Task", State: "ready", Kind: "implement"})
+	f.resetCalls()
 	f.press("y")
 	if f.model.mode != modeNormal {
 		t.Errorf("mode after confirm = %d, want normal", f.model.mode)
@@ -73,8 +88,14 @@ func TestBoardModel_UnblockFlow(t *testing.T) {
 	if got := f.got(); got != "transition blocked-task-1 ready" {
 		t.Errorf("calls = %q", got)
 	}
-	if len(*notes) != 1 || (*notes)[0] == nil || *(*notes)[0] != "Dependency resolved" {
-		t.Errorf("note = %v, want 'Dependency resolved'", *notes)
+	if len(*notes) != 1 || (*notes)[0] == nil || *(*notes)[0] != "dep ok" {
+		t.Errorf("note = %v, want 'dep ok'", *notes)
+	}
+	if len(f.listCalls()) == 0 {
+		t.Error("no refetch after the transition")
+	}
+	if got := taskState(f, "blocked-task-1"); got != "ready" {
+		t.Errorf("task state after refetch = %q, want ready", got)
 	}
 }
 
@@ -86,13 +107,16 @@ func TestBoardModel_FailFlow(t *testing.T) {
 	if f.model.mode != modeFailNote {
 		t.Fatalf("mode after 'f' = %d, want modeFailNote", f.model.mode)
 	}
-	f.press("Unresolvable", "enter")
+	f.press("nope", "enter")
 	if f.model.mode != modeFailConfirm {
 		t.Fatalf("mode after enter = %d, want modeFailConfirm", f.model.mode)
 	}
 	if view := f.model.viewContent(); !strings.Contains(view, "→ failed?") {
 		t.Errorf("confirm prompt not in view:\n%s", view)
 	}
+	// The refetch that follows the transition serves the task in its new state.
+	f.setTasks(tuiclient.Task{ID: "blocked-task-1", Title: "Blocked Task", State: "failed", Kind: "implement"})
+	f.resetCalls()
 	f.press("y")
 	if f.model.mode != modeNormal {
 		t.Errorf("mode after confirm = %d, want normal", f.model.mode)
@@ -100,8 +124,14 @@ func TestBoardModel_FailFlow(t *testing.T) {
 	if got := f.got(); got != "transition blocked-task-1 failed" {
 		t.Errorf("calls = %q", got)
 	}
-	if len(*notes) != 1 || (*notes)[0] == nil || *(*notes)[0] != "Unresolvable" {
-		t.Errorf("note = %v, want 'Unresolvable'", *notes)
+	if len(*notes) != 1 || (*notes)[0] == nil || *(*notes)[0] != "nope" {
+		t.Errorf("note = %v, want 'nope'", *notes)
+	}
+	if len(f.listCalls()) == 0 {
+		t.Error("no refetch after the transition")
+	}
+	if got := taskState(f, "blocked-task-1"); got != "failed" {
+		t.Errorf("task state after refetch = %q, want failed", got)
 	}
 }
 
