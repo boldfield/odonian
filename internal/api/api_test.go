@@ -11744,3 +11744,54 @@ func mustListTasks(t *testing.T, server *Server, authHeader, taskID string) []st
 	json.NewDecoder(w.Body).Decode(&tasks)
 	return tasks
 }
+
+// TestListTasksSummaryMatchesFullListMinusBodies verifies the fields=summary
+// response carries the same keys and values as the full list without spec/result,
+// for a task that has both a spec and a result.
+func TestListTasksSummaryMatchesFullListMinusBodies(t *testing.T) {
+	server := setupTestServer(t, "test-token")
+	authHeader := "Bearer test-token"
+	projectID, docID := setupProjectAndDocument(t, server, authHeader)
+
+	taskBody, _ := json.Marshal([]store.TaskInput{{Title: "Task 1", Spec: "This is the spec", DocumentID: docID}})
+	createReq := httptest.NewRequest("POST", "/projects/"+projectID+"/tasks", bytes.NewReader(taskBody))
+	createReq.Header.Set("Authorization", authHeader)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.mux.ServeHTTP(createW, createReq)
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", createW.Code, createW.Body.String())
+	}
+	if _, err := server.store.Conn().ExecContext(context.Background(), "UPDATE task SET result = ? WHERE project_id = ?", "the result", projectID); err != nil {
+		t.Fatalf("failed to set result: %v", err)
+	}
+
+	list := func(query string) []map[string]interface{} {
+		req := httptest.NewRequest("GET", "/projects/"+projectID+"/tasks"+query, nil)
+		req.Header.Set("Authorization", authHeader)
+		w := httptest.NewRecorder()
+		server.mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", w.Code)
+		}
+		var out []map[string]interface{}
+		if err := json.NewDecoder(w.Body).Decode(&out); err != nil {
+			t.Fatalf("failed to decode: %v", err)
+		}
+		return out
+	}
+
+	full := list("")
+	summary := list("?fields=summary")
+	if len(full) != 1 || len(summary) != 1 {
+		t.Fatalf("expected one task each, got %d and %d", len(full), len(summary))
+	}
+	if full[0]["spec"] != "This is the spec" || full[0]["result"] != "the result" {
+		t.Errorf("full list should include spec and result, got %v / %v", full[0]["spec"], full[0]["result"])
+	}
+	delete(full[0], "spec")
+	delete(full[0], "result")
+	if !reflect.DeepEqual(full[0], summary[0]) {
+		t.Errorf("summary differs from full list minus bodies:\nfull:    %v\nsummary: %v", full[0], summary[0])
+	}
+}
