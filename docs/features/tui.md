@@ -1,7 +1,7 @@
 # Feature: Odonian TUI
 
-> **Status checked 2026-11-03 · v0.24.0 / `b3da896`: Implemented and expanded; historical v1 scope.**
-> The [TUI implementation](../../cmd/odonian-tui/) now includes capabilities beyond this proposal, including priority controls and research scorecards. The original non-goals below are historical, not a current capability list. See the [main guide](../../README.md) and [documentation index](../README.md).
+> **Status: the TUI runs the three-pane layout described under "Layout & navigation" and "Keybindings".**
+> The [TUI implementation](../../cmd/odonian-tui/) includes capabilities beyond the original v1 scope, including priority controls and research scorecards. The goals, non-goals and task breakdown below are the historical v1 scope, not a current capability list. The design behind the layout is [`tui-redesign.md`](./tui-redesign.md). See the [main guide](../../README.md) and [documentation index](../README.md).
 
 Status: feature spec, 2026-06-05
 Kind: feature_spec (for project Odonian)
@@ -72,27 +72,68 @@ Resolution order (highest wins): **flags > environment > config file > defaults*
 
 ## Layout & navigation
 
-**Focused column + tabs.** Column names with counts run across the top as tabs; the active
-column's tasks are listed full-width below, so titles are readable. The board never tries to
-cram five columns side by side.
+**Three panes:** projects on the left, work items in the middle, a preview of the selected work
+item on the right. The board shows one project at a time (the one selected in the projects
+pane). Each work item is one row: an implement task, with its review and merge tasks nested
+under it. A glyph shows its status: `○` ready to claim, `⛓` waiting on a dependency, `·` in
+backlog, `●` in progress, `◷` checks, `◆` review, `✔` approved, `✖` blocked, `!` failed, `✓`
+done, `⊗` abandoned; a held item carries a hold prefix.
+
+Wide terminal (120 columns or more), a backlog item selected:
 
 ```
- backlog(2)  ready(0)  ‹in_progress(1)›  review(0)  done(3)
- ──────────────────────────────────────────────────────────
- ▸ TUI-2  Board view + nav + polling
-     haiku-1 · lease 2m11s · updated 14s ago
-
-   TUI-5  Task detail pane
- ──────────────────────────────────────────────────────────
- ←/→ column   ↑/↓ select   enter detail   p/a/x act   ? help   q quit
+ PROJECTS        │ syndic                                    │ D-36 Author prompt
+─────────────────┼───────────────────────────────────────────┼──────────────────────────────
+   ohand         │ ◷ D-31 Repair loop            checks  18m │ backlog
+ ▸ syndic        │ ● D-35 Replace prompts   sonnet @2bllr 12m│
+   llm-gw        │ ◆ D-30 Rubric loader          review r2   │ History
+   reala         │ · D-36 Author prompt          backlog     │   events of the selected task
+ ──────────────────────────────────────────────────────────────────────────────────────────
+ p promote · enter detail · tab pane · ↑/↓ move · t hold/release · i priority · w front · ...
 ```
 
-- `←/→` (and `h/l`) switch the active column; `↑/↓` (and `j/k`) move the selection within it.
-- The selected column's available actions show in the help bar (e.g. `p` only on `backlog`,
-  `a/x` only on `review`).
-- A column with more tasks than fit scrolls internally (the `bubbles` list handles this).
-- Responsive to terminal resize; a minimum width below which it shows a "wider terminal"
-  hint rather than rendering garbage.
+The row and preview contents are illustrative; the help line is the real text for a backlog
+item with the items pane focused (before truncation to the terminal width):
+
+```
+p promote · enter detail · tab pane · ↑/↓ move · t hold/release · i priority · w front · e reset · z archive · v preview · V projects · c scorecards · r refresh · ? help · q quit
+```
+
+The help bar is generated from the key bindings for the focused pane and the selected item's
+state, so it lists only keys that work now. When it is wider than the terminal it is cut at the
+end with `…`.
+
+### Width
+
+The layout follows the terminal width (`internal/tuiview/layout.go`):
+
+| Terminal width | Panes shown |
+|----------------|-------------|
+| 120 columns or more | Projects (17 columns), items, and the preview when a work item is selected |
+| 80 to 119 | A 10-column project rail with abbreviated names, and items. No preview pane |
+| 40 to 79 | Items only |
+| under 40 | "Terminal too narrow. Please resize." |
+
+Press `enter` on a work item at any width to open its full-screen detail view. `V` hides and
+shows the projects pane (or rail); `v` hides and shows the preview (wide terminals only).
+
+### Focus
+
+`tab` moves focus to the next visible pane and `shift+tab` to the previous one, wrapping around.
+`↑/↓` (and `j/k`) act on the focused pane: they move the project selection, the work-item
+selection, or scroll the preview. Item actions (`p`, `a`, `x`, ...) work when the items pane has
+focus; the same keys do nothing in other panes, except that `z` in the projects pane archives
+the selected project (with a confirmation). `enter` in the projects pane opens the selected
+project in the items pane and moves focus there. Panes that are not visible at the current width
+cannot take focus.
+
+### Not yet built
+
+The design in [`tui-redesign.md`](./tui-redesign.md) also describes an **"All"** entry at the top
+of the projects pane: a cross-project view in four bands (Needs You, In Flight, Queued,
+Finished in the Last Hour), and per-project status badges. None of these exists yet. The items
+pane always shows one project, the projects pane lists projects only, and the project badges stay
+empty. The bands and badges are not in the key tables below because they have no keys.
 
 ## Data & refresh
 
@@ -123,11 +164,13 @@ All actions go through the API; the board you see can be stale, so **every actio
 
 ## Detail view
 
-`enter` opens a **full-screen** detail (not a cramped split); `esc` returns to the board.
+`enter` opens a **full-screen** detail (not a cramped split); `esc` (or `q`) returns to the board.
 Shows: title, state, the full `spec` (scrollable viewport), `depends_on` resolved to task
 titles, `links` (with `o` to open the `pr` link in `$BROWSER`/`open`/`xdg-open`), `result`,
 `assignee`, lease countdown, and created/updated timestamps. On `review` tasks the same
-`a`/`x` actions are available from the detail view.
+`a`/`x` actions are available from the detail view, and on `approved` tasks `m` merges. `i`, `w`
+and `e` set, front-load and reset the task's priority, `↑/↓` (or `j/k`) scroll the spec,
+`pgup/pgdn` page it, and `?` shows help.
 
 From detail you can also open the task's **source documents** in the browser:
 
@@ -144,26 +187,68 @@ the ref — the TUI builds the URL (GitHub-shaped; abstract for other forges lat
 
 ## Keybindings (full)
 
+Checked against the `Shell` and `Detail` key maps in `cmd/odonian-tui/keybindings.go`.
+
+### Board (all panes)
+
 | Key | Action |
 |-----|--------|
-| `←/→`, `h/l` | switch column |
-| `↑/↓`, `j/k` | move selection |
-| `enter` | open detail |
-| `esc` | back / close |
+| `tab`, `shift+tab` | focus the next / previous visible pane |
+| `↑/↓`, `j/k` | move the selection in the focused pane; scroll the preview when it has focus |
+| `v` | show or hide the preview |
+| `V` | show or hide the projects pane |
+| `c` | scorecards |
+| `r` | refresh now |
+| `?` | toggle the full key list |
+| `q`, `ctrl+c` | quit |
+
+### Items pane
+
+| Key | Action |
+|-----|--------|
+| `enter` | open the detail view (also from the preview pane) |
 | `p` | promote (backlog → ready) |
 | `a` | approve (review → done, confirmed) |
 | `x` | reject (review → ready, reason required) |
+| `m` | merge an approved task's PR |
+| `b` | bounce an approved task |
+| `u` | unblock (blocked) |
+| `f` | fail (blocked) |
+| `t` | hold or release the item (any state) |
+| `i` | set priority |
+| `w` | move to front |
+| `e` | reset priority |
+| `z` | archive (confirmed) |
+
+`p`, `a`, `x`, `m`, `b`, `u` and `f` apply only to an item in the state named in the table; the
+rest apply to any item.
+
+### Projects pane
+
+| Key | Action |
+|-----|--------|
+| `enter` | open the selected project |
+| `z` | archive the selected project (confirmed) |
+
+### Detail view
+
+| Key | Action |
+|-----|--------|
+| `esc`, `q` | back to the board |
+| `a`, `x` | approve / reject (review tasks) |
+| `m` | merge (approved tasks) |
+| `i`, `w`, `e` | set priority / move to front / reset priority |
+| `↑/↓`, `j/k` | scroll the spec |
+| `pgup/pgdn` | page the spec |
 | `o` | open the task's PR link in the browser |
-| `s` | (detail) open the task's source doc in the browser |
-| `d` | (detail) open the project's base design doc in the browser |
-| `r` | refresh now |
-| `?` | toggle help overlay |
-| `q`, `ctrl+c` | quit |
+| `s` | open the task's source doc in the browser |
+| `d` | open the project's base design doc in the browser |
+| `?` | help |
 
 ## Visual design
 
-- State-tinted columns/badges (e.g. backlog dim, ready blue, in_progress yellow, review
-  magenta, done green), counts in the tab headers, a persistent status/help bar.
+- A status glyph per work item, a pane separator, and a persistent help bar built from the key
+  bindings.
 - Lease rendered as a live countdown (`2m11s`) and `EXPIRED` (red) when past — an expired
   lease on an `in_progress` task means it's reclaimable.
 - Styling via `lipgloss`; degrade gracefully on narrow/low-color terminals.
