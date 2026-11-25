@@ -286,6 +286,7 @@ type reviewActionMsg struct {
 	// tasks is non-nil on success; it holds the refreshed board data.
 	tasks         map[string][]tuiclient.Task
 	err           string
+	refetchFailed bool // true when err is a failed task refetch after the action
 	fromDetail    bool
 	actionSuccess bool   // true only when the priority action itself succeeded
 	status        string // success text shown above the refreshed list (not an error)
@@ -760,7 +761,7 @@ func (m *BoardModel) fetchTasksInline(ctx context.Context, errPrefix string) rev
 		if errPrefix != "" {
 			errMsg = errPrefix + "; " + errMsg
 		}
-		return reviewActionMsg{err: errMsg}
+		return reviewActionMsg{err: errMsg, refetchFailed: true}
 	}
 
 	bucketed := bucketTasksByState(tasks)
