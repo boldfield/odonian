@@ -42,6 +42,9 @@ type shellState struct {
 	// selection has since left is dropped.
 	previewSeq      int
 	previewDebounce time.Duration
+	// fetchErrorMsg is the m.error a failed task fetch set. The retry hint is shown only
+	// while m.error still equals it, so a later error from another action never inherits it.
+	fetchErrorMsg string
 }
 
 // shellTasksMsg carries one project's work for the shell: the tasks and the ids of the
@@ -317,6 +320,12 @@ func (m *BoardModel) updateShell(msg tea.Msg) (tea.Model, tea.Cmd) {
 	model, cmd := m.updateTabs(msg)
 	switch msg.(type) {
 	case reviewActionMsg, tasksFetchedMsg:
+		if fetched, ok := msg.(tasksFetchedMsg); ok {
+			m.shell.fetchErrorMsg = ""
+			if fetched.err != nil {
+				m.shell.fetchErrorMsg = m.error
+			}
+		}
 		rebuild := m.rebuildShellItems()
 		m.shell.preview.SetItem(m.shell.items.SelectedItem())
 		cmd = tea.Batch(cmd, rebuild)
@@ -337,10 +346,12 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 		}
 		if msg.err != nil {
 			m.error = fmt.Sprintf("Error: %v", msg.err)
+			s.fetchErrorMsg = m.error
 			return nil, true
 		}
 		m.loading = false
 		m.error = ""
+		s.fetchErrorMsg = ""
 		m.tasks = bucketTasksByState(msg.tasks)
 		m.lastRefresh = time.Now()
 		cmd = m.setShellItems(msg.tasks, msg.claimable)
@@ -430,6 +441,8 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 func (m *BoardModel) shellHelpBar() string {
 	var text string
 	switch {
+	case m.error != "" && m.error == m.shell.fetchErrorMsg:
+		return m.fetchErrorBar()
 	case m.error != "":
 		text = m.error
 	case m.statusMessage != "":
@@ -438,6 +451,17 @@ func (m *BoardModel) shellHelpBar() string {
 		return m.helpLine(m.keyBindings.Shell.help(m.shellKeyCtx()), m.width)
 	}
 	return ansi.Truncate(text, m.width, "…")
+}
+
+// fetchErrorBar is the bar for a failed task fetch: the error text, truncated to leave room,
+// then a hint naming the refresh key. The hint is never truncated unless it alone is too wide.
+func (m *BoardModel) fetchErrorBar() string {
+	hint := fmt.Sprintf("Press '%s' to retry.", m.keyBindings.Shell.binding(actRefresh).Help().Key)
+	avail := m.width - ansi.StringWidth(" "+hint)
+	if avail <= 0 {
+		return ansi.Truncate(hint, m.width, "…")
+	}
+	return ansi.Truncate(m.error, avail, "…") + " " + hint
 }
 
 // shellKeyCtx is the context the shell's keys resolve in: the focused pane and the state of
