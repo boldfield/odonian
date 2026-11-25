@@ -277,3 +277,11 @@ func TestShellToggles(t *testing.T) {
 	}
 	assertWidth(t, out, 120)
 }
+
+func TestShellHeaderShowsProjectNameAndOpenCount(t *testing.T) {
+	f := newShellFixture(t, 70, 24) // items pane only, so the name comes from the items header
+	out := f.model.View().Content
+	if !strings.Contains(out, "One · ") || !strings.Contains(out, " open") {
+		t.Errorf("items header should read '<project> · N open':\n%s", out)
+	}
+}

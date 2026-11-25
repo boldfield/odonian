@@ -696,3 +696,80 @@ func TestRenderRowPendingReviewerMark(t *testing.T) {
 func ptrString(s string) *string {
 	return &s
 }
+
+func TestRenderRowHeldInProgressKeepsDetail(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	assignee := "worker-xyz"
+	wi := &WorkItem{Implement: &tuiclient.Task{
+		ID: "in-prog-1", Title: "Held in progress task", State: "in_progress", Model: "opus",
+		Kind: "implement", Held: true, Assignee: &assignee,
+		LeaseExpiresAt: ptrString(now.Add(2 * time.Hour).Format(time.RFC3339Nano)),
+	}}
+	row := RenderRow(wi, 100, now, newMockTheme(), false)
+	for _, want := range []string{"⏸", "in-prog-", "opus @worker-xyz lease"} {
+		if !hasSubstring(row, want) {
+			t.Errorf("missing %q in row: %q", want, row)
+		}
+	}
+}
+
+func TestRenderRowHeldGlyphSurvivesLongTitle(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	wi := &WorkItem{Implement: &tuiclient.Task{
+		ID: "ready-lg", State: "ready", Model: "haiku", Kind: "implement", Held: true,
+		Title: "This is a very long task title that should not push the held marker off the visible area even at standard widths",
+	}}
+	row := RenderRow(wi, 60, now, newMockTheme(), true)
+	if !hasSubstring(row, "⏸") {
+		t.Errorf("held glyph lost with a long title: %q", row)
+	}
+	if w := lipgloss.Width(row); w > 60 {
+		t.Errorf("row width %d exceeds 60: %q", w, row)
+	}
+}
+
+func TestRenderRowInProgressWithoutAssignee(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	wi := &WorkItem{Implement: &tuiclient.Task{
+		ID: "task-no-assignee", Title: "No Assignee Task", State: "in_progress", Model: "haiku",
+		Kind: "implement", LeaseExpiresAt: ptrString(now.Add(5 * time.Minute).Format(time.RFC3339Nano)),
+	}}
+	row := RenderRow(wi, 100, now, newMockTheme(), false)
+	for _, bad := range []string{"null", "(unassigned)", "@"} {
+		if hasSubstring(row, bad) {
+			t.Errorf("unassigned row must not contain %q: %q", bad, row)
+		}
+	}
+	if !hasSubstring(row, "No Assignee Task") {
+		t.Errorf("missing title: %q", row)
+	}
+}
+
+func TestRenderRowPriorityValues(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	for _, p := range []int64{750, 1000, 1500} {
+		wi := &WorkItem{Implement: &tuiclient.Task{
+			ID: "task-p", Title: "Prioritised", State: "ready", Kind: "implement", Priority: ptrInt64(p),
+		}}
+		row := RenderRow(wi, 100, now, newMockTheme(), true)
+		if want := fmt.Sprintf("P:%d", p); !hasSubstring(row, want) {
+			t.Errorf("missing %q in row: %q", want, row)
+		}
+	}
+}
+
+func TestRenderRowChecksDuration(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	started := now.Add(-7 * time.Minute).Format(time.RFC3339Nano)
+	agent := "w1"
+	for _, assignee := range []*string{&agent, nil} {
+		wi := &WorkItem{Implement: &tuiclient.Task{
+			ID: "task-c1", Title: "In checks", State: "checks", Kind: "implement",
+			Assignee: assignee, ChecksStartedAt: &started,
+		}}
+		row := RenderRow(wi, 100, now, newMockTheme(), false)
+		if !hasSubstring(row, "checks 7m") {
+			t.Errorf("missing checks duration (assignee %v): %q", assignee, row)
+		}
+	}
+}

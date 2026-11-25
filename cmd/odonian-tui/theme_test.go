@@ -13,3 +13,9 @@ func TestThemeHasStatusStyleForEachState(t *testing.T) {
 		}
 	}
 }
+
+func TestThemeHasChecksStatusStyle(t *testing.T) {
+	if _, ok := NewTheme().StatusStyles[stateChecks]; !ok {
+		t.Fatal("checks has no colour")
+	}
+}
