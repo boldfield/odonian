@@ -227,7 +227,8 @@ reconciler for every task state.
 [agent runbook](./AGENT-API.md) explains claiming, submission, priority, research permits and
 isolated evaluation, and the [API reference](./docs/api.md) covers operations without a CLI wrapper.
 
-The optional `odonian-tui` shows the board by state with search, filtering, topic priority,
+The optional `odonian-tui` shows one project's work items in three panes (projects, work items,
+preview), with review and merge tasks nested under their implement task, topic priority,
 reviewer scorecards and confirm-gated archive actions. Four [interactive skills](./docs/skills.md)
 cover task decomposition, board inspection, operations and the human merge gate.
 
