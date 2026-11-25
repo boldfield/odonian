@@ -1830,12 +1830,11 @@ const claimableSQL = `(state = 'ready' OR (state = 'in_progress' AND lease_expir
 		WHERE d.task_id = task.id AND t2.state != 'done'
 	)`
 
-// ListTasks retrieves tasks for a project with optional filters.
-// Filters compose with AND logic.
-// By default, archived tasks are excluded unless filter.IncludeArchived is true.
-func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error) {
+// buildListTasksQuery builds the base SELECT query for ListTasks.
+// It returns the query with omitBodies columns and the base args.
+func buildListTasksQuery(projectID string, omitBodies bool) (string, []interface{}) {
 	var specColumn, resultColumn string
-	if filter.OmitBodies {
+	if omitBodies {
 		specColumn = `'' as spec`
 		resultColumn = `NULL as result`
 	} else {
@@ -1846,6 +1845,14 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 		FROM task
 		WHERE project_id = ?`
 	args := []interface{}{projectID}
+	return query, args
+}
+
+// ListTasks retrieves tasks for a project with optional filters.
+// Filters compose with AND logic.
+// By default, archived tasks are excluded unless filter.IncludeArchived is true.
+func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error) {
+	query, args := buildListTasksQuery(projectID, filter.OmitBodies)
 
 	if !filter.IncludeArchived {
 		query += ` AND archived_at IS NULL`

@@ -19952,42 +19952,25 @@ func TestListTasksOmitBodies(t *testing.T) {
 		}
 	}
 
-	// Test 3: Verify via SQL that OmitBodies query uses constant expressions, not actual columns.
-	// Run a simplified query with OmitBodies (using constant expressions) and verify it works.
-	// This confirms the query builder uses '' as spec and NULL as result.
-	testQuery := `SELECT id, '' as spec, NULL as result FROM task WHERE project_id = ? AND kind = ? LIMIT 1`
-	var testID, testSpec string
-	var testResult *string
-	err = store.Conn().QueryRowContext(ctx, testQuery, proj.ID, "implement").Scan(&testID, &testSpec, &testResult)
-	if err != nil && err != sql.ErrNoRows {
-		t.Fatalf("failed to run simplified OmitBodies query: %v", err)
+	// Test 3: Verify at SQL level that OmitBodies query uses constant expressions, not actual columns.
+	// The query built by ListTasks when OmitBodies=true must use '' as spec and NULL as result aliases,
+	// not bare spec/result columns from the task table.
+	omitBodiesQuery, _ := buildListTasksQuery(proj.ID, true)
+	fullListQuery, _ := buildListTasksQuery(proj.ID, false)
+
+	// OmitBodies query must contain the alias patterns, not bare columns
+	if !strings.Contains(omitBodiesQuery, "'' as spec") {
+		t.Errorf("OmitBodies query should use '' as spec alias, but doesn't: %s", omitBodiesQuery)
 	}
-	// If query succeeded, it proves the constant expression format works in the actual query
-	if err == nil {
-		if testSpec != "" {
-			t.Errorf("simplified OmitBodies query returned non-empty spec: %q", testSpec)
-		}
-		if testResult != nil {
-			t.Errorf("simplified OmitBodies query returned non-nil result: %v", testResult)
-		}
+	if !strings.Contains(omitBodiesQuery, "NULL as result") {
+		t.Errorf("OmitBodies query should use NULL as result alias, but doesn't: %s", omitBodiesQuery)
 	}
 
-	// Verify that full list still includes spec and result when OmitBodies is not set
-	fullListWithoutOmit, err := store.ListTasks(ctx, proj.ID, TaskListFilter{Kind: &[]string{"implement"}[0]})
-	if err != nil {
-		t.Fatalf("failed to list tasks: %v", err)
+	// Full list query must contain bare spec and result columns
+	if !strings.Contains(fullListQuery, "spec,") {
+		t.Errorf("full list query should contain bare spec column, but doesn't: %s", fullListQuery)
 	}
-
-	for _, task := range fullListWithoutOmit {
-		if task.Spec == "" {
-			t.Errorf("expected spec to be non-empty in full list, got empty string")
-		}
-	}
-
-	// Summary list should have empty specs
-	for _, task := range tasksWithoutBodies {
-		if task.Spec != "" {
-			t.Errorf("expected empty spec in summary list, got %q", task.Spec)
-		}
+	if !strings.Contains(fullListQuery, "result,") {
+		t.Errorf("full list query should contain bare result column, but doesn't: %s", fullListQuery)
 	}
 }
