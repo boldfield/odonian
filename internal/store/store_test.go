@@ -19837,3 +19837,137 @@ func TestSubmitReviewTaskContents(t *testing.T) {
 		t.Error("spawn_review event not found")
 	}
 }
+
+// TestAnalyzeDatabaseStatistics verifies that ANALYZE is run after migrations
+// and that sqlite_stat1 contains statistics for major tables. It uses a file
+// database with a few hundred tasks and events to exercise realistic scale.
+func TestAnalyzeDatabaseStatistics(t *testing.T) {
+	// Create a temporary file database instead of in-memory
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	// Open store with file database to create tables and data
+	store, err := Open(dbPath, defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Create test data
+	proj, err := store.CreateProject(ctx, "Test Project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Create several tasks to generate statistics
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Spec", "ref", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a few hundred tasks with events to generate meaningful statistics
+	const taskCount = 300
+	const eventsPerTask = 2
+
+	// Batch create all tasks in one call
+	taskInputs := make([]TaskInput, taskCount)
+	for i := 0; i < taskCount; i++ {
+		taskInputs[i] = TaskInput{
+			Title:      fmt.Sprintf("Task %d", i),
+			Spec:       "test spec content",
+			DocumentID: doc.ID,
+		}
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, taskInputs)
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	// Create all events in a single transaction
+	tx, err := store.Conn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	for _, task := range tasks {
+		for j := 0; j < eventsPerTask; j++ {
+			_, err = store.AppendEvent(ctx, tx, task.ID, "test-actor", "test_event", nil, nil)
+			if err != nil {
+				t.Fatalf("failed to append event: %v", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit events transaction: %v", err)
+	}
+
+	store.Close()
+
+	// Reopen the store to trigger ANALYZE again
+	start := time.Now()
+	store2, err := Open(dbPath, defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to reopen store: %v", err)
+	}
+	defer store2.Close()
+	elapsed := time.Since(start)
+	t.Logf("reopened store with %d tasks and %d events per task; reopen took %v", taskCount, eventsPerTask, elapsed)
+
+	// Check that sqlite_stat1 has statistics for task and event tables
+	conn := store2.Conn()
+	rows, err := conn.QueryContext(ctx, "SELECT tbl FROM sqlite_stat1 WHERE tbl IN ('task', 'event') ORDER BY tbl")
+	if err != nil {
+		t.Fatalf("failed to query sqlite_stat1: %v", err)
+	}
+	defer rows.Close()
+
+	tables := make(map[string]bool)
+	for rows.Next() {
+		var tbl string
+		if err := rows.Scan(&tbl); err != nil {
+			t.Fatalf("failed to scan table name: %v", err)
+		}
+		tables[tbl] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("failed to read rows: %v", err)
+	}
+
+	if !tables["task"] {
+		t.Error("sqlite_stat1 does not have statistics for task table")
+	}
+	if !tables["event"] {
+		t.Error("sqlite_stat1 does not have statistics for event table")
+	}
+}
+
+// TestOpenSucceedsWhenAnalysisFails verifies that Open succeeds even when
+// the ANALYZE step fails, by injecting invalid SQL via the analyzeSQLCmd seam.
+func TestOpenSucceedsWhenAnalysisFails(t *testing.T) {
+	// Save the original SQL command and restore it after the test
+	originalCmd := analyzeSQLCmd
+	defer func() { analyzeSQLCmd = originalCmd }()
+
+	// Inject an invalid SQL command to simulate an ANALYZE failure
+	analyzeSQLCmd = "INVALID SQL COMMAND XYZ"
+
+	// Open a store with the injected failure; it should still succeed
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open store despite injected ANALYZE failure: %v", err)
+	}
+	defer store.Close()
+
+	// Verify the store is usable despite the analysis failure
+	ctx := context.Background()
+	proj, err := store.CreateProject(ctx, "Test Project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("store should be usable after ANALYZE failure: %v", err)
+	}
+	if proj.ID == "" {
+		t.Fatal("project creation should succeed despite ANALYZE failure")
+	}
+}
