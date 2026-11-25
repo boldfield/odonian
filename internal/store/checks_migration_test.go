@@ -38,7 +38,7 @@ func TestMigration0035ChecksState(t *testing.T) {
 	conn.SetMaxOpenConns(1)
 	s := &sqliteStore{conn: conn}
 	if err := s.migrate(legacyFS); err != nil {
-		t.Fatalf("migrate to 0035: %v", err)
+		t.Fatalf("migrate to 0034: %v", err)
 	}
 
 	for _, stmt := range []string{
@@ -117,7 +117,7 @@ func TestMigration0035ChecksState(t *testing.T) {
 	}
 
 	if err := s.migrate(migrationsFS); err != nil {
-		t.Fatalf("migrate to 0035: %v", err)
+		t.Fatalf("migrate to latest: %v", err)
 	}
 
 	afterRows, afterIdx := snapshot(), indexes()
