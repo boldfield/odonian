@@ -320,9 +320,15 @@ func (m *BoardModel) updateShell(msg tea.Msg) (tea.Model, tea.Cmd) {
 	model, cmd := m.updateTabs(msg)
 	switch msg.(type) {
 	case reviewActionMsg, tasksFetchedMsg:
-		if fetched, ok := msg.(tasksFetchedMsg); ok {
+		switch typed := msg.(type) {
+		case tasksFetchedMsg:
 			m.shell.fetchErrorMsg = ""
-			if fetched.err != nil {
+			if typed.err != nil {
+				m.shell.fetchErrorMsg = m.error
+			}
+		case reviewActionMsg:
+			m.shell.fetchErrorMsg = ""
+			if typed.refetchFailed {
 				m.shell.fetchErrorMsg = m.error
 			}
 		}

@@ -112,3 +112,26 @@ func TestShellLaterErrorDoesNotInheritRetryHint(t *testing.T) {
 		})
 	}
 }
+
+func TestShellPostActionRefetchFailureShowsHint(t *testing.T) {
+	f := newShellFixture(t, 140, 24)
+	hint := retryHintFor(f.model)
+	setListTasks(f, func() ([]tuiclient.Task, error) { return nil, errors.New("network down") })
+
+	msg := f.model.fetchTasksInline(context.Background(), "")
+	if !msg.refetchFailed {
+		t.Fatalf("a failed refetch must be marked as one: %+v", msg)
+	}
+	f.send(msg)
+	out := f.model.View().Content
+	if !strings.Contains(out, "refetch failed: network down") || !strings.Contains(out, hint) {
+		t.Errorf("want refetch error and %q in view:\n%s", hint, out)
+	}
+
+	// An action error that is not a refetch failure gets no hint.
+	f.send(reviewActionMsg{err: "approve review failed: nope"})
+	out = f.model.View().Content
+	if !strings.Contains(out, "approve review failed: nope") || strings.Contains(out, hint) {
+		t.Errorf("want the action error without the hint:\n%s", out)
+	}
+}
