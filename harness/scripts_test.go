@@ -1,7 +1,9 @@
 package harness
 
 import (
+	"os"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -24,5 +26,19 @@ func TestHarnessScripts(t *testing.T) {
 				t.Fatalf("%s failed: %v\n%s", script, err, out)
 			}
 		})
+	}
+}
+
+// Each implement prompt's branch-setup step must tell a replacement task that the closed pull
+// request named under "Prior attempt feedback" is not its own.
+func TestImplementPromptsScopeClosedPR(t *testing.T) {
+	for _, track := range []string{"build", "design", "research"} {
+		b, err := os.ReadFile("prompts/pull_request/" + track + "/implement.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), "Prior attempt feedback") {
+			t.Errorf("%s implement prompt does not mention Prior attempt feedback", track)
+		}
 	}
 }

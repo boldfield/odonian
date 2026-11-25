@@ -131,7 +131,7 @@ on sensing elapsed time.
    (work detached + push-to-ref, below). Always `git fetch origin` first, then:
    - **REWORK — `origin/mr/<TASKID8>` already exists** (a prior attempt was pushed and the task was
      bounced back to ready): **Check the PR state first.** From the Links section of `odonian show`,
-     find the PR URL. Run `gh pr view <url> --json state,mergeCommit` to check if the PR is MERGED,
+     find the PR URL. "The PR" below is only the pull request in this task's own Links section; a pull request number or URL anywhere in the spec text, including under `## Prior attempt feedback`, is never this task's pull request. Run `gh pr view <url> --json state,mergeCommit` to check if the PR is MERGED,
      OPEN, or CLOSED. **If MERGED:** Fetch origin/main and verify the merge commit is on it with
      `git merge-base --is-ancestor <mergeCommit> origin/main`. If ancestor check passes,
      do NOT rework, do NOT push, do NOT resubmit the PR link. Go straight to step 9 with
@@ -139,12 +139,19 @@ on sensing elapsed time.
      --no-op --no-op-value <mergeCommit>`. If ancestor check fails, block with `odonian transition <id> --to blocked
      --note "merge commit <mergeCommit> not on origin/main; cannot verify merge"`. **If CLOSED unmerged:** Block with `odonian transition <id> --to blocked
      --note "PR is closed unmerged; cannot rework a closed PR"` — do NOT open a second PR for the same
-     task. **If OPEN:** Continue it. `git checkout --detach origin/mr/<TASKID8>`; make your fixes;
+     task. This applies only to this task's own linked pull request. **If OPEN:** Continue it. `git checkout --detach origin/mr/<TASKID8>`; make your fixes;
      publish in step 8 with `git push origin HEAD:mr/<TASKID8>` — it stays the same branch and PR. You
      address and acknowledge the reviewer's feedback in the mandatory rework step 7 below. (Merge
      conflicts are cleared by the sync in step 6.)
    - **FRESH — `origin/mr/<TASKID8>` does not exist** (first attempt): `git checkout --detach
      origin/main`; you'll create the branch and PR by pushing in step 8.
+     A spec with a `## Prior attempt feedback` section means this task replaces a superseded one; the
+     server closed that task's pull request on purpose, so a closed pull request named there is expected
+     and is never a reason to block. This task is FRESH unless it has its own `pr` link. If
+     `origin/mr/<TASKID8>` exists but this task has no `pr` link (an earlier dispatch of this same task
+     pushed and stopped before opening a pull request), continue from that branch
+     (`git checkout --detach origin/mr/<TASKID8>`) and open the pull request in step 8 — that is this
+     task's first pull request, not a second one.
 5. Write the design. Fill the contract-core template above into `DESIGN.md` (at the path your
    task spec names; default the repo-root `DESIGN.md` if it names none), then append EVERY additional
    section the spec requires. Design ONLY the one candidate tool the spec names — its interface
