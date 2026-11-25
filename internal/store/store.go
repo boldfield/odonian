@@ -5256,6 +5256,13 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 		}
 		oldTask.Spec = newSpec
 	} else {
+		var prURL string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT value FROM task_link WHERE task_id = ? AND kind = 'pr' AND tombstoned_at IS NULL ORDER BY id DESC LIMIT 1
+		`, taskID).Scan(&prURL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("failed to load superseded task pr link: %w", err)
+		}
+
 		rows, err := tx.QueryContext(ctx, `
 			SELECT actor, verdict, note FROM event
 			WHERE task_id = ? AND ((kind IN ('review', 'submit') AND verdict = 'reject') OR kind = 'checks_failed')
@@ -5265,13 +5272,6 @@ func (s *sqliteStore) supersedeTaskTx(ctx context.Context, tx *sql.Tx, taskID st
 			return "", fmt.Errorf("failed to query feedback events: %w", err)
 		}
 		defer rows.Close()
-
-		var prURL string
-		if err := tx.QueryRowContext(ctx, `
-			SELECT value FROM task_link WHERE task_id = ? AND kind = 'pr' AND tombstoned_at IS NULL ORDER BY id DESC LIMIT 1
-		`, taskID).Scan(&prURL); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("failed to load superseded task pr link: %w", err)
-		}
 
 		var feedbackBlock strings.Builder
 		var hasFeedback bool
