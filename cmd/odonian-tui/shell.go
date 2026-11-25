@@ -358,10 +358,14 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 	case projectArchiveMsg:
 		if msg.err != "" {
 			m.error = msg.err
+			s.errorBase = ""
+			s.retryHint = ""
 			m.mode = modeNormal
 			return nil, true
 		}
 		m.error = ""
+		s.errorBase = ""
+		s.retryHint = ""
 		m.mode = modeNormal
 		m.projects = msg.projects
 		s.projects.SetProjects(m.projects)
@@ -405,6 +409,8 @@ func (m *BoardModel) handleShellMsg(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 		m.tasks = make(map[string][]tuiclient.Task)
 		m.loading = true
 		m.error = ""
+		s.errorBase = ""
+		s.retryHint = ""
 		s.items.SetProjectName(m.project.Name)
 		s.items.SetItems(nil, nil)
 		m.syncShellSelection()
@@ -451,9 +457,15 @@ func (m *BoardModel) shellHelpBar() string {
 			return m.error
 		}
 		availableForError := m.width - sepWidth - hintWidth
-		if availableForError < 10 {
-			return ansi.Truncate(m.error, m.width, "…")
+		if availableForError < 0 {
+			// Not enough room for error + separator + hint; try just the hint
+			if hintWidth <= m.width {
+				return s.retryHint
+			}
+			// Hint doesn't fit either; truncate the hint
+			return ansi.Truncate(s.retryHint, m.width, "…")
 		}
+		// Truncate error and keep hint
 		truncatedError := ansi.Truncate(s.errorBase, availableForError, "…")
 		return truncatedError + separator + s.retryHint
 	case m.statusMessage != "":

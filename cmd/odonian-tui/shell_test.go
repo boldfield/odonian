@@ -393,22 +393,32 @@ func TestShellToggles(t *testing.T) {
 func TestShellErrorAtNarrowWidthPreservesHint(t *testing.T) {
 	f := newShellFixture(t, 60, 24)
 
-	// Simulate a long error message with retry hint
-	errorMsg := "Error: This is a very long error message that would normally exceed the terminal width and needs to be truncated carefully"
-	hintMsg := "Press 'r' to retry"
-	f.model.shell.errorBase = errorMsg
-	f.model.shell.retryHint = hintMsg
-	f.model.error = errorMsg + ". " + hintMsg
-
-	out := f.model.View().Content
-	assertWidth(t, out, 60)
+	// Deliver a failed fetch with a long error message at narrow width
+	longError := "This is a very long error message that would normally exceed the terminal width and needs to be truncated carefully to fit"
+	f.send(shellTasksMsg{projectID: "p1", err: fmt.Errorf("%s", longError)})
 
 	// The hint should still be present even if error text is truncated
 	bar := f.model.shellHelpBar()
-	if !strings.Contains(bar, "Press 'r' to retry") {
-		t.Errorf("retry hint missing from error bar at narrow width: %q", bar)
+	refreshBinding := f.model.keyBindings.Shell.binding(actRefresh)
+	refreshKey := refreshBinding.Help().Key
+	expectedHint := fmt.Sprintf("Press '%s' to retry", refreshKey)
+	if !strings.Contains(bar, expectedHint) {
+		t.Errorf("retry hint missing from error bar at narrow width: got %q, want to contain %q", bar, expectedHint)
 	}
 	if ansi.StringWidth(bar) > 60 {
 		t.Errorf("error bar exceeds width: %d > 60", ansi.StringWidth(bar))
+	}
+
+	// Verify full view has no line exceeding width
+	out := f.model.View().Content
+	assertWidth(t, out, 60)
+
+	// Now send another long error (simulating projectArchiveMsg or similar error path)
+	// to verify stale errorBase/retryHint don't break truncation
+	anotherLongError := "Another completely different error message that is also quite long and would overflow if measured against stale state from the first error but should be measured against itself"
+	f.model.error = anotherLongError
+	bar2 := f.model.shellHelpBar()
+	if ansi.StringWidth(bar2) > 60 {
+		t.Errorf("error bar exceeds width after second error: %d > 60: %q", ansi.StringWidth(bar2), bar2)
 	}
 }

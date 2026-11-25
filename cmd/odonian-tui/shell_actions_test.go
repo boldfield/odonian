@@ -363,7 +363,6 @@ func TestShellStaleMergeResolutionIgnored(t *testing.T) {
 }
 
 func TestShellErrorShowsRetryHint(t *testing.T) {
-	t.Helper()
 	f := &actionFixture{}
 	tasks := []tuiclient.Task{
 		{ID: "t-ready", Title: "Ready", State: "ready", Kind: "implement", CreatedAt: "2026-01-01T00:00:00Z"},
@@ -398,18 +397,22 @@ func TestShellErrorShowsRetryHint(t *testing.T) {
 	failCount = 1
 	f.send(f.run(f.model.fetchShellTasks())...)
 
-	// Verify error contains the retry hint with the refresh key
+	// Verify error contains the retry hint with the actual refresh key from bindings
 	bar := f.model.shellHelpBar()
 	if !strings.Contains(bar, "Error") {
 		t.Errorf("error bar missing error text: %q", bar)
 	}
-	if !strings.Contains(bar, "Press 'r' to retry") {
-		t.Errorf("error bar missing retry hint: %q", bar)
+	refreshBinding := f.model.keyBindings.Shell.binding(actRefresh)
+	refreshKey := refreshBinding.Help().Key
+	expectedHint := fmt.Sprintf("Press '%s' to retry", refreshKey)
+	if !strings.Contains(bar, expectedHint) {
+		t.Errorf("error bar missing retry hint: got %q, want to contain %q", bar, expectedHint)
 	}
 
-	// Press 'r' to retry with successful fetch
+	// Press the refresh key to retry with successful fetch
 	failCount = 0
-	f.send(f.run(f.model.fetchShellTasks())...)
+	refreshKeyStr := refreshBinding.Keys()[0]
+	f.press(refreshKeyStr)
 
 	// Verify error is cleared and normal help bar is back
 	bar = f.model.shellHelpBar()
