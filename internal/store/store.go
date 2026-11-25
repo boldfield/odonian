@@ -248,6 +248,9 @@ func Open(dbPath string, allowedModels []string, opts ...StoreOption) (Store, er
 		return nil, fmt.Errorf("failed to apply migrations: %w", err)
 	}
 
+	// Collect planner statistics for query optimization
+	store.analyzeDatabase(conn)
+
 	// Open a second connection for reads with SetMaxOpenConns(4)
 	readConn, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -385,6 +388,30 @@ func (s *sqliteStore) migrate(fsys fs.FS) error {
 	}
 
 	return tx.Commit()
+}
+
+// analyzeSQLCmd is the SQL command to run for analysis. It can be overridden in tests.
+var analyzeSQLCmd = "ANALYZE"
+
+// analyzeDatabase runs the SQLite ANALYZE pragma to collect planner statistics.
+// It runs with a limit to avoid delaying startup on large databases.
+// If analysis fails, the error is logged but does not stop startup.
+func (s *sqliteStore) analyzeDatabase(conn *sql.DB) {
+	start := time.Now()
+	logger := slog.Default()
+
+	if _, err := conn.Exec("PRAGMA analysis_limit = 1000"); err != nil {
+		logger.Error("failed to set analysis_limit pragma", "error", err)
+		return
+	}
+
+	if _, err := conn.Exec(analyzeSQLCmd); err != nil {
+		logger.Error("failed to run ANALYZE", "error", err)
+		return
+	}
+
+	elapsed := time.Since(start)
+	logger.Info("database statistics analysis completed", "duration_ms", elapsed.Milliseconds())
 }
 
 type migration struct {
@@ -806,6 +833,9 @@ type TaskListFilter struct {
 	Claimable         bool
 	IncludeArchived   bool
 	IncludeSuperseded bool
+	// OmitBodies makes ListTasks skip reading the spec and result columns:
+	// the returned tasks have an empty Spec and a nil Result.
+	OmitBodies bool
 }
 
 // ProjectListFilter contains filters for listing projects.
@@ -1829,11 +1859,15 @@ const claimableSQL = `(state = 'ready' OR (state = 'in_progress' AND lease_expir
 		WHERE d.task_id = task.id AND t2.state != 'done'
 	)`
 
-// ListTasks retrieves tasks for a project with optional filters.
+// buildListTasksQuery builds the ListTasks SQL and its arguments.
 // Filters compose with AND logic.
 // By default, archived tasks are excluded unless filter.IncludeArchived is true.
-func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error) {
-	query := `SELECT id, project_id, document_id, title, spec, state, assignee, lease_expires_at, result, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, ` + taskTopicColumns + `, created_at, updated_at, archived_at, superseded_by
+func buildListTasksQuery(projectID string, filter TaskListFilter) (string, []interface{}) {
+	specColumn, resultColumn := "spec", "result"
+	if filter.OmitBodies {
+		specColumn, resultColumn = "'' AS spec", "NULL AS result"
+	}
+	query := `SELECT id, project_id, document_id, title, ` + specColumn + `, state, assignee, lease_expires_at, ` + resultColumn + `, model, kind, review_models, review_round, target_task_id, verdict, agent_merge, held, escalate, track, branch, await_checks, checks_started_at, ` + taskTopicColumns + `, created_at, updated_at, archived_at, superseded_by
 		FROM task
 		WHERE project_id = ?`
 	args := []interface{}{projectID}
@@ -1873,6 +1907,12 @@ func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter Ta
 
 	query += ` ORDER BY topic_priority DESC, created_at, id`
 
+	return query, args
+}
+
+// ListTasks retrieves tasks for a project with optional filters (see buildListTasksQuery).
+func (s *sqliteStore) ListTasks(ctx context.Context, projectID string, filter TaskListFilter) ([]Task, error) {
+	query, args := buildListTasksQuery(projectID, filter)
 	rows, err := s.readConn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tasks: %w", err)

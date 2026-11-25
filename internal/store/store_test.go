@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -169,8 +170,8 @@ func TestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations: %v", err)
 	}
-	if migrationCount != 35 {
-		t.Errorf("expected 35 migrations to be recorded, but got %d", migrationCount)
+	if migrationCount != 36 {
+		t.Errorf("expected 36 migrations to be recorded, but got %d", migrationCount)
 	}
 
 	// Verify idempotency: re-open the same database and it should work
@@ -180,13 +181,13 @@ func TestMigrations(t *testing.T) {
 	}
 	defer store2.Close()
 
-	// Verify that we still have exactly 35 migrations recorded (idempotency)
+	// Verify that we still have exactly 36 migrations recorded (idempotency)
 	err = store2.Conn().QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount)
 	if err != nil {
 		t.Fatalf("failed to count migrations after re-open: %v", err)
 	}
-	if migrationCount != 35 {
-		t.Errorf("expected 35 migrations after re-open (idempotency), but got %d", migrationCount)
+	if migrationCount != 36 {
+		t.Errorf("expected 36 migrations after re-open (idempotency), but got %d", migrationCount)
 	}
 }
 
@@ -282,8 +283,8 @@ func TestOpenSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count migrations after second open: %v", err)
 	}
-	if migrationCount != 35 {
-		t.Errorf("expected 35 migrations after second open, but got %d", migrationCount)
+	if migrationCount != 36 {
+		t.Errorf("expected 36 migrations after second open, but got %d", migrationCount)
 	}
 }
 
@@ -19835,5 +19836,205 @@ func TestSubmitReviewTaskContents(t *testing.T) {
 	}
 	if !found {
 		t.Error("spawn_review event not found")
+	}
+}
+
+// TestAnalyzeDatabaseStatistics verifies that ANALYZE is run after migrations
+// and that sqlite_stat1 contains statistics for major tables. It uses a file
+// database with a few hundred tasks and events to exercise realistic scale.
+func TestAnalyzeDatabaseStatistics(t *testing.T) {
+	// Create a temporary file database instead of in-memory
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	// Open store with file database to create tables and data
+	store, err := Open(dbPath, defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Create test data
+	proj, err := store.CreateProject(ctx, "Test Project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Create several tasks to generate statistics
+	doc, err := store.CreateDocument(ctx, proj.ID, "feature_spec", "Test Spec", "ref", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+
+	// Create a few hundred tasks with events to generate meaningful statistics
+	const taskCount = 300
+	const eventsPerTask = 2
+
+	// Batch create all tasks in one call
+	taskInputs := make([]TaskInput, taskCount)
+	for i := 0; i < taskCount; i++ {
+		taskInputs[i] = TaskInput{
+			Title:      fmt.Sprintf("Task %d", i),
+			Spec:       "test spec content",
+			DocumentID: doc.ID,
+		}
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, taskInputs)
+	if err != nil {
+		t.Fatalf("failed to create tasks: %v", err)
+	}
+
+	// Create all events in a single transaction
+	tx, err := store.Conn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	for _, task := range tasks {
+		for j := 0; j < eventsPerTask; j++ {
+			_, err = store.AppendEvent(ctx, tx, task.ID, "test-actor", "test_event", nil, nil)
+			if err != nil {
+				t.Fatalf("failed to append event: %v", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit events transaction: %v", err)
+	}
+
+	store.Close()
+
+	// Reopen the store to trigger ANALYZE again
+	start := time.Now()
+	store2, err := Open(dbPath, defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to reopen store: %v", err)
+	}
+	defer store2.Close()
+	elapsed := time.Since(start)
+	t.Logf("reopened store with %d tasks and %d events per task; reopen took %v", taskCount, eventsPerTask, elapsed)
+
+	// Check that sqlite_stat1 has statistics for task and event tables
+	conn := store2.Conn()
+	rows, err := conn.QueryContext(ctx, "SELECT tbl FROM sqlite_stat1 WHERE tbl IN ('task', 'event') ORDER BY tbl")
+	if err != nil {
+		t.Fatalf("failed to query sqlite_stat1: %v", err)
+	}
+	defer rows.Close()
+
+	tables := make(map[string]bool)
+	for rows.Next() {
+		var tbl string
+		if err := rows.Scan(&tbl); err != nil {
+			t.Fatalf("failed to scan table name: %v", err)
+		}
+		tables[tbl] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("failed to read rows: %v", err)
+	}
+
+	if !tables["task"] {
+		t.Error("sqlite_stat1 does not have statistics for task table")
+	}
+	if !tables["event"] {
+		t.Error("sqlite_stat1 does not have statistics for event table")
+	}
+}
+
+// TestOpenSucceedsWhenAnalysisFails verifies that Open succeeds even when
+// the ANALYZE step fails, by injecting invalid SQL via the analyzeSQLCmd seam.
+func TestOpenSucceedsWhenAnalysisFails(t *testing.T) {
+	// Save the original SQL command and restore it after the test
+	originalCmd := analyzeSQLCmd
+	defer func() { analyzeSQLCmd = originalCmd }()
+
+	// Inject an invalid SQL command to simulate an ANALYZE failure
+	analyzeSQLCmd = "INVALID SQL COMMAND XYZ"
+
+	// Open a store with the injected failure; it should still succeed
+	store, err := Open("file::memory:?cache=shared", defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open store despite injected ANALYZE failure: %v", err)
+	}
+	defer store.Close()
+
+	// Verify the store is usable despite the analysis failure
+	ctx := context.Background()
+	proj, err := store.CreateProject(ctx, "Test Project", "https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("store should be usable after ANALYZE failure: %v", err)
+	}
+	if proj.ID == "" {
+		t.Fatal("project creation should succeed despite ANALYZE failure")
+	}
+}
+
+// TestListTasksOmitBodies verifies OmitBodies returns tasks without spec/result
+// and that the query ListTasks builds never references those columns.
+func TestListTasksOmitBodies(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	proj, err := store.CreateProject(ctx, "omit-bodies", "https://github.com/example/repo")
+	if err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	doc, err := store.CreateDocument(ctx, proj.ID, "design", "Doc", "DOC.md", nil)
+	if err != nil {
+		t.Fatalf("failed to create document: %v", err)
+	}
+	tasks, err := store.CreateTasks(ctx, proj.ID, []TaskInput{{Title: "T", Spec: "the spec", DocumentID: doc.ID, Model: "haiku"}})
+	if err != nil {
+		t.Fatalf("failed to create task: %v", err)
+	}
+	if _, err := store.Conn().ExecContext(ctx, "UPDATE task SET result = ? WHERE id = ?", "the result", tasks[0].ID); err != nil {
+		t.Fatalf("failed to set result: %v", err)
+	}
+
+	full, err := store.ListTasks(ctx, proj.ID, TaskListFilter{})
+	if err != nil {
+		t.Fatalf("ListTasks failed: %v", err)
+	}
+	if len(full) != 1 || full[0].Spec != "the spec" || full[0].Result == nil || *full[0].Result != "the result" {
+		t.Errorf("full list should return spec and result, got %+v", full)
+	}
+
+	slim, err := store.ListTasks(ctx, proj.ID, TaskListFilter{OmitBodies: true})
+	if err != nil {
+		t.Fatalf("ListTasks with OmitBodies failed: %v", err)
+	}
+	if len(slim) != 1 || slim[0].ID != tasks[0].ID || slim[0].Title != "T" {
+		t.Fatalf("unexpected slim list: %+v", slim)
+	}
+	if slim[0].Spec != "" || slim[0].Result != nil {
+		t.Errorf("OmitBodies should give empty spec and nil result, got %q / %v", slim[0].Spec, slim[0].Result)
+	}
+
+	// The built SQL must not read the spec or result columns, bare or qualified.
+	// The constant aliases are the only permitted mentions.
+	bodyRef := regexp.MustCompile("(?i)\\b(spec|result)\\b")
+	selectList := func(q string) string {
+		i := strings.Index(q, "FROM task")
+		if i < 0 {
+			t.Fatalf("no FROM task in query: %s", q)
+		}
+		return q[:i]
+	}
+	omitSQL, _ := buildListTasksQuery(proj.ID, TaskListFilter{OmitBodies: true})
+	stripped := strings.NewReplacer("'' AS spec", "", "NULL AS result", "").Replace(selectList(omitSQL))
+	if m := bodyRef.FindString(stripped); m != "" {
+		t.Errorf("OmitBodies query references %q column: %s", m, omitSQL)
+	}
+	// Sanity: the same check catches the full query, and the filter tails never mention the columns.
+	fullSQL, _ := buildListTasksQuery(proj.ID, TaskListFilter{})
+	if !bodyRef.MatchString(selectList(fullSQL)) {
+		t.Errorf("check is vacuous: full query should reference spec/result: %s", fullSQL)
+	}
+	if bodyRef.MatchString(omitSQL[strings.Index(omitSQL, "FROM task"):]) {
+		t.Errorf("OmitBodies query references spec/result outside the select list: %s", omitSQL)
 	}
 }
