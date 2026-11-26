@@ -241,13 +241,13 @@ func TestDetailHelpBarFollowsState(t *testing.T) {
 // Every binding a context lists must resolve, in that context, to its own action.
 func TestListedBindingsResolveToTheirActions(t *testing.T) {
 	kb := DefaultKeyBindings()
-	cases := map[string][]keyCtx{"Board": {{state: stateReview}, {state: stateBlocked}, {state: stateBacklog}}, "Detail": {{state: stateReview}, {state: stateApproved}}, "Shell": {}}
+	cases := map[string][]keyCtx{"Detail": {{state: stateReview}, {state: stateApproved}}, "Shell": {}}
 	for _, p := range []shellPane{paneItems, paneProjects, panePreview} {
 		for _, s := range []string{stateBacklog, stateReview, stateApproved, stateBlocked, "ready", ""} {
 			cases["Shell"] = append(cases["Shell"], keyCtx{pane: p, state: s})
 		}
 	}
-	maps := map[string]keyMap{"Board": kb.Board, "Detail": kb.Detail, "Shell": kb.Shell}
+	maps := map[string]keyMap{"Detail": kb.Detail, "Shell": kb.Shell}
 	for name, ctxs := range cases {
 		for _, c := range ctxs {
 			for _, e := range maps[name] {

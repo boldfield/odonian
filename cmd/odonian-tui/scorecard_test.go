@@ -455,3 +455,23 @@ func TestBuildScorecardContent_SparseData(t *testing.T) {
 		t.Error("expected sparse data warning in content")
 	}
 }
+
+// TestBoardModel_ScorecardMode_ProjectKeyReturnsToProjectsPane tests that 'P' in the scorecard
+// view returns to the shell with the projects pane focused.
+func TestBoardModel_ScorecardMode_ProjectKeyReturnsToProjectsPane(t *testing.T) {
+	f := newScorecardFixture(t, &tuiclient.MockClient{})
+	f.press("c")
+	if f.model.mode != modeScorecards {
+		t.Fatalf("mode = %d after 'c', want modeScorecards", f.model.mode)
+	}
+	f.press("P")
+	if f.model.mode != modeNormal {
+		t.Errorf("mode = %d after 'P', want modeNormal", f.model.mode)
+	}
+	if got := f.model.shell.focus; got != paneProjects {
+		t.Errorf("focus = %v after 'P', want the projects pane", got)
+	}
+	if f.model.lastScorecards != nil || f.model.scorecardLoading {
+		t.Error("scorecard state was not cleared")
+	}
+}

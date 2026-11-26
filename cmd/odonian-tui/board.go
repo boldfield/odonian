@@ -19,7 +19,6 @@ import (
 	"github.com/boldfield/odonian/internal/localcommit"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
-	"github.com/boldfield/odonian/internal/tuiview"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 )
@@ -43,8 +42,6 @@ const (
 	modeRejectReason
 	// modeMergeConfirm is the "Merge PR and complete? [y/N]" confirmation step.
 	modeMergeConfirm
-	// modeProjectSwitch is the project selection overlay.
-	modeProjectSwitch
 	// modeApprovedRejectNote is the optional note input step for approved→ready send-back.
 	modeApprovedRejectNote
 	// modeApprovedRejectConfirm is the "Send back to ready? [y/N]" confirmation step.
@@ -88,9 +85,7 @@ type BoardModel struct {
 	project        tuiclient.Project
 	tasks          map[string][]tuiclient.Task // keyed by state
 	selectedTaskID string                      // current selection, keyed by ID
-	selectedIndex  int                         // index position within selected column, for nearest-selection on disappear
 	selectedColumn int                         // index into stateOrder
-	scrollOffset   int                         // vertical scroll offset for the task list
 	loading        bool
 	error          string
 	width          int
@@ -135,11 +130,10 @@ type BoardModel struct {
 	scorecardLoading  bool                          // true when a fetch is in progress
 	lastScorecards    *tuiclient.ReviewerScorecards // cached for rebuild on resize
 
-	// Project switcher state
-	projects           []tuiclient.Project // cached list of all projects
-	projectSwitchIndex int                 // current selection in project switcher
+	// projects is the cached list of all projects.
+	projects []tuiclient.Project
 
-	// shell is the three-pane layout; nil renders the old tab layout, which a later task deletes.
+	// shell is the three-pane layout.
 	shell *shellState
 
 	// Key bindings and help
@@ -195,7 +189,7 @@ func (m *BoardModel) reviewInputView() string {
 	return input.View()
 }
 
-// NewBoardModel creates a new board model and starts the initial fetch.
+// NewBoardModel creates a board model that renders the three-pane layout.
 func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tuiclient.Project) *BoardModel {
 	inputWidget := textinput.New()
 	inputWidget.CharLimit = 512
@@ -205,6 +199,7 @@ func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tu
 	helpModel.ShowAll = false
 	helpModel.Ellipsis = "…"
 
+	theme := NewTheme()
 	m := &BoardModel{
 		client:         client,
 		config:         config,
@@ -218,7 +213,17 @@ func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tu
 		keyBindings:    DefaultKeyBindings(),
 		helpModel:      helpModel,
 		showFullHelp:   false,
+		shell: &shellState{
+			theme:           theme,
+			projects:        NewProjectsPane(theme, []tuiclient.Project{project}),
+			items:           NewWorkItemsPane(theme),
+			preview:         NewPreviewPane(nil, 0, 0),
+			focus:           paneItems,
+			previewDebounce: previewDebounce,
+		},
 	}
+	m.shell.preview.SetTheme(theme)
+	m.shell.items.SetProjectName(project.Name)
 	m.newTickCmd = m.defaultTickCmd
 	return m
 }
@@ -233,14 +238,7 @@ func (m *BoardModel) defaultTickCmd() tea.Cmd {
 // Init starts the initial fetch and the polling loop.
 // Exactly one tick chain is started here; it perpetuates itself in the tickMsg handler.
 func (m *BoardModel) Init() tea.Cmd {
-	if m.shell != nil {
-		return tea.Batch(m.fetchShellTasks(), m.fetchProjects(), m.newTickCmd())
-	}
-	return tea.Batch(
-		m.fetchTasksFullRefresh(),
-		m.fetchProjects(),
-		m.newTickCmd(),
-	)
+	return tea.Batch(m.fetchShellTasks(), m.fetchProjects(), m.newTickCmd())
 }
 
 // promoteTask creates a command that promotes a task and then refetches.
@@ -795,54 +793,6 @@ func (m *BoardModel) fetchStatesSummary(ctx context.Context, states []string) ([
 	return all, nil
 }
 
-// fetchActiveTasks creates a command that fetches only the active-state tasks (backlog,
-// ready, in_progress, review, approved, blocked). Used as the steady-state poll body when
-// there is no existing terminal-column data to preserve (e.g. tests exercising it directly).
-func (m *BoardModel) fetchActiveTasks() tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		tasks, err := m.fetchStatesSummary(ctx, activeStates)
-		if err != nil {
-			return tasksFetchedMsg{err: err}
-		}
-
-		return tasksFetchedMsg{tasks: bucketTasksByState(tasks)}
-	}
-}
-
-// fetchActiveTasksAndMerge creates a command that fetches only the active-state tasks and
-// merges them with the existing terminal columns (done, failed, abandoned), which are not
-// re-fetched on every tick. The terminal columns are captured here, on the goroutine calling
-// this method (the main Bubble Tea event loop), rather than inside the returned tea.Cmd's
-// closure: tea.Cmd bodies run on their own goroutine concurrently with Update, and Update is
-// the only other place that mutates m.tasks, so reading m.tasks from inside the closure would
-// be a data race.
-func (m *BoardModel) fetchActiveTasksAndMerge() tea.Cmd {
-	terminalCols := make(map[string][]tuiclient.Task, len(terminalStates))
-	for _, state := range terminalStates {
-		terminalCols[state] = m.tasks[state]
-	}
-
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		tasks, err := m.fetchStatesSummary(ctx, activeStates)
-		if err != nil {
-			return tasksFetchedMsg{err: err}
-		}
-
-		bucketed := bucketTasksByState(tasks)
-		for _, state := range terminalStates {
-			bucketed[state] = terminalCols[state]
-		}
-
-		return tasksFetchedMsg{tasks: bucketed}
-	}
-}
-
 // fetchTasksFullRefresh creates a command that fetches every state (active and terminal),
 // one ListTasks call per state with fields=summary. Used for the initial load, manual
 // refresh ('r'), and project switches, none of which are on the steady-state poll path.
@@ -963,14 +913,11 @@ type tickMsg struct{}
 
 // Update handles messages from Bubble Tea.
 func (m *BoardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if m.shell == nil {
-		return m.updateTabs(msg)
-	}
 	return m.updateShell(msg)
 }
 
-// updateTabs is the update of the old tab layout.
-func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
+// updateShared handles the messages and the keys of the modes the shell does not handle itself.
+func (m *BoardModel) updateShared(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -1012,29 +959,13 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateScorecardMode(msg)
 		}
 
-		// Project switcher mode: all keys go to the switcher handler.
-		if m.mode == modeProjectSwitch {
-			return m.updateProjectSwitchMode(msg)
-		}
-
 		// When a text-input or confirm mode is active, route keys to the review flow
 		// instead of the normal navigation handlers.
 		if m.mode != modeNormal {
 			return m.updateReviewMode(msg)
 		}
 
-		act, _ := m.keyBindings.Board.lookup(msg, keyCtx{state: stateOrder[m.selectedColumn]})
-		// While the full key list is open it takes the keys: ? closes it, the rest are swallowed.
-		if m.showFullHelp {
-			switch act {
-			case actQuit:
-				return m, tea.Quit
-			case actHelp:
-				m.showFullHelp = false
-			}
-			return m, nil
-		}
-		return m.boardAction(act)
+		return m, nil
 
 	case detailFetchedMsg:
 		if msg.err != nil {
@@ -1079,16 +1010,14 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// A shell merge resolves asynchronously; drop the answer if the user has moved on.
-		if m.shell != nil {
-			if msg.fromShell && (m.mode != modeNormal || m.shell.items.SelectedTaskID() != msg.taskID) {
-				return m, nil
-			}
-			if fromDetail && m.detailTask.ID != msg.taskID {
-				return m, nil
-			}
-			if !fromDetail && m.mode != modeNormal {
-				return m, nil
-			}
+		if msg.fromShell && (m.mode != modeNormal || m.shell.items.SelectedTaskID() != msg.taskID) {
+			return m, nil
+		}
+		if fromDetail && m.detailTask.ID != msg.taskID {
+			return m, nil
+		}
+		if !fromDetail && m.mode != modeNormal {
+			return m, nil
 		}
 		// Enter merge confirm mode with the resolved PR.
 		m.pendingTaskID = msg.taskID
@@ -1112,7 +1041,6 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading = false
 			m.tasks = msg.tasks
 			m.lastRefresh = time.Now()
-			m.ensureSelectionInColumn()
 		}
 		if msg.err != "" {
 			m.error = msg.err
@@ -1146,7 +1074,6 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.error = ""
 		m.tasks = msg.tasks
 		m.lastRefresh = time.Now()
-		m.ensureSelectionInColumn()
 
 		// Just update data; do NOT arm a tick. The single tick chain in tickMsg handles
 		// re-arming itself.
@@ -1155,165 +1082,32 @@ func (m *BoardModel) updateTabs(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case projectsFetchedMsg:
 		if msg.err != nil {
 			m.error = fmt.Sprintf("Error fetching projects: %v", msg.err)
-			if m.mode == modeProjectSwitch {
-				m.mode = modeNormal
-			}
 			return m, nil
 		}
 		m.projects = msg.projects
-		// If we're in project switcher mode, preserve the current project selection by ID
-		if m.mode == modeProjectSwitch {
-			for i, proj := range m.projects {
-				if proj.ID == m.project.ID {
-					m.projectSwitchIndex = i
-					break
-				}
-			}
-		}
-		return m, nil
-
-	case projectArchiveMsg:
-		if msg.err != "" {
-			m.error = msg.err
-		} else {
-			m.error = ""
-			m.projects = msg.projects
-			// If the archived project was the current one, switch to the first available
-			currentProjectFound := false
-			for _, p := range msg.projects {
-				if p.ID == m.project.ID {
-					currentProjectFound = true
-					break
-				}
-			}
-			if !currentProjectFound && len(msg.projects) > 0 {
-				m.project = msg.projects[0]
-				// Refetch tasks for the new project; a project switch needs the terminal
-				// columns too, so use the full refresh rather than the active-only poll.
-				m.loading = true
-				m.tasks = make(map[string][]tuiclient.Task)
-				return m, m.fetchTasksFullRefresh()
-			}
-		}
-		m.mode = modeNormal
 		return m, nil
 
 	case tickMsg:
-		if m.shell != nil {
-			return m, tea.Batch(m.fetchShellTasks(), m.newTickCmd())
-		}
-		// Re-arm exactly one next tick and issue a fetch.
-		// This is the ONLY place (besides Init) where a new tick is armed.
-		// The fetch merges freshly-polled active states with the existing terminal
-		// columns rather than re-fetching them.
-		return m, tea.Batch(
-			m.fetchActiveTasksAndMerge(),
-			m.newTickCmd(),
-		)
+		return m, tea.Batch(m.fetchShellTasks(), m.newTickCmd())
 	}
 
 	return m, nil
 }
 
-// boardAction runs a normal-mode action on the selected task. Both layouts resolve their keys to
-// actions through their own bindings and share this code.
+// boardAction runs the task actions, the refresh and the scorecards on the shell's selected task.
 func (m *BoardModel) boardAction(act action) (tea.Model, tea.Cmd) {
 	switch act {
-	case actQuit:
-		return m, tea.Quit
-
-	// Column navigation
-	case actLeft:
-		if m.selectedColumn > 0 {
-			m.selectedColumn--
-			m.selectedIndex = 0 // Reset to top when changing columns
-			m.scrollOffset = 0  // Reset scroll to top
-			m.ensureSelectionInColumn()
-		}
-
-	case actRight:
-		if m.selectedColumn < len(stateOrder)-1 {
-			m.selectedColumn++
-			m.selectedIndex = 0 // Reset to top when changing columns
-			m.scrollOffset = 0  // Reset scroll to top
-			m.ensureSelectionInColumn()
-		}
-
-	// Selection within column
-	case actUp:
-		tasksInColumn := m.getTasksInSelectedColumn()
-		if len(tasksInColumn) == 0 {
-			return m, nil
-		}
-
-		if m.selectedTaskID == "" {
-			m.selectedTaskID = tasksInColumn[0].ID
-			m.selectedIndex = 0
-		} else {
-			// Find current position
-			for i, t := range tasksInColumn {
-				if t.ID == m.selectedTaskID && i > 0 {
-					m.selectedTaskID = tasksInColumn[i-1].ID
-					m.selectedIndex = i - 1
-					break
-				}
-			}
-		}
-		m.clampScrollToSelection()
-
-	case actDown:
-		tasksInColumn := m.getTasksInSelectedColumn()
-		if len(tasksInColumn) == 0 {
-			return m, nil
-		}
-
-		if m.selectedTaskID == "" {
-			m.selectedTaskID = tasksInColumn[0].ID
-			m.selectedIndex = 0
-		} else {
-			// Find current position
-			for i, t := range tasksInColumn {
-				if t.ID == m.selectedTaskID && i < len(tasksInColumn)-1 {
-					m.selectedTaskID = tasksInColumn[i+1].ID
-					m.selectedIndex = i + 1
-					break
-				}
-			}
-		}
-		m.clampScrollToSelection()
-
 	// Refresh: issue one-shot fetch of all columns (active and terminal); do NOT arm
 	// a new tick. The single perpetual tick chain started in Init re-arms itself from
 	// tickMsg.
 	case actRefresh:
 		return m, m.fetchTasksFullRefresh()
 
-	// Open detail view for the selected task.
-	case actEnter:
-		if m.selectedTaskID != "" {
-			m.mode = modeDetail
-			m.detailMessage = ""
-			return m, m.fetchDetailCmd(m.selectedTaskID)
-		}
-
 	// Promote: only on backlog tasks
 	case actPromote:
 		if m.selectedColumn == 0 && m.selectedTaskID != "" {
 			return m, m.promoteTask(m.selectedTaskID)
 		}
-
-	// Switch project
-	case actSwitchProject:
-		m.mode = modeProjectSwitch
-		m.projectSwitchIndex = 0
-		// Find the current project's index for re-selection purposes
-		for i, proj := range m.projects {
-			if proj.ID == m.project.ID {
-				m.projectSwitchIndex = i
-				break
-			}
-		}
-		return m, m.fetchProjects()
 
 	// Approve: only on review column tasks
 	case actApprove:
@@ -1462,8 +1256,6 @@ func (m *BoardModel) boardAction(act action) (tea.Model, tea.Cmd) {
 		m.scorecardLoading = true
 		return m, m.fetchScorecardCmd()
 
-	case actHelp:
-		m.showFullHelp = true
 	}
 	return m, nil
 }
@@ -1471,7 +1263,7 @@ func (m *BoardModel) boardAction(act action) (tea.Model, tea.Cmd) {
 // updateDetailMode handles key events while the full-screen detail view is active.
 // Board navigation is fully suppressed in this mode.
 func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	act, _ := m.detailKeys().lookup(msg, m.detailKeyCtx())
+	act, _ := m.keyBindings.Detail.lookup(msg, m.detailKeyCtx())
 	// While the full key list is open it takes the keys: ? closes it, the rest are swallowed.
 	if m.showFullHelp {
 		if act == actHelp {
@@ -1616,77 +1408,6 @@ func (m *BoardModel) updateDetailMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		m.reviewInput, cmd = m.reviewInput.Update(nil)
 		return m, cmd
 
-	// Switch project from detail view
-	case actSwitchProject:
-		// Exit detail view and enter project switcher mode
-		m.mode = modeProjectSwitch
-		m.projectSwitchIndex = 0
-		// Find the current project's index for re-selection purposes
-		for i, proj := range m.projects {
-			if proj.ID == m.project.ID {
-				m.projectSwitchIndex = i
-				break
-			}
-		}
-		return m, m.fetchProjects()
-	}
-
-	return m, nil
-}
-
-// updateProjectSwitchMode handles key events while the project switcher overlay is active.
-func (m *BoardModel) updateProjectSwitchMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		// Cancel and return to normal mode
-		m.mode = modeNormal
-		return m, nil
-
-	case "up", "k":
-		if m.projectSwitchIndex > 0 {
-			m.projectSwitchIndex--
-		}
-		return m, nil
-
-	case "down", "j":
-		if m.projectSwitchIndex < len(m.projects)-1 {
-			m.projectSwitchIndex++
-		}
-		return m, nil
-
-	case "enter":
-		if m.projectSwitchIndex >= 0 && m.projectSwitchIndex < len(m.projects) {
-			selectedProject := m.projects[m.projectSwitchIndex]
-			// Only switch if it's a different project
-			if selectedProject.ID != m.project.ID {
-				m.project = selectedProject
-				// Reset all board state to avoid leaking data across projects
-				m.selectedTaskID = ""
-				m.selectedIndex = 0
-				m.selectedColumn = columnIndex(stateInProgress) // Reset to in_progress column
-				m.tasks = make(map[string][]tuiclient.Task)
-				m.detailTask = tuiclient.TaskDetail{}
-				m.detailDocuments = nil
-				m.detailEvents = nil
-				m.mode = modeNormal
-				m.loading = true
-				// Refetch tasks for the new project; use the full refresh so the
-				// terminal columns (done, failed, abandoned) are populated too.
-				return m, m.fetchTasksFullRefresh()
-			}
-			// Same project selected: just close the switcher
-			m.mode = modeNormal
-		}
-		return m, nil
-
-	case "z":
-		// Archive the selected project
-		if m.projectSwitchIndex >= 0 && m.projectSwitchIndex < len(m.projects) {
-			selectedProject := m.projects[m.projectSwitchIndex]
-			m.pendingProjectID = selectedProject.ID
-			m.mode = modeArchiveProjectConfirm
-		}
-		return m, nil
 	}
 
 	return m, nil
@@ -2172,88 +1893,6 @@ func (m *BoardModel) priorityActionKey(taskID, action string, priority int64, re
 	return m.lastPriorityAttempt.key
 }
 
-// getTasksInSelectedColumn returns the tasks in the currently selected column.
-func (m *BoardModel) getTasksInSelectedColumn() []tuiclient.Task {
-	state := stateOrder[m.selectedColumn]
-	return m.tasks[state]
-}
-
-// getVisibleTaskHeight returns the number of tasks that fit in the visible area.
-// Each task renders 1-2 lines (assignee-bearing columns show 2 lines).
-// Account for project name, tabs, separator, and help bar.
-func (m *BoardModel) getVisibleTaskHeight() int {
-	// Convert line budget to task count: (height - 5) lines / 2 lines per task.
-	// At least 1 task visible, at most (height-5)/2 tasks.
-	if m.height < 6 {
-		return 1
-	}
-	tasksVisible := (m.height - 5) / 2
-	if tasksVisible < 1 {
-		return 1
-	}
-	return tasksVisible
-}
-
-// clampScrollToSelection ensures the scroll offset shows the selected task.
-// If the selected index is above the viewport, scroll up; if below, scroll down.
-func (m *BoardModel) clampScrollToSelection() {
-	visibleHeight := m.getVisibleTaskHeight()
-	// If selected index is above the scroll window, scroll up
-	if m.selectedIndex < m.scrollOffset {
-		m.scrollOffset = m.selectedIndex
-	}
-	// If selected index is below the scroll window, scroll down
-	if m.selectedIndex >= m.scrollOffset+visibleHeight {
-		m.scrollOffset = m.selectedIndex - visibleHeight + 1
-	}
-	// Ensure scroll offset doesn't go negative
-	if m.scrollOffset < 0 {
-		m.scrollOffset = 0
-	}
-	// Ensure scroll offset doesn't show blank area at the bottom
-	tasksInColumn := m.getTasksInSelectedColumn()
-	maxOffset := len(tasksInColumn) - visibleHeight
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	if m.scrollOffset > maxOffset {
-		m.scrollOffset = maxOffset
-	}
-}
-
-// ensureSelectionInColumn ensures the selected task exists in the current column.
-// If the task is gone, select the nearest task at the prior index position (clamped to available).
-// If no tasks, clear selection.
-func (m *BoardModel) ensureSelectionInColumn() {
-	tasksInColumn := m.getTasksInSelectedColumn()
-
-	if len(tasksInColumn) == 0 {
-		m.selectedTaskID = ""
-		m.selectedIndex = 0
-		m.scrollOffset = 0
-		return
-	}
-
-	// Check if selected task is still in this column
-	for i, t := range tasksInColumn {
-		if t.ID == m.selectedTaskID {
-			m.selectedIndex = i
-			m.clampScrollToSelection()
-			return // Selection is valid
-		}
-	}
-
-	// Selection lost (task disappeared). Select at the same index position,
-	// clamped to the available range.
-	newIdx := m.selectedIndex
-	if newIdx >= len(tasksInColumn) {
-		newIdx = len(tasksInColumn) - 1
-	}
-	m.selectedIndex = newIdx
-	m.selectedTaskID = tasksInColumn[newIdx].ID
-	m.clampScrollToSelection()
-}
-
 // View renders the board in the alternate screen buffer.
 func (m *BoardModel) View() tea.View {
 	v := tea.NewView(m.viewContent())
@@ -2289,67 +1928,17 @@ func (m *BoardModel) viewContent() string {
 		return b.String()
 	}
 
-	if m.shell != nil && m.mode != modeScorecards && m.mode != modeProjectSwitch {
+	if m.mode != modeScorecards {
 		return m.shellView()
 	}
 
 	// Full-screen scorecard view.
-	if m.mode == modeScorecards {
-		var b strings.Builder
-		b.WriteString(m.renderScorecardView())
-		b.WriteString("\n")
-		b.WriteString(strings.Repeat("─", m.width))
-		b.WriteString("\n")
-		b.WriteString(m.renderScorecardHelpBar())
-		return b.String()
-	}
-
-	// Project switcher overlay.
-	if m.mode == modeProjectSwitch {
-		var b strings.Builder
-		if m.project.Name != "" {
-			projName := truncateString(m.project.Name, m.width)
-			b.WriteString(projName)
-			b.WriteString("\n")
-		}
-		b.WriteString(m.renderTabs())
-		b.WriteString("\n")
-		b.WriteString(strings.Repeat("─", m.width))
-		b.WriteString("\n")
-		b.WriteString(m.renderProjectSwitchOverlay())
-		return b.String()
-	}
-
 	var b strings.Builder
-
-	// Render project name
-	if m.project.Name != "" {
-		projName := truncateString(m.project.Name, m.width)
-		b.WriteString(projName)
-		b.WriteString("\n")
-	}
-
-	// Render tabs (column headers)
-	b.WriteString(m.renderTabs())
-	b.WriteString("\n")
-
-	// Separator
-	b.WriteString(strings.Repeat("─", m.width))
-	b.WriteString("\n")
-
-	// When a review mode is active, overlay the input/confirm prompt instead of the task list.
-	if m.mode != modeNormal {
-		b.WriteString(m.renderReviewOverlay())
-	} else {
-		b.WriteString(m.renderColumnTasks())
-	}
-
-	// Help bar
+	b.WriteString(m.renderScorecardView())
 	b.WriteString("\n")
 	b.WriteString(strings.Repeat("─", m.width))
 	b.WriteString("\n")
-	b.WriteString(m.renderHelpBar())
-
+	b.WriteString(m.renderScorecardHelpBar())
 	return b.String()
 }
 
@@ -2496,142 +2085,6 @@ func (m *BoardModel) renderReviewOverlay() string {
 	return b.String()
 }
 
-// renderProjectSwitchOverlay renders the project switcher overlay.
-func (m *BoardModel) renderProjectSwitchOverlay() string {
-	var b strings.Builder
-	b.WriteString("Switch project (↑/↓ or k/j to select, enter to switch, z to archive, esc to cancel):\n\n")
-	for i, p := range m.projects {
-		cursor := "  "
-		if i == m.projectSwitchIndex {
-			cursor = "> "
-		}
-		b.WriteString(fmt.Sprintf("%s%s\n", cursor, p.Name))
-	}
-	return b.String()
-}
-
-// truncateString truncates a string to the given width, adding "…" if truncated.
-func truncateString(s string, width int) string {
-	if len(s) <= width {
-		return s
-	}
-	if width <= 1 {
-		return "…"
-	}
-	return s[:width-1] + "…"
-}
-
-// renderTabs renders the column tabs with counts.
-func (m *BoardModel) renderTabs() string {
-	var tabs []string
-	for i, state := range stateOrder {
-		count := len(m.tasks[state])
-		tab := fmt.Sprintf("%s(%d)", state, count)
-
-		if i == m.selectedColumn {
-			// Active tab: surrounded by angle brackets
-			tab = fmt.Sprintf("‹%s›", tab)
-		}
-
-		tabs = append(tabs, tab)
-	}
-
-	return strings.Join(tabs, "  ")
-}
-
-// renderColumnTasks renders the tasks in the selected column, respecting scroll offset.
-func (m *BoardModel) renderColumnTasks() string {
-	if m.loading {
-		return "Loading..."
-	}
-
-	if m.error != "" {
-		return fmt.Sprintf("Error: %s\nPress 'r' to retry.", m.error)
-	}
-
-	statusLine := ""
-	if m.statusMessage != "" {
-		statusLine = m.statusMessage + "\n"
-	}
-
-	tasksInColumn := m.getTasksInSelectedColumn()
-
-	if len(tasksInColumn) == 0 {
-		return statusLine + "(empty)"
-	}
-
-	// Calculate the visible task range
-	visibleHeight := m.getVisibleTaskHeight()
-	endOffset := m.scrollOffset + visibleHeight
-	if endOffset > len(tasksInColumn) {
-		endOffset = len(tasksInColumn)
-	}
-
-	var b strings.Builder
-	b.WriteString(statusLine)
-	for i := m.scrollOffset; i < endOffset; i++ {
-		task := tasksInColumn[i]
-		isSelected := task.ID == m.selectedTaskID
-		prefix := " "
-		if isSelected {
-			prefix = "▸"
-		}
-
-		taskIDDisplay := task.ID
-		if len(task.ID) > 8 {
-			taskIDDisplay = task.ID[:8]
-		}
-		modelBadge := fmt.Sprintf("[%s]", task.Model)
-		held := ""
-		if task.Held {
-			held = " [HELD]"
-		}
-		priority := ""
-		if task.Priority != nil {
-			priority = fmt.Sprintf(" P:%d", *task.Priority)
-		} else {
-			priority = " P:500"
-		}
-		anchor := ""
-		if task.TopicAnchorID != nil && *task.TopicAnchorID != "" && *task.TopicAnchorID != task.ID {
-			anchorDisplay := *task.TopicAnchorID
-			if len(anchorDisplay) > 8 {
-				anchorDisplay = anchorDisplay[:8]
-			}
-			anchor = fmt.Sprintf(" [anchor:%s]", anchorDisplay)
-		}
-		b.WriteString(fmt.Sprintf("%s %s %s%s%s%s  %s\n", prefix, taskIDDisplay, modelBadge, held, priority, anchor, task.Title))
-
-		// Show assignee for in_progress, review, approved, and done states
-		shouldShowAssignee := task.State == stateInProgress || task.State == stateChecks || task.State == stateReview ||
-			task.State == stateApproved || task.State == stateDone
-		now := time.Now()
-		if task.State == stateChecks && task.Assignee == nil {
-			b.WriteString(fmt.Sprintf("    in checks %s · updated %s ago\n", tuiview.FormatChecksDuration(task.ChecksStartedAt, now), tuiview.FormatTime(task.UpdatedAt, now)))
-		}
-		if shouldShowAssignee && task.Assignee != nil {
-			assignee := *task.Assignee
-			// Truncate long agent IDs to keep layout compact
-			if len(assignee) > 20 {
-				assignee = assignee[:17] + "…"
-			}
-
-			// For in_progress, also show lease countdown and updated time
-			if task.State == stateInProgress {
-				leaseStatus := tuiview.FormatLeaseCountdown(task.LeaseExpiresAt, now)
-				b.WriteString(fmt.Sprintf("    @%s · lease %s · updated %s ago\n", assignee, leaseStatus, tuiview.FormatTime(task.UpdatedAt, now)))
-			} else if task.State == stateChecks {
-				b.WriteString(fmt.Sprintf("    @%s · in checks %s · updated %s ago\n", assignee, tuiview.FormatChecksDuration(task.ChecksStartedAt, now), tuiview.FormatTime(task.UpdatedAt, now)))
-			} else {
-				// For other states, just show assignee and updated time
-				b.WriteString(fmt.Sprintf("    @%s · updated %s ago\n", assignee, tuiview.FormatTime(task.UpdatedAt, now)))
-			}
-		}
-	}
-
-	return b.String()
-}
-
 // helpLine renders bindings as one help line no wider than width (0 means no limit),
 // truncating with an ellipsis instead of overflowing.
 func (m *BoardModel) helpLine(bindings []keybind.Binding, width int) string {
@@ -2644,40 +2097,14 @@ func (m *BoardModel) helpLine(bindings []keybind.Binding, width int) string {
 	return line
 }
 
-// detailKeys is the detail view's bindings. The shell has no project switcher, so there the
-// switch-project binding is left out — of the keys and of the help alike.
-func (m *BoardModel) detailKeys() keyMap {
-	if m.shell == nil {
-		return m.keyBindings.Detail
-	}
-	var km keyMap
-	for _, e := range m.keyBindings.Detail {
-		if e.act != actSwitchProject {
-			km = append(km, e)
-		}
-	}
-	return km
-}
-
 func (m *BoardModel) detailKeyCtx() keyCtx { return keyCtx{state: m.detailTask.State} }
 
 // helpBindings is the full list of bindings live in the current view.
 func (m *BoardModel) helpBindings() []keybind.Binding {
-	switch {
-	case m.mode == modeDetail:
-		return m.detailKeys().help(m.detailKeyCtx())
-	case m.shell != nil:
-		return m.keyBindings.Shell.help(m.shellKeyCtx())
+	if m.mode == modeDetail {
+		return m.keyBindings.Detail.help(m.detailKeyCtx())
 	}
-	return m.keyBindings.Board.help(keyCtx{state: stateOrder[m.selectedColumn]})
-}
-
-// renderHelpBar renders the bottom help bar of the tab layout.
-func (m *BoardModel) renderHelpBar() string {
-	if m.mode != modeNormal {
-		return "esc cancel"
-	}
-	return m.helpLine(m.helpBindings(), m.width)
+	return m.keyBindings.Shell.help(m.shellKeyCtx())
 }
 
 // renderDetailHelpBar renders the help bar for the detail view.
