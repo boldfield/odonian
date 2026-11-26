@@ -2,12 +2,16 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
+	"github.com/boldfield/odonian/internal/tuiconfig"
+	"github.com/boldfield/odonian/internal/tuiview"
 )
 
 func assertWidth(t *testing.T, out string, w int) {
@@ -283,5 +287,113 @@ func TestShellHeaderShowsProjectNameAndOpenCount(t *testing.T) {
 	out := f.model.View().Content
 	if !strings.Contains(out, "One · ") || !strings.Contains(out, " open") {
 		t.Errorf("items header should read '<project> · N open':\n%s", out)
+	}
+}
+
+func filterTasks() []tuiclient.Task {
+	return []tuiclient.Task{
+		{ID: "t-prog", Title: "Prog", State: "in_progress", Kind: "implement"},
+		{ID: "t-ready", Title: "Ready", State: "ready", Kind: "implement"},
+		{ID: "t-fail", Title: "Fail", State: "failed", Kind: "implement"},
+		{ID: "t-aban", Title: "Aban", State: "abandoned", Kind: "implement"},
+	}
+}
+
+func (f *boardFixture) listedStates() map[string]bool {
+	seen := map[string]bool{}
+	for _, c := range f.listCalls() {
+		if c.claimable {
+			seen["claimable"] = true
+		} else {
+			seen[c.state] = true
+		}
+	}
+	return seen
+}
+
+func TestShellDefaultFilterHidesFailedAndAbandoned(t *testing.T) {
+	f := newBoardFixture(t, 120, 20, filterTasks()...)
+	seen := f.listedStates()
+	if seen["failed"] || seen["abandoned"] || !seen["in_progress"] || !seen["claimable"] {
+		t.Errorf("list calls = %v", seen)
+	}
+	view := f.model.viewContent()
+	if strings.Contains(view, "Fail") || strings.Contains(view, "Aban") {
+		t.Errorf("hidden tasks rendered:\n%s", view)
+	}
+	lines := strings.Split(strings.TrimRight(f.model.shell.items.render(), "\n"), "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "hidden: failed, abandoned") {
+		t.Errorf("last pane line = %q", last)
+	}
+}
+
+func TestShellEmptyHiddenStatesShowsEverything(t *testing.T) {
+	f := newBoardFixtureCfg(t, 120, 20, func(c *tuiconfig.Config) {
+		c.HiddenStates, c.HiddenStatesSet = []string{}, true
+	}, filterTasks()...)
+	seen := f.listedStates()
+	if !seen["failed"] || !seen["abandoned"] {
+		t.Errorf("list calls = %v", seen)
+	}
+	if got := fmt.Sprint(ids(f.model.shell.items)); got != "[t-prog t-ready t-fail t-aban]" {
+		t.Errorf("items = %s", got)
+	}
+	if strings.Contains(f.model.viewContent(), "hidden:") {
+		t.Error("footer shown with nothing hidden")
+	}
+}
+
+func TestShellReadyHiddenSkipsClaimableListing(t *testing.T) {
+	f := newBoardFixtureCfg(t, 120, 20, func(c *tuiconfig.Config) {
+		c.HiddenStates, c.HiddenStatesSet = []string{"ready"}, true
+	}, filterTasks()...)
+	seen := f.listedStates()
+	if seen["claimable"] || seen["ready"] {
+		t.Errorf("list calls = %v", seen)
+	}
+}
+
+func TestShellFilterFooterFitsWidth(t *testing.T) {
+	for _, w := range []int{40, 60, 80, 120} {
+		f := newBoardFixture(t, w, 20, filterTasks()...)
+		assertWidth(t, f.model.View().Content, w)
+	}
+}
+
+func TestShellUnknownHiddenStateWarns(t *testing.T) {
+	r, w, _ := os.Pipe()
+	old := os.Stderr
+	os.Stderr = w
+	f := newBoardFixtureCfg(t, 120, 20, func(c *tuiconfig.Config) {
+		c.HiddenStates, c.HiddenStatesSet = []string{"bogus", "ready"}, true
+	}, filterTasks()...)
+	os.Stderr = old
+	w.Close()
+	out, _ := io.ReadAll(r)
+	if n := strings.Count(string(out), "bogus"); n != 1 || strings.Count(string(out), "Warning") != 1 {
+		t.Errorf("stderr = %q", out)
+	}
+	if f.model.shell.filter.Visible("ready") || !f.model.shell.filter.Visible("failed") {
+		t.Error("known names must still apply")
+	}
+}
+
+func TestShellSetStateFilterRefetchesAndKeepsSelection(t *testing.T) {
+	f := newBoardFixture(t, 120, 20, filterTasks()...)
+	f.selectItem(t, "t-prog")
+	f.resetCalls()
+	f.send(f.run(f.model.SetStateFilter(tuiview.StateFilter{}))...)
+	if seen := f.listedStates(); !seen["failed"] || !seen["abandoned"] {
+		t.Errorf("no refetch of shown states: %v", seen)
+	}
+	if got := f.model.shell.items.SelectedTaskID(); got != "t-prog" {
+		t.Errorf("selection = %q", got)
+	}
+	// Hiding the selected item's state moves selection to the nearest visible item.
+	f.selectItem(t, "t-ready")
+	hide, _ := tuiview.ParseHiddenStates([]string{"ready", "failed", "abandoned"})
+	f.send(f.run(f.model.SetStateFilter(hide))...)
+	if got := f.model.shell.items.SelectedTaskID(); got != "t-prog" {
+		t.Errorf("selection after hiding = %q", got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/boldfield/odonian/internal/localcommit"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
+	"github.com/boldfield/odonian/internal/tuiview"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 )
@@ -223,9 +225,24 @@ func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tu
 		},
 	}
 	m.shell.preview.SetTheme(theme)
+	m.shell.filter = stateFilterFromConfig(config)
+	m.shell.items.SetFilter(m.shell.filter)
 	m.shell.items.SetProjectName(project.Name)
 	m.newTickCmd = m.defaultTickCmd
 	return m
+}
+
+// stateFilterFromConfig builds the startup state filter: the config's hidden_states when
+// set, otherwise the default. Ignored names are reported once on stderr.
+func stateFilterFromConfig(config *tuiconfig.Config) tuiview.StateFilter {
+	if config == nil || !config.HiddenStatesSet {
+		return tuiview.DefaultStateFilter()
+	}
+	filter, ignored := tuiview.ParseHiddenStates(config.HiddenStates)
+	if len(ignored) > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: hidden_states: ignoring unknown state names: %s\n", strings.Join(ignored, ", "))
+	}
+	return filter
 }
 
 // defaultTickCmd is the production tick: fires after PollInterval.

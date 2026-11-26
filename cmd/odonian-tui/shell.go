@@ -44,6 +44,8 @@ type shellState struct {
 	// fetchErrorMsg is the m.error a failed task fetch set. The retry hint is shown only
 	// while m.error still equals it, so a later error from another action never inherits it.
 	fetchErrorMsg string
+	// filter is the set of hidden task states; it applies to every project.
+	filter tuiview.StateFilter
 }
 
 // shellTasksMsg carries one project's work for the shell: the tasks and the ids of the
@@ -61,26 +63,33 @@ type previewFetchMsg struct {
 	taskID string
 }
 
-// fetchShellTasks lists the project's open tasks with fields=summary, plus one
-// claimable=true listing so ready tasks can be told apart from tasks waiting on a dependency.
+// fetchShellTasks lists the project's tasks in the visible states with fields=summary, plus
+// one claimable=true listing so ready tasks can be told apart from tasks waiting on a
+// dependency. A hidden state is not requested; the claimable listing is skipped when ready
+// is hidden.
 func (m *BoardModel) fetchShellTasks() tea.Cmd {
 	client := m.client
 	projectID := m.project.ID
+	filter := m.shell.filter
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		var all []tuiclient.Task
-		for _, state := range append(append([]string{}, activeStates...), stateFailed) {
+		for _, state := range filter.VisibleStates() {
 			tasks, err := client.ListTasks(ctx, projectID, tuiclient.WithState(state), tuiclient.WithFields("summary"))
 			if err != nil {
 				return shellTasksMsg{projectID: projectID, err: err}
 			}
 			all = append(all, tasks...)
 		}
-		ready, err := client.ListTasks(ctx, projectID, tuiclient.WithClaimable(true), tuiclient.WithFields("summary"))
-		if err != nil {
-			return shellTasksMsg{projectID: projectID, err: err}
+		var ready []tuiclient.Task
+		if filter.Visible(stateReady) {
+			var err error
+			ready, err = client.ListTasks(ctx, projectID, tuiclient.WithClaimable(true), tuiclient.WithFields("summary"))
+			if err != nil {
+				return shellTasksMsg{projectID: projectID, err: err}
+			}
 		}
 		claimable := make(map[string]bool, len(ready))
 		for _, t := range ready {
@@ -114,6 +123,17 @@ func (m *BoardModel) setShellItems(tasks []tuiclient.Task, claimable map[string]
 	cmd := m.shell.items.SetItems(tuiview.GroupWorkItems(ptrs).WorkItems, claimable)
 	m.syncShellSelection()
 	return cmd
+}
+
+// SetStateFilter replaces the state filter, regroups the tasks already held so the list
+// reflects it at once, and refetches so a newly shown state appears. Selection stays on the
+// same work item while it is visible, otherwise it moves to the nearest visible item.
+func (m *BoardModel) SetStateFilter(filter tuiview.StateFilter) tea.Cmd {
+	m.shell.filter = filter
+	m.shell.items.SetFilter(filter)
+	rebuild := m.rebuildShellItems()
+	m.shell.preview.SetItem(m.shell.items.SelectedItem())
+	return tea.Batch(rebuild, m.fetchShellTasks())
 }
 
 // rebuildShellItems regroups m.tasks after an action refetched them.

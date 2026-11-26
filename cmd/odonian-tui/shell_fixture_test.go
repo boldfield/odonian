@@ -63,6 +63,13 @@ const maxFixtureMsgs = 1000
 // tasks, and delivers the initial size, project list and task fetch.
 func newBoardFixture(t *testing.T, width, height int, tasks ...tuiclient.Task) *boardFixture {
 	t.Helper()
+	return newBoardFixtureCfg(t, width, height, nil, tasks...)
+}
+
+// newBoardFixtureCfg is newBoardFixture with a hook that edits the config before the
+// model is built (for example to set hidden_states).
+func newBoardFixtureCfg(t *testing.T, width, height int, edit func(*tuiconfig.Config), tasks ...tuiclient.Task) *boardFixture {
+	t.Helper()
 	f := &boardFixture{
 		t:      t,
 		listed: map[string][]tuiclient.Task{"p1": tasks},
@@ -143,6 +150,9 @@ func newBoardFixture(t *testing.T, width, height int, tasks ...tuiclient.Task) *
 		},
 	}
 	cfg := &tuiconfig.Config{URL: "http://test", Token: "t", Actor: "u", PollInterval: time.Hour}
+	if edit != nil {
+		edit(cfg)
+	}
 	f.model = NewBoardModel(client, cfg, tuiclient.Project{ID: "p1", Name: "One"})
 	f.model.shell.previewDebounce = 0
 	f.model.newTickCmd = func() tea.Cmd {
