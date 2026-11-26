@@ -228,6 +228,7 @@ func TestWorkItemsEmptyRefreshEmitsClearedSelection(t *testing.T) {
 
 func TestWorkItemsAbandonedAndDoneAreHidden(t *testing.T) {
 	p := newTestPane(80, 20)
+	p.SetFilter(tuiview.DefaultStateFilter())
 	p.SetItems([]*tuiview.WorkItem{wiOf("open", "backlog"), wiOf("gone", "abandoned"), wiOf("fin", "done")}, nil)
 	out := p.render()
 	if got := fmt.Sprint(ids(p)); got != "[open]" {

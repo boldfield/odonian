@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/boldfield/odonian/internal/localcommit"
 	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/boldfield/odonian/internal/tuiconfig"
+	"github.com/boldfield/odonian/internal/tuiview"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 )
@@ -223,9 +225,24 @@ func NewBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tu
 		},
 	}
 	m.shell.preview.SetTheme(theme)
+	m.shell.filter = stateFilterFromConfig(config)
+	m.shell.items.SetFilter(m.shell.filter)
 	m.shell.items.SetProjectName(project.Name)
 	m.newTickCmd = m.defaultTickCmd
 	return m
+}
+
+// stateFilterFromConfig builds the startup state filter: the config's hidden_states when
+// set, otherwise the default. Ignored names are reported once on stderr.
+func stateFilterFromConfig(config *tuiconfig.Config) tuiview.StateFilter {
+	if config == nil || !config.HiddenStatesSet {
+		return tuiview.DefaultStateFilter()
+	}
+	filter, ignored := tuiview.ParseHiddenStates(config.HiddenStates)
+	if len(ignored) > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: hidden_states: ignoring unknown state names: %s\n", strings.Join(ignored, ", "))
+	}
+	return filter
 }
 
 // defaultTickCmd is the production tick: fires after PollInterval.
@@ -753,7 +770,7 @@ func isDefinitiveRejection(statusCode int) bool {
 // result surfaces through the reviewActionMsg handler instead of tasksFetchedMsg. This
 // avoids starting a second tea.Cmd goroutine from within the first.
 func (m *BoardModel) fetchTasksInline(ctx context.Context, errPrefix string) reviewActionMsg {
-	tasks, fetchErr := m.client.ListTasks(ctx, m.project.ID)
+	tasks, fetchErr := m.fetchStatesSummary(ctx, m.shell.filter.VisibleStates())
 	if fetchErr != nil {
 		errMsg := fmt.Sprintf("refetch failed: %v", fetchErr)
 		if errPrefix != "" {
@@ -793,15 +810,14 @@ func (m *BoardModel) fetchStatesSummary(ctx context.Context, states []string) ([
 	return all, nil
 }
 
-// fetchTasksFullRefresh creates a command that fetches every state (active and terminal),
-// one ListTasks call per state with fields=summary. Used for the initial load, manual
-// refresh ('r'), and project switches, none of which are on the steady-state poll path.
+// fetchTasksFullRefresh creates a command that fetches the visible states, one ListTasks
+// call per state with fields=summary. A hidden state is never requested.
 func (m *BoardModel) fetchTasksFullRefresh() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		tasks, err := m.fetchStatesSummary(ctx, stateOrder)
+		tasks, err := m.fetchStatesSummary(ctx, m.shell.filter.VisibleStates())
 		if err != nil {
 			return tasksFetchedMsg{err: err}
 		}
@@ -1097,7 +1113,7 @@ func (m *BoardModel) updateShared(msg tea.Msg) (tea.Model, tea.Cmd) {
 // boardAction runs the task actions, the refresh and the scorecards on the shell's selected task.
 func (m *BoardModel) boardAction(act action) (tea.Model, tea.Cmd) {
 	switch act {
-	// Refresh: issue one-shot fetch of all columns (active and terminal); do NOT arm
+	// Refresh: one-shot fetch of the visible states; do NOT arm
 	// a new tick. The single perpetual tick chain started in Init re-arms itself from
 	// tickMsg.
 	case actRefresh:

@@ -311,7 +311,7 @@ func extractFieldsFromOptions(options ...tuiclient.TaskListOption) string {
 
 // TestBoardModel_PerStatePollingWithSummaryFields verifies the per-state poll contract:
 // a tick issues exactly one WithState(...)+fields=summary ListTasks call per active state
-// (backlog, ready, in_progress, checks, review, approved, blocked) plus failed, and one
+// (backlog, ready, in_progress, checks, review, approved, blocked) (failed and abandoned are hidden by default), and one
 // claimable+fields=summary call, leaving done and abandoned unpolled; manual refresh
 // issues one such call per state across all states.
 func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
@@ -349,22 +349,19 @@ func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
 		}
 	}
 
-	// --- Tick polls only the active states and failed ---
+	// --- Tick polls only the visible states ---
 	f.resetCalls()
 	f.send(tickMsg{})
-	assertCalls(t, f.listCalls(), append(append([]string{}, activeStates...), stateFailed), 1)
+	assertCalls(t, f.listCalls(), activeStates, 1)
 
-	if len(f.model.tasks["failed"]) != 1 || f.model.tasks["failed"][0].ID != "task-failed" {
-		t.Errorf("expected failed tasks polled with task-failed, got %v", f.model.tasks["failed"])
-	}
-	if view := f.model.viewContent(); !strings.Contains(view, "Active") || !strings.Contains(view, "Failed") {
-		t.Errorf("expected the polled tasks in the work items:\n%s", view)
+	if view := f.model.viewContent(); !strings.Contains(view, "Active") || strings.Contains(view, "Failed") {
+		t.Errorf("expected the polled tasks in the work items, and not the hidden failed one:\n%s", view)
 	}
 
-	// --- Manual refresh ('r') fetches every state ---
+	// --- Manual refresh ('r') fetches the same visible states as the poll ---
 	f.resetCalls()
 	f.press("r")
-	assertCalls(t, f.listCalls(), stateOrder, 0)
+	assertCalls(t, f.listCalls(), activeStates, 0)
 }
 
 // --- TUI-4: Review action tests ---

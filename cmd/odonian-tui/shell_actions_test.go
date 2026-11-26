@@ -159,9 +159,14 @@ func TestShellProjectsPaneRefreshAndQuit(t *testing.T) {
 		listed = append(listed, c.state)
 	}
 	states := strings.Join(listed, ",")
-	for _, want := range []string{"backlog", "ready", "review", "approved", "blocked", "done", "failed"} {
+	for _, want := range []string{"backlog", "ready", "review", "approved", "blocked"} {
 		if !strings.Contains(states, want) {
 			t.Errorf("refresh did not list state %q: %s", want, states)
+		}
+	}
+	for _, hidden := range []string{"done", "failed", "abandoned"} {
+		if strings.Contains(states, hidden) {
+			t.Errorf("refresh listed hidden state %q: %s", hidden, states)
 		}
 	}
 	_, cmd = f.model.Update(key("q"))

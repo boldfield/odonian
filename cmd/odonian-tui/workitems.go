@@ -31,6 +31,7 @@ type WorkItemsPane struct {
 	width       int
 	height      int
 	focused     bool
+	filter      tuiview.StateFilter // hidden states; the zero value shows everything
 	now         func() time.Time
 }
 
@@ -60,6 +61,11 @@ func (p *WorkItemsPane) SetSize(width, height int) {
 	p.width = width
 	p.height = height
 	p.ensureSelectionVisible()
+}
+
+// SetFilter sets the state filter applied by SetItems. It takes effect on the next SetItems.
+func (p *WorkItemsPane) SetFilter(filter tuiview.StateFilter) {
+	p.filter = filter
 }
 
 // SetFocused updates the focus state of the pane.
@@ -98,8 +104,7 @@ func (p *WorkItemsPane) SetItems(items []*tuiview.WorkItem, claimable map[string
 		if wi == nil || wi.Implement == nil {
 			continue
 		}
-		switch tuiview.Status(wi.Implement, claimable) {
-		case tuiview.StatusDone, tuiview.StatusAbandoned:
+		if state := wi.Implement.State; state == "done" || state == "superseded" || !p.filter.Visible(state) {
 			continue
 		}
 		open = append(open, wi)
@@ -130,7 +135,7 @@ func (p *WorkItemsPane) SetItems(items []*tuiview.WorkItem, claimable map[string
 }
 
 // groupRank orders status groups: checks, in progress, review, approved,
-// ready and waiting, backlog, blocked and failed.
+// ready and waiting, backlog, blocked, then failed, then abandoned.
 func groupRank(s tuiview.StatusType) int {
 	switch s {
 	case tuiview.StatusChecks:
@@ -145,6 +150,10 @@ func groupRank(s tuiview.StatusType) int {
 		return 4
 	case tuiview.StatusBacklogNotPromoted, tuiview.StatusBacklogWaiting:
 		return 5
+	case tuiview.StatusFailed:
+		return 7
+	case tuiview.StatusAbandoned:
+		return 8
 	default:
 		return 6
 	}
@@ -230,7 +239,19 @@ func (p *WorkItemsPane) bodyHeight() int {
 	if p.height < 1 {
 		return 0
 	}
+	if p.footer() != "" {
+		return max(p.height-2, 0)
+	}
 	return p.height - 1
+}
+
+// footer is the line naming the hidden states, or "" when none are hidden or the pane is
+// too short to spare a line for it.
+func (p *WorkItemsPane) footer() string {
+	if p.height < 2 {
+		return ""
+	}
+	return tuiview.HiddenLabel(p.filter)
 }
 
 // itemHeight is the number of lines a work item renders to.
@@ -337,14 +358,26 @@ func (p *WorkItemsPane) render() string {
 	return p.clampLines(lines)
 }
 
-// clampLines cuts the output to the pane height.
+// clampLines cuts the output to the pane height. The hidden-states footer, when shown,
+// is the pane's last line.
 func (p *WorkItemsPane) clampLines(lines []string) string {
 	h := p.height
 	if h < 1 {
 		h = 1
 	}
+	footer := p.footer()
+	if footer != "" {
+		h--
+	}
 	if len(lines) > h {
 		lines = lines[:h]
+	}
+	if footer != "" {
+		w := max(p.width, 1)
+		for len(lines) < h {
+			lines = append(lines, "")
+		}
+		lines = append(lines, ensureLineWidth(p.theme.DimmedText.Render(truncateToDisplayWidth(footer, w)), w))
 	}
 	return strings.Join(lines, "\n")
 }

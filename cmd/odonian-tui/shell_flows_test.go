@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/boldfield/odonian/internal/tuiclient"
+	"github.com/boldfield/odonian/internal/tuiview"
 )
 
 // captureTransitions wraps the fixture client's TransitionTask to record the note it is given.
@@ -116,6 +117,7 @@ func TestBoardModel_FailFlow(t *testing.T) {
 	}
 	// The refetch that follows the transition serves the task in its new state.
 	f.setTasks(tuiclient.Task{ID: "blocked-task-1", Title: "Blocked Task", State: "failed", Kind: "implement"})
+	f.model.shell.filter, _ = tuiview.ParseHiddenStates(nil) // failed is hidden by default
 	f.resetCalls()
 	f.press("y")
 	if f.model.mode != modeNormal {
