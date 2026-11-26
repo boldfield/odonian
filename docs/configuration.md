@@ -328,6 +328,7 @@ a missing file is fine.
 | Actor | `ODONIAN_ACTOR` | `actor` | `--actor` | OS username | Identity recorded for operator actions taken from the TUI. |
 | Default project | — | `default_project` | — | unset | File-only; no env or flag equivalent. |
 | Poll interval | — | `poll_interval` | — | `2s` | File-only Go duration string; an unparseable value warns and keeps `2s`. |
+| Hidden states | — | `hidden_states` | — | `["failed", "abandoned"]` | File-only list of state names the work-item pane hides and does not fetch. `[]` shows every state; an unknown name warns and is ignored. Example: `hidden_states = ["failed", "abandoned", "backlog"]`. |
 
 ## Harness (`harness/agent.sh` and its wrappers)
 
