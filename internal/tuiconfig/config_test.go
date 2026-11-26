@@ -345,3 +345,68 @@ token = "world-readable-token"
 		t.Errorf("warning should mention world-readable: %s", stderrOutput)
 	}
 }
+
+func loadWithHiddenStates(t *testing.T, line string) (*Config, string) {
+	t.Helper()
+	tempDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tempDir)
+	t.Setenv("ODONIAN_URL", "http://localhost:8080")
+	t.Setenv("ODONIAN_TOKEN", "token")
+	configDir := filepath.Join(tempDir, "odonian")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	content := "url = \"http://localhost:8080\"\n" + line + "\n"
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	cfg, err := LoadConfig("", "", "")
+	w.Close()
+	os.Stderr = oldStderr
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	return cfg, buf.String()
+}
+
+func TestHiddenStates(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		cfg, warn := loadWithHiddenStates(t, "")
+		if cfg.HiddenStatesSet || len(cfg.HiddenStates) != 0 || warn != "" {
+			t.Errorf("got set=%v states=%v warn=%q", cfg.HiddenStatesSet, cfg.HiddenStates, warn)
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		cfg, warn := loadWithHiddenStates(t, "hidden_states = []")
+		if !cfg.HiddenStatesSet || len(cfg.HiddenStates) != 0 || warn != "" {
+			t.Errorf("got set=%v states=%v warn=%q", cfg.HiddenStatesSet, cfg.HiddenStates, warn)
+		}
+	})
+	t.Run("names", func(t *testing.T) {
+		cfg, warn := loadWithHiddenStates(t, `hidden_states = ["failed", "blocked"]`)
+		if !cfg.HiddenStatesSet || len(cfg.HiddenStates) != 2 || cfg.HiddenStates[0] != "failed" || cfg.HiddenStates[1] != "blocked" || warn != "" {
+			t.Errorf("got set=%v states=%v warn=%q", cfg.HiddenStatesSet, cfg.HiddenStates, warn)
+		}
+	})
+	t.Run("not a list", func(t *testing.T) {
+		cfg, warn := loadWithHiddenStates(t, `hidden_states = "failed"`)
+		if cfg.HiddenStatesSet || len(cfg.HiddenStates) != 0 {
+			t.Errorf("expected not set, got set=%v states=%v", cfg.HiddenStatesSet, cfg.HiddenStates)
+		}
+		if warn == "" {
+			t.Error("expected warning to stderr")
+		}
+	})
+	t.Run("non-string element", func(t *testing.T) {
+		cfg, warn := loadWithHiddenStates(t, `hidden_states = ["failed", 3]`)
+		if cfg.HiddenStatesSet || warn == "" {
+			t.Errorf("got set=%v warn=%q", cfg.HiddenStatesSet, warn)
+		}
+	})
+}

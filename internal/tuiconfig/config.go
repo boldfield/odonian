@@ -17,6 +17,14 @@ type Config struct {
 	Actor          string
 	DefaultProject string
 	PollInterval   time.Duration
+
+	// HiddenStates carries the hidden_states key from the config file as
+	// plain strings; names are not validated here. HiddenStatesSet tells the
+	// three cases apart: false means the key is absent (or invalid) and the
+	// caller uses its built-in default; true with an empty slice means show
+	// every state; true with names means hide exactly those.
+	HiddenStates    []string
+	HiddenStatesSet bool
 }
 
 // LoadConfig resolves configuration from file, environment, and flags.
@@ -75,11 +83,12 @@ func LoadConfig(flagURL, flagToken, flagActor string) (*Config, error) {
 
 // fileConfig is the structure for parsing the TOML config file.
 type fileConfig struct {
-	URL            string `toml:"url"`
-	Token          string `toml:"token"`
-	Actor          string `toml:"actor"`
-	DefaultProject string `toml:"default_project"`
-	PollInterval   string `toml:"poll_interval"` // Parse as string, then duration
+	URL            string      `toml:"url"`
+	Token          string      `toml:"token"`
+	Actor          string      `toml:"actor"`
+	DefaultProject string      `toml:"default_project"`
+	PollInterval   string      `toml:"poll_interval"` // Parse as string, then duration
+	HiddenStates   interface{} `toml:"hidden_states"` // checked after load: must be a list of strings
 }
 
 // loadFromFile loads configuration from ~/.config/odonian/config.toml
@@ -145,7 +154,34 @@ func loadFromFile(cfg *Config) error {
 		}
 	}
 
+	if fileCfg.HiddenStates != nil {
+		if names, ok := parseStringList(fileCfg.HiddenStates); ok {
+			cfg.HiddenStates = names
+			cfg.HiddenStatesSet = true
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: hidden_states must be a list of state names, got %v; using default\n", fileCfg.HiddenStates)
+		}
+	}
+
 	return nil
+}
+
+// parseStringList converts a decoded TOML array into a string slice. It
+// reports false when v is not an array or holds a non-string element.
+func parseStringList(v interface{}) ([]string, bool) {
+	items, ok := v.([]interface{})
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		s, ok := it.(string)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, s)
+	}
+	return out, true
 }
 
 // checkTokenFilePermissions warns if the config file is world-readable or group-readable.

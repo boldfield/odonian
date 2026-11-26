@@ -19973,6 +19973,206 @@ func TestOpenSucceedsWhenAnalysisFails(t *testing.T) {
 	}
 }
 
+// TestStartupStatisticsKeepListPlansOnProjectIndex is the regression test for the
+// sampled startup ANALYZE. On skewed data like production (nearly every task has
+// archived_at NULL and held = 0) PRAGMA analysis_limit made sqlite_stat1 claim a few
+// rows per archived_at value, and the planner then answered every task list through
+// idx_task_archived_at. Statistics are computed when the store opens, so the data is
+// inserted, the store closed, and the plans read after reopening.
+func TestStartupStatisticsKeepListPlansOnProjectIndex(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "stats.db")
+
+	const projectCount, tasksPerProject = 3, 1500
+	store, err := Open(dbPath, defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to open store: %v", err)
+	}
+	var projectIDs, documentIDs []string
+	for p := 0; p < projectCount; p++ {
+		proj, err := store.CreateProject(ctx, fmt.Sprintf("stats-%d", p), "https://github.com/example/repo")
+		if err != nil {
+			t.Fatalf("failed to create project: %v", err)
+		}
+		doc, err := store.CreateDocument(ctx, proj.ID, "design", "Doc", "DOC.md", nil)
+		if err != nil {
+			t.Fatalf("failed to create document: %v", err)
+		}
+		projectIDs = append(projectIDs, proj.ID)
+		documentIDs = append(documentIDs, doc.ID)
+	}
+	tx, err := store.Conn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	now := nowTimestamp()
+	models := []string{"haiku", "sonnet", "opus"}
+	for p, projectID := range projectIDs {
+		for i := 0; i < tasksPerProject; i++ {
+			// Most tasks are done, a few are live; a handful are archived or held.
+			state := "done"
+			switch {
+			case i%50 == 1:
+				state = "ready"
+			case i%50 == 2:
+				state = "in_progress"
+			case i%50 == 3:
+				state = "backlog"
+			}
+			var archivedAt interface{}
+			if i%300 == 7 {
+				archivedAt = now
+			}
+			held := 0
+			if i%300 == 11 {
+				held = 1
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO task (id, project_id, document_id, title, spec, state, model, held, created_at, updated_at, archived_at)
+				VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)`,
+				fmt.Sprintf("%s-%05d", projectID, i), projectID, documentIDs[p], "T", state, models[i%len(models)], held, now, now, archivedAt); err != nil {
+				t.Fatalf("failed to insert task: %v", err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit tasks: %v", err)
+	}
+	store.Close()
+
+	ready, done, model := "ready", "done", "haiku"
+	filters := map[string]TaskListFilter{
+		"no state":  {},
+		"ready":     {State: &ready},
+		"done":      {State: &done},
+		"claimable": {Claimable: true, Model: &model},
+	}
+	outerTask := regexp.MustCompile(`^(SEARCH|SCAN) task( |$)`)
+	usingIndex := regexp.MustCompile(`USING (?:COVERING )?INDEX (\S+)`)
+
+	// planLines returns the EXPLAIN QUERY PLAN details of the list query on a
+	// freshly opened store, read through the connection ListTasks uses.
+	planLines := func(t *testing.T, s Store, filter TaskListFilter) []string {
+		t.Helper()
+		query, args := buildListTasksQuery(projectIDs[1], filter)
+		rows, err := s.(*sqliteStore).readConn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, args...)
+		if err != nil {
+			t.Fatalf("failed to explain list query: %v", err)
+		}
+		defer rows.Close()
+		var lines []string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				t.Fatalf("failed to scan plan row: %v", err)
+			}
+			lines = append(lines, detail)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("failed to read plan rows: %v", err)
+		}
+		return lines
+	}
+	badPlan := func(lines []string) bool {
+		plan := strings.Join(lines, " | ")
+		return strings.Contains(plan, "idx_task_archived_at") || strings.Contains(plan, "idx_task_held")
+	}
+
+	// Prove the test can fail: the old sampled statistics reproduce the bad plan.
+	originalCmd := analyzeSQLCmd
+	analyzeSQLCmd = "PRAGMA analysis_limit = 1000; ANALYZE"
+	limited, err := Open(dbPath, defaultTestAllowedModels())
+	analyzeSQLCmd = originalCmd
+	if err != nil {
+		t.Fatalf("failed to reopen store with limited analysis: %v", err)
+	}
+	var stat string
+	if err := limited.Conn().QueryRowContext(ctx, "SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_task_archived_at'").Scan(&stat); err != nil {
+		t.Fatalf("failed to read limited statistics: %v", err)
+	}
+	reproduced := 0
+	for _, omit := range []bool{false, true} {
+		for name, filter := range filters {
+			filter.OmitBodies = omit
+			if lines := planLines(t, limited, filter); badPlan(lines) {
+				reproduced++
+				for _, line := range lines {
+					if outerTask.MatchString(line) {
+						t.Logf("limited analysis, %s (omit bodies %v): bad plan reproduced: %s", name, omit, line)
+					}
+				}
+			}
+		}
+	}
+	limited.Close()
+	t.Logf("limited analysis: idx_task_archived_at stat %q; bad plan reproduced in %d of %d queries", stat, reproduced, 2*len(filters))
+	if reproduced == 0 {
+		t.Fatalf("the sampled statistics no longer reproduce the bad plan; grow the test data so the test can fail")
+	}
+
+	// With the fix the startup analysis is exact.
+	fixed, err := Open(dbPath, defaultTestAllowedModels())
+	if err != nil {
+		t.Fatalf("failed to reopen store: %v", err)
+	}
+	defer fixed.Close()
+	start := time.Now()
+	if _, err := fixed.Conn().ExecContext(ctx, "ANALYZE"); err != nil {
+		t.Fatalf("failed to run ANALYZE: %v", err)
+	}
+	t.Logf("full ANALYZE of %d tasks took %v", projectCount*tasksPerProject, time.Since(start))
+	if err := fixed.Conn().QueryRowContext(ctx, "SELECT stat FROM sqlite_stat1 WHERE idx = 'idx_task_archived_at'").Scan(&stat); err != nil {
+		t.Fatalf("failed to read statistics: %v", err)
+	}
+	t.Logf("full analysis: idx_task_archived_at stat %q", stat)
+
+	// Indexes on task whose first column is project_id.
+	projectIndexes := map[string]bool{}
+	idxRows, err := fixed.Conn().QueryContext(ctx, `SELECT il.name FROM pragma_index_list('task') il
+		JOIN pragma_index_info(il.name) ii ON ii.seqno = 0 WHERE ii.name = 'project_id'`)
+	if err != nil {
+		t.Fatalf("failed to list task indexes: %v", err)
+	}
+	for idxRows.Next() {
+		var name string
+		if err := idxRows.Scan(&name); err != nil {
+			t.Fatalf("failed to scan index name: %v", err)
+		}
+		projectIndexes[name] = true
+	}
+	idxRows.Close()
+	if len(projectIndexes) == 0 {
+		t.Fatal("no task index leads with project_id")
+	}
+
+	for _, omit := range []bool{false, true} {
+		for name, filter := range filters {
+			filter.OmitBodies = omit
+			t.Run(fmt.Sprintf("%s/omit=%v", name, omit), func(t *testing.T) {
+				lines := planLines(t, fixed, filter)
+				plan := strings.Join(lines, " | ")
+				if badPlan(lines) {
+					t.Fatalf("list plan uses idx_task_archived_at or idx_task_held: %s", plan)
+				}
+				outer := 0
+				for _, line := range lines {
+					if !outerTask.MatchString(line) {
+						continue
+					}
+					outer++
+					m := usingIndex.FindStringSubmatch(line)
+					if m == nil || !projectIndexes[m[1]] {
+						t.Errorf("outer task rows not read through a project_id index: %q (plan %s)", line, plan)
+					}
+				}
+				if outer == 0 {
+					t.Fatalf("no outer task step found in plan: %s", plan)
+				}
+			})
+		}
+	}
+}
+
 // TestListTasksOmitBodies verifies OmitBodies returns tasks without spec/result
 // and that the query ListTasks builds never references those columns.
 func TestListTasksOmitBodies(t *testing.T) {
