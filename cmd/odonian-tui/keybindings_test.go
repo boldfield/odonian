@@ -237,3 +237,80 @@ func TestDetailHelpBarFollowsState(t *testing.T) {
 		t.Errorf("blocked detail bar offers other states' keys: %q", bar)
 	}
 }
+
+// Every binding a context lists must resolve, in that context, to its own action.
+func TestListedBindingsResolveToTheirActions(t *testing.T) {
+	kb := DefaultKeyBindings()
+	cases := map[string][]keyCtx{"Board": {{state: stateReview}, {state: stateBlocked}, {state: stateBacklog}}, "Detail": {{state: stateReview}, {state: stateApproved}}, "Shell": {}}
+	for _, p := range []shellPane{paneItems, paneProjects, panePreview} {
+		for _, s := range []string{stateBacklog, stateReview, stateApproved, stateBlocked, "ready", ""} {
+			cases["Shell"] = append(cases["Shell"], keyCtx{pane: p, state: s})
+		}
+	}
+	maps := map[string]keyMap{"Board": kb.Board, "Detail": kb.Detail, "Shell": kb.Shell}
+	for name, ctxs := range cases {
+		for _, c := range ctxs {
+			for _, e := range maps[name] {
+				if !e.valid(c) || e.bind.Help().Key == "" {
+					continue
+				}
+				for _, k := range e.bind.Keys() {
+					got, ok := maps[name].lookup(key2msg(k), c)
+					if !ok || got != e.act {
+						t.Errorf("%s %+v: key %q lists %s but resolves to %q (ok=%v)", name, c, k, e.act, got, ok)
+					}
+				}
+			}
+		}
+	}
+}
+
+func key2msg(s string) tea.KeyPressMsg {
+	switch s {
+	case "esc":
+		return tea.KeyPressMsg{Code: tea.KeyEscape}
+	case "pgup":
+		return tea.KeyPressMsg{Code: tea.KeyPgUp}
+	case "pgdown":
+		return tea.KeyPressMsg{Code: tea.KeyPgDown}
+	case "ctrl+c":
+		return tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}
+	case "left":
+		return tea.KeyPressMsg{Code: tea.KeyLeft}
+	case "right":
+		return tea.KeyPressMsg{Code: tea.KeyRight}
+	}
+	return key(s)
+}
+
+func TestShellNavigationComesFromBindings(t *testing.T) {
+	f := newActionFixture(t)
+	for i := range f.model.keyBindings.Shell {
+		e := &f.model.keyBindings.Shell[i]
+		if e.act == actDown {
+			e.bind.SetKeys("y")
+		}
+	}
+	first := f.model.shell.items.SelectedTaskID()
+	f.press("j")
+	if f.model.shell.items.SelectedTaskID() != first {
+		t.Error("the old key still moves after rebinding")
+	}
+	f.press("y")
+	if f.model.shell.items.SelectedTaskID() == first {
+		t.Error("the rebound key did not move the selection")
+	}
+}
+
+func TestShellEnterOpensDetailFromPreviewPane(t *testing.T) {
+	f := newActionFixture(t)
+	f.selectItem(t, "t-review")
+	f.press("tab")
+	if f.model.shell.focus != panePreview {
+		t.Fatalf("focus = %v, want preview", f.model.shell.focus)
+	}
+	f.press("enter")
+	if f.model.mode != modeDetail {
+		t.Errorf("mode = %d, want detail", f.model.mode)
+	}
+}
