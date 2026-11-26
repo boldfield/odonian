@@ -143,7 +143,7 @@ func newBoardFixture(t *testing.T, width, height int, tasks ...tuiclient.Task) *
 		},
 	}
 	cfg := &tuiconfig.Config{URL: "http://test", Token: "t", Actor: "u", PollInterval: time.Hour}
-	f.model = NewShellBoardModel(client, cfg, tuiclient.Project{ID: "p1", Name: "One"})
+	f.model = NewBoardModel(client, cfg, tuiclient.Project{ID: "p1", Name: "One"})
 	f.model.shell.previewDebounce = 0
 	f.model.newTickCmd = func() tea.Cmd {
 		f.ticks++

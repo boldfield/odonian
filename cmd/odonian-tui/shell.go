@@ -9,7 +9,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	"github.com/boldfield/odonian/internal/tuiconfig"
 	"github.com/boldfield/odonian/internal/tuiview"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -60,23 +59,6 @@ type shellTasksMsg struct {
 type previewFetchMsg struct {
 	seq    int
 	taskID string
-}
-
-// NewShellBoardModel creates a board model that renders the three-pane layout.
-func NewShellBoardModel(client tuiclient.Client, config *tuiconfig.Config, project tuiclient.Project) *BoardModel {
-	m := NewBoardModel(client, config, project)
-	theme := NewTheme()
-	m.shell = &shellState{
-		theme:           theme,
-		projects:        NewProjectsPane(theme, []tuiclient.Project{project}),
-		items:           NewWorkItemsPane(theme),
-		preview:         NewPreviewPane(nil, 0, 0),
-		focus:           paneItems,
-		previewDebounce: previewDebounce,
-	}
-	m.shell.preview.SetTheme(theme)
-	m.shell.items.SetProjectName(project.Name)
-	return m
 }
 
 // fetchShellTasks lists the project's open tasks with fields=summary, plus one
@@ -317,7 +299,7 @@ func (m *BoardModel) updateShell(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return model, cmd
 		}
 	}
-	model, cmd := m.updateTabs(msg)
+	model, cmd := m.updateShared(msg)
 	switch msg.(type) {
 	case reviewActionMsg, tasksFetchedMsg:
 		switch typed := msg.(type) {

@@ -12,8 +12,6 @@ type action string
 const (
 	actQuit           action = "quit"
 	actHelp           action = "help"
-	actLeft           action = "left"
-	actRight          action = "right"
 	actUp             action = "up"
 	actDown           action = "down"
 	actEnter          action = "enter"
@@ -26,7 +24,6 @@ const (
 	actToggleProjects action = "toggle-projects"
 	actOpenProject    action = "open-project"
 	actArchiveProject action = "archive-project"
-	actSwitchProject  action = "switch-project"
 	actHold           action = "hold"
 	actSetPriority    action = "set-priority"
 	actMoveToFront    action = "move-to-front"
@@ -47,7 +44,7 @@ const (
 )
 
 // keyCtx is what decides which bindings are live: the focused shell pane and the state of
-// the item the keys would act on. The tab layout and the detail view ignore the pane.
+// the item the keys would act on. The detail view ignores the pane.
 type keyCtx struct {
 	pane  shellPane
 	state string
@@ -126,7 +123,6 @@ func (km keyMap) binding(a action) keybind.Binding {
 
 // KeyBindings holds the bindings of each context.
 type KeyBindings struct {
-	Board  keyMap // the tab layout (legacy)
 	Detail keyMap // the full-screen detail view
 	Shell  keyMap // the three-pane shell
 }
@@ -147,30 +143,6 @@ func (e keyEntry) hidden() keyEntry {
 // DefaultKeyBindings returns the default key bindings.
 func DefaultKeyBindings() KeyBindings {
 	return KeyBindings{
-		Board: keyMap{
-			bind(actPromote, "p", "p", "promote").inStates(stateBacklog),
-			bind(actApprove, "a", "a", "approve").inStates(stateReview),
-			bind(actReject, "x", "x", "reject").inStates(stateReview),
-			bind(actBounce, "b", "b", "bounce").inStates(stateApproved),
-			bind(actUnblock, "u", "u", "unblock").inStates(stateBlocked),
-			bind(actFail, "f", "f", "fail").inStates(stateBlocked),
-			bind(actLeft, "left", "←/→", "column", "h"),
-			bind(actRight, "right", "", "", "l").hidden(),
-			bind(actUp, "up", "↑/↓", "select", "k"),
-			bind(actDown, "down", "", "", "j").hidden(),
-			bind(actEnter, "enter", "enter", "detail"),
-			bind(actHold, "t", "t", "hold/release"),
-			bind(actSetPriority, "i", "i", "set priority"),
-			bind(actMoveToFront, "w", "w", "move to front"),
-			bind(actResetPriority, "e", "e", "reset priority"),
-			bind(actArchive, "z", "z", "archive"),
-			bind(actScorecards, "c", "c", "scorecards"),
-			bind(actSwitchProject, "P", "P", "switch project"),
-			bind(actRefresh, "r", "r", "refresh"),
-			bind(actHelp, "?", "?", "help"),
-			bind(actQuit, "q", "q", "quit", "ctrl+c"),
-		},
-
 		Detail: keyMap{
 			bind(actApprove, "a", "a", "approve").inStates(stateReview),
 			bind(actReject, "x", "x", "reject").inStates(stateReview),
@@ -187,7 +159,6 @@ func DefaultKeyBindings() KeyBindings {
 			bind(actOpenPR, "o", "o", "open PR"),
 			bind(actSourceDoc, "s", "s", "source doc"),
 			bind(actDesignDoc, "d", "d", "design doc"),
-			bind(actSwitchProject, "P", "P", "switch project"),
 		},
 
 		Shell: keyMap{

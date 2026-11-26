@@ -155,14 +155,9 @@ func (m *BoardModel) updateScorecardMode(msg tea.KeyPressMsg) (*BoardModel, tea.
 		return m, m.fetchScorecardCmd()
 
 	case "P":
-		m.mode = modeProjectSwitch
-		m.projectSwitchIndex = 0
-		for i, proj := range m.projects {
-			if proj.ID == m.project.ID {
-				m.projectSwitchIndex = i
-				break
-			}
-		}
+		m.mode = modeNormal
+		m.shell.projectHidden = false
+		m.shell.focus = paneProjects
 		m.scorecardViewport.SetContent("")
 		m.lastScorecards = nil
 		m.scorecardLoading = false
