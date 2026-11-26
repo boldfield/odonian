@@ -217,7 +217,7 @@ func (f *boardFixture) send(msgs ...tea.Msg) {
 func (f *boardFixture) press(keys ...string) {
 	f.t.Helper()
 	for _, k := range keys {
-		if len(k) > 1 && k != "enter" && k != "tab" && k != "down" && k != "up" {
+		if len(k) > 1 && k != "enter" && k != "tab" && k != "down" && k != "up" && k != "esc" {
 			for _, ch := range k {
 				f.send(key(string(ch)))
 			}
@@ -282,6 +282,8 @@ func key(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyUp}
 	case "enter":
 		return tea.KeyPressMsg{Code: tea.KeyEnter}
+	case "esc":
+		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	}
 	return tea.KeyPressMsg{Code: rune(s[0]), Text: s}
 }

@@ -46,6 +46,8 @@ type shellState struct {
 	fetchErrorMsg string
 	// filter is the set of hidden task states; it applies to every project.
 	filter tuiview.StateFilter
+	// filterCursor is the row of the state filter overlay under the cursor.
+	filterCursor int
 }
 
 // shellTasksMsg carries one project's work for the shell: the tasks and the ids of the
@@ -210,6 +212,9 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 	switch act {
 	case actHelp:
 		m.showFullHelp = true
+	case actStateFilter:
+		s.filterCursor = 0
+		m.mode = modeStateFilter
 	case actNextPane:
 		m.cycleFocus(1)
 	case actPrevPane:
@@ -267,6 +272,53 @@ func (m *BoardModel) updateShellKey(msg tea.KeyPressMsg) (model tea.Model, cmd t
 	return m, nil, true
 }
 
+// updateStateFilterKey handles a key while the state filter overlay is open. The overlay
+// takes every key: the movement and toggle keys act on it, esc and F close it, and the rest
+// are swallowed so no board action runs behind it.
+func (m *BoardModel) updateStateFilterKey(msg tea.KeyPressMsg) tea.Cmd {
+	s := m.shell
+	n := len(tuiview.FilterableStates)
+	switch msg.String() {
+	case "ctrl+c":
+		return tea.Quit
+	case "esc", "F":
+		m.mode = modeNormal
+	case "up", "k":
+		if s.filterCursor > 0 {
+			s.filterCursor--
+		}
+	case "down", "j":
+		if s.filterCursor < n-1 {
+			s.filterCursor++
+		}
+	case "space", " ":
+		return m.SetStateFilter(s.filter.Toggle(tuiview.FilterableStates[s.filterCursor]))
+	}
+	return nil
+}
+
+// renderStateFilterOverlay lists the filterable states, each marked shown or hidden, with
+// the cursor row marked. Every line is cut to the terminal width.
+func (m *BoardModel) renderStateFilterOverlay() string {
+	s := m.shell
+	lines := []string{"Task states (shown / hidden):"}
+	for i, state := range tuiview.FilterableStates {
+		cursor, mark := "  ", "[ ]"
+		if i == s.filterCursor {
+			cursor = "> "
+		}
+		if s.filter.Visible(state) {
+			mark = "[x]"
+		}
+		lines = append(lines, cursor+mark+" "+state)
+	}
+	lines = append(lines, "↑/↓ move · space toggle · esc/F close")
+	for i, l := range lines {
+		lines[i] = ansi.Truncate(l, m.width, "…")
+	}
+	return strings.Join(lines, "\n")
+}
+
 // effectiveFocus is the pane that has focus at the current layout (a hidden pane cannot).
 func (m *BoardModel) effectiveFocus() shellPane {
 	layout := m.shellLayout()
@@ -312,6 +364,9 @@ func (s *shellState) projectsVisible(m *BoardModel) bool {
 func (m *BoardModel) updateShell(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if cmd, handled := m.handleShellMsg(msg); handled {
 		return m, cmd
+	}
+	if key, ok := msg.(tea.KeyPressMsg); ok && m.mode == modeStateFilter {
+		return m, m.updateStateFilterKey(key)
 	}
 	if key, ok := msg.(tea.KeyPressMsg); ok && m.mode == modeNormal {
 		m.statusMessage = ""
@@ -495,7 +550,10 @@ func (m *BoardModel) shellView() string {
 	bodyHeight := m.height - 2
 	// An active prompt takes the help bar's place and as many rows above it as it needs.
 	prompt := ""
-	if m.mode != modeNormal {
+	if m.mode == modeStateFilter {
+		prompt = m.renderStateFilterOverlay()
+		bodyHeight -= strings.Count(prompt, "\n")
+	} else if m.mode != modeNormal {
 		prompt = strings.TrimRight(m.renderReviewOverlay(), "\n")
 		bodyHeight -= strings.Count(prompt, "\n")
 	}
