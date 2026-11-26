@@ -6,68 +6,32 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	"github.com/boldfield/odonian/internal/tuiconfig"
 )
 
-// approvedTestBucketed returns a bucketed task map with one approved task.
-// The PR link is only available in the TaskDetail (fetched when entering detail mode).
-func approvedTestBucketed(approvedTaskID string) map[string][]tuiclient.Task {
-	bucketed := make(map[string][]tuiclient.Task)
-	for _, state := range []string{"backlog", "ready", "in_progress", "review", "approved", "done"} {
-		bucketed[state] = []tuiclient.Task{}
-	}
-	bucketed["approved"] = []tuiclient.Task{
-		{
-			ID:    approvedTaskID,
-			Title: "Approved Task",
-			State: "approved",
-		},
-	}
-	return bucketed
-}
-
-// buildApprovedModel returns a board model set up in the approved column with one approved
-// task selected. approvedClient is the mock client to inject.
+// buildApprovedModel returns a shell board model with one approved task selected. approvedClient
+// is the mock client to inject; it replaces the fixture's client once the board has loaded.
 func buildApprovedModel(t *testing.T, approvedClient *tuiclient.MockClient) *BoardModel {
 	t.Helper()
+	f := newBoardFixture(t, 80, 24, tuiclient.Task{ID: "approved-task-1", Title: "Approved Task", State: "approved", Kind: "implement"})
+	f.selectItem(t, "approved-task-1")
+	f.model.client = approvedClient
+	f.model.project.Repo = "https://github.com/boldfield/odonian"
+	return f.model
+}
 
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "reviewer-bot",
-		PollInterval: 100 * time.Millisecond,
+// selectedItemState is the state of the task selected in the work-items pane, after a refresh.
+func selectedItemState(t *testing.T, m *BoardModel) string {
+	// The action's refetch lands as a follow-up message the single-step helpers drop, so poll
+	// once more with the refresh key.
+	(&boardFixture{t: t, model: m}).send(key("r"))
+	item := m.shell.items.SelectedItem()
+	if item == nil {
+		return ""
 	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test", Repo: "https://github.com/boldfield/odonian"}
-
-	model := NewBoardModel(approvedClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
-
-	// Load an approved task into the board.
-	m, _ = model.Update(tasksFetchedMsg{tasks: approvedTestBucketed("approved-task-1")})
-	model = m.(*BoardModel)
-
-	// Navigate to the approved column. Starting from in_progress, press right once per
-	// column in stateOrder: checks, review, then approved.
-	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
-	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
-	model = m.(*BoardModel)
-	m, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
-	model = m.(*BoardModel)
-
-	if model.selectedColumn != columnIndex(stateApproved) {
-		t.Fatalf("buildApprovedModel: expected selectedColumn %d (approved), got %d", columnIndex(stateApproved), model.selectedColumn)
-	}
-	if model.selectedTaskID != "approved-task-1" {
-		t.Fatalf("buildApprovedModel: expected selectedTaskID approved-task-1, got %q", model.selectedTaskID)
-	}
-
-	return model
+	return item.Implement.State
 }
 
 // TestBoardModel_MergePRConfirmFlow tests the merge PR confirmation flow in detail view.
@@ -215,7 +179,7 @@ func TestBoardModel_MergePRSuccess(t *testing.T) {
 		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
 			callLog = append(callLog, "refetch")
 			return []tuiclient.Task{
-				{ID: "approved-task-1", Title: "Approved Task", State: "done"},
+				{ID: "approved-task-1", Title: "Approved Task", State: "done", Kind: "implement"},
 			}, nil
 		},
 	}
@@ -310,7 +274,7 @@ func TestBoardModel_MergePRFailure(t *testing.T) {
 		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
 			callLog = append(callLog, "refetch")
 			return []tuiclient.Task{
-				{ID: "approved-task-1", Title: "Approved Task", State: "approved"},
+				{ID: "approved-task-1", Title: "Approved Task", State: "approved", Kind: "implement"},
 			}, nil
 		},
 	}
@@ -355,9 +319,8 @@ func TestBoardModel_MergePRFailure(t *testing.T) {
 	}
 
 	// Verify the task is still in approved state (refetch happened but no transition).
-	output := model.View().Content
-	if !strings.Contains(output, "approved(1)") {
-		t.Errorf("Expected task to remain in approved state, got:\n%s", output)
+	if got := selectedItemState(t, model); got != "approved" {
+		t.Errorf("Expected task to remain in approved state, got %q:\n%s", got, model.View().Content)
 	}
 }
 
@@ -399,10 +362,11 @@ func TestBoardModel_ApprovedHelpBar(t *testing.T) {
 	m, _ = model.Update(tea.KeyPressMsg{Code: 'q', Text: "q"})
 	model = m.(*BoardModel)
 
-	// The help bar on the board should not show the merge action.
+	// The shell's bar offers the keys valid for the selected item, so merge stays on the board
+	// bar for an approved task, but not as the detail view's longer label.
 	boardOutput := model.View().Content
-	if strings.Contains(boardOutput, "m merge") {
-		t.Errorf("Did not expect 'm merge' in board help bar, got:\n%s", boardOutput)
+	if strings.Contains(boardOutput, "m merge & complete") {
+		t.Errorf("Did not expect the detail label 'm merge & complete' on the board, got:\n%s", boardOutput)
 	}
 }
 
@@ -426,7 +390,7 @@ func TestBoardModel_ApprovedSendBackSuccess(t *testing.T) {
 		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
 			callLog = append(callLog, "refetch")
 			return []tuiclient.Task{
-				{ID: "approved-task-1", Title: "Approved Task", State: "ready"},
+				{ID: "approved-task-1", Title: "Approved Task", State: "ready", Kind: "implement"},
 			}, nil
 		},
 	}
@@ -493,9 +457,8 @@ func TestBoardModel_ApprovedSendBackSuccess(t *testing.T) {
 	}
 
 	// Verify the task is now in the ready column.
-	output := model.View().Content
-	if !strings.Contains(output, "ready(1)") {
-		t.Errorf("Expected task to be in ready column, got:\n%s", output)
+	if got := selectedItemState(t, model); got != "ready" {
+		t.Errorf("Expected task to be in ready state, got %q:\n%s", got, model.View().Content)
 	}
 }
 
@@ -510,7 +473,7 @@ func TestBoardModel_ApprovedSendBackNoNote(t *testing.T) {
 		},
 		ListTasksFunc: func(ctx context.Context, projectID string, options ...tuiclient.TaskListOption) ([]tuiclient.Task, error) {
 			return []tuiclient.Task{
-				{ID: "approved-task-1", Title: "Approved Task", State: "ready"},
+				{ID: "approved-task-1", Title: "Approved Task", State: "ready", Kind: "implement"},
 			}, nil
 		},
 	}

@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/boldfield/odonian/internal/tuiclient"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -236,26 +235,6 @@ func TestDetailHelpBarFollowsState(t *testing.T) {
 	f = detailFixture(t, "t-blocked")
 	if bar := lastLine(f.model.View().Content); strings.Contains(bar, "approve") || strings.Contains(bar, "merge") {
 		t.Errorf("blocked detail bar offers other states' keys: %q", bar)
-	}
-}
-
-func TestLegacyBoardFullHelpToggle(t *testing.T) {
-	m := NewBoardModel(nil, nil, tuiclient.Project{ID: "p", Name: "p"})
-	m.width, m.height = 100, 30
-	m.tasks[stateReview] = []tuiclient.Task{{ID: "r1", State: stateReview, Title: "R"}}
-	m.selectedColumn = columnIndex(stateReview)
-	m.selectedTaskID = "r1"
-	m.Update(key("?"))
-	if out := squeeze(m.viewContent()); !strings.Contains(out, "a approve") || !strings.Contains(out, "←/→ column") {
-		t.Errorf("legacy full list incomplete:\n%s", out)
-	}
-	m.Update(key("a"))
-	if m.mode != modeNormal {
-		t.Error("a leaked through the open list")
-	}
-	m.Update(key("?"))
-	if m.showFullHelp {
-		t.Error("second ? should close the list")
 	}
 }
 

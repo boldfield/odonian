@@ -5,12 +5,18 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/boldfield/odonian/internal/tuiclient"
-	"github.com/boldfield/odonian/internal/tuiconfig"
 )
+
+// newScorecardFixture is an 80x24 shell whose client serves scorecards from mockClient.
+func newScorecardFixture(t *testing.T, mockClient *tuiclient.MockClient) *boardFixture {
+	t.Helper()
+	f := newBoardFixture(t, 80, 24)
+	f.mock().GetResearchReviewerScorecardsFunc = mockClient.GetResearchReviewerScorecardsFunc
+	return f
+}
 
 // TestBoardModel_ScorecardMode_Normal tests the normal scorecard flow: press 'c', loading state, then data display.
 func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
@@ -35,17 +41,8 @@ func TestBoardModel_ScorecardMode_Normal(t *testing.T) {
 		},
 	}
 
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
-
-	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
+	model := newScorecardFixture(t, mockClient).model
+	var m tea.Model
 
 	// Press 'c' to enter scorecard mode
 	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
@@ -116,17 +113,8 @@ func TestBoardModel_ScorecardMode_Empty(t *testing.T) {
 		},
 	}
 
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
-
-	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
+	model := newScorecardFixture(t, mockClient).model
+	var m tea.Model
 
 	// Press 'c' to enter scorecard mode
 	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
@@ -175,17 +163,8 @@ func TestBoardModel_ScorecardMode_Sparse(t *testing.T) {
 		},
 	}
 
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
-
-	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
+	model := newScorecardFixture(t, mockClient).model
+	var m tea.Model
 
 	// Press 'c' to enter scorecard mode
 	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
@@ -226,17 +205,8 @@ func TestBoardModel_ScorecardMode_APIError(t *testing.T) {
 		},
 	}
 
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
-
-	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
+	model := newScorecardFixture(t, mockClient).model
+	var m tea.Model
 
 	// Press 'c' to enter scorecard mode
 	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
@@ -319,17 +289,8 @@ func TestBoardModel_ScorecardMode_Refresh(t *testing.T) {
 		},
 	}
 
-	config := &tuiconfig.Config{
-		URL:          "http://test",
-		Token:        "test",
-		Actor:        "testuser",
-		PollInterval: 100 * time.Millisecond,
-	}
-	project := tuiclient.Project{ID: "project-1", Name: "Test Project"}
-
-	model := NewBoardModel(mockClient, config, project)
-	m, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	model = m.(*BoardModel)
+	model := newScorecardFixture(t, mockClient).model
+	var m tea.Model
 
 	// Press 'c' to enter scorecard mode
 	m, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
