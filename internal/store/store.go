@@ -393,17 +393,15 @@ func (s *sqliteStore) migrate(fsys fs.FS) error {
 // analyzeSQLCmd is the SQL command to run for analysis. It can be overridden in tests.
 var analyzeSQLCmd = "ANALYZE"
 
-// analyzeDatabase runs the SQLite ANALYZE pragma to collect planner statistics.
-// It runs with a limit to avoid delaying startup on large databases.
+// analyzeDatabase runs the SQLite ANALYZE command to collect planner statistics.
+// It reads every index in full (no analysis_limit): a sampled ANALYZE badly
+// underestimates rows per value on skewed columns such as archived_at, where nearly
+// every task is NULL, and the planner then walks idx_task_archived_at for every task
+// list. A full ANALYZE takes tens of milliseconds even on a large database.
 // If analysis fails, the error is logged but does not stop startup.
 func (s *sqliteStore) analyzeDatabase(conn *sql.DB) {
 	start := time.Now()
 	logger := slog.Default()
-
-	if _, err := conn.Exec("PRAGMA analysis_limit = 1000"); err != nil {
-		logger.Error("failed to set analysis_limit pragma", "error", err)
-		return
-	}
 
 	if _, err := conn.Exec(analyzeSQLCmd); err != nil {
 		logger.Error("failed to run ANALYZE", "error", err)
