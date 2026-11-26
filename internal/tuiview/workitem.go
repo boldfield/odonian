@@ -110,10 +110,11 @@ func IsHeld(task *tuiclient.Task) bool {
 }
 
 // NeedsYou returns whether a task needs the operator.
-// A task needs you when: blocked, failed, or approved with agent_merge=false.
+// A task needs you when: blocked, or approved with agent_merge=false.
+// A failed task is terminal, so there is no action to take on it.
 func NeedsYou(task *tuiclient.Task) bool {
 	switch task.State {
-	case "blocked", "failed":
+	case "blocked":
 		return true
 	case "approved":
 		return !task.AgentMerge
@@ -123,9 +124,10 @@ func NeedsYou(task *tuiclient.Task) bool {
 }
 
 // Badge computes a project's badge from its work items and returns the badge glyph and count.
-// Returns ("", 0) for projects with only queued work (no needs-you, no awaiting-merge, no in-flight items).
+// Callers pass work items already filtered by FilterWorkItems, so badges count only
+// tasks in visible states. Returns ("", 0) for projects with only queued work (no needs-you, no awaiting-merge, no in-flight items).
 // Badge priority (highest first):
-// 1. Needs you (blocked or failed): "⚠"
+// 1. Needs you (blocked): "⚠"
 // 2. Awaiting merge (approved with agent_merge=false): "✔"
 // 3. In flight (in_progress, checks, review, or approved with agent_merge=true): "●"
 func Badge(workItems []*WorkItem) (string, int) {
@@ -139,7 +141,7 @@ func Badge(workItems []*WorkItem) (string, int) {
 				// approved with agent_merge=false counts as awaiting merge
 				awaitingMergeCount++
 			} else {
-				// blocked or failed
+				// blocked
 				needsYouCount++
 			}
 		} else if impl.State == "in_progress" || impl.State == "checks" || impl.State == "review" {
