@@ -219,8 +219,8 @@ func TestBoardModel_MergePRSuccess(t *testing.T) {
 	}
 
 	// Verify call order: merge → transition → refetch.
-	if len(callLog) != 3 {
-		t.Fatalf("Expected 3 calls (merge, transition, refetch), got %d: %v", len(callLog), callLog)
+	if want := 2 + len(model.shell.filter.VisibleStates()); len(callLog) != want {
+		t.Fatalf("Expected %d calls (merge, transition, one refetch per visible state), got %d: %v", want, len(callLog), callLog)
 	}
 	if callLog[0] != "merge" {
 		t.Errorf("Expected first call to be 'merge', got %q", callLog[0])
@@ -435,8 +435,8 @@ func TestBoardModel_ApprovedSendBackSuccess(t *testing.T) {
 	}
 
 	// Verify call order: transition → refetch (no ReviewTask).
-	if len(callLog) != 2 {
-		t.Fatalf("Expected 2 calls (transition, refetch), got %d: %v", len(callLog), callLog)
+	if want := 1 + len(model.shell.filter.VisibleStates()); len(callLog) != want {
+		t.Fatalf("Expected %d calls (transition, one refetch per visible state), got %d: %v", want, len(callLog), callLog)
 	}
 	if callLog[0] != "transition" {
 		t.Errorf("Expected first call to be 'transition', got %q", callLog[0])

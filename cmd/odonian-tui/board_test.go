@@ -349,7 +349,7 @@ func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
 		}
 	}
 
-	// --- Tick polls only the active states and failed ---
+	// --- Tick polls only the visible states ---
 	f.resetCalls()
 	f.send(tickMsg{})
 	assertCalls(t, f.listCalls(), activeStates, 1)
@@ -358,10 +358,10 @@ func TestBoardModel_PerStatePollingWithSummaryFields(t *testing.T) {
 		t.Errorf("expected the polled tasks in the work items, and not the hidden failed one:\n%s", view)
 	}
 
-	// --- Manual refresh ('r') fetches every state ---
+	// --- Manual refresh ('r') fetches the same visible states as the poll ---
 	f.resetCalls()
 	f.press("r")
-	assertCalls(t, f.listCalls(), stateOrder, 0)
+	assertCalls(t, f.listCalls(), activeStates, 0)
 }
 
 // --- TUI-4: Review action tests ---
