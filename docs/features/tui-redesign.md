@@ -158,22 +158,50 @@ glyph, so the board stays readable without colour.
 | `◆` | in review (shows round and each reviewer's verdict) |
 | `✔` | approved, awaiting merge |
 | `✖` | blocked |
-| `!` | failed |
+| `!` | failed (hidden by default) |
 | `⏸` | held (prefix on any of the above) |
 
 Priority is shown only when it differs from the default.
 
 **Needs you.** A task is in the "needs you" band, and counts toward a project's `⚠`/`✔`
-badge, when a human is the next actor: `blocked`, `failed`, or `approved` with
-`agent_merge=false`. An approved task with `agent_merge=true` is in flight, not waiting on
-the operator.
+badge, when a human is the next actor: `blocked`, or `approved` with `agent_merge=false`. An
+approved task with `agent_merge=true` is in flight, not waiting on the operator. A `failed`
+task is not in this band: `failed` is terminal, so there is no action to take on it. When
+failed tasks are shown (see State filter) they form their own group after the queued work.
 
 **Finished, last hour.** Implement tasks that reached `done` in the last hour, newest first,
 so watching shows completions and not just rows disappearing. Shown in "All" only. It is the
 last band and the first to be cut when the pane is short.
 
-**Project badge.** The highest-priority non-zero count: `⚠` needs you (blocked or failed),
-`!` failed only, `✔` awaiting your merge, `●` in flight. No badge means queued work only.
+**Project badge.** The highest-priority non-zero count: `⚠` needs you (blocked), `✔` awaiting
+your merge, `●` in flight. No badge means queued work only. Badges count only tasks in
+visible states (see State filter), so a badge never points at rows the list does not show.
+
+## State filter
+
+The operator chooses which task states the work-item pane shows. The filter is one set of
+hidden states for the whole TUI: it applies to every project and to "All".
+
+- **States that can be hidden or shown:** `backlog`, `ready`, `in_progress`, `checks`,
+  `review`, `approved`, `blocked`, `failed`, `abandoned`. `done` and `superseded` are never
+  listed; completions belong to the "finished, last hour" band.
+- **Default:** `failed` and `abandoned` are hidden. Both are terminal and accumulate.
+- **Config:** `hidden_states` in `~/.config/odonian/config.toml` (a list of state names)
+  replaces the default at startup. An empty list shows every state. An unknown name is
+  reported on stderr and ignored.
+- **Changing it:** `F` opens an overlay listing the nine states, each marked shown or hidden.
+  Up and down move, space toggles, `esc` or `F` closes. A change applies at once and lasts
+  for the session; the TUI does not write the config file.
+- **Fetching:** a hidden state is not requested from the server. Showing a state fetches it
+  immediately. The dependency listing (`claimable=true`) is skipped when `ready` is hidden.
+- **Telling the operator:** when any state is hidden, the last line of the work-item pane
+  reads `hidden: failed, abandoned · F to change`, naming the hidden states in the order
+  above, without counts (a count would need the fetch the filter avoids). The line is
+  truncated to the pane width.
+- **Selection:** if the selected work item's state becomes hidden, selection moves to the
+  nearest visible item, as it does when a task disappears between polls.
+- **Review and merge tasks** follow their implement task: they are shown or hidden with it,
+  whatever their own state.
 
 ## Keys
 
@@ -184,6 +212,7 @@ quit. Changes:
 - `tab` / `shift+tab` move focus between panes; arrows move within the focused pane.
 - `/` filters the work-item pane by text.
 - `v` toggles the preview; `V` (shift+v) hides the project pane.
+- `F` (shift+f) opens the state filter. Lower-case `f` remains "fail" on a blocked task.
 - `?` opens the full key list. The bottom bar shows only the keys valid for the selected
   item's status, and truncates with `…` instead of overflowing.
 - The project-switcher overlay goes away; the project pane replaces it.
