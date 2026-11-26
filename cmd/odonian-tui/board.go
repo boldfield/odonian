@@ -78,6 +78,8 @@ const (
 	modeResetPriorityReason
 	// modeResetPriorityConfirm is the confirmation step for a reset priority action.
 	modeResetPriorityConfirm
+	// modeStateFilter is the overlay that shows or hides task states.
+	modeStateFilter
 )
 
 // BoardModel is the Bubble Tea model for the task board view.

@@ -41,6 +41,7 @@ const (
 	actOpenPR         action = "open-pr"
 	actSourceDoc      action = "source-doc"
 	actDesignDoc      action = "design-doc"
+	actStateFilter    action = "state-filter"
 )
 
 // keyCtx is what decides which bindings are live: the focused shell pane and the state of
@@ -185,6 +186,7 @@ func DefaultKeyBindings() KeyBindings {
 			bind(actArchiveProject, "z", "z", "archive project").inPanes(paneProjects),
 			bind(actTogglePreview, "v", "v", "preview"),
 			bind(actToggleProjects, "V", "V", "projects"),
+			bind(actStateFilter, "F", "F", "states"),
 			bind(actScorecards, "c", "c", "scorecards"),
 			bind(actRefresh, "r", "r", "refresh"),
 			bind(actHelp, "?", "?", "help"),
