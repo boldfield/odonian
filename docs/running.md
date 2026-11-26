@@ -69,7 +69,11 @@ or `--url` / `--token` flags, in that order of precedence from lowest to highest
 ```
 
 The board polls the active states and failed tasks automatically; `r` refreshes immediately. Done
-and abandoned tasks are not shown.
+tasks are not shown. By default `failed` and `abandoned` tasks are hidden too and are not fetched;
+`F` opens an overlay to show or hide any state for the session. To change the startup default, set
+`hidden_states` in the config file (`hidden_states = []` shows every state, and
+`hidden_states = ["failed", "abandoned", "backlog"]` hides more). See
+[the TUI guide](./features/tui.md#state-filter).
 
 The layout is three panes: projects, work items and a preview of the selected item. It adapts to
 the terminal width: all three at 120 columns or more, a narrow project rail beside the items

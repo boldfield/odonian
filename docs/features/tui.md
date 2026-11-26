@@ -62,7 +62,8 @@ Resolution order (highest wins): **flags > environment > config file > defaults*
 
 - Config file (TOML) at `$XDG_CONFIG_HOME/odonian/config.toml` (default
   `~/.config/odonian/config.toml`). Keys: `url`, `token`, `actor`, `default_project`,
-  `poll_interval` (default `2s`).
+  `poll_interval` (default `2s`), `hidden_states` (a list of state names; see
+  [State filter](#state-filter)).
 - Env: `ODONIAN_URL`, `ODONIAN_TOKEN`, `ODONIAN_ACTOR` (same vars the agents use).
 - `actor` (the reviewer identity recorded on review events) defaults to the OS `$USER` when
   unset.
@@ -141,7 +142,9 @@ empty. The bands and badges are not in the key tables below because they have no
 
 - Each refresh issues one state-filtered `ListTasks` call for every active state and for `failed`,
   plus one `claimable=true` call that tells ready tasks from tasks waiting on a dependency. Done
-  and abandoned tasks are never requested, so they are not shown.
+  tasks are never requested, so they are not shown. States hidden by the
+  [state filter](#state-filter) (by default `failed` and `abandoned`) are not requested either,
+  and the `claimable=true` call is skipped when `ready` is hidden.
 - The tasks are grouped into work items (an implement task with its review and merge tasks nested
   under it) and shown as one list; there are no state columns.
 - Poll every `poll_interval` (default 2s); `r` forces an immediate refresh.
@@ -152,6 +155,38 @@ empty. The bands and badges are not in the key tables below because they have no
 - States: the items pane shows "Nothing open in this project" until the first fetch returns, and
   when the project has no open work items. A fetch error replaces the help line with the error text
   until a later refresh succeeds.
+
+## State filter
+
+The state filter chooses which task states the work-item pane shows. It is one set of hidden
+states for the whole TUI, applied to every project.
+
+- **States you can hide or show:** `backlog`, `ready`, `in_progress`, `checks`, `review`,
+  `approved`, `blocked`, `failed`, `abandoned`. `done` and `superseded` are never listed.
+- **Default:** `failed` and `abandoned` are hidden, since both are terminal and accumulate.
+- **Config:** `hidden_states` in the config file replaces the default at startup. An empty list
+  shows every state. An unknown state name is reported on stderr and ignored; a value that is
+  not a list of strings warns and keeps the default.
+
+  ```toml
+  # show every state
+  hidden_states = []
+
+  # hide more than the default
+  hidden_states = ["failed", "abandoned", "backlog"]
+  ```
+
+- **Changing it:** `F` opens an overlay listing the nine states, each marked shown or hidden.
+  `↑/↓` (or `j/k`) move, `space` toggles, `esc` or `F` closes. A change applies at once and
+  lasts for the session; the TUI does not write the config file.
+- **Fetching:** a hidden state is not requested from the server. Showing a state fetches it
+  immediately. The `claimable=true` listing is skipped when `ready` is hidden.
+- **Footer:** when any state is hidden, the last line of the work-item pane reads, for example,
+  `hidden: failed, abandoned · F to change`. It names the hidden states without counts and is
+  truncated to the pane width.
+- **Selection:** if the selected item's state becomes hidden, the selection moves to the nearest
+  visible item.
+- **Review and merge tasks** follow their implement task: they are shown or hidden with it.
 
 ## Actions
 
@@ -203,6 +238,7 @@ Checked against the `Shell` and `Detail` key maps in `cmd/odonian-tui/keybinding
 | `↑/↓`, `j/k` | move the selection in the focused pane; scroll the preview when it has focus |
 | `v` | show or hide the preview |
 | `V` | show or hide the projects pane |
+| `F` | open the state filter overlay |
 | `c` | scorecards |
 | `r` | refresh now |
 | `?` | toggle the full key list |
@@ -235,6 +271,14 @@ rest apply to any item.
 |-----|--------|
 | `enter` | open the selected project |
 | `z` | archive the selected project (confirmed) |
+
+### State filter overlay
+
+| Key | Action |
+|---|---|
+| `↑/↓`, `j/k` | move between states |
+| `space` | hide or show the state |
+| `esc`, `F` | close |
 
 ### Detail view
 
