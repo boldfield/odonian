@@ -497,11 +497,11 @@ func TestNeedsYou(t *testing.T) {
 			want: true,
 		},
 
-		// Failed always needs you
+		// Failed is terminal: nothing to do
 		{
 			name: "failed",
 			task: &tuiclient.Task{State: "failed"},
-			want: true,
+			want: false,
 		},
 
 		// Approved with agent_merge=false needs you
@@ -603,8 +603,8 @@ func TestBadge(t *testing.T) {
 			workItems: []*WorkItem{
 				{Implement: &tuiclient.Task{State: "failed"}},
 			},
-			wantGlyph: "⚠",
-			wantCount: 1,
+			wantGlyph: "",
+			wantCount: 0,
 		},
 
 		// Mixed blocked and failed (needs you)
@@ -615,7 +615,7 @@ func TestBadge(t *testing.T) {
 				{Implement: &tuiclient.Task{State: "failed"}},
 			},
 			wantGlyph: "⚠",
-			wantCount: 2,
+			wantCount: 1,
 		},
 
 		// Approved with agent_merge=false (awaiting merge)
@@ -686,7 +686,7 @@ func TestBadge(t *testing.T) {
 				{Implement: &tuiclient.Task{State: "failed"}},
 				{Implement: &tuiclient.Task{State: "approved", AgentMerge: true}},
 			},
-			wantGlyph: "⚠",
+			wantGlyph: "●",
 			wantCount: 1,
 		},
 
